@@ -89,6 +89,11 @@ cmd_apply() {
     load "$1"
 
     if [ "$LISTENS" != yes ]; then
+        # Switching a tunnel between direct and reverse swaps which side accepts.
+        # If this side used to accept, its rules are now meaningless and would
+        # keep a port shut that nothing is listening on, so clear them.
+        purge_port iptables "$TPORT"
+        purge_port ip6tables "$TPORT"
         echo "tunnel $1 dials out, so no firewall rule is needed on this server"
         return 0
     fi
@@ -140,7 +145,8 @@ purge_port() {
 
 cmd_remove() {
     load "$1"
-    [ "$LISTENS" = yes ] || return 0
+    # Purge whether or not this side accepts now: the mode may have been changed
+    # since the rules were added, and leaving them behind shuts a port for good.
     purge_port iptables "$TPORT"
     purge_port ip6tables "$TPORT"
     echo "firewall rules for tunnel port $TPORT removed"
