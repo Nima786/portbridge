@@ -231,8 +231,8 @@ PortBridge is installed."
 say "
 Open the menu any time with:  ${B}portbridge-menu${R}
 "
-say "${DIM}Start on your relay, the server your users connect to: create the tunnel there.${R}"
-say "${DIM}It gives you a code. Then install on your server and paste the code there.${R}"
+say "${DIM}On your Iran server, choose 'Create a tunnel'. It gives you a code.${R}"
+say "${DIM}Then on your foreign server, choose 'Join a tunnel' and paste that code.${R}"
 say ""
 
 if [ "$NOMENU" = no ] && [ -t 0 ]; then
