@@ -98,8 +98,31 @@ gen_secret() {
     fi
 }
 
+is_private_ipv4() {
+    case "$1" in
+        10.* | 192.168.* | 127.* | 169.254.*) return 0 ;;
+        172.1[6-9].* | 172.2[0-9].* | 172.3[01].*) return 0 ;;
+        100.6[4-9].* | 100.[7-9][0-9].* | 100.1[01][0-9].* | 100.12[0-7].*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+# The address the OTHER server should use to reach this one.
+#
+# A public address bound directly to an interface is the most trustworthy
+# answer, so it wins. Asking a website is only a fallback: on some providers
+# outgoing traffic leaves through a different address than the one that accepts
+# incoming connections, and the website only ever sees the outgoing one. Found
+# on a real server, where that mistake sent the other side dialling an address
+# that never answered.
 public_ip() {
     local ip
+    for ip in $(ip -4 -o addr show scope global 2>/dev/null | awk '{print $4}' | cut -d/ -f1); do
+        if ! is_private_ipv4 "$ip"; then
+            printf '%s' "$ip"
+            return 0
+        fi
+    done
     for url in https://api.ipify.org https://ifconfig.me https://ipinfo.io/ip; do
         ip=$(curl -4 -fsS --max-time 5 "$url" 2>/dev/null | tr -d '[:space:]')
         case "$ip" in
@@ -430,7 +453,19 @@ create_tunnel() {
     valid_port "$pool" 2>/dev/null || pool=25
 
     secret=$(gen_secret)
+
+    # This goes into the pairing code, and in some setups the other server dials
+    # it, so it has to be right. Detection is usually correct but not always, so
+    # show it and let the user confirm.
     localip=$(public_ip)
+    say ""
+    info "The other server needs this server's address. Detected: ${localip:-unknown}"
+    info "Some providers send outgoing traffic from a different address, so check it."
+    while :; do
+        localip=$(ask "This server's public IP" "$localip")
+        valid_host "$localip" && break
+        err "  That does not look like an address."
+    done
 
     hr
     say "${B}About to create:${R}"
