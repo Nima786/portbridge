@@ -11,7 +11,10 @@ import (
 	"time"
 )
 
-const inboundDialTimeout = 5 * time.Second
+// inboundDialTimeout bounds how long we spend connecting to the local service.
+// It must stay comfortably below the other side's confirmation timeout, or a
+// slow service would look like a broken tunnel connection.
+const inboundDialTimeout = 3 * time.Second
 
 // origin sits next to the service being published. It never touches that service
 // until a real user is actually waiting, which is what stops idle spare

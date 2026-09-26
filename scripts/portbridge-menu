@@ -123,8 +123,10 @@ public_ip() {
             return 0
         fi
     done
-    for url in https://api.ipify.org https://ifconfig.me https://ipinfo.io/ip; do
-        ip=$(curl -4 -fsS --max-time 5 "$url" 2>/dev/null | tr -d '[:space:]')
+    # Short timeouts: plenty of servers have no outbound web access at all, and a
+    # setup screen that appears frozen for fifteen seconds looks broken.
+    for url in https://api.ipify.org https://ifconfig.me; do
+        ip=$(curl -4 -fsS --max-time 3 "$url" 2>/dev/null | tr -d '[:space:]')
         case "$ip" in
             [0-9]*.[0-9]*.[0-9]*.[0-9]*) printf '%s' "$ip"; return 0 ;;
         esac
@@ -194,11 +196,39 @@ ask() {
     printf '%s' "${reply:-$def}"
 }
 
+# Only a clear yes or no is accepted. Anything else is asked again rather than
+# being taken as "no", so a stray keystroke can never silently cancel something.
+# An empty answer still means no, which keeps it safe to just press Enter.
 confirm() {
     local reply
-    printf '%s' "$1 ${DIM}[y/N]${R}: " >&2
-    read -r reply || true
-    case "$reply" in [yY]|[yY][eE][sS]) return 0 ;; *) return 1 ;; esac
+    while :; do
+        printf '%s' "$1 ${DIM}[y/N]${R}: " >&2
+        if ! read -r reply; then
+            return 1 # no input available at all
+        fi
+        case "$reply" in
+            [yY] | [yY][eE][sS]) return 0 ;;
+            '' | [nN] | [nN][oO]) return 1 ;;
+            *) err "  Please answer y or n." ;;
+        esac
+    done
+}
+
+# choose <prompt> <default> <valid...> - keeps asking until the answer is one of
+# the listed options, so a mistyped key cannot skip a setup step.
+choose() {
+    local prompt=$1 def=$2 reply opt
+    shift 2
+    while :; do
+        reply=$(ask "$prompt" "$def")
+        for opt in "$@"; do
+            if [ "$reply" = "$opt" ]; then
+                printf '%s' "$reply"
+                return 0
+            fi
+        done
+        err "  Please enter one of: $*"
+    done
 }
 
 ask_port() {
@@ -348,10 +378,21 @@ write_tunnel() {
     chmod 600 "$(secret_of "$name")"
 }
 
+# discard_tunnel removes a half-made tunnel. Without this, a setup that failed
+# validation left its settings behind, so the tunnel appeared in the list and in
+# the firewall view while never being able to run.
+discard_tunnel() {
+    systemctl disable --now "$(unit_of "$1")" >/dev/null 2>&1
+    rm -f "$(conf_of "$1")" "$(secret_of "$1")" "$RUN_DIR/$1.json"
+    systemctl daemon-reload
+}
+
 validate_and_enable() {
     local name=$1
     if ! "$BIN" check -config "$(conf_of "$name")"; then
-        err "That configuration was refused. Nothing has been started."
+        err "Those settings were refused, so nothing has been started."
+        discard_tunnel "$name"
+        err "The half-made tunnel has been cleaned up. Nothing was left behind."
         return 1
     fi
     systemctl daemon-reload
@@ -364,6 +405,9 @@ validate_and_enable() {
     if [ "$(systemctl is-active "$(unit_of "$name")")" != active ]; then
         err "The tunnel started then stopped. Recent log:"
         journalctl -u "$(unit_of "$name")" -n 25 --no-pager
+        say ""
+        warn "The settings have been kept so you can look at them or edit them."
+        warn "Use 'Delete a tunnel' to remove it."
         return 1
     fi
     return 0
@@ -393,17 +437,15 @@ create_tunnel() {
     done
 
     explain_modes
-    case "$(ask "Choose 1 or 2" "1")" in
+    case "$(choose "Choose 1 or 2" "1" 1 2)" in
         1) mode=direct ;;
         2) mode=reverse ;;
-        *) err "Not a valid choice."; return 1 ;;
     esac
 
     explain_roles
-    case "$(ask "Choose 1 or 2" "1")" in
+    case "$(choose "Choose 1 or 2" "1" 1 2)" in
         1) role=edge ;;
         2) role=origin ;;
-        *) err "Not a valid choice."; return 1 ;;
     esac
 
     say ""
@@ -459,7 +501,9 @@ create_tunnel() {
     # This goes into the pairing code, and in some setups the other server dials
     # it, so it has to be right. Detection is usually correct but not always, so
     # show it and let the user confirm.
+    printf '%s' "${DIM}Working out this server's address...${R}" >&2
     localip=$(public_ip)
+    printf '\r%*s\r' 45 '' >&2
     say ""
     info "The other server needs this server's address. Detected: ${localip:-unknown}"
     info "Some providers send outgoing traffic from a different address, so check it."
@@ -699,11 +743,16 @@ show_details() {
 }
 
 edit_tunnel() {
-    local name=$1 cur new changed=0
+    local name=$1 cur new changed=0 backup
     hr
     say "${B}Edit '$name'${R}"
     say "${DIM}Press Enter to keep the current value.${R}"
     hr
+
+    # A real copy, taken before anything is touched. The previous version told
+    # the user to restore from a backup that was never actually made.
+    backup=$(mktemp)
+    cp "$(conf_of "$name")" "$backup"
 
     cur=$(read_conf "$name" pool_size)
     new=$(ask "Spare connections" "$cur")
@@ -754,15 +803,19 @@ edit_tunnel() {
     fi
 
     if [ "$changed" -eq 0 ]; then
+        rm -f "$backup"
         say "Nothing changed."
         return 0
     fi
 
     if ! "$BIN" check -config "$(conf_of "$name")"; then
-        err "Those settings were refused, so the tunnel has NOT been restarted."
-        err "Fix them, or restore from the backup in $CONF_DIR."
+        err "Those settings were refused, so nothing has been changed."
+        cp "$backup" "$(conf_of "$name")"
+        rm -f "$backup"
+        ok "The previous settings have been put back. The tunnel is untouched."
         return 1
     fi
+    rm -f "$backup"
     if confirm "Restart '$name' now to apply this?"; then
         "$FIREWALL" apply "$name" >/dev/null 2>&1
         systemctl restart "$(unit_of "$name")"

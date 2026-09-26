@@ -21,10 +21,22 @@ const (
 	headBufferSize  = 16 * 1024
 
 	activateWriteTimeout = 5 * time.Second
-	ackWaitTimeout       = 20 * time.Second
 
-	// Attempts, including the first, to find a spare that actually works.
-	maxActivateTries = 3
+	// How long to wait for the other server to confirm it reached the service.
+	//
+	// Kept short on purpose. Confirmation needs one round trip plus a local
+	// connection, so under a second on any working path. The old value of twenty
+	// seconds meant a single silently broken spare cost the user twenty seconds
+	// before anything was retried, which is far longer than any client waits, so
+	// the retry never got a chance to help. Observed on a real network where
+	// data could reach a server but not come back: every user gave up while the
+	// tunnel was still patiently waiting.
+	ackWaitTimeout = 4 * time.Second
+
+	// Attempts, including the first, to find a spare that actually works. Higher
+	// than it looks necessary because on a partly broken path a good number of
+	// spares can be unusable, and each attempt discards one.
+	maxActivateTries = 6
 
 	// How long a user waits in reverse mode for the origin to supply a spare.
 	reverseWaitForSpare = 5 * time.Second

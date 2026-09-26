@@ -126,6 +126,28 @@ systemctl status portbridge@home
 journalctl -u portbridge@home -f
 ```
 
+## Reverse mode depends on the network, not just on this tool
+
+Reverse mode needs the doorway to be able to send data *back* out along a
+connection that was opened from outside. That sounds automatic, and usually is,
+but it is not guaranteed.
+
+On networks where connections are rewritten on the way in, which is common on
+restricted or heavily filtered links, the connection is accepted and data flows
+inwards perfectly well, while data going back out is quietly dropped. Nothing
+reports an error. The symptom is a connection that hangs instead of failing.
+
+Two signs, checked on the doorway server, that this is what is happening:
+
+```bash
+# unsent bytes stuck on a tunnel connection that never clear
+ss -nti state established '( sport = :<tunnel-port> )' | grep -B1 retrans
+```
+
+If you see the same small amount of unsent data with a growing retransmit count,
+while the same connection shows plenty of bytes received, then the path only
+works one way and no tunnel software can fix it. Use direct mode instead.
+
 ## When something is wrong
 
 Use **Check a tunnel for problems** in the menu. It confirms the service is
