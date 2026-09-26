@@ -32,6 +32,40 @@ step() { printf '\n%s\n' "${B}==> $*${R}"; }
 
 [ "$(id -u)" -eq 0 ] || die "Please run this as root."
 
+FORCE=no
+NOMENU=no
+for arg in "$@"; do
+    case "$arg" in
+        --force | --reinstall) FORCE=yes ;;
+        --no-menu) NOMENU=yes ;;
+        -h | --help)
+            cat <<'EOF'
+Installs or updates PortBridge, then opens the menu.
+
+Running it again is also how you update: it checks for a newer version, and
+goes straight to the menu if there is nothing to do.
+
+  --force     reinstall even if it is already up to date
+  --no-menu   do not open the menu afterwards
+EOF
+            exit 0
+            ;;
+        *) die "Unknown option: $arg. Try --help." ;;
+    esac
+done
+
+open_menu_and_exit() {
+    if [ "$NOMENU" = yes ]; then
+        exit 0
+    fi
+    if [ -t 0 ] && [ -x "$MENU" ]; then
+        exec "$MENU"
+    fi
+    say ""
+    say "Open the menu with: ${B}portbridge-menu${R}"
+    exit 0
+}
+
 # ------------------------------------------------------------------ environment
 
 step "Checking this server"
@@ -73,13 +107,15 @@ command -v iptables >/dev/null 2>&1 || warn "  iptables is missing, so tunnel po
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
 
+latest_tag() {
+    curl -fsSL --max-time 15 "https://api.github.com/repos/$REPO/releases/latest" 2>/dev/null |
+        sed -nE 's/.*"tag_name"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/p' | head -1
+}
+
 fetch_release() {
-    local tag url
-    tag=$(curl -fsSL --max-time 20 "https://api.github.com/repos/$REPO/releases/latest" 2>/dev/null |
-        sed -nE 's/.*"tag_name"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/p' | head -1)
+    local tag=$1 url
     [ -n "$tag" ] || return 1
     url="https://github.com/$REPO/releases/download/$tag/portbridge_${tag#v}_linux_${ARCH}.tar.gz"
-    say "  Found release $tag"
     curl -fsSL --max-time 120 -o "$TMP/pb.tar.gz" "$url" || return 1
     tar -xzf "$TMP/pb.tar.gz" -C "$TMP" || return 1
     [ -f "$TMP/portbridge" ] || return 1
@@ -98,8 +134,34 @@ build_from_source() {
     return 0
 }
 
+# Running this command again is the intended way to update. But when nothing has
+# changed there is no reason to download and reinstall everything, and whoever
+# ran it again almost certainly just wants the menu.
+INSTALLED=""
+if [ -x "$BIN" ] && [ -x "$MENU" ] && [ -f "$UNIT" ]; then
+    INSTALLED=$("$BIN" version 2>/dev/null)
+fi
+
+WANTED=""
+if [ -n "$INSTALLED" ] && [ "$FORCE" = no ]; then
+    step "Checking for a newer version"
+    WANTED=$(latest_tag)
+    if [ -z "$WANTED" ]; then
+        say "  Cannot reach GitHub right now, so keeping what is already here ($INSTALLED)"
+        open_menu_and_exit
+    fi
+    if [ "$WANTED" = "$INSTALLED" ]; then
+        ok "  PortBridge $INSTALLED is already installed and up to date."
+        say "  ${DIM}Opening the menu. You can also just run: portbridge-menu${R}"
+        open_menu_and_exit
+    fi
+    say "  You have $INSTALLED, and $WANTED is available. Updating."
+fi
+
 step "Fetching PortBridge"
-if fetch_release; then
+[ -n "$WANTED" ] || WANTED=$(latest_tag)
+[ -n "$WANTED" ] && say "  Release $WANTED"
+if fetch_release "$WANTED"; then
     ok "  Downloaded a prebuilt copy"
 elif build_from_source; then
     ok "  Built from source"
@@ -172,7 +234,7 @@ Open the menu any time with:  ${B}portbridge-menu${R}
 say "${DIM}Set up the first server, then use the pairing code it gives you on the second.${R}"
 say ""
 
-if [ -t 0 ]; then
+if [ "$NOMENU" = no ] && [ -t 0 ]; then
     printf '%s' "Open the menu now? ${DIM}[Y/n]${R}: "
     read -r a || true
     case "$a" in [nN]*) exit 0 ;; *) exec "$MENU" ;; esac

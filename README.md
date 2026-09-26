@@ -18,11 +18,15 @@ bash <(curl -fsSL https://raw.githubusercontent.com/Nima786/portbridge/main/inst
 Set up the first server, and it gives you a pairing code. Paste that into the
 menu on the second server and the two halves are connected.
 
-Open the menu again any time:
+After that, the menu is one word:
 
 ```bash
 portbridge-menu
 ```
+
+Running the install command again is also how you update. It checks for a newer
+version and, if there is nothing to do, goes straight to the menu instead of
+reinstalling. Add `--force` to reinstall anyway.
 
 ## The two jobs
 
