@@ -1,0 +1,944 @@
+#!/usr/bin/env bash
+#
+# PortBridge control menu.
+#
+# Each tunnel is one config file plus one secret file, run by one instance of a
+# single systemd template unit. That keeps tunnels genuinely independent: several
+# can run side by side, in different modes, without touching each other.
+#
+#   /etc/portbridge/tunnels/<name>.conf     settings
+#   /etc/portbridge/tunnels/<name>.secret   shared password, root-only
+#   portbridge@<name>.service               the running service
+#   /run/portbridge/<name>.json             live status, written by the tunnel
+
+set -uo pipefail
+
+VERSION_FALLBACK="unknown"
+BIN=/usr/local/bin/portbridge
+FIREWALL=/usr/local/bin/portbridge-firewall
+CONF_DIR=/etc/portbridge/tunnels
+RUN_DIR=/run/portbridge
+DEFAULT_TUNNEL_PORT=8388
+
+# ---------------------------------------------------------------- presentation
+
+if [ -t 1 ]; then
+    B=$'\033[1m'; DIM=$'\033[2m'; R=$'\033[0m'
+    RED=$'\033[31m'; GREEN=$'\033[32m'; YELLOW=$'\033[33m'; CYAN=$'\033[36m'
+else
+    B=''; DIM=''; R=''; RED=''; GREEN=''; YELLOW=''; CYAN=''
+fi
+
+# Only say() and deliberate printfs go to stdout. Everything decorative goes to
+# stderr, so that helpers whose output is captured in a variable cannot be
+# polluted by a stray status message.
+say()  { printf '%s\n' "$*"; }
+info() { printf '%s\n' "${CYAN}$*${R}" >&2; }
+ok()   { printf '%s\n' "${GREEN}$*${R}" >&2; }
+warn() { printf '%s\n' "${YELLOW}$*${R}" >&2; }
+err()  { printf '%s\n' "${RED}$*${R}" >&2; }
+hr()   { printf '%s\n' "${DIM}------------------------------------------------------------${R}"; }
+
+pause() {
+    printf '\n%s' "${DIM}Press Enter to continue...${R}"
+    read -r _ || true
+}
+
+require_root() {
+    [ "$(id -u)" -eq 0 ] || { err "Please run this as root."; exit 1; }
+}
+
+# ------------------------------------------------------------------- utilities
+
+conf_of()   { printf '%s/%s.conf' "$CONF_DIR" "$1"; }
+secret_of() { printf '%s/%s.secret' "$CONF_DIR" "$1"; }
+unit_of()   { printf 'portbridge@%s.service' "$1"; }
+
+tunnel_names() {
+    [ -d "$CONF_DIR" ] || return 0
+    for f in "$CONF_DIR"/*.conf; do
+        [ -e "$f" ] || continue
+        basename "$f" .conf
+    done
+}
+
+tunnel_count() { tunnel_names | wc -l | tr -d ' '; }
+
+# read_conf <name> <key>
+read_conf() {
+    local f
+    f=$(conf_of "$1")
+    [ -f "$f" ] || return 1
+    sed -nE "s/^[[:space:]]*$2[[:space:]]*=[[:space:]]*\"?([^\"#]*)\"?[[:space:]]*$/\1/p" "$f" |
+        tail -1 | sed -E 's/[[:space:]]+$//'
+}
+
+# write_conf <name> <key> <value>  (replaces the line, or appends it)
+write_conf() {
+    local f
+    f=$(conf_of "$1")
+    if grep -qE "^[[:space:]]*$2[[:space:]]*=" "$f" 2>/dev/null; then
+        sed -i -E "s|^[[:space:]]*$2[[:space:]]*=.*|$2 = $3|" "$f"
+    else
+        printf '%s = %s\n' "$2" "$3" >>"$f"
+    fi
+}
+
+# json_field <file> <key> - good enough for the flat status file we write
+json_field() {
+    [ -f "$1" ] || return 1
+    sed -nE "s/^[[:space:]]*\"$2\"[[:space:]]*:[[:space:]]*\"?([^\",]*)\"?,?[[:space:]]*$/\1/p" "$1" | head -1
+}
+
+gen_secret() {
+    if command -v openssl >/dev/null 2>&1; then
+        openssl rand -base64 32 | tr -d '\n'
+    else
+        head -c 32 /dev/urandom | base64 | tr -d '\n'
+    fi
+}
+
+public_ip() {
+    local ip
+    for url in https://api.ipify.org https://ifconfig.me https://ipinfo.io/ip; do
+        ip=$(curl -4 -fsS --max-time 5 "$url" 2>/dev/null | tr -d '[:space:]')
+        case "$ip" in
+            [0-9]*.[0-9]*.[0-9]*.[0-9]*) printf '%s' "$ip"; return 0 ;;
+        esac
+    done
+    # No outbound web access, which is common. Fall back to the routing table.
+    ip route get 1.1.1.1 2>/dev/null | sed -nE 's/.* src ([0-9.]+).*/\1/p' | head -1
+}
+
+engine_version() {
+    if [ -x "$BIN" ]; then "$BIN" version 2>/dev/null || printf '%s' "$VERSION_FALLBACK"
+    else printf '%s' "not installed"; fi
+}
+
+# -------------------------------------------------------------------- validation
+
+valid_name() {
+    case "$1" in
+        '' ) return 1 ;;
+        *[!a-zA-Z0-9_-]* ) return 1 ;;
+        *) [ "${#1}" -le 40 ] ;;
+    esac
+}
+
+valid_port() {
+    case "$1" in
+        '' | *[!0-9]* ) return 1 ;;
+        *) [ "$1" -ge 1 ] && [ "$1" -le 65535 ] ;;
+    esac
+}
+
+valid_host() {
+    case "$1" in
+        '' ) return 1 ;;
+        *[!a-zA-Z0-9.:_-]* ) return 1 ;;
+        *) return 0 ;;
+    esac
+}
+
+# port_owner <port> - names the tunnel already using a port, if any
+port_owner() {
+    local want=$1 n a
+    for n in $(tunnel_names); do
+        for key in tunnel_addr user_listen; do
+            a=$(read_conf "$n" "$key") || continue
+            [ -n "$a" ] || continue
+            [ "${a##*:}" = "$want" ] && { printf '%s' "$n"; return 0; }
+        done
+    done
+    return 1
+}
+
+port_in_use_by_system() {
+    ss -lntH 2>/dev/null | awk '{print $4}' | sed -E 's/.*:([0-9]+)$/\1/' | grep -qx "$1"
+}
+
+# ------------------------------------------------------------------- prompting
+
+# ask <prompt> <default> -> echoes the answer
+ask() {
+    local prompt=$1 def=${2-} reply
+    if [ -n "$def" ]; then
+        printf '%s' "$prompt ${DIM}[$def]${R}: " >&2
+    else
+        printf '%s' "$prompt: " >&2
+    fi
+    read -r reply || true
+    printf '%s' "${reply:-$def}"
+}
+
+confirm() {
+    local reply
+    printf '%s' "$1 ${DIM}[y/N]${R}: " >&2
+    read -r reply || true
+    case "$reply" in [yY]|[yY][eE][sS]) return 0 ;; *) return 1 ;; esac
+}
+
+ask_port() {
+    local prompt=$1 def=$2 skip_name=${3-} p owner
+    while :; do
+        p=$(ask "$prompt" "$def")
+        if ! valid_port "$p"; then
+            err "  A port must be a number from 1 to 65535."
+            continue
+        fi
+        owner=$(port_owner "$p" || true)
+        if [ -n "$owner" ] && [ "$owner" != "$skip_name" ]; then
+            err "  Port $p is already used by tunnel '$owner'. Pick another."
+            continue
+        fi
+        if port_in_use_by_system "$p"; then
+            warn "  Something is already listening on port $p."
+            confirm "  Use it anyway?" || continue
+        fi
+        printf '%s' "$p"
+        return 0
+    done
+}
+
+# --------------------------------------------------------------- explain modes
+
+explain_modes() {
+    hr
+    say "${B}Which way should the connection be opened?${R}"
+    say ""
+    say "  ${B}1) Direct${R}  - the server users connect to reaches out to the other one."
+    say "     ${DIM}The usual choice. Needs the users' server to be allowed to make${R}"
+    say "     ${DIM}outbound connections to the other server's address.${R}"
+    say ""
+    say "  ${B}2) Reverse${R} - the server holding the service reaches in instead."
+    say "     ${DIM}Use this when the users' server cannot reach the other one, for${R}"
+    say "     ${DIM}example because its address is blocked outbound. The server holding${R}"
+    say "     ${DIM}the service then needs no open ports at all.${R}"
+    hr
+}
+
+explain_roles() {
+    hr
+    say "${B}What is this server's job in the tunnel?${R}"
+    say ""
+    say "  ${B}1) Users connect here${R}"
+    say "     ${DIM}The public doorway. It listens on a port your users point their${R}"
+    say "     ${DIM}apps at, and hands that traffic to the other server.${R}"
+    say ""
+    say "  ${B}2) The service lives here${R}"
+    say "     ${DIM}The server running the thing you are publishing, such as an Xray${R}"
+    say "     ${DIM}inbound. It connects to that service only when a real user arrives.${R}"
+    hr
+}
+
+# ----------------------------------------------------------------- pairing code
+
+# Carries only what the other server cannot work out for itself. The joining side
+# is asked for its own local detail, because the issuer genuinely does not know
+# it: the doorway does not know the service's address, and vice versa.
+make_pairing_code() {
+    local name=$1 mode=$2 issuer_role=$3 tport=$4 issuer_ip=$5 secret=$6
+    {
+        printf 'v=1\n'
+        printf 'name=%s\n' "$name"
+        printf 'mode=%s\n' "$mode"
+        printf 'issuer_role=%s\n' "$issuer_role"
+        printf 'tunnel_port=%s\n' "$tport"
+        printf 'issuer_ip=%s\n' "$issuer_ip"
+        printf 'secret=%s\n' "$secret"
+    } | base64 -w0 2>/dev/null || {
+        # busybox base64 has no -w
+        {
+            printf 'v=1\nname=%s\nmode=%s\nissuer_role=%s\ntunnel_port=%s\nissuer_ip=%s\nsecret=%s\n' \
+                "$name" "$mode" "$issuer_role" "$tport" "$issuer_ip" "$secret"
+        } | base64 | tr -d '\n'
+    }
+}
+
+show_pairing_code() {
+    local name=$1
+    local mode tport secret role ip code
+    mode=$(read_conf "$name" mode)
+    tport=$(read_conf "$name" tunnel_addr); tport=${tport##*:}
+    role=$(read_conf "$name" role)
+    secret=$(cat "$(secret_of "$name")" 2>/dev/null)
+    ip=$(read_conf "$name" local_ip)
+    [ -n "$ip" ] || ip=$(public_ip)
+
+    code=$(make_pairing_code "$name" "$mode" "$role" "$tport" "$ip" "$secret")
+
+    hr
+    say "${B}Pairing code for '$name'${R}"
+    say ""
+    say "On the ${B}other${R} server, install PortBridge and choose ${B}'Join a tunnel'${R},"
+    say "then paste this single line:"
+    say ""
+    printf '%s\n' "$code"
+    say ""
+    warn "This contains the tunnel's password. Send it over something private."
+    hr
+}
+
+# ---------------------------------------------------------------- write a tunnel
+
+# write_tunnel <name> <mode> <role> <tunnel_addr> <user_listen> <inbound_addr>
+#              <peer_ip> <local_ip> <pool> <secret>
+write_tunnel() {
+    local name=$1 mode=$2 role=$3 taddr=$4 ulisten=$5 inbound=$6
+    local peer=$7 localip=$8 pool=$9 secret=${10}
+
+    mkdir -p "$CONF_DIR"
+    chmod 700 "$CONF_DIR"
+
+    local conf
+    conf=$(conf_of "$name")
+    {
+        printf '# PortBridge tunnel "%s", written by the menu on %s\n' "$name" "$(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+        printf '# Edit with: portbridge-menu  ->  Edit a tunnel\n\n'
+        printf 'name = %s\n' "$name"
+        printf 'mode = %s\n' "$mode"
+        printf 'role = %s\n\n' "$role"
+        if [ "$mode:$role" = "direct:edge" ] || [ "$mode:$role" = "reverse:origin" ]; then
+            printf '# This side opens the cross-border connection, so this is where to dial.\n'
+        else
+            printf '# This side accepts the cross-border connection, so this is where to listen.\n'
+        fi
+        printf 'tunnel_addr = %s\n' "$taddr"
+        [ -n "$ulisten" ] && printf '\n# Where your users connect.\nuser_listen = %s\n' "$ulisten"
+        [ -n "$inbound" ] && printf '\n# The local service being published.\ninbound_addr = %s\n' "$inbound"
+        printf '\n# The other server. Used to lock the tunnel port to a single source.\n'
+        printf 'peer_ip = %s\n' "$peer"
+        [ -n "$localip" ] && printf 'local_ip = %s\n' "$localip"
+        printf '\npool_size = %s\n' "$pool"
+        printf 'max_conn = 2000\n'
+        printf 'max_pending = 512\n'
+        printf 'spare_ttl = 10m\n'
+        printf 'park_timeout = 15m\n'
+        printf 'drain = 5s\n'
+        printf '\nsecret_file = %s\n' "$(secret_of "$name")"
+    } >"$conf"
+    chmod 600 "$conf"
+
+    printf '%s\n' "$secret" >"$(secret_of "$name")"
+    chmod 600 "$(secret_of "$name")"
+}
+
+validate_and_enable() {
+    local name=$1
+    if ! "$BIN" check -config "$(conf_of "$name")"; then
+        err "That configuration was refused. Nothing has been started."
+        return 1
+    fi
+    systemctl daemon-reload
+    systemctl enable --now "$(unit_of "$name")" >/dev/null 2>&1 || {
+        err "Could not start the tunnel. Recent log:"
+        journalctl -u "$(unit_of "$name")" -n 20 --no-pager
+        return 1
+    }
+    sleep 2
+    if [ "$(systemctl is-active "$(unit_of "$name")")" != active ]; then
+        err "The tunnel started then stopped. Recent log:"
+        journalctl -u "$(unit_of "$name")" -n 25 --no-pager
+        return 1
+    fi
+    return 0
+}
+
+# ------------------------------------------------------------------ create flow
+
+create_tunnel() {
+    local name mode role tport taddr ulisten inbound peer localip pool secret
+    local uport svc_addr
+
+    hr
+    say "${B}Create a tunnel${R}"
+    hr
+
+    while :; do
+        name=$(ask "A short name for this tunnel (letters, digits, dash)" "")
+        if ! valid_name "$name"; then
+            err "  Use only letters, digits, dash and underscore, up to 40 characters."
+            continue
+        fi
+        if [ -f "$(conf_of "$name")" ]; then
+            err "  A tunnel called '$name' already exists."
+            continue
+        fi
+        break
+    done
+
+    explain_modes
+    case "$(ask "Choose 1 or 2" "1")" in
+        1) mode=direct ;;
+        2) mode=reverse ;;
+        *) err "Not a valid choice."; return 1 ;;
+    esac
+
+    explain_roles
+    case "$(ask "Choose 1 or 2" "1")" in
+        1) role=edge ;;
+        2) role=origin ;;
+        *) err "Not a valid choice."; return 1 ;;
+    esac
+
+    say ""
+    info "The tunnel port is the private port the two servers use to talk to each other."
+    tport=$(ask_port "Tunnel port" "$DEFAULT_TUNNEL_PORT")
+
+    say ""
+    peer=$(ask "The other server's IP address" "")
+    if ! valid_host "$peer"; then
+        err "That does not look like an address."
+        return 1
+    fi
+
+    # Whoever dials needs the peer's address; whoever listens binds locally.
+    if [ "$mode:$role" = "direct:edge" ] || [ "$mode:$role" = "reverse:origin" ]; then
+        taddr="$peer:$tport"
+        info "This server will dial out to $taddr."
+    else
+        taddr="0.0.0.0:$tport"
+        info "This server will wait for the other one to connect in on port $tport."
+    fi
+
+    ulisten=""
+    inbound=""
+    if [ "$role" = edge ]; then
+        say ""
+        info "Now the port your users will point their apps at."
+        uport=$(ask_port "Port for users" "443")
+        ulisten="0.0.0.0:$uport"
+    else
+        say ""
+        info "Now the local service you are publishing, for example an Xray inbound."
+        while :; do
+            svc_addr=$(ask "Service address on this server" "127.0.0.1:26963")
+            case "$svc_addr" in
+                *:*) ;;
+                *) err "  Please give it as address:port, for example 127.0.0.1:26963."; continue ;;
+            esac
+            valid_port "${svc_addr##*:}" || { err "  That port is not valid."; continue; }
+            break
+        done
+        inbound="$svc_addr"
+    fi
+
+    say ""
+    info "Spare connections are kept ready so a user does not wait for a new one."
+    info "25 suits most setups. Raise it if you expect many users arriving at once."
+    pool=$(ask "Spare connections" "25")
+    valid_port "$pool" 2>/dev/null || pool=25
+
+    secret=$(gen_secret)
+    localip=$(public_ip)
+
+    hr
+    say "${B}About to create:${R}"
+    say "  name            $name"
+    say "  mode            $mode"
+    say "  this server     $([ "$role" = edge ] && echo 'users connect here' || echo 'the service lives here')"
+    if [ "$mode:$role" = "direct:edge" ] || [ "$mode:$role" = "reverse:origin" ]; then
+        say "  connection      this server dials $peer:$tport"
+    else
+        say "  connection      $peer connects in to port $tport here"
+        say "  firewall        port $tport will be locked to $peer only"
+    fi
+    [ -n "$ulisten" ] && say "  users connect   port ${ulisten##*:}"
+    [ -n "$inbound" ] && say "  publishes       $inbound"
+    say "  spares          $pool"
+    hr
+    confirm "Create it?" || { say "Cancelled."; return 1; }
+
+    write_tunnel "$name" "$mode" "$role" "$taddr" "$ulisten" "$inbound" \
+        "$peer" "$localip" "$pool" "$secret"
+
+    if ! validate_and_enable "$name"; then
+        return 1
+    fi
+
+    ok "Tunnel '$name' is running."
+    say ""
+    if [ "$mode" = reverse ] && [ "$role" = edge ]; then
+        info "It is waiting for the other server to connect in. Until you set that up,"
+        info "users will not get through. That is expected."
+    fi
+    show_pairing_code "$name"
+}
+
+# -------------------------------------------------------------------- join flow
+
+join_tunnel() {
+    local code decoded name mode issuer_role tport issuer_ip secret v
+    local role taddr ulisten inbound pool localip uport svc_addr
+
+    hr
+    say "${B}Join a tunnel${R}"
+    say ""
+    say "Paste the pairing code from the ${B}other${R} server."
+    hr
+    code=$(ask "Pairing code" "")
+    [ -n "$code" ] || { err "Nothing pasted."; return 1; }
+
+    decoded=$(printf '%s' "$code" | tr -d '[:space:]' | base64 -d 2>/dev/null) || {
+        err "That code could not be read. Copy the whole single line and try again."
+        return 1
+    }
+    get() { printf '%s\n' "$decoded" | sed -nE "s/^$1=(.*)$/\1/p" | head -1; }
+
+    v=$(get v); name=$(get name); mode=$(get mode)
+    issuer_role=$(get issuer_role); tport=$(get tunnel_port)
+    issuer_ip=$(get issuer_ip); secret=$(get secret)
+
+    if [ "$v" != 1 ] || [ -z "$name" ] || [ -z "$mode" ] || [ -z "$secret" ]; then
+        err "That code is not a valid pairing code."
+        return 1
+    fi
+    if [ -f "$(conf_of "$name")" ]; then
+        err "A tunnel called '$name' already exists on this server."
+        return 1
+    fi
+
+    # This server takes the opposite job.
+    if [ "$issuer_role" = edge ]; then role=origin; else role=edge; fi
+
+    hr
+    say "${B}This code describes:${R}"
+    say "  tunnel        $name"
+    say "  mode          $mode"
+    say "  other server  $issuer_ip ($([ "$issuer_role" = edge ] && echo 'users connect there' || echo 'the service is there'))"
+    say "  this server   $([ "$role" = edge ] && echo 'users will connect here' || echo 'the service is here')"
+    say "  tunnel port   $tport"
+    hr
+
+    if [ "$mode:$role" = "direct:edge" ] || [ "$mode:$role" = "reverse:origin" ]; then
+        taddr="$issuer_ip:$tport"
+        info "This server will dial out to $taddr."
+    else
+        taddr="0.0.0.0:$tport"
+        info "This server will wait for $issuer_ip to connect in on port $tport."
+        if port_in_use_by_system "$tport"; then
+            warn "Something is already listening on port $tport here."
+        fi
+    fi
+
+    ulisten=""; inbound=""
+    if [ "$role" = edge ]; then
+        say ""
+        info "The code cannot know which port you want users to use, so choose it now."
+        uport=$(ask_port "Port for users" "443")
+        ulisten="0.0.0.0:$uport"
+    else
+        say ""
+        info "The code cannot know your local service address, so give it now."
+        while :; do
+            svc_addr=$(ask "Service address on this server" "127.0.0.1:26963")
+            case "$svc_addr" in *:*) ;; *) err "  Use address:port."; continue ;; esac
+            valid_port "${svc_addr##*:}" || { err "  That port is not valid."; continue; }
+            break
+        done
+        inbound="$svc_addr"
+    fi
+
+    pool=$(ask "Spare connections" "25")
+    valid_port "$pool" 2>/dev/null || pool=25
+    localip=$(public_ip)
+
+    confirm "Create this tunnel?" || { say "Cancelled."; return 1; }
+
+    write_tunnel "$name" "$mode" "$role" "$taddr" "$ulisten" "$inbound" \
+        "$issuer_ip" "$localip" "$pool" "$secret"
+
+    validate_and_enable "$name" || return 1
+    ok "Tunnel '$name' is running and paired."
+    say ""
+    info "Give it a few seconds, then check 'List tunnels' on both servers."
+}
+
+# ------------------------------------------------------------------- list/status
+
+status_line() {
+    local name=$1 unit active parked active_s mode role
+    unit=$(unit_of "$name")
+    active=$(systemctl is-active "$unit" 2>/dev/null)
+    mode=$(read_conf "$name" mode)
+    role=$(read_conf "$name" role)
+
+    # Colour codes are invisible but still count towards a printf width, so pad
+    # the plain word and wrap the colour around it separately.
+    local colour state
+    case "$active" in
+        active)   colour=$GREEN;  state=running ;;
+        inactive) colour=$DIM;    state=stopped ;;
+        failed)   colour=$RED;    state=failed ;;
+        *)        colour=$YELLOW; state=${active:-unknown} ;;
+    esac
+
+    parked=$(json_field "$RUN_DIR/$name.json" parked_spares 2>/dev/null)
+    active_s=$(json_field "$RUN_DIR/$name.json" active_sessions 2>/dev/null)
+    [ -n "$parked" ] || parked="-"
+    [ -n "$active_s" ] || active_s="-"
+
+    local job
+    [ "$role" = edge ] && job="doorway" || job="service side"
+
+    printf '  %-16s %-9s %-13s %s%-8s%s users:%-5s spares:%s\n' \
+        "$name" "$mode" "$job" "$colour" "$state" "$R" "$active_s" "$parked"
+}
+
+list_tunnels() {
+    hr
+    say "${B}Tunnels on this server${R}"
+    hr
+    if [ "$(tunnel_count)" -eq 0 ]; then
+        say "  ${DIM}None yet. Choose 'Create a tunnel' to make one.${R}"
+        hr
+        return 0
+    fi
+    local n
+    for n in $(tunnel_names); do
+        status_line "$n"
+    done
+    hr
+    say "${DIM}spares = ready connections waiting. users = sessions right now.${R}"
+}
+
+pick_tunnel() {
+    local names count n i choice
+    names=$(tunnel_names)
+    count=$(printf '%s\n' "$names" | grep -c . || true)
+    if [ "$count" -eq 0 ]; then
+        err "There are no tunnels on this server yet."
+        return 1
+    fi
+    say "" >&2
+    i=0
+    for n in $names; do
+        i=$((i + 1))
+        printf '  %d) %s\n' "$i" "$n" >&2
+    done
+    say "" >&2
+    choice=$(ask "Which one (number, or name)" "")
+    case "$choice" in
+        '' ) return 1 ;;
+        *[!0-9]* ) # treated as a name
+            if [ -f "$(conf_of "$choice")" ]; then printf '%s' "$choice"; return 0; fi
+            err "No tunnel called '$choice'."; return 1 ;;
+        * )
+            i=0
+            for n in $names; do
+                i=$((i + 1))
+                [ "$i" = "$choice" ] && { printf '%s' "$n"; return 0; }
+            done
+            err "That number is not on the list."; return 1 ;;
+    esac
+}
+
+show_details() {
+    local name=$1 f
+    f="$RUN_DIR/$name.json"
+    hr
+    say "${B}Tunnel '$name'${R}"
+    hr
+    say "${B}Settings${R}"
+    sed -E '/^[[:space:]]*#/d; /^[[:space:]]*$/d; s/^/  /' "$(conf_of "$name")"
+    say ""
+    say "${B}Service${R}"
+    printf '  state          %s\n' "$(systemctl is-active "$(unit_of "$name")" 2>/dev/null)"
+    printf '  starts at boot %s\n' "$(systemctl is-enabled "$(unit_of "$name")" 2>/dev/null)"
+    if [ -f "$f" ]; then
+        say ""
+        say "${B}Live${R}"
+        printf '  running for    %s seconds\n' "$(json_field "$f" uptime_seconds)"
+        printf '  users now      %s\n' "$(json_field "$f" active_sessions)"
+        printf '  spares ready   %s of %s\n' "$(json_field "$f" parked_spares)" "$(json_field "$f" pool_target)"
+        printf '  failed         %s\n' "$(json_field "$f" failed_sessions)"
+        printf '  turned away    %s\n' "$(json_field "$f" dropped_sessions)"
+        printf '  retried        %s\n' "$(json_field "$f" retries)"
+    fi
+    say ""
+    say "${B}Firewall${R}"
+    "$FIREWALL" show "$name" 2>/dev/null | sed 's/^/  /'
+    hr
+}
+
+edit_tunnel() {
+    local name=$1 cur new changed=0
+    hr
+    say "${B}Edit '$name'${R}"
+    say "${DIM}Press Enter to keep the current value.${R}"
+    hr
+
+    cur=$(read_conf "$name" pool_size)
+    new=$(ask "Spare connections" "$cur")
+    [ "$new" != "$cur" ] && { write_conf "$name" pool_size "$new"; changed=1; }
+
+    cur=$(read_conf "$name" max_conn)
+    new=$(ask "Maximum users at once" "$cur")
+    [ "$new" != "$cur" ] && { write_conf "$name" max_conn "$new"; changed=1; }
+
+    cur=$(read_conf "$name" spare_ttl)
+    new=$(ask "How long a spare lives before being replaced" "$cur")
+    [ "$new" != "$cur" ] && { write_conf "$name" spare_ttl "$new"; changed=1; }
+
+    cur=$(read_conf "$name" drain)
+    new=$(ask "How long to let sessions finish when restarting" "$cur")
+    [ "$new" != "$cur" ] && { write_conf "$name" drain "$new"; changed=1; }
+
+    cur=$(read_conf "$name" peer_ip)
+    new=$(ask "The other server's IP" "$cur")
+    if [ "$new" != "$cur" ] && valid_host "$new"; then
+        write_conf "$name" peer_ip "$new"
+        # Keep the dial target in step with it.
+        local taddr
+        taddr=$(read_conf "$name" tunnel_addr)
+        case "$taddr" in
+            0.0.0.0:*|:::*) : ;;
+            *) write_conf "$name" tunnel_addr "$new:${taddr##*:}" ;;
+        esac
+        changed=1
+    fi
+
+    local role uport cur_u
+    role=$(read_conf "$name" role)
+    if [ "$role" = edge ]; then
+        cur_u=$(read_conf "$name" user_listen)
+        new=$(ask "Port for users" "${cur_u##*:}")
+        if [ "$new" != "${cur_u##*:}" ]; then
+            if valid_port "$new"; then
+                write_conf "$name" user_listen "0.0.0.0:$new"; changed=1
+            else
+                err "  Not a valid port; leaving it as it was."
+            fi
+        fi
+    else
+        cur_u=$(read_conf "$name" inbound_addr)
+        new=$(ask "Service address on this server" "$cur_u")
+        [ "$new" != "$cur_u" ] && { write_conf "$name" inbound_addr "$new"; changed=1; }
+    fi
+
+    if [ "$changed" -eq 0 ]; then
+        say "Nothing changed."
+        return 0
+    fi
+
+    if ! "$BIN" check -config "$(conf_of "$name")"; then
+        err "Those settings were refused, so the tunnel has NOT been restarted."
+        err "Fix them, or restore from the backup in $CONF_DIR."
+        return 1
+    fi
+    if confirm "Restart '$name' now to apply this?"; then
+        "$FIREWALL" apply "$name" >/dev/null 2>&1
+        systemctl restart "$(unit_of "$name")"
+        sleep 2
+        if [ "$(systemctl is-active "$(unit_of "$name")")" = active ]; then
+            ok "Applied and running."
+        else
+            err "It did not come back up. Recent log:"
+            journalctl -u "$(unit_of "$name")" -n 20 --no-pager
+        fi
+    else
+        warn "Saved. It will take effect next time the tunnel restarts."
+    fi
+}
+
+delete_tunnel() {
+    local name=$1
+    hr
+    warn "This will stop and remove tunnel '$name' on this server."
+    say "${DIM}The other server's half is untouched, so remember to remove it there too.${R}"
+    hr
+    confirm "Delete '$name'?" || { say "Cancelled."; return 1; }
+
+    systemctl disable --now "$(unit_of "$name")" >/dev/null 2>&1
+    "$FIREWALL" remove "$name" >/dev/null 2>&1
+    rm -f "$(conf_of "$name")" "$(secret_of "$name")" "$RUN_DIR/$name.json"
+    systemctl daemon-reload
+    ok "Tunnel '$name' removed."
+}
+
+show_logs() {
+    local name=$1
+    hr
+    say "${B}Recent log for '$name'${R} ${DIM}(newest last)${R}"
+    hr
+    journalctl -u "$(unit_of "$name")" -n 40 --no-pager
+    hr
+    if confirm "Watch it live? (Ctrl+C to stop)"; then
+        journalctl -u "$(unit_of "$name")" -f --no-pager
+    fi
+}
+
+test_tunnel() {
+    local name=$1 role ulisten taddr peer mode
+    role=$(read_conf "$name" role)
+    mode=$(read_conf "$name" mode)
+    peer=$(read_conf "$name" peer_ip)
+    hr
+    say "${B}Checking '$name'${R}"
+    hr
+
+    printf '  service running          '
+    [ "$(systemctl is-active "$(unit_of "$name")")" = active ] && ok "yes" || { err "no"; }
+
+    if [ "$role" = edge ]; then
+        ulisten=$(read_conf "$name" user_listen)
+        printf '  listening for users      '
+        if port_in_use_by_system "${ulisten##*:}"; then ok "yes, port ${ulisten##*:}"; else err "no"; fi
+    else
+        local inbound
+        inbound=$(read_conf "$name" inbound_addr)
+        printf '  local service reachable  '
+        if timeout 5 bash -c "echo > /dev/tcp/${inbound%:*}/${inbound##*:}" 2>/dev/null; then
+            ok "yes, $inbound"
+        else
+            err "no - cannot reach $inbound"
+        fi
+    fi
+
+    taddr=$(read_conf "$name" tunnel_addr)
+    if [ "$mode:$role" = "direct:edge" ] || [ "$mode:$role" = "reverse:origin" ]; then
+        printf '  other server reachable   '
+        if timeout 8 bash -c "echo > /dev/tcp/${taddr%:*}/${taddr##*:}" 2>/dev/null; then
+            ok "yes, $taddr"
+        else
+            err "no - cannot reach $taddr"
+            say "    ${DIM}Either the other half is not running, or its firewall is not${R}"
+            say "    ${DIM}allowing this server's address.${R}"
+        fi
+    else
+        printf '  waiting on tunnel port   '
+        if port_in_use_by_system "${taddr##*:}"; then ok "yes, port ${taddr##*:}"; else err "no"; fi
+    fi
+
+    local f spares
+    f="$RUN_DIR/$name.json"
+    spares=$(json_field "$f" parked_spares 2>/dev/null)
+    printf '  spare connections ready  '
+    if [ -n "$spares" ] && [ "$spares" -gt 0 ] 2>/dev/null; then
+        ok "$spares"
+    elif [ "$role" = origin ] && [ "$mode" = direct ]; then
+        say "${DIM}n/a on this side in direct mode${R}"
+    else
+        err "0 - the two halves are not talking"
+        say "    ${DIM}Check the password matches on both servers, and that both${R}"
+        say "    ${DIM}clocks are correct.${R}"
+    fi
+
+    local rejects
+    rejects=$(journalctl -u "$(unit_of "$name")" --since "-10 min" --no-pager 2>/dev/null |
+        grep -ci 'wrong or missing secret' || true)
+    if [ "${rejects:-0}" -gt 0 ]; then
+        say ""
+        err "  The password does not match: $rejects refusals in the last 10 minutes."
+        say "  ${DIM}Recreate the tunnel on one side using the other side's pairing code.${R}"
+    fi
+    local skew
+    skew=$(journalctl -u "$(unit_of "$name")" --since "-10 min" --no-pager 2>/dev/null |
+        grep -ci 'clocks differ' || true)
+    if [ "${skew:-0}" -gt 0 ]; then
+        say ""
+        err "  The two servers' clocks disagree. Run: timedatectl set-ntp true"
+    fi
+    hr
+}
+
+uninstall_all() {
+    hr
+    warn "This removes PortBridge and every tunnel on this server."
+    hr
+    confirm "Are you sure?" || { say "Cancelled."; return 1; }
+    confirm "Really sure? This cannot be undone." || { say "Cancelled."; return 1; }
+
+    local n
+    for n in $(tunnel_names); do
+        systemctl disable --now "$(unit_of "$n")" >/dev/null 2>&1
+        "$FIREWALL" remove "$n" >/dev/null 2>&1
+    done
+    rm -f /etc/systemd/system/portbridge@.service
+    systemctl daemon-reload
+    rm -rf /etc/portbridge "$RUN_DIR"
+    rm -f "$BIN" "$FIREWALL" /usr/local/bin/portbridge-menu
+    ok "PortBridge has been removed."
+    say "${DIM}Any firewall rules it added have been taken out too.${R}"
+    exit 0
+}
+
+# -------------------------------------------------------------------- main menu
+
+main_menu() {
+    while :; do
+        clear 2>/dev/null || true
+        say "${B}PortBridge${R} ${DIM}$(engine_version)${R}"
+        say "${DIM}$(hostname) - $(tunnel_count) tunnel(s) configured${R}"
+        hr
+        say "  ${B}1${R}) List tunnels and status"
+        say "  ${B}2${R}) Create a tunnel"
+        say "  ${B}3${R}) Join a tunnel from a pairing code"
+        say "  ${B}4${R}) Show a tunnel's pairing code"
+        say "  ${B}5${R}) Tunnel details"
+        say "  ${B}6${R}) Check a tunnel for problems"
+        say "  ${B}7${R}) Edit a tunnel"
+        say "  ${B}8${R}) Start, stop or restart a tunnel"
+        say "  ${B}9${R}) View a tunnel's log"
+        say " ${B}10${R}) Delete a tunnel"
+        say " ${B}11${R}) Uninstall PortBridge"
+        say "  ${B}0${R}) Quit"
+        hr
+        local choice name
+        choice=$(ask "Choose" "")
+        case "$choice" in
+            1) list_tunnels; pause ;;
+            2) create_tunnel; pause ;;
+            3) join_tunnel; pause ;;
+            4) name=$(pick_tunnel) && show_pairing_code "$name"; pause ;;
+            5) name=$(pick_tunnel) && show_details "$name"; pause ;;
+            6) name=$(pick_tunnel) && test_tunnel "$name"; pause ;;
+            7) name=$(pick_tunnel) && edit_tunnel "$name"; pause ;;
+            8) name=$(pick_tunnel) && service_menu "$name"; pause ;;
+            9) name=$(pick_tunnel) && show_logs "$name"; pause ;;
+            10) name=$(pick_tunnel) && delete_tunnel "$name"; pause ;;
+            11) uninstall_all ;;
+            0 | q | Q) say "Bye."; exit 0 ;;
+            *) err "Not a valid choice."; sleep 1 ;;
+        esac
+    done
+}
+
+service_menu() {
+    local name=$1 unit
+    unit=$(unit_of "$name")
+    hr
+    say "${B}'$name' is currently: $(systemctl is-active "$unit")${R}"
+    hr
+    say "  ${B}1${R}) Start"
+    say "  ${B}2${R}) Stop"
+    say "  ${B}3${R}) Restart"
+    say "  ${B}4${R}) Back"
+    hr
+    case "$(ask "Choose" "3")" in
+        1) systemctl start "$unit" && ok "Started." ;;
+        2) systemctl stop "$unit" && ok "Stopped." ;;
+        3) systemctl restart "$unit" && ok "Restarted." ;;
+        *) return 0 ;;
+    esac
+    sleep 2
+    say "Now: $(systemctl is-active "$unit")"
+    if [ "$(systemctl is-active "$unit")" = failed ]; then
+        journalctl -u "$unit" -n 20 --no-pager
+    fi
+}
+
+# ------------------------------------------------------------------------- entry
+
+require_root
+[ -x "$BIN" ] || { err "PortBridge is not installed properly: $BIN is missing."; exit 1; }
+mkdir -p "$CONF_DIR" "$RUN_DIR"
+chmod 700 "$CONF_DIR"
+
+case "${1-}" in
+    list) list_tunnels ;;
+    check) shift; test_tunnel "${1:?tunnel name required}" ;;
+    code) shift; show_pairing_code "${1:?tunnel name required}" ;;
+    '' ) main_menu ;;
+    *) say "Usage: portbridge-menu [list|check <name>|code <name>]" ;;
+esac

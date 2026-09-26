@@ -1,0 +1,30 @@
+[Unit]
+# One template serves every tunnel: portbridge@<name> reads <name>.conf.
+Description=PortBridge tunnel %i
+Documentation=https://github.com/Nima786/portbridge
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+
+# Applies this tunnel's firewall rule before starting. The leading dash means a
+# failure here does not stop the tunnel. Because it runs on every start it also
+# restores the rule after a reboot, with no extra service to manage.
+ExecStartPre=-/usr/local/bin/portbridge-firewall apply %i
+
+ExecStart=/usr/local/bin/portbridge run -config /etc/portbridge/tunnels/%i.conf
+
+Restart=always
+RestartSec=3
+
+# Each session needs two connections plus headroom, so the default limit is
+# nowhere near enough at the capacities this is designed for.
+LimitNOFILE=65535
+
+# Must exceed the tunnel's own drain setting, or systemd kills it mid-drain.
+TimeoutStopSec=45
+
+[Install]
+WantedBy=multi-user.target

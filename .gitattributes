@@ -1,0 +1,15 @@
+# These are run by bash on Linux servers. A Windows line ending in a shell script
+# produces errors like "$'\r': command not found", so force LF regardless of the
+# machine they are edited on.
+*.sh            text eol=lf
+*.service       text eol=lf
+*.yml           text eol=lf
+*.go            text eol=lf
+*.md            text eol=lf
+LICENSE         text eol=lf
+.gitignore      text eol=lf
+.gitattributes  text eol=lf
+
+# Extensionless scripts.
+scripts/portbridge-menu     text eol=lf
+scripts/portbridge-firewall text eol=lf

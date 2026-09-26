@@ -1,0 +1,309 @@
+package main
+
+import (
+	"context"
+	"errors"
+	"io"
+	"log"
+	"net"
+	"sync"
+	"sync/atomic"
+	"time"
+)
+
+const inboundDialTimeout = 5 * time.Second
+
+// origin sits next to the service being published. It never touches that service
+// until a real user is actually waiting, which is what stops idle spare
+// connections from making the service log and time out connections that carry
+// nothing.
+type origin struct {
+	cfg *Config
+	st  *status
+
+	active  chan struct{}
+	pending chan struct{}
+	wg      sync.WaitGroup
+
+	guard *replayGuard
+
+	logAccept   *throttled
+	logAuth     *throttled
+	logCapacity *throttled
+	logDial     *throttled
+	logConnect  *throttled
+}
+
+func runOrigin(ctx context.Context, cfg *Config, st *status) error {
+	o := &origin{
+		cfg:         cfg,
+		st:          st,
+		active:      make(chan struct{}, cfg.MaxConn),
+		pending:     make(chan struct{}, cfg.MaxPending),
+		guard:       newReplayGuard(ctx),
+		logAccept:   newThrottled(),
+		logAuth:     newThrottled(),
+		logCapacity: newThrottled(),
+		logDial:     newThrottled(),
+		logConnect:  newThrottled(),
+	}
+
+	if cfg.Mode == ModeReverse {
+		return o.runReverse(ctx)
+	}
+	return o.runDirect(ctx)
+}
+
+// runDirect accepts tunnel connections from the edge.
+func (o *origin) runDirect(ctx context.Context) error {
+	ln, err := net.Listen("tcp", o.cfg.TunnelAddr)
+	if err != nil {
+		return err
+	}
+	go func() {
+		<-ctx.Done()
+		_ = ln.Close()
+	}()
+
+	for {
+		c, err := ln.Accept()
+		if err != nil {
+			if ctx.Err() != nil || errors.Is(err, net.ErrClosed) {
+				break
+			}
+			o.logAccept.printf("accepting a tunnel connection failed (check the open-file limit): %v", err)
+			time.Sleep(50 * time.Millisecond)
+			continue
+		}
+
+		select {
+		case o.pending <- struct{}{}:
+			o.wg.Add(1)
+			go func(c net.Conn) {
+				defer o.wg.Done()
+				released := false
+				release := func() {
+					if !released {
+						released = true
+						<-o.pending
+					}
+				}
+				defer release()
+
+				tuneSocket(c)
+				if err := recvAuth(c, o.cfg.secret, o.guard); err != nil {
+					o.logAuth.printf("refused a tunnel connection from %s: %v", c.RemoteAddr(), err)
+					_ = c.Close()
+					return
+				}
+				atomic.AddInt64(&o.st.parkedSpares, 1)
+				err := o.parkUntilActivated(ctx, c, o.cfg.ParkTimeout)
+				atomic.AddInt64(&o.st.parkedSpares, -1)
+				if err != nil {
+					_ = c.Close()
+					return
+				}
+				release()
+				o.handleActivated(c)
+			}(c)
+		default:
+			o.logCapacity.printf("too many unestablished tunnel connections (%d); dropping one", o.cfg.MaxPending)
+			_ = c.Close()
+		}
+	}
+
+	log.Printf("shutting down; letting live sessions finish for up to %s", o.cfg.Drain)
+	if !waitTimeout(&o.wg, o.cfg.Drain) {
+		log.Printf("drain time ran out; exiting with sessions still open")
+	}
+	return nil
+}
+
+// runReverse keeps a fixed number of connections open into the edge.
+//
+// One worker owns one parked connection. When its connection is activated the
+// worker hands the session to a separate goroutine and immediately opens a
+// replacement, so the number of ready spares waiting at the edge stays constant
+// instead of dropping for the length of every session.
+func (o *origin) runReverse(ctx context.Context) error {
+	workers := o.cfg.PoolSize
+	if workers < 1 {
+		workers = 1
+	}
+	log.Printf("opening %d connections into the edge at %s", workers, o.cfg.TunnelAddr)
+
+	var workerWg sync.WaitGroup
+	for i := 0; i < workers; i++ {
+		workerWg.Add(1)
+		go func(n int) {
+			defer workerWg.Done()
+			o.reverseWorker(ctx, n)
+		}(i)
+	}
+
+	<-ctx.Done()
+	log.Printf("shutting down; letting live sessions finish for up to %s", o.cfg.Drain)
+
+	// Workers abandon their parked connections immediately, so this returns
+	// promptly. Bounded anyway, so a wedged worker can never hold up a restart.
+	if !waitTimeout(&workerWg, 10*time.Second) {
+		log.Printf("some tunnel connections did not close promptly")
+	}
+	if !waitTimeout(&o.wg, o.cfg.Drain) {
+		log.Printf("drain time ran out; exiting with sessions still open")
+	}
+	return nil
+}
+
+func (o *origin) reverseWorker(ctx context.Context, n int) {
+	backoff := time.Duration(0)
+
+	for ctx.Err() == nil {
+		c, err := o.dialEdge()
+		if err != nil {
+			if backoff == 0 {
+				backoff = refillBackoff0
+			} else if backoff < refillBackoffM {
+				backoff *= 2
+				if backoff > refillBackoffM {
+					backoff = refillBackoffM
+				}
+			}
+			o.logConnect.printf("cannot reach the edge at %s: %v (retrying, currently every %s)",
+				o.cfg.TunnelAddr, err, backoff)
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(backoff):
+			}
+			continue
+		}
+		backoff = 0
+
+		// Park until a user shows up. The spare lifetime doubles as the age cap:
+		// when it expires we replace the connection rather than trusting a route
+		// that a firewall may quietly have forgotten about.
+		atomic.AddInt64(&o.st.parkedSpares, 1)
+		err = o.parkUntilActivated(ctx, c, o.cfg.SpareTTL)
+		atomic.AddInt64(&o.st.parkedSpares, -1)
+
+		if err != nil {
+			_ = c.Close()
+			if ctx.Err() != nil {
+				return
+			}
+			// A timeout here is the normal recycle path, not a problem.
+			if !isTimeout(err) {
+				o.logConnect.printf("a parked connection to the edge ended early: %v", err)
+			}
+			continue
+		}
+
+		// Hand the session off and immediately rebuild this spare.
+		o.wg.Add(1)
+		go func(c net.Conn) {
+			defer o.wg.Done()
+			o.handleActivated(c)
+		}(c)
+	}
+}
+
+func (o *origin) dialEdge() (net.Conn, error) {
+	d := net.Dialer{Timeout: 10 * time.Second}
+	c, err := d.Dial("tcp", o.cfg.TunnelAddr)
+	if err != nil {
+		return nil, err
+	}
+	tuneSocket(c)
+	if err := sendAuth(c, o.cfg.secret); err != nil {
+		_ = c.Close()
+		return nil, err
+	}
+	return c, nil
+}
+
+// parkUntilActivated waits for the edge to signal a user, but gives up at once
+// if we are shutting down.
+//
+// The wait itself is a blocking read with a deadline measured in minutes.
+// Cancelling a context does not interrupt a blocked socket read, so without this
+// the process would appear to hang on shutdown until that deadline expired.
+// Moving the deadline to "now" makes the read return immediately.
+func (o *origin) parkUntilActivated(ctx context.Context, c net.Conn, timeout time.Duration) error {
+	unpark := make(chan struct{})
+	go func() {
+		select {
+		case <-ctx.Done():
+			_ = c.SetReadDeadline(time.Now())
+		case <-unpark:
+		}
+	}()
+	defer close(unpark)
+
+	return o.awaitActivation(c, timeout)
+}
+
+// awaitActivation blocks until the edge says a user has arrived. Anything other
+// than the activation byte means the connection is finished with.
+func (o *origin) awaitActivation(c net.Conn, timeout time.Duration) error {
+	if err := c.SetReadDeadline(time.Now().Add(timeout)); err != nil {
+		return err
+	}
+	var sig [1]byte
+	if _, err := io.ReadFull(c, sig[:]); err != nil {
+		return err
+	}
+	if err := c.SetReadDeadline(time.Time{}); err != nil {
+		return err
+	}
+	switch sig[0] {
+	case msgActivate:
+		return nil
+	case rejClockSkew, rejReplay:
+		err := describeRejection(sig[0])
+		o.logAuth.printf("the edge refused our credentials: %v", err)
+		return err
+	default:
+		return errBadAck
+	}
+}
+
+// handleActivated is reached only once a real user is waiting on the other side.
+func (o *origin) handleActivated(tunnel net.Conn) {
+	select {
+	case o.active <- struct{}{}:
+	default:
+		atomic.AddInt64(&o.st.droppedSessions, 1)
+		o.logCapacity.printf("at capacity (%d sessions); dropping an activated session", o.cfg.MaxConn)
+		_ = tunnel.Close()
+		return
+	}
+	defer func() { <-o.active }()
+
+	atomic.AddInt64(&o.st.activeSessions, 1)
+	defer atomic.AddInt64(&o.st.activeSessions, -1)
+
+	svc, err := net.DialTimeout("tcp", o.cfg.InboundAddr, inboundDialTimeout)
+	if err != nil {
+		atomic.AddInt64(&o.st.failedSessions, 1)
+		o.logDial.printf("cannot reach the local service at %s: %v", o.cfg.InboundAddr, err)
+		_ = tunnel.Close()
+		return
+	}
+
+	// Confirm we got through. Until this lands the edge is free to abandon this
+	// connection and replay the user's opening bytes down a different one.
+	if err := tunnel.SetWriteDeadline(time.Now().Add(activateWriteTimeout)); err != nil {
+		_ = tunnel.Close()
+		_ = svc.Close()
+		return
+	}
+	if _, err := tunnel.Write([]byte{msgAck}); err != nil {
+		_ = tunnel.Close()
+		_ = svc.Close()
+		return
+	}
+	_ = tunnel.SetWriteDeadline(time.Time{})
+
+	relay(tunnel, svc)
+}

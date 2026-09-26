@@ -1,0 +1,13 @@
+# Build output
+/portbridge
+/dist/
+*.exe
+
+# Local verification leftovers
+*.log
+/coverage.out
+
+# Never commit anything resembling a tunnel secret or a live config
+*.secret
+*.conf
+!packaging/*.conf
