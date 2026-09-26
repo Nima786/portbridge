@@ -27,7 +27,8 @@ die() {
 usage() {
     cat >&2 <<'EOF'
 Usage:
-  portbridge-firewall apply  <tunnel-name>
+  portbridge-firewall status                 every tunnel at a glance
+  portbridge-firewall apply  <tunnel-name>   lock, or unlock if turned off
   portbridge-firewall remove <tunnel-name>
   portbridge-firewall show   <tunnel-name>
 EOF
@@ -52,6 +53,9 @@ load() {
     role=$(read_conf "$conf" role)
     tunnel_addr=$(read_conf "$conf" tunnel_addr)
     PEER=$(read_conf "$conf" peer_ip)
+    # Missing means on: tunnels made before this setting existed stay protected.
+    ENABLED=$(read_conf "$conf" firewall)
+    [ -n "$ENABLED" ] || ENABLED=on
 
     # Port is whatever follows the last colon, so IPv6 literals survive.
     TPORT=${tunnel_addr##*:}
@@ -88,10 +92,21 @@ cmd_apply() {
         echo "tunnel $1 dials out, so no firewall rule is needed on this server"
         return 0
     fi
+    if [ "$ENABLED" = off ]; then
+        # Turned off by the user: make sure nothing is left behind from when it
+        # was on, so "off" really means the port is open.
+        cmd_remove "$1" >/dev/null
+        echo "firewall is turned off for tunnel $1, so port $TPORT is open to everyone"
+        return 0
+    fi
     if [ -z "$PEER" ]; then
         echo "tunnel $1 has no peer address recorded, so port $TPORT is left open" >&2
         return 0
     fi
+
+    # Start clean, so a changed peer address never leaves the old one allowed.
+    purge_port iptables "$TPORT"
+    purge_port ip6tables "$TPORT"
 
     # Order matters: the allow rules must sit above the catch-all drop.
     ensure4 INPUT -p tcp --dport "$TPORT" -s "$PEER" -j ACCEPT
@@ -108,20 +123,47 @@ cmd_apply() {
     echo "tunnel port $TPORT is restricted to $PEER"
 }
 
+# Removes every allow and drop rule for a port, whatever source address it
+# names. Matching on the port rather than on the recorded peer matters: if the
+# peer address was changed, the rule for the old address must go too, or it
+# would stay open to a server that is no longer part of the tunnel.
+purge_port() {
+    local tool=$1 port=$2 rule
+    have "$tool" || return 0
+    "$tool" -S INPUT 2>/dev/null |
+        grep -E -- "^-A INPUT( -s [^ ]+)? -p tcp -m tcp --dport $port -j (ACCEPT|DROP)$" |
+        while read -r rule; do
+            # shellcheck disable=SC2086 # the rule must be split back into words
+            "$tool" ${rule/-A/-D} 2>/dev/null || true
+        done
+}
+
 cmd_remove() {
     load "$1"
     [ "$LISTENS" = yes ] || return 0
-
-    drop4 INPUT -p tcp --dport "$TPORT" -j DROP
-    [ -n "$PEER" ] && drop4 INPUT -p tcp --dport "$TPORT" -s "$PEER" -j ACCEPT
-    drop4 INPUT -p tcp --dport "$TPORT" -s 127.0.0.1 -j ACCEPT
-
-    if have ip6tables; then
-        while ip6tables -C INPUT -p tcp --dport "$TPORT" -j DROP 2>/dev/null; do
-            ip6tables -D INPUT -p tcp --dport "$TPORT" -j DROP || break
-        done
-    fi
+    purge_port iptables "$TPORT"
+    purge_port ip6tables "$TPORT"
     echo "firewall rules for tunnel port $TPORT removed"
+}
+
+cmd_status() {
+    local f name
+    printf '%-16s %-8s %-7s %-10s %s\n' TUNNEL PORT SETTING STATE "ALLOWED FROM"
+    for f in "$CONF_DIR"/*.conf; do
+        [ -e "$f" ] || continue
+        name=$(basename "$f" .conf)
+        load "$name"
+        if [ "$LISTENS" != yes ]; then
+            printf '%-16s %-8s %-7s %-10s %s\n' "$name" "$TPORT" "-" "not needed" "this side dials out"
+            continue
+        fi
+        local state="open"
+        if have iptables && iptables -C INPUT -p tcp --dport "$TPORT" -j DROP 2>/dev/null; then
+            state="locked"
+        fi
+        printf '%-16s %-8s %-7s %-10s %s\n' "$name" "$TPORT" "$ENABLED" "$state" \
+            "$([ "$state" = locked ] && echo "$PEER only" || echo "everyone")"
+    done
 }
 
 cmd_show() {
@@ -138,10 +180,10 @@ cmd_show() {
     fi
 }
 
-[ $# -eq 2 ] || usage
-case "$1" in
-    apply) cmd_apply "$2" ;;
-    remove) cmd_remove "$2" ;;
-    show) cmd_show "$2" ;;
+case "${1-}:$#" in
+    status:1) cmd_status ;;
+    apply:2) cmd_apply "$2" ;;
+    remove:2) cmd_remove "$2" ;;
+    show:2) cmd_show "$2" ;;
     *) usage ;;
 esac

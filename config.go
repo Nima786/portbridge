@@ -61,6 +61,10 @@ type Config struct {
 	// without needing outbound web access every time.
 	LocalIP string
 
+	// Firewall says whether the tunnel port should be locked to PeerIP. Handled
+	// entirely by the firewall helper; the engine only checks it is valid.
+	Firewall string
+
 	PoolSize    int
 	MaxConn     int
 	MaxPending  int
@@ -166,6 +170,15 @@ func (c *Config) set(key, val string) error {
 		c.PeerIP = val
 	case "local_ip":
 		c.LocalIP = val
+	case "firewall":
+		// Read by the firewall helper, not by the engine. Accepted here so the
+		// engine does not refuse a config that contains it.
+		switch strings.ToLower(val) {
+		case "on", "off":
+			c.Firewall = strings.ToLower(val)
+		default:
+			return fmt.Errorf("firewall must be on or off, got %q", val)
+		}
 	case "secret_file":
 		c.SecretFile = val
 	case "status_file":

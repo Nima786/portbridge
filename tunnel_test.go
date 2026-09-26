@@ -848,6 +848,20 @@ func TestConfigValidation(t *testing.T) {
 	}
 }
 
+// The menu writes a firewall setting the engine itself does not use. The engine
+// must accept it, or every tunnel made by the menu would refuse to start.
+func TestFirewallSettingIsAccepted(t *testing.T) {
+	c := defaultConfig()
+	for _, v := range []string{"on", "off", "ON", "Off"} {
+		if err := c.set("firewall", v); err != nil {
+			t.Fatalf("firewall=%s was refused: %v", v, err)
+		}
+	}
+	if err := c.set("firewall", "maybe"); err == nil {
+		t.Fatal("firewall=maybe was accepted; want a refusal")
+	}
+}
+
 func TestConfigRoundTripFromFile(t *testing.T) {
 	dir := t.TempDir()
 	secret := filepath.Join(dir, "s")

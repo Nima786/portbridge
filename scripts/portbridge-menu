@@ -331,6 +331,8 @@ write_tunnel() {
         [ -n "$inbound" ] && printf '\n# The local service being published.\ninbound_addr = %s\n' "$inbound"
         printf '\n# The other server. Used to lock the tunnel port to a single source.\n'
         printf 'peer_ip = %s\n' "$peer"
+        printf '# on = only the other server may use the tunnel port. Change from the menu.\n'
+        printf 'firewall = on\n'
         [ -n "$localip" ] && printf 'local_ip = %s\n' "$localip"
         printf '\npool_size = %s\n' "$pool"
         printf 'max_conn = 2000\n'
@@ -955,7 +957,8 @@ main_menu() {
         say "  ${B}8${R}) Start, stop or restart a tunnel"
         say "  ${B}9${R}) View a tunnel's log"
         say " ${B}10${R}) Delete a tunnel"
-        say " ${B}11${R}) Uninstall PortBridge"
+        say " ${B}11${R}) Firewall"
+        say " ${B}12${R}) Uninstall PortBridge"
         say "  ${B}0${R}) Quit"
         hr
         local choice name
@@ -971,9 +974,68 @@ main_menu() {
             8) name=$(pick_tunnel) && service_menu "$name"; pause ;;
             9) name=$(pick_tunnel) && show_logs "$name"; pause ;;
             10) name=$(pick_tunnel) && delete_tunnel "$name"; pause ;;
-            11) uninstall_all ;;
+            11) firewall_menu ;;
+            12) uninstall_all ;;
             0 | q | Q) say "Bye."; exit 0 ;;
             *) err "Not a valid choice."; sleep 1 ;;
+        esac
+    done
+}
+
+# set_firewall <name> <on|off> - records the choice and applies it at once
+set_firewall() {
+    write_conf "$1" firewall "$2"
+    "$FIREWALL" apply "$1"
+}
+
+firewall_menu() {
+    local choice name n addr
+    while :; do
+        hr
+        say "${B}Firewall${R}"
+        say "${DIM}PortBridge only ever touches the private port the two servers use to${R}"
+        say "${DIM}talk to each other. Your users' ports, SSH, panels and any other${R}"
+        say "${DIM}services are never blocked by it.${R}"
+        hr
+        "$FIREWALL" status | sed 's/^/  /'
+        hr
+        say "  ${B}1${R}) Turn the firewall off for a tunnel"
+        say "  ${B}2${R}) Turn the firewall on for a tunnel"
+        say "  ${B}3${R}) Change which address a tunnel allows"
+        say "  ${B}4${R}) Turn it off for every tunnel"
+        say "  ${B}5${R}) Turn it on for every tunnel"
+        say "  ${B}0${R}) Back"
+        hr
+        choice=$(ask "Choose" "0")
+        case "$choice" in
+            1)
+                name=$(pick_tunnel) || continue
+                warn "With it off, anyone can connect to this tunnel's port. They still"
+                warn "cannot get through without the tunnel's password."
+                confirm "Turn it off for '$name'?" && set_firewall "$name" off
+                ;;
+            2)
+                name=$(pick_tunnel) || continue
+                set_firewall "$name" on
+                ;;
+            3)
+                name=$(pick_tunnel) || continue
+                addr=$(ask "Address to allow" "$(read_conf "$name" peer_ip)")
+                if valid_host "$addr"; then
+                    write_conf "$name" peer_ip "$addr"
+                    "$FIREWALL" apply "$name"
+                else
+                    err "That does not look like an address."
+                fi
+                ;;
+            4)
+                confirm "Turn the firewall off for every tunnel?" || continue
+                for n in $(tunnel_names); do set_firewall "$n" off; done
+                ;;
+            5)
+                for n in $(tunnel_names); do set_firewall "$n" on; done
+                ;;
+            *) return 0 ;;
         esac
     done
 }
@@ -1013,6 +1075,7 @@ case "${1-}" in
     list) list_tunnels ;;
     check) shift; test_tunnel "${1:?tunnel name required}" ;;
     code) shift; show_pairing_code "${1:?tunnel name required}" ;;
+    firewall) "$FIREWALL" status ;;
     '' ) main_menu ;;
-    *) say "Usage: portbridge-menu [list|check <name>|code <name>]" ;;
+    *) say "Usage: portbridge-menu [list|check <name>|code <name>|firewall]" ;;
 esac
