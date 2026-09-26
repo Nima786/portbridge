@@ -170,6 +170,12 @@ func (c *Config) set(key, val string) error {
 		c.PeerIP = val
 	case "local_ip":
 		c.LocalIP = val
+	case "server_inbound_port":
+		// Recorded on the relay by the menu, purely so it can rebuild the code
+		// for the server later. The engine does not use it.
+		if _, err := strconv.Atoi(val); err != nil {
+			return fmt.Errorf("%s: %w", key, err)
+		}
 	case "firewall":
 		// Read by the firewall helper, not by the engine. Accepted here so the
 		// engine does not refuse a config that contains it.

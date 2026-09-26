@@ -253,92 +253,97 @@ ask_port() {
     done
 }
 
-# --------------------------------------------------------------- explain modes
-
-explain_modes() {
-    hr
-    say "${B}Which way should the connection be opened?${R}"
-    say ""
-    say "  ${B}1) Direct${R}  - the server users connect to reaches out to the other one."
-    say "     ${DIM}The usual choice. Needs the users' server to be allowed to make${R}"
-    say "     ${DIM}outbound connections to the other server's address.${R}"
-    say ""
-    say "  ${B}2) Reverse${R} - the server holding the service reaches in instead."
-    say "     ${DIM}Use this when the users' server cannot reach the other one, for${R}"
-    say "     ${DIM}example because its address is blocked outbound. The server holding${R}"
-    say "     ${DIM}the service then needs no open ports at all.${R}"
-    hr
-}
+# ------------------------------------------------------------ the two servers
+#
+# The words used everywhere in this menu:
+#
+#   relay  - the server your users connect to. Usually in the same country as
+#            them. Internally this is the "edge".
+#   server - the server with your panel and Xray inbound, where the traffic
+#            ends up. Usually abroad. Internally this is the "origin".
+#
+# A tunnel is always created on the relay, which asks every question once and
+# produces a code. The server only pastes that code. This keeps the answers in
+# one place, so the two halves cannot disagree, and nobody is asked the same
+# thing twice.
 
 explain_roles() {
     hr
-    say "${B}What is this server's job in the tunnel?${R}"
+    say "${B}Is this server the relay or the server?${R}"
     say ""
-    say "  ${B}1) Users connect here${R}"
-    say "     ${DIM}The public doorway. It listens on a port your users point their${R}"
-    say "     ${DIM}apps at, and hands that traffic to the other server.${R}"
+    say "  ${B}1) Relay${R}"
+    say "     ${DIM}The one your users connect to. Usually in Iran, close to them.${R}"
+    say "     ${DIM}Their apps point at this machine's IP address.${R}"
     say ""
-    say "  ${B}2) The service lives here${R}"
-    say "     ${DIM}The server running the thing you are publishing, such as an Xray${R}"
-    say "     ${DIM}inbound. It connects to that service only when a real user arrives.${R}"
+    say "  ${B}2) Server${R}"
+    say "     ${DIM}The one with your panel and Xray inbound on it. Usually abroad.${R}"
+    say "     ${DIM}This is where your users' traffic finally ends up.${R}"
     hr
 }
 
-# ----------------------------------------------------------------- pairing code
+explain_modes() {
+    hr
+    say "${B}Direct or reverse?${R}"
+    say "${DIM}Your users will not notice any difference. This only decides which of${R}"
+    say "${DIM}the two machines opens the connection between them.${R}"
+    say ""
+    say "  ${B}1) Direct${R}  - this relay connects out to your server."
+    say "     ${DIM}Start with this. It works in most cases.${R}"
+    say ""
+    say "  ${B}2) Reverse${R} - your server connects in to this relay instead."
+    say "     ${DIM}Try this if direct stops working, usually because the relay can${R}"
+    say "     ${DIM}no longer reach your server's IP. Your server then needs no open${R}"
+    say "     ${DIM}ports at all.${R}"
+    hr
+}
 
-# Carries only what the other server cannot work out for itself. The joining side
-# is asked for its own local detail, because the issuer genuinely does not know
-# it: the doorway does not know the service's address, and vice versa.
+# -------------------------------------------------------------- pairing code
+
+# The code carries everything the server needs, so the server asks nothing.
 make_pairing_code() {
-    local name=$1 mode=$2 issuer_role=$3 tport=$4 issuer_ip=$5 secret=$6
-    {
-        printf 'v=1\n'
-        printf 'name=%s\n' "$name"
-        printf 'mode=%s\n' "$mode"
-        printf 'issuer_role=%s\n' "$issuer_role"
-        printf 'tunnel_port=%s\n' "$tport"
-        printf 'issuer_ip=%s\n' "$issuer_ip"
-        printf 'secret=%s\n' "$secret"
-    } | base64 -w0 2>/dev/null || {
-        # busybox base64 has no -w
-        {
-            printf 'v=1\nname=%s\nmode=%s\nissuer_role=%s\ntunnel_port=%s\nissuer_ip=%s\nsecret=%s\n' \
-                "$name" "$mode" "$issuer_role" "$tport" "$issuer_ip" "$secret"
-        } | base64 | tr -d '\n'
-    }
+    local name=$1 mode=$2 tport=$3 relay_ip=$4 server_ip=$5 inbound_port=$6 pool=$7 secret=$8
+    printf 'v=2\nname=%s\nmode=%s\ntunnel_port=%s\nrelay_ip=%s\nserver_ip=%s\ninbound_port=%s\npool=%s\nsecret=%s\n' \
+        "$name" "$mode" "$tport" "$relay_ip" "$server_ip" "$inbound_port" "$pool" "$secret" |
+        base64 | tr -d '\n'
 }
 
 show_pairing_code() {
-    local name=$1
-    local mode tport secret role ip code
+    local name=$1 role mode tport secret relay_ip server_ip inbound_port pool code
+    role=$(read_conf "$name" role)
+    if [ "$role" != edge ]; then
+        warn "Codes are only made on the relay. Look this tunnel up on your relay instead."
+        return 1
+    fi
     mode=$(read_conf "$name" mode)
     tport=$(read_conf "$name" tunnel_addr); tport=${tport##*:}
-    role=$(read_conf "$name" role)
     secret=$(cat "$(secret_of "$name")" 2>/dev/null)
-    ip=$(read_conf "$name" local_ip)
-    [ -n "$ip" ] || ip=$(public_ip)
+    relay_ip=$(read_conf "$name" local_ip)
+    [ -n "$relay_ip" ] || relay_ip=$(public_ip)
+    server_ip=$(read_conf "$name" peer_ip)
+    inbound_port=$(read_conf "$name" server_inbound_port)
+    pool=$(read_conf "$name" pool_size)
 
-    code=$(make_pairing_code "$name" "$mode" "$role" "$tport" "$ip" "$secret")
+    code=$(make_pairing_code "$name" "$mode" "$tport" "$relay_ip" "$server_ip" "$inbound_port" "$pool" "$secret")
 
     hr
-    say "${B}Pairing code for '$name'${R}"
+    say "${B}Code for your server${R}"
     say ""
-    say "On the ${B}other${R} server, install PortBridge and choose ${B}'Join a tunnel'${R},"
-    say "then paste this single line:"
+    say "Now log in to your ${B}server${R} ($server_ip), install PortBridge there, choose"
+    say "${B}'Join a tunnel'${R} and paste this one line. It will not ask you anything else."
     say ""
     printf '%s\n' "$code"
     say ""
-    warn "This contains the tunnel's password. Send it over something private."
+    warn "This line contains the tunnel's password, so do not post it anywhere public."
     hr
 }
 
-# ---------------------------------------------------------------- write a tunnel
+# ------------------------------------------------------------ write a tunnel
 
 # write_tunnel <name> <mode> <role> <tunnel_addr> <user_listen> <inbound_addr>
-#              <peer_ip> <local_ip> <pool> <secret>
+#              <peer_ip> <local_ip> <pool> <secret> [server_inbound_port]
 write_tunnel() {
     local name=$1 mode=$2 role=$3 taddr=$4 ulisten=$5 inbound=$6
-    local peer=$7 localip=$8 pool=$9 secret=${10}
+    local peer=$7 localip=$8 pool=$9 secret=${10} sinport=${11-}
 
     mkdir -p "$CONF_DIR"
     chmod 700 "$CONF_DIR"
@@ -350,18 +355,24 @@ write_tunnel() {
         printf '# Edit with: portbridge-menu  ->  Edit a tunnel\n\n'
         printf 'name = %s\n' "$name"
         printf 'mode = %s\n' "$mode"
+        if [ "$role" = edge ]; then
+            printf '# edge = the relay, where users connect\n'
+        else
+            printf '# origin = the server, where the inbound is\n'
+        fi
         printf 'role = %s\n\n' "$role"
         if [ "$mode:$role" = "direct:edge" ] || [ "$mode:$role" = "reverse:origin" ]; then
-            printf '# This side opens the cross-border connection, so this is where to dial.\n'
+            printf '# This machine opens the connection, so this is the address it calls.\n'
         else
-            printf '# This side accepts the cross-border connection, so this is where to listen.\n'
+            printf '# This machine waits for the other one to call, on this port.\n'
         fi
         printf 'tunnel_addr = %s\n' "$taddr"
         [ -n "$ulisten" ] && printf '\n# Where your users connect.\nuser_listen = %s\n' "$ulisten"
-        [ -n "$inbound" ] && printf '\n# The local service being published.\ninbound_addr = %s\n' "$inbound"
-        printf '\n# The other server. Used to lock the tunnel port to a single source.\n'
+        [ -n "$inbound" ] && printf '\n# Your Xray inbound.\ninbound_addr = %s\n' "$inbound"
+        [ -n "$sinport" ] && printf '\n# The inbound port on the server, remembered for the pairing code.\nserver_inbound_port = %s\n' "$sinport"
+        printf '\n# The other machine. The tunnel port is locked to this address.\n'
         printf 'peer_ip = %s\n' "$peer"
-        printf '# on = only the other server may use the tunnel port. Change from the menu.\n'
+        printf '# on = only the other machine may use the tunnel port. Change from the menu.\n'
         printf 'firewall = on\n'
         [ -n "$localip" ] && printf 'local_ip = %s\n' "$localip"
         printf '\npool_size = %s\n' "$pool"
@@ -389,7 +400,8 @@ discard_tunnel() {
 
 validate_and_enable() {
     local name=$1
-    if ! "$BIN" check -config "$(conf_of "$name")"; then
+    if ! "$BIN" check -config "$(conf_of "$name")" >/dev/null; then
+        "$BIN" check -config "$(conf_of "$name")" >&2
         err "Those settings were refused, so nothing has been started."
         discard_tunnel "$name"
         err "The half-made tunnel has been cleaned up. Nothing was left behind."
@@ -413,16 +425,52 @@ validate_and_enable() {
     return 0
 }
 
-# ------------------------------------------------------------------ create flow
+# ask_remote_port <prompt> <default> - a port on the OTHER machine, so the local
+# "is it free here" checks would be meaningless and are skipped.
+ask_remote_port() {
+    local p
+    while :; do
+        p=$(ask "$1" "${2-}")
+        valid_port "$p" && { printf '%s' "$p"; return 0; }
+        err "  A port must be a number from 1 to 65535."
+    done
+}
+
+# this_machine_has_ip <ip> - true if the address is bound to one of our interfaces
+this_machine_has_ip() {
+    ip -o addr show 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | grep -qx "$1"
+}
+
+# ---------------------------------------------------------------- create flow
 
 create_tunnel() {
-    local name mode role tport taddr ulisten inbound peer localip pool secret
-    local uport svc_addr
+    local name mode role tport taddr ulisten peer localip secret inport uport
+    local pool=25
 
     hr
     say "${B}Create a tunnel${R}"
     hr
 
+    explain_roles
+    case "$(choose "Choose 1 or 2" "1" 1 2)" in
+        1) role=edge ;;
+        2) role=origin ;;
+    esac
+
+    if [ "$role" = origin ]; then
+        say ""
+        info "Tunnels are always started on the relay, so every question is asked once"
+        info "and both machines end up with matching settings."
+        say ""
+        say "  1. Log in to your ${B}relay${R} and choose ${B}'Create a tunnel'${R} there."
+        say "  2. It gives you a code at the end."
+        say "  3. Come back to this server and choose ${B}'Join a tunnel'${R}, then paste it."
+        say ""
+        say "Nothing has been changed here."
+        return 0
+    fi
+
+    say ""
     while :; do
         name=$(ask "A short name for this tunnel (letters, digits, dash)" "")
         if ! valid_name "$name"; then
@@ -442,197 +490,202 @@ create_tunnel() {
         2) mode=reverse ;;
     esac
 
-    explain_roles
-    case "$(choose "Choose 1 or 2" "1" 1 2)" in
-        1) role=edge ;;
-        2) role=origin ;;
-    esac
+    say ""
+    info "Your server's IP address, the one with your panel on it."
+    while :; do
+        peer=$(ask "Server IP" "")
+        if this_machine_has_ip "$peer"; then
+            err "  That is this relay's own address. Enter your other server's IP."
+            continue
+        fi
+        valid_host "$peer" && break
+        err "  That does not look like an address."
+    done
 
     say ""
-    info "The tunnel port is the private port the two servers use to talk to each other."
-    tport=$(ask_port "Tunnel port" "$DEFAULT_TUNNEL_PORT")
+    info "The port of your inbound on the server, exactly as it appears in your panel."
+    inport=$(ask_remote_port "Inbound port on the server" "")
 
     say ""
-    peer=$(ask "The other server's IP address" "")
-    if ! valid_host "$peer"; then
-        err "That does not look like an address."
-        return 1
-    fi
+    info "The port your users will put in their apps, with this relay's IP."
+    info "Using the same number as the inbound keeps things simple, so that is the"
+    info "suggestion."
+    uport=$(ask_port "Port for your users on this relay" "$inport")
+    ulisten="0.0.0.0:$uport"
 
-    # Whoever dials needs the peer's address; whoever listens binds locally.
-    if [ "$mode:$role" = "direct:edge" ] || [ "$mode:$role" = "reverse:origin" ]; then
+    say ""
+    info "One more port: a private one the relay and the server use between"
+    info "themselves. Your users never see it. Anything free will do."
+    while :; do
+        if [ "$mode" = reverse ]; then
+            # Reverse: it is opened on this relay, so check it here.
+            tport=$(ask_port "Port between the two machines" "$DEFAULT_TUNNEL_PORT")
+            if [ "$tport" = "$uport" ]; then
+                err "  It cannot be the same as your users' port."
+                continue
+            fi
+        else
+            # Direct: it is opened on the server, which cannot be checked from here.
+            tport=$(ask_remote_port "Port between the two machines" "$DEFAULT_TUNNEL_PORT")
+        fi
+        break
+    done
+
+    if [ "$mode" = direct ]; then
         taddr="$peer:$tport"
-        info "This server will dial out to $taddr."
     else
         taddr="0.0.0.0:$tport"
-        info "This server will wait for the other one to connect in on port $tport."
     fi
 
-    ulisten=""
-    inbound=""
-    if [ "$role" = edge ]; then
-        say ""
-        info "Now the port your users will point their apps at."
-        uport=$(ask_port "Port for users" "443")
-        ulisten="0.0.0.0:$uport"
-    else
-        say ""
-        info "Now the local service you are publishing, for example an Xray inbound."
-        while :; do
-            svc_addr=$(ask "Service address on this server" "127.0.0.1:26963")
-            case "$svc_addr" in
-                *:*) ;;
-                *) err "  Please give it as address:port, for example 127.0.0.1:26963."; continue ;;
-            esac
-            valid_port "${svc_addr##*:}" || { err "  That port is not valid."; continue; }
-            break
-        done
-        inbound="$svc_addr"
-    fi
-
-    say ""
-    info "Spare connections are kept ready so a user does not wait for a new one."
-    info "25 suits most setups. Raise it if you expect many users arriving at once."
-    pool=$(ask "Spare connections" "25")
-    valid_port "$pool" 2>/dev/null || pool=25
-
-    secret=$(gen_secret)
-
-    # This goes into the pairing code, and in some setups the other server dials
-    # it, so it has to be right. Detection is usually correct but not always, so
-    # show it and let the user confirm.
-    printf '%s' "${DIM}Working out this server's address...${R}" >&2
+    printf '%s' "${DIM}Working out this relay's own address...${R}" >&2
     localip=$(public_ip)
     printf '\r%*s\r' 45 '' >&2
     say ""
-    info "The other server needs this server's address. Detected: ${localip:-unknown}"
-    info "Some providers send outgoing traffic from a different address, so check it."
+    info "Last thing: this relay's own IP, which your server needs to know."
+    info "Detected: ${localip:-could not tell}"
+    info "Some hosts show a different address for outgoing traffic, so please check"
+    info "this is the IP your users connect to."
     while :; do
-        localip=$(ask "This server's public IP" "$localip")
+        localip=$(ask "This relay's IP" "$localip")
         valid_host "$localip" && break
         err "  That does not look like an address."
     done
 
+    secret=$(gen_secret)
+
     hr
-    say "${B}About to create:${R}"
-    say "  name            $name"
-    say "  mode            $mode"
-    say "  this server     $([ "$role" = edge ] && echo 'users connect here' || echo 'the service lives here')"
-    if [ "$mode:$role" = "direct:edge" ] || [ "$mode:$role" = "reverse:origin" ]; then
-        say "  connection      this server dials $peer:$tport"
+    say "${B}Ready to set this up:${R}"
+    say "  tunnel name        $name"
+    say "  this relay         $localip, your users connect on port $uport"
+    say "  your server        $peer, inbound on port $inport"
+    if [ "$mode" = direct ]; then
+        say "  connection         direct: this relay connects out to $peer:$tport"
     else
-        say "  connection      $peer connects in to port $tport here"
-        say "  firewall        port $tport will be locked to $peer only"
+        say "  connection         reverse: $peer connects in to this relay on port $tport"
+        say "  firewall           port $tport here open to $peer only"
     fi
-    [ -n "$ulisten" ] && say "  users connect   port ${ulisten##*:}"
-    [ -n "$inbound" ] && say "  publishes       $inbound"
-    say "  spares          $pool"
     hr
-    confirm "Create it?" || { say "Cancelled."; return 1; }
+    confirm "Set it up?" || { say "Cancelled. Nothing was changed."; return 1; }
 
-    write_tunnel "$name" "$mode" "$role" "$taddr" "$ulisten" "$inbound" \
-        "$peer" "$localip" "$pool" "$secret"
+    write_tunnel "$name" "$mode" edge "$taddr" "$ulisten" "" \
+        "$peer" "$localip" "$pool" "$secret" "$inport"
 
-    if ! validate_and_enable "$name"; then
-        return 1
-    fi
+    validate_and_enable "$name" || return 1
 
-    ok "Tunnel '$name' is running."
+    ok "Done. The relay half of '$name' is running."
     say ""
-    if [ "$mode" = reverse ] && [ "$role" = edge ]; then
-        info "It is waiting for the other server to connect in. Until you set that up,"
-        info "users will not get through. That is expected."
-    fi
+    info "Nothing works until the server half is set up too. That is normal."
     show_pairing_code "$name"
 }
 
-# -------------------------------------------------------------------- join flow
+# ------------------------------------------------------------------ join flow
 
 join_tunnel() {
-    local code decoded name mode issuer_role tport issuer_ip secret v
-    local role taddr ulisten inbound pool localip uport svc_addr
+    local code decoded v name mode tport relay_ip server_ip inport pool secret
+    local taddr inbound
 
     hr
     say "${B}Join a tunnel${R}"
     say ""
-    say "Paste the pairing code from the ${B}other${R} server."
+    say "Paste the code your ${B}relay${R} showed you when you created the tunnel."
     hr
-    code=$(ask "Pairing code" "")
+    code=$(ask "Code" "")
     [ -n "$code" ] || { err "Nothing pasted."; return 1; }
 
     decoded=$(printf '%s' "$code" | tr -d '[:space:]' | base64 -d 2>/dev/null) || {
-        err "That code could not be read. Copy the whole single line and try again."
+        err "That code could not be read. Copy the whole line and try again."
         return 1
     }
     get() { printf '%s\n' "$decoded" | sed -nE "s/^$1=(.*)$/\1/p" | head -1; }
 
-    v=$(get v); name=$(get name); mode=$(get mode)
-    issuer_role=$(get issuer_role); tport=$(get tunnel_port)
-    issuer_ip=$(get issuer_ip); secret=$(get secret)
+    v=$(get v)
+    if [ "$v" = 1 ]; then
+        err "That code comes from an older version of PortBridge."
+        err "Update the relay, then create the tunnel there again for a new code."
+        return 1
+    fi
+    name=$(get name); mode=$(get mode); tport=$(get tunnel_port)
+    relay_ip=$(get relay_ip); server_ip=$(get server_ip)
+    inport=$(get inbound_port); pool=$(get pool); secret=$(get secret)
 
-    if [ "$v" != 1 ] || [ -z "$name" ] || [ -z "$mode" ] || [ -z "$secret" ]; then
-        err "That code is not a valid pairing code."
+    if [ "$v" != 2 ] || [ -z "$name" ] || [ -z "$mode" ] || [ -z "$secret" ] ||
+        ! valid_port "${tport:-x}" || ! valid_port "${inport:-x}" || [ -z "$relay_ip" ]; then
+        err "That is not a valid PortBridge code."
+        return 1
+    fi
+    valid_port "${pool:-x}" || pool=25
+
+    # Pasting the code back on the relay is an easy slip; catch it.
+    if this_machine_has_ip "$relay_ip"; then
+        err "This machine is the relay that made this code."
+        err "Paste the code on your other server, $server_ip, instead."
         return 1
     fi
     if [ -f "$(conf_of "$name")" ]; then
-        err "A tunnel called '$name' already exists on this server."
+        err "A tunnel called '$name' already exists here. Delete it first to replace it."
         return 1
     fi
 
-    # This server takes the opposite job.
-    if [ "$issuer_role" = edge ]; then role=origin; else role=edge; fi
-
     hr
-    say "${B}This code describes:${R}"
-    say "  tunnel        $name"
-    say "  mode          $mode"
-    say "  other server  $issuer_ip ($([ "$issuer_role" = edge ] && echo 'users connect there' || echo 'the service is there'))"
-    say "  this server   $([ "$role" = edge ] && echo 'users will connect here' || echo 'the service is here')"
-    say "  tunnel port   $tport"
-    hr
-
-    if [ "$mode:$role" = "direct:edge" ] || [ "$mode:$role" = "reverse:origin" ]; then
-        taddr="$issuer_ip:$tport"
-        info "This server will dial out to $taddr."
+    say "${B}This code sets up the server half of:${R}"
+    say "  tunnel name        $name"
+    say "  your relay         $relay_ip"
+    say "  your inbound       port $inport on this server"
+    if [ "$mode" = direct ]; then
+        say "  connection         direct: the relay connects in to this server on port $tport"
+        say "  firewall           port $tport here open to $relay_ip only"
     else
-        taddr="0.0.0.0:$tport"
-        info "This server will wait for $issuer_ip to connect in on port $tport."
-        if port_in_use_by_system "$tport"; then
-            warn "Something is already listening on port $tport here."
+        say "  connection         reverse: this server connects out to $relay_ip:$tport"
+        say "                     so this server needs no open port for it"
+    fi
+    hr
+
+    # Nothing to ask, but two things are worth checking before going ahead.
+    inbound="127.0.0.1:$inport"
+    if ! timeout 3 bash -c "echo > /dev/tcp/127.0.0.1/$inport" 2>/dev/null; then
+        warn "Nothing is answering on port $inport on this server."
+        warn "Is Xray running, and is this the machine with your panel on it?"
+        confirm "Carry on anyway?" || { say "Cancelled. Nothing was changed."; return 1; }
+    fi
+    if [ "$mode" = direct ]; then
+        if port_in_use_by_system "$tport" || port_owner "$tport" >/dev/null; then
+            err "Port $tport is already in use on this server, so the relay could not"
+            err "connect to it. Create the tunnel again on the relay with another port."
+            return 1
         fi
-    fi
-
-    ulisten=""; inbound=""
-    if [ "$role" = edge ]; then
-        say ""
-        info "The code cannot know which port you want users to use, so choose it now."
-        uport=$(ask_port "Port for users" "443")
-        ulisten="0.0.0.0:$uport"
+        taddr="0.0.0.0:$tport"
     else
-        say ""
-        info "The code cannot know your local service address, so give it now."
-        while :; do
-            svc_addr=$(ask "Service address on this server" "127.0.0.1:26963")
-            case "$svc_addr" in *:*) ;; *) err "  Use address:port."; continue ;; esac
-            valid_port "${svc_addr##*:}" || { err "  That port is not valid."; continue; }
-            break
-        done
-        inbound="$svc_addr"
+        taddr="$relay_ip:$tport"
     fi
 
-    pool=$(ask "Spare connections" "25")
-    valid_port "$pool" 2>/dev/null || pool=25
-    localip=$(public_ip)
+    confirm "Set it up?" || { say "Cancelled. Nothing was changed."; return 1; }
 
-    confirm "Create this tunnel?" || { say "Cancelled."; return 1; }
-
-    write_tunnel "$name" "$mode" "$role" "$taddr" "$ulisten" "$inbound" \
-        "$issuer_ip" "$localip" "$pool" "$secret"
+    write_tunnel "$name" "$mode" origin "$taddr" "" "$inbound" \
+        "$relay_ip" "${server_ip:-}" "$pool" "$secret"
 
     validate_and_enable "$name" || return 1
-    ok "Tunnel '$name' is running and paired."
+
     say ""
-    info "Give it a few seconds, then check 'List tunnels' on both servers."
+    # In direct mode the relay has been retrying since it was set up and backs off
+    # to one attempt every thirty seconds, so allow a little longer for that.
+    local i spares="" wait_for=15
+    [ "$mode" = direct ] && wait_for=40
+    printf '%s' "${DIM}Waiting for the two machines to find each other...${R}" >&2
+    for i in $(seq 1 "$wait_for"); do
+        sleep 1
+        spares=$(json_field "$RUN_DIR/$name.json" parked_spares 2>/dev/null)
+        [ -n "$spares" ] && [ "$spares" -gt 0 ] 2>/dev/null && break
+    done
+    printf '\r%*s\r' 55 '' >&2
+
+    if [ -n "$spares" ] && [ "$spares" -gt 0 ] 2>/dev/null; then
+        ok "Done. Both halves of '$name' are connected."
+    else
+        warn "Set up, but the two machines have not found each other yet."
+        warn "Use 'Check a tunnel for problems' to see why."
+    fi
+    say ""
+    info "Test it by pointing an app at $relay_ip and your users' port."
 }
 
 # ------------------------------------------------------------------- list/status
@@ -660,7 +713,7 @@ status_line() {
     [ -n "$active_s" ] || active_s="-"
 
     local job
-    [ "$role" = edge ] && job="doorway" || job="service side"
+    [ "$role" = edge ] && job="relay" || job="server"
 
     printf '  %-16s %-9s %-13s %s%-8s%s users:%-5s spares:%s\n' \
         "$name" "$mode" "$job" "$colour" "$state" "$R" "$active_s" "$parked"
@@ -755,7 +808,7 @@ edit_tunnel() {
     cp "$(conf_of "$name")" "$backup"
 
     cur=$(read_conf "$name" pool_size)
-    new=$(ask "Spare connections" "$cur")
+    new=$(ask "Connections to keep ready" "$cur")
     [ "$new" != "$cur" ] && { write_conf "$name" pool_size "$new"; changed=1; }
 
     cur=$(read_conf "$name" max_conn)
@@ -798,7 +851,7 @@ edit_tunnel() {
         fi
     else
         cur_u=$(read_conf "$name" inbound_addr)
-        new=$(ask "Service address on this server" "$cur_u")
+        new=$(ask "Your inbound on this server" "$cur_u")
         [ "$new" != "$cur_u" ] && { write_conf "$name" inbound_addr "$new"; changed=1; }
     fi
 
@@ -926,14 +979,12 @@ test_tunnel() {
     local f spares
     f="$RUN_DIR/$name.json"
     spares=$(json_field "$f" parked_spares 2>/dev/null)
-    if [ "$role" = origin ] && [ "$mode" = direct ]; then
-        result "spare connections ready" note "not applicable on this side"
-    elif [ -n "$spares" ] && [ "$spares" -gt 0 ] 2>/dev/null; then
-        result "spare connections ready" good "$spares"
+    if [ -n "$spares" ] && [ "$spares" -gt 0 ] 2>/dev/null; then
+        result "relay and server linked" good "yes, $spares connections ready"
     else
-        result "spare connections ready" bad "none, the two halves are not talking"
-        note "Check the password matches on both servers, and that both clocks"
-        note "are correct."
+        result "relay and server linked" bad "no, the two machines are not talking"
+        note "Make sure the tunnel is set up on both machines, that the code was"
+        note "pasted on the right one, and that both clocks are correct."
     fi
 
     local empties
@@ -951,8 +1002,8 @@ test_tunnel() {
     if [ "${rejects:-0}" -gt 0 ]; then
         say ""
         printf '  %s%s%s\n' "$RED" "The password does not match: $rejects refusals in the last 10 minutes." "$R"
-        note "Delete this tunnel on one server and recreate it from the other"
-        note "server's pairing code."
+        note "Delete this tunnel on your server, then join again with the code"
+        note "from 'Show a tunnel's code' on your relay."
         fail=$((fail + 1))
     fi
     if [ "${skew:-0}" -gt 0 ]; then
@@ -1001,9 +1052,9 @@ main_menu() {
         say "${DIM}$(hostname) - $(tunnel_count) tunnel(s) configured${R}"
         hr
         say "  ${B}1${R}) List tunnels and status"
-        say "  ${B}2${R}) Create a tunnel"
-        say "  ${B}3${R}) Join a tunnel from a pairing code"
-        say "  ${B}4${R}) Show a tunnel's pairing code"
+        say "  ${B}2${R}) Create a tunnel        ${DIM}start here, on your relay${R}"
+        say "  ${B}3${R}) Join a tunnel          ${DIM}then this, on your server${R}"
+        say "  ${B}4${R}) Show a tunnel's code   ${DIM}on the relay, if you need it again${R}"
         say "  ${B}5${R}) Tunnel details"
         say "  ${B}6${R}) Check a tunnel for problems"
         say "  ${B}7${R}) Edit a tunnel"
