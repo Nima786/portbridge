@@ -76,6 +76,7 @@ type edge struct {
 	logCapacity *throttled
 	logSession  *throttled
 	logAuth     *throttled
+	logRelay    *throttled
 }
 
 func runEdge(ctx context.Context, cfg *Config, st *status) error {
@@ -89,15 +90,17 @@ func runEdge(ctx context.Context, cfg *Config, st *status) error {
 		logCapacity: newThrottled(),
 		logSession:  newThrottled(),
 		logAuth:     newThrottled(),
+		logRelay:    newThrottled(),
 	}
 
 	// Direct mode: we dial the origin ourselves, so connections can be built on
 	// demand. Reverse mode: we cannot dial anywhere, so we wait to be called.
 	var dial func() (net.Conn, error)
 	if cfg.Mode == ModeDirect {
+		routes := newRouter(cfg)
+		log.Printf("reaching the other server at %s", routes.describe())
 		dial = func() (net.Conn, error) {
-			d := net.Dialer{Timeout: 5 * time.Second}
-			raw, err := d.Dial("tcp", cfg.dialTarget())
+			raw, err := routes.dial(5 * time.Second)
 			if err != nil {
 				return nil, err
 			}
@@ -304,7 +307,12 @@ func (e *edge) serve(ctx context.Context, user net.Conn) error {
 			atomic.AddInt64(&e.st.retries, 1)
 			continue
 		}
-		relay(user, tunnel)
+		if err := relay(user, tunnel); err != nil {
+			// The user has already been served as far as it got, so this is a
+			// report rather than a failure: their download was cut short by the
+			// tunnel rather than by them.
+			e.logRelay.printf("a session was cut short bringing data back: %v", err)
+		}
 		return nil
 	}
 	return lastErr

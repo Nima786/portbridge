@@ -94,14 +94,30 @@ your answer in the pairing code so both ends always agree.
 | **Plain** | Random-looking bytes. Slightly faster, easiest to spot. |
 | **Look like a normal website** (recommended) | An ordinary secure website connection, including a real handshake if anyone probes the port. |
 | **Through Cloudflare or another CDN** | A normal secure websocket request to your domain, with your foreign server's IP never appearing on the link. |
+| **Look like a website, with a CDN standing by** | As the second option, but if your foreign server's address ever stops being reachable the link moves to your domain through the CDN by itself. Direct mode only. |
 
 The middle option needs nothing from you but a name for the link to claim, and
 that name does not have to be real or yours. A certificate is generated on the
 spot. It is not checked for trust, because the shared password already proves who
 is who; the certificate is only there to make the handshake look normal.
 
-The CDN option does need a domain you control, pointed at the CDN with its proxy
-turned on. It is the only option that hides your foreign server's address.
+The two CDN options need a domain you control, pointed at the CDN with its proxy
+turned on. Only the third option hides your foreign server's address; the fourth
+keeps the CDN in reserve and uses the direct address while it works, which is
+faster.
+
+The fourth option is the answer to the most common way a working tunnel dies:
+nothing is wrong with either server, but the foreign one's address stops being
+reachable. No tunnel software can fix that from the inside. Reaching the same
+server by a different name, through addresses nobody wants to block, can. When
+that happens the log says which route it moved to, and it tries the direct one
+again every couple of minutes.
+
+Either CDN option has one consequence worth knowing: the link can arrive from
+the CDN rather than from your other server, so the tunnel port cannot be locked
+to a single address and is left open. The menu says so at the time. What protects
+it then is the disguise: without the right web address and the right password, a
+visitor gets a plain 404.
 
 None of this touches your users' own traffic, which Xray has already encrypted.
 
@@ -181,7 +197,9 @@ the retry, which then moves the user to a different shared connection.
   so capturing one is no use later.
 - On whichever half accepts the connection, the tunnel port is locked to the
   other server's address automatically. The rule is reapplied on every start, so
-  it survives a reboot.
+  it survives a reboot. The exception is a link that may arrive through a CDN,
+  where the address it arrives from is the CDN's; the port is then left open and
+  the menu tells you.
 - The port your users connect to is deliberately left open.
 - Traffic is passed through untouched. What PortBridge carries is normally
   already encrypted end to end, so the website disguise is camouflage rather
@@ -253,7 +271,9 @@ added, and deletes everything it installed.
 ## Not included
 
 - No UDP. TCP services only.
-- No automatic switching between direct and reverse if one stops working.
+- No automatic switching between direct and reverse. A blocked address is handled
+  by the CDN backup route above; a broken return path is not, and needs the mode
+  changed by hand.
 
 ## Licence
 

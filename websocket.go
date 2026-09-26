@@ -312,3 +312,29 @@ func (w *wsConn) CloseWrite() error {
 	}
 	return nil
 }
+
+// How long to spend swallowing whatever is still arriving before closing. Long
+// enough for the tail of a finished exchange, short enough not to hold a
+// finished session open.
+const wsDrainTime = 250 * time.Millisecond
+
+// Close finishes with the connection, but reads off anything still arriving
+// first.
+//
+// This is not tidiness. Reading a websocket Close frame ends the stream as far as
+// this wrapper is concerned, while the bytes that follow it on the wire, the
+// secure channel's own goodbye, have not been read. Closing a connection that
+// still has unread data waiting makes the system send a reset rather than a
+// polite finish, and a reset tells the other end to throw away everything it has
+// not handed over yet.
+//
+// The result was a download that stopped a few hundred kilobytes short, now and
+// then, with nothing in any log. Swallowing the tail first turns the close back
+// into a polite one.
+func (w *wsConn) Close() error {
+	if wsDrainTime > 0 {
+		_ = w.Conn.SetReadDeadline(time.Now().Add(wsDrainTime))
+		_, _ = io.Copy(io.Discard, w.br)
+	}
+	return w.Conn.Close()
+}

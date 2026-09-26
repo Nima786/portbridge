@@ -322,8 +322,31 @@ DG_TRANSPORT=plain
 DG_SERVERNAME=""
 DG_WSPATH=""
 DG_CDN=off
+# DG_ALTHOST is the domain to fall back to through a CDN when the foreign
+# server's own address stops being reachable. Empty means no second route.
+DG_ALTHOST=""
+
+# ask_domain - reads a domain name, rejecting anything that is not one.
+ask_domain() {
+    local host
+    while :; do
+        host=$(ask "Your domain name" "")
+        case "$host" in
+            '' | *[!a-zA-Z0-9.-]*)
+                err "  That does not look like a domain name."
+                continue
+                ;;
+        esac
+        case "$host" in
+            *.*) break ;;
+            *) err "  Please give a full domain name, such as link.example.com." ;;
+        esac
+    done
+    printf '%s' "$host"
+}
 
 explain_disguise() {
+    local mode=$1
     hr
     say "${B}How should the link between the two servers look?${R}"
     say "${DIM}This is about the connection between your two servers only. Your users'${R}"
@@ -341,19 +364,32 @@ explain_disguise() {
     say "     ${DIM}As above, and routed through a CDN, so your foreign server's IP${R}"
     say "     ${DIM}never appears on the link and cannot simply be blocked. Needs a${R}"
     say "     ${DIM}domain name you control, pointed at the CDN.${R}"
+    if [ "$mode" = direct ]; then
+        say ""
+        say "  ${B}4) Look like a website, with a CDN standing by${R}"
+        say "     ${DIM}Normally connects straight to your foreign server, which is the${R}"
+        say "     ${DIM}fastest way. If that address ever stops being reachable, it moves${R}"
+        say "     ${DIM}to your domain through the CDN on its own and keeps working.${R}"
+        say "     ${DIM}Also needs a domain pointed at the CDN.${R}"
+    fi
     hr
 }
 
 # ask_disguise <mode> - fills the DG_* variables.
 ask_disguise() {
-    local mode=$1 choice host
+    local mode=$1 choice
 
-    explain_disguise
-    choice=$(choose "Choose 1, 2 or 3" "2" 1 2 3)
+    explain_disguise "$mode"
+    if [ "$mode" = direct ]; then
+        choice=$(choose "Choose 1, 2, 3 or 4" "2" 1 2 3 4)
+    else
+        choice=$(choose "Choose 1, 2 or 3" "2" 1 2 3)
+    fi
 
     DG_SERVERNAME=""
     DG_WSPATH=""
     DG_CDN=off
+    DG_ALTHOST=""
 
     case "$choice" in
         1)
@@ -363,31 +399,27 @@ ask_disguise() {
             ;;
         2) DG_TRANSPORT=tls ;;
         3) DG_TRANSPORT=wss; DG_CDN=on ;;
+        4) DG_TRANSPORT=wss; DG_CDN=off ;;
     esac
 
-    if [ "$DG_CDN" = on ]; then
+    if [ "$choice" = 3 ] || [ "$choice" = 4 ]; then
         say ""
         info "A CDN routes by name, so this needs a domain you control which is"
         info "already pointed at the CDN, with its proxy turned on."
-        while :; do
-            host=$(ask "Your domain name" "")
-            case "$host" in
-                '' | *[!a-zA-Z0-9.-]* | *.*) ;;
-                *) err "  That does not look like a domain name."; continue ;;
-            esac
-            case "$host" in
-                *.*) break ;;
-                *) err "  Please give a full domain name, such as link.example.com." ;;
-            esac
-        done
-        DG_SERVERNAME=$host
+        DG_SERVERNAME=$(ask_domain)
         DG_WSPATH="/$(head -c 9 /dev/urandom | base64 | tr -dc 'a-zA-Z0-9' | head -c 10)"
+        [ "$choice" = 4 ] && DG_ALTHOST=$DG_SERVERNAME
         say ""
         info "Using the web address $DG_SERVERNAME$DG_WSPATH for the link."
-        if [ "$mode" = reverse ]; then
+        if [ "$choice" = 3 ] && [ "$mode" = reverse ]; then
             warn "Note: a CDN only carries connections towards your domain, so with"
             warn "reverse this only works if the domain points at THIS Iran server."
         fi
+        say ""
+        warn "Because the link can arrive from the CDN rather than from your other"
+        warn "server, the tunnel port cannot be locked to one address, so it is left"
+        warn "open. Anything that knocks on it without the right web address and"
+        warn "password gets an ordinary 404 and nothing else."
     else
         say ""
         info "The link will claim to be a website. Any believable name works, and it"
@@ -397,14 +429,27 @@ ask_disguise() {
     fi
 }
 
-# describe_disguise <transport> <cdn> - one short phrase for summaries.
+# describe_disguise <transport> <cdn> [althost] - one short phrase for summaries.
 describe_disguise() {
     case "$1:$2" in
         tls:*) printf 'looks like a normal website' ;;
         wss:on) printf 'through a CDN' ;;
-        wss:*) printf 'looks like a website, websocket' ;;
+        wss:*)
+            if [ -n "${3-}" ]; then
+                printf 'looks like a website, CDN standing by'
+            else
+                printf 'looks like a website, websocket'
+            fi
+            ;;
         *) printf 'plain, not hidden' ;;
     esac
+}
+
+# cdn_involved <cdn> <althost> - can the link arrive from a CDN rather than
+# straight from the other server? If so the tunnel port cannot be locked to one
+# address, because the address it arrives from is the CDN's.
+cdn_involved() {
+    [ "$1" = on ] || [ -n "${2-}" ]
 }
 
 # ------------------------------------------------------------------- sharing
@@ -477,9 +522,10 @@ describe_sharing() {
 make_pairing_code() {
     local name=$1 mode=$2 tport=$3 relay_ip=$4 server_ip=$5 inbound_port=$6 pool=$7 secret=$8
     local transport=$9 servername=${10} wspath=${11} cdn=${12} mux=${13} muxlinks=${14}
-    printf 'v=4\nname=%s\nmode=%s\ntunnel_port=%s\nrelay_ip=%s\nserver_ip=%s\ninbound_port=%s\npool=%s\ntransport=%s\nserver_name=%s\nws_path=%s\ncdn=%s\nmux=%s\nmux_links=%s\nsecret=%s\n' \
+    local althost=${15-}
+    printf 'v=5\nname=%s\nmode=%s\ntunnel_port=%s\nrelay_ip=%s\nserver_ip=%s\ninbound_port=%s\npool=%s\ntransport=%s\nserver_name=%s\nws_path=%s\ncdn=%s\nalt_host=%s\nmux=%s\nmux_links=%s\nsecret=%s\n' \
         "$name" "$mode" "$tport" "$relay_ip" "$server_ip" "$inbound_port" "$pool" \
-        "$transport" "$servername" "$wspath" "$cdn" "${mux:-off}" "${muxlinks:-4}" "$secret" |
+        "$transport" "$servername" "$wspath" "$cdn" "$althost" "${mux:-off}" "${muxlinks:-4}" "$secret" |
         base64 | tr -d '\n'
 }
 
@@ -499,16 +545,20 @@ show_pairing_code() {
     inbound_port=$(read_conf "$name" server_inbound_port)
     pool=$(read_conf "$name" pool_size)
 
-    local transport servername wspath cdn mux muxlinks
+    local transport servername wspath cdn mux muxlinks alt althost
     transport=$(read_conf "$name" transport); [ -n "$transport" ] || transport=plain
     servername=$(read_conf "$name" server_name)
     wspath=$(read_conf "$name" ws_path)
     cdn=$(read_conf "$name" cdn); [ -n "$cdn" ] || cdn=off
     mux=$(read_conf "$name" mux); [ -n "$mux" ] || mux=off
     muxlinks=$(read_conf "$name" mux_links); [ -n "$muxlinks" ] || muxlinks=4
+    # The other side does not dial, so it needs the second route only to know
+    # that the link may arrive from a CDN and its port must stay open.
+    alt=$(read_conf "$name" alt_target)
+    althost=${alt%:*}
 
     code=$(make_pairing_code "$name" "$mode" "$tport" "$relay_ip" "$server_ip" "$inbound_port" \
-        "$pool" "$secret" "$transport" "$servername" "$wspath" "$cdn" "$mux" "$muxlinks")
+        "$pool" "$secret" "$transport" "$servername" "$wspath" "$cdn" "$mux" "$muxlinks" "$althost")
 
     hr
     say "${B}Code for your foreign server${R}"
@@ -555,10 +605,16 @@ write_tunnel() {
         [ -n "$ulisten" ] && printf '\n# Where your users connect.\nuser_listen = %s\n' "$ulisten"
         [ -n "$inbound" ] && printf '\n# Your Xray inbound.\ninbound_addr = %s\n' "$inbound"
         [ -n "$sinport" ] && printf '\n# The inbound port on the foreign server, kept for the code.\nserver_inbound_port = %s\n' "$sinport"
-        printf '\n# The other machine. The tunnel port is locked to this address.\n'
+        printf '\n# The other machine.\n'
         printf 'peer_ip = %s\n' "$peer"
-        printf '# on = only the other machine may use the tunnel port. Change from the menu.\n'
-        printf 'firewall = on\n'
+        if cdn_involved "${DG_CDN:-off}" "${DG_ALTHOST-}"; then
+            printf '# off because the link can arrive from a CDN, whose address is not\n'
+            printf '# the other server, so the port cannot be locked to one address.\n'
+            printf 'firewall = off\n'
+        else
+            printf '# on = only the other machine may use the tunnel port. Change from the menu.\n'
+            printf 'firewall = on\n'
+        fi
         [ -n "$localip" ] && printf 'local_ip = %s\n' "$localip"
         printf '\n# What the link looks like to anyone watching it. See the menu.\n'
         printf 'transport = %s\n' "${DG_TRANSPORT:-plain}"
@@ -568,6 +624,13 @@ write_tunnel() {
             printf 'cdn = %s\n' "${DG_CDN:-off}"
             printf 'cert_file = %s/%s.crt\n' "$CONF_DIR" "$name"
             printf 'key_file = %s/%s.key\n' "$CONF_DIR" "$name"
+        fi
+        # A second route is only of use to the side that dials; the other side
+        # accepts the link whichever way it arrives, so it is told nothing.
+        if [ -n "${DG_ALTHOST-}" ] &&
+            { [ "$mode:$role" = "direct:edge" ] || [ "$mode:$role" = "reverse:origin" ]; }; then
+            printf '\n# If the address above cannot be reached, try this instead.\n'
+            printf 'alt_target = %s:%s\n' "$DG_ALTHOST" "${taddr##*:}"
         fi
 
         printf '\n# on = every user session shares a few long-lived connections.\n'
@@ -772,10 +835,16 @@ create_tunnel() {
         say "  connection         direct: this Iran server connects out to $peer:$tport"
     else
         say "  connection         reverse: $peer connects in to this Iran server on port $tport"
-        say "  firewall           port $tport here open to $peer only"
+        if cdn_involved "$DG_CDN" "$DG_ALTHOST"; then
+            say "  firewall           port $tport here left open, because the link can"
+            say "                     arrive from the CDN rather than from $peer"
+        else
+            say "  firewall           port $tport here open to $peer only"
+        fi
     fi
-    say "  link appearance    $(describe_disguise "$DG_TRANSPORT" "$DG_CDN")"
+    say "  link appearance    $(describe_disguise "$DG_TRANSPORT" "$DG_CDN" "$DG_ALTHOST")"
     [ -n "$DG_SERVERNAME" ] && say "  claims to be       $DG_SERVERNAME$DG_WSPATH"
+    [ -n "$DG_ALTHOST" ] && say "  if that is blocked  it moves to $DG_ALTHOST:$tport by itself"
     say "  connections        $(describe_sharing "$MX_MUX" "$MX_LINKS")"
     hr
     confirm "Set it up?" || { say "Cancelled. Nothing was changed."; return 1; }
@@ -813,7 +882,7 @@ join_tunnel() {
     get() { printf '%s\n' "$decoded" | sed -nE "s/^$1=(.*)$/\1/p" | head -1; }
 
     v=$(get v)
-    if [ "$v" = 1 ] || [ "$v" = 2 ] || [ "$v" = 3 ]; then
+    if [ "$v" = 1 ] || [ "$v" = 2 ] || [ "$v" = 3 ] || [ "$v" = 4 ]; then
         err "That code was made by an older version of PortBridge, and does not say"
         err "everything this one needs to know about the link."
         err "Update the Iran server, then create the tunnel there again for a new code."
@@ -828,13 +897,16 @@ join_tunnel() {
     DG_SERVERNAME=$(get server_name)
     DG_WSPATH=$(get ws_path)
     DG_CDN=$(get cdn); [ -n "$DG_CDN" ] || DG_CDN=off
+    # Carried so this side knows the link may arrive from a CDN and must leave
+    # its port open, even though it is the Iran server that does the dialling.
+    DG_ALTHOST=$(get alt_host)
 
     # So does whether connections are shared: it must match on both ends or
     # neither side would understand the other.
     MX_MUX=$(get mux); [ -n "$MX_MUX" ] || MX_MUX=off
     MX_LINKS=$(get mux_links); [ -n "$MX_LINKS" ] || MX_LINKS=4
 
-    if [ "$v" != 4 ] || [ -z "$name" ] || [ -z "$mode" ] || [ -z "$secret" ] ||
+    if [ "$v" != 5 ] || [ -z "$name" ] || [ -z "$mode" ] || [ -z "$secret" ] ||
         ! valid_port "${tport:-x}" || ! valid_port "${inport:-x}" || [ -z "$relay_ip" ]; then
         err "That is not a valid PortBridge code."
         return 1
@@ -859,12 +931,17 @@ join_tunnel() {
     say "  traffic goes to    your inbound on port $inport, on this server"
     if [ "$mode" = direct ]; then
         say "  connection         direct: $relay_ip connects in to this server on port $tport"
-        say "  firewall           port $tport here open to $relay_ip only"
+        if cdn_involved "$DG_CDN" "$DG_ALTHOST"; then
+            say "  firewall           port $tport here left open, because the link can"
+            say "                     arrive from the CDN rather than from $relay_ip"
+        else
+            say "  firewall           port $tport here open to $relay_ip only"
+        fi
     else
         say "  connection         reverse: this server connects out to $relay_ip:$tport"
         say "                     so this server needs no open port for it"
     fi
-    say "  link appearance    $(describe_disguise "$DG_TRANSPORT" "$DG_CDN")"
+    say "  link appearance    $(describe_disguise "$DG_TRANSPORT" "$DG_CDN" "$DG_ALTHOST")"
     [ -n "$DG_SERVERNAME" ] && say "  claims to be       $DG_SERVERNAME$DG_WSPATH"
     say "  connections        $(describe_sharing "$MX_MUX" "$MX_LINKS")"
     hr
@@ -963,7 +1040,13 @@ status_line() {
     case "$transport:$cdn" in
         tls:*) look=website ;;
         wss:on) look=cdn ;;
-        wss:*) look=websocket ;;
+        wss:*)
+            if [ -n "$(read_conf "$name" alt_target)" ]; then
+                look="cdn-backup"
+            else
+                look="websocket"
+            fi
+            ;;
         *) look=plain ;;
     esac
 
@@ -1265,8 +1348,28 @@ test_tunnel() {
     local transport cdn
     transport=$(read_conf "$name" transport); [ -n "$transport" ] || transport=plain
     cdn=$(read_conf "$name" cdn); [ -n "$cdn" ] || cdn=off
-    result "link appearance" note "$(describe_disguise "$transport" "$cdn")"
+    local alt
+    alt=$(read_conf "$name" alt_target)
+    result "link appearance" note "$(describe_disguise "$transport" "$cdn" "$alt")"
     result "connections" note "$(describe_sharing "$mux" "$(read_conf "$name" mux_links)")"
+
+    if [ -n "$alt" ]; then
+        if timeout 8 bash -c "echo > /dev/tcp/${alt%:*}/${alt##*:}" 2>/dev/null; then
+            result "backup route" good "ready, $alt"
+        else
+            result "backup route" bad "cannot reach $alt"
+            note "If the main route ever fails, this one would not take over."
+            note "Check the domain points at your CDN with its proxy turned on, and"
+            note "that the CDN is set to forward this port."
+        fi
+        # Which route is actually carrying the tunnel right now is worth saying.
+        if journalctl -u "$(unit_of "$name")" --since "-1 h" --no-pager 2>/dev/null |
+            grep -q "instead of"; then
+            result "route in use" note "the backup, the main address was unreachable"
+        else
+            result "route in use" note "the main address"
+        fi
+    fi
 
     # A mismatched disguise looks exactly like a wrong password from the log, so
     # call it out separately or it sends people hunting the wrong problem.

@@ -92,6 +92,10 @@ type Config struct {
 	// address then never appears on the link, so it cannot simply be blocked.
 	CDN bool
 
+	// AltTarget is a second address to reach the other server, tried when the
+	// first cannot be reached. Only the side that dials uses it. See route.go.
+	AltTarget string
+
 	// CertFile and KeyFile hold the certificate the accepting side presents. They
 	// are created automatically if missing.
 	CertFile string
@@ -274,6 +278,8 @@ func (c *Config) set(key, val string) error {
 		default:
 			return fmt.Errorf("cdn must be on or off, got %q", val)
 		}
+	case "alt_target":
+		c.AltTarget = val
 	case "mux":
 		switch strings.ToLower(val) {
 		case "on", "yes", "true":
@@ -414,6 +420,18 @@ func (c *Config) Validate() error {
 			return fmt.Errorf("cert_file and key_file are required for the %s disguise on the side that accepts", c.Transport)
 		}
 	}
+	if c.AltTarget != "" {
+		host, port, err := net.SplitHostPort(c.AltTarget)
+		if err != nil {
+			return fmt.Errorf("alt_target must be host:port: %w", err)
+		}
+		if host == "" || host == "0.0.0.0" || host == "::" || port == "" {
+			return fmt.Errorf("alt_target must name the other server, got %q", c.AltTarget)
+		}
+		if !c.Dials() {
+			return fmt.Errorf("alt_target is only used by the side that dials, and this side waits to be called")
+		}
+	}
 	if c.Mux {
 		if c.MuxLinks < 1 {
 			return fmt.Errorf("mux_links must be at least 1")
@@ -459,7 +477,11 @@ func (c *Config) Summary() string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "tunnel %q: %s mode, acting as %s. ", c.Name, c.Mode, c.Role)
 	if c.Dials() {
-		fmt.Fprintf(&b, "Dialling out to %s. ", c.TunnelAddr)
+		fmt.Fprintf(&b, "Dialling out to %s", c.TunnelAddr)
+		if c.AltTarget != "" {
+			fmt.Fprintf(&b, ", falling back to %s if that cannot be reached", c.AltTarget)
+		}
+		b.WriteString(". ")
 	} else {
 		fmt.Fprintf(&b, "Accepting tunnel connections on %s. ", c.TunnelAddr)
 	}

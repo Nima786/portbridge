@@ -30,6 +30,10 @@ type origin struct {
 	// sessions share a few long-lived connections.
 	links *carrierSet
 
+	// routes is how to reach the edge, with a fallback if one was given. Only
+	// used in reverse mode, where this side is the one that dials.
+	routes *router
+
 	active  chan struct{}
 	pending chan struct{}
 	wg      sync.WaitGroup
@@ -42,6 +46,7 @@ type origin struct {
 	logCapacity *throttled
 	logDial     *throttled
 	logConnect  *throttled
+	logRelay    *throttled
 }
 
 func runOrigin(ctx context.Context, cfg *Config, st *status) error {
@@ -56,9 +61,12 @@ func runOrigin(ctx context.Context, cfg *Config, st *status) error {
 		logCapacity: newThrottled(),
 		logDial:     newThrottled(),
 		logConnect:  newThrottled(),
+		logRelay:    newThrottled(),
 	}
 
 	if cfg.Mode == ModeReverse {
+		o.routes = newRouter(cfg)
+		log.Printf("reaching the other server at %s", o.routes.describe())
 		return o.runReverse(ctx)
 	}
 	return o.runDirect(ctx)
@@ -288,8 +296,7 @@ func (o *origin) reverseWorker(ctx context.Context, n int) {
 }
 
 func (o *origin) dialEdge() (net.Conn, error) {
-	d := net.Dialer{Timeout: 10 * time.Second}
-	raw, err := d.Dial("tcp", o.cfg.dialTarget())
+	raw, err := o.routes.dial(10 * time.Second)
 	if err != nil {
 		return nil, err
 	}
@@ -390,5 +397,7 @@ func (o *origin) handleActivated(tunnel net.Conn) {
 	}
 	_ = tunnel.SetWriteDeadline(time.Time{})
 
-	relay(tunnel, svc)
+	if err := relay(svc, tunnel); err != nil {
+		o.logRelay.printf("a session was cut short taking data from the tunnel: %v", err)
+	}
 }
