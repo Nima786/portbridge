@@ -16,11 +16,12 @@ type status struct {
 	started time.Time
 	pool    *pool
 
-	activeSessions  int64
-	failedSessions  int64
-	droppedSessions int64
-	parkedSpares    int64
-	retries         int64
+	activeSessions   int64
+	failedSessions   int64
+	droppedSessions  int64
+	parkedSpares     int64
+	retries          int64
+	emptyConnections int64
 }
 
 type statusFile struct {
@@ -40,7 +41,10 @@ type statusFile struct {
 	FailedSessions  int64  `json:"failed_sessions"`
 	DroppedSessions int64  `json:"dropped_sessions"`
 	Retries         int64  `json:"retries"`
-	UpdatedAt       string `json:"updated_at"`
+	// EmptyConnections counts connections that arrived and left without sending
+	// anything, which is mostly internet background scanning.
+	EmptyConnections int64  `json:"empty_connections"`
+	UpdatedAt        string `json:"updated_at"`
 }
 
 func newStatus(cfg *Config) *status {
@@ -80,23 +84,24 @@ func (s *status) writeOnce() {
 	}
 
 	sf := statusFile{
-		Name:            s.cfg.Name,
-		Mode:            string(s.cfg.Mode),
-		Role:            string(s.cfg.Role),
-		Dials:           s.cfg.Dials(),
-		TunnelAddr:      s.cfg.TunnelAddr,
-		UserListen:      s.cfg.UserListen,
-		InboundAddr:     s.cfg.InboundAddr,
-		PID:             os.Getpid(),
-		StartedAt:       s.started.UTC().Format(time.RFC3339),
-		UptimeSeconds:   int64(time.Since(s.started).Seconds()),
-		ActiveSessions:  atomic.LoadInt64(&s.activeSessions),
-		ParkedSpares:    parked,
-		PoolTarget:      s.cfg.PoolSize,
-		FailedSessions:  atomic.LoadInt64(&s.failedSessions),
-		DroppedSessions: atomic.LoadInt64(&s.droppedSessions),
-		Retries:         atomic.LoadInt64(&s.retries),
-		UpdatedAt:       time.Now().UTC().Format(time.RFC3339),
+		Name:             s.cfg.Name,
+		Mode:             string(s.cfg.Mode),
+		Role:             string(s.cfg.Role),
+		Dials:            s.cfg.Dials(),
+		TunnelAddr:       s.cfg.TunnelAddr,
+		UserListen:       s.cfg.UserListen,
+		InboundAddr:      s.cfg.InboundAddr,
+		PID:              os.Getpid(),
+		StartedAt:        s.started.UTC().Format(time.RFC3339),
+		UptimeSeconds:    int64(time.Since(s.started).Seconds()),
+		ActiveSessions:   atomic.LoadInt64(&s.activeSessions),
+		ParkedSpares:     parked,
+		PoolTarget:       s.cfg.PoolSize,
+		FailedSessions:   atomic.LoadInt64(&s.failedSessions),
+		DroppedSessions:  atomic.LoadInt64(&s.droppedSessions),
+		Retries:          atomic.LoadInt64(&s.retries),
+		EmptyConnections: atomic.LoadInt64(&s.emptyConnections),
+		UpdatedAt:        time.Now().UTC().Format(time.RFC3339),
 	}
 
 	b, err := json.MarshalIndent(sf, "", "  ")

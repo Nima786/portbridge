@@ -769,75 +769,114 @@ show_logs() {
 }
 
 test_tunnel() {
-    local name=$1 role ulisten taddr peer mode
+    local name=$1 role ulisten taddr mode
     role=$(read_conf "$name" role)
     mode=$(read_conf "$name" mode)
-    peer=$(read_conf "$name" peer_ip)
     hr
     say "${B}Checking '$name'${R}"
     hr
 
-    printf '  service running          '
-    [ "$(systemctl is-active "$(unit_of "$name")")" = active ] && ok "yes" || { err "no"; }
+    # Results are printed on stdout alongside their label. Sending one to stdout
+    # and the other to stderr looks fine on a terminal but arrives scrambled the
+    # moment the output is redirected or captured.
+    local pass=0 fail=0
+    result() { # result <label> <good|bad|note> <detail>
+        local colour
+        case "$2" in
+            good) colour=$GREEN; pass=$((pass + 1)) ;;
+            bad)  colour=$RED;   fail=$((fail + 1)) ;;
+            *)    colour=$DIM ;;
+        esac
+        printf '  %-26s %s%s%s\n' "$1" "$colour" "$3" "$R"
+    }
+    note() { printf '     %s%s%s\n' "$DIM" "$1" "$R"; }
+
+    if [ "$(systemctl is-active "$(unit_of "$name")")" = active ]; then
+        result "service running" good "yes"
+    else
+        result "service running" bad "no"
+        note "Start it from the menu, or look at the log for why it stopped."
+    fi
 
     if [ "$role" = edge ]; then
         ulisten=$(read_conf "$name" user_listen)
-        printf '  listening for users      '
-        if port_in_use_by_system "${ulisten##*:}"; then ok "yes, port ${ulisten##*:}"; else err "no"; fi
+        if port_in_use_by_system "${ulisten##*:}"; then
+            result "listening for users" good "yes, port ${ulisten##*:}"
+        else
+            result "listening for users" bad "no"
+        fi
     else
         local inbound
         inbound=$(read_conf "$name" inbound_addr)
-        printf '  local service reachable  '
         if timeout 5 bash -c "echo > /dev/tcp/${inbound%:*}/${inbound##*:}" 2>/dev/null; then
-            ok "yes, $inbound"
+            result "local service reachable" good "yes, $inbound"
         else
-            err "no - cannot reach $inbound"
+            result "local service reachable" bad "no, cannot reach $inbound"
+            note "Is the service actually running on this server?"
         fi
     fi
 
     taddr=$(read_conf "$name" tunnel_addr)
     if [ "$mode:$role" = "direct:edge" ] || [ "$mode:$role" = "reverse:origin" ]; then
-        printf '  other server reachable   '
         if timeout 8 bash -c "echo > /dev/tcp/${taddr%:*}/${taddr##*:}" 2>/dev/null; then
-            ok "yes, $taddr"
+            result "other server reachable" good "yes, $taddr"
         else
-            err "no - cannot reach $taddr"
-            say "    ${DIM}Either the other half is not running, or its firewall is not${R}"
-            say "    ${DIM}allowing this server's address.${R}"
+            result "other server reachable" bad "no, cannot reach $taddr"
+            note "Either the other half is not running, or its firewall is not"
+            note "allowing this server's address."
         fi
     else
-        printf '  waiting on tunnel port   '
-        if port_in_use_by_system "${taddr##*:}"; then ok "yes, port ${taddr##*:}"; else err "no"; fi
+        if port_in_use_by_system "${taddr##*:}"; then
+            result "waiting on tunnel port" good "yes, port ${taddr##*:}"
+        else
+            result "waiting on tunnel port" bad "no"
+        fi
     fi
 
     local f spares
     f="$RUN_DIR/$name.json"
     spares=$(json_field "$f" parked_spares 2>/dev/null)
-    printf '  spare connections ready  '
-    if [ -n "$spares" ] && [ "$spares" -gt 0 ] 2>/dev/null; then
-        ok "$spares"
-    elif [ "$role" = origin ] && [ "$mode" = direct ]; then
-        say "${DIM}n/a on this side in direct mode${R}"
+    if [ "$role" = origin ] && [ "$mode" = direct ]; then
+        result "spare connections ready" note "not applicable on this side"
+    elif [ -n "$spares" ] && [ "$spares" -gt 0 ] 2>/dev/null; then
+        result "spare connections ready" good "$spares"
     else
-        err "0 - the two halves are not talking"
-        say "    ${DIM}Check the password matches on both servers, and that both${R}"
-        say "    ${DIM}clocks are correct.${R}"
+        result "spare connections ready" bad "none, the two halves are not talking"
+        note "Check the password matches on both servers, and that both clocks"
+        note "are correct."
     fi
 
-    local rejects
+    local empties
+    empties=$(json_field "$f" empty_connections 2>/dev/null)
+    if [ -n "$empties" ] && [ "$empties" -gt 0 ] 2>/dev/null; then
+        result "ignored port scans" note "$empties"
+    fi
+
+    local rejects skew
     rejects=$(journalctl -u "$(unit_of "$name")" --since "-10 min" --no-pager 2>/dev/null |
         grep -ci 'wrong or missing secret' || true)
-    if [ "${rejects:-0}" -gt 0 ]; then
-        say ""
-        err "  The password does not match: $rejects refusals in the last 10 minutes."
-        say "  ${DIM}Recreate the tunnel on one side using the other side's pairing code.${R}"
-    fi
-    local skew
     skew=$(journalctl -u "$(unit_of "$name")" --since "-10 min" --no-pager 2>/dev/null |
         grep -ci 'clocks differ' || true)
+
+    if [ "${rejects:-0}" -gt 0 ]; then
+        say ""
+        printf '  %s%s%s\n' "$RED" "The password does not match: $rejects refusals in the last 10 minutes." "$R"
+        note "Delete this tunnel on one server and recreate it from the other"
+        note "server's pairing code."
+        fail=$((fail + 1))
+    fi
     if [ "${skew:-0}" -gt 0 ]; then
         say ""
-        err "  The two servers' clocks disagree. Run: timedatectl set-ntp true"
+        printf '  %s%s%s\n' "$RED" "The two servers' clocks disagree." "$R"
+        note "Run this on both: timedatectl set-ntp true"
+        fail=$((fail + 1))
+    fi
+
+    hr
+    if [ "$fail" -eq 0 ]; then
+        printf '  %s%s%s\n' "$GREEN" "Everything checks out." "$R"
+    else
+        printf '  %s%s%s\n' "$RED" "$fail problem(s) found, listed above." "$R"
     fi
     hr
 }

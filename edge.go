@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log"
 	"net"
@@ -29,7 +30,15 @@ const (
 	reverseWaitForSpare = 5 * time.Second
 )
 
-var errBadAck = errors.New("unexpected handshake reply from the other server")
+var (
+	errBadAck = errors.New("unexpected handshake reply from the other server")
+
+	// errUserWentAway means someone connected and disconnected without sending
+	// anything. That is what a port scanner looks like, and the port users
+	// connect to is public, so this happens constantly and is not worth a log
+	// line.
+	errUserWentAway = errors.New("user disconnected before sending anything")
+)
 
 // edge faces the users. It holds the pool of ready connections and tells the
 // origin when a user turns up. Its behaviour is the same in both modes; only the
@@ -133,9 +142,14 @@ func runEdge(ctx context.Context, cfg *Config, st *status) error {
 					<-e.active
 				}()
 				if err := e.serve(ctx, user); err != nil {
+					_ = user.Close()
+					if errors.Is(err, errUserWentAway) {
+						// Background noise on a public port. Counted, not logged.
+						atomic.AddInt64(&st.emptyConnections, 1)
+						return
+					}
 					atomic.AddInt64(&st.failedSessions, 1)
 					e.logSession.printf("could not put a user on the tunnel: %v", err)
-					_ = user.Close()
 				}
 			}(c)
 		default:
@@ -202,7 +216,9 @@ func (e *edge) serve(ctx context.Context, user net.Conn) error {
 	n, err := user.Read(head)
 	_ = user.SetReadDeadline(time.Time{})
 	if n == 0 && err != nil && !isTimeout(err) {
-		return err // user hung up before saying anything
+		// Connected then vanished without a word: almost always a port scan.
+		// Do not spend a tunnel connection on it, and do not log it.
+		return fmt.Errorf("%w: %v", errUserWentAway, err)
 	}
 	head = head[:n]
 
