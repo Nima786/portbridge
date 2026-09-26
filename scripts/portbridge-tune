@@ -1,0 +1,145 @@
+#!/usr/bin/env bash
+#
+# Network tuning for long-distance links.
+#
+# The default Linux settings assume packet loss means congestion, which is true
+# on a local network and wrong on a route between continents. There, loss is
+# mostly interference, and the default reaction of slowing down sharply is
+# exactly wrong: throughput collapses even though the link is fine.
+#
+# BBR judges the link by measuring how fast data actually arrives instead of
+# counting losses, so it keeps a lossy long route running near its real speed.
+# On a bad path the difference is large, often several times faster.
+#
+# Everything here is applied to the whole server, not just PortBridge, and every
+# change is written to one file that can be removed to undo it.
+
+set -uo pipefail
+
+CONF=/etc/sysctl.d/99-portbridge-tuning.conf
+MARK="# written by portbridge-tune"
+
+if [ -t 1 ]; then
+    B=$'\033[1m'; DIM=$'\033[2m'; R=$'\033[0m'
+    RED=$'\033[31m'; GREEN=$'\033[32m'; YELLOW=$'\033[33m'
+else
+    B=''; DIM=''; R=''; RED=''; GREEN=''; YELLOW=''
+fi
+say() { printf '%s\n' "$*"; }
+ok() { printf '%s\n' "${GREEN}$*${R}"; }
+warn() { printf '%s\n' "${YELLOW}$*${R}" >&2; }
+die() { printf '%s\n' "${RED}$*${R}" >&2; exit 1; }
+
+[ "$(id -u)" -eq 0 ] || die "Please run this as root."
+
+current() { sysctl -n "$1" 2>/dev/null; }
+
+bbr_available() {
+    # Either already built in, or loadable as a module.
+    grep -qw bbr /proc/sys/net/ipv4/tcp_available_congestion_control 2>/dev/null && return 0
+    modprobe tcp_bbr 2>/dev/null || return 1
+    grep -qw bbr /proc/sys/net/ipv4/tcp_available_congestion_control 2>/dev/null
+}
+
+cmd_status() {
+    say "${B}Network tuning${R}"
+    say "  congestion control : $(current net.ipv4.tcp_congestion_control)"
+    say "  queue discipline   : $(current net.core.default_qdisc)"
+    say "  send buffer max    : $(current net.core.wmem_max)"
+    say "  receive buffer max : $(current net.core.rmem_max)"
+    say "  open file limit    : $(current fs.file-max)"
+    say "  fast open          : $(current net.ipv4.tcp_fastopen)"
+    if [ -f "$CONF" ]; then
+        say "  tuned by PortBridge: ${GREEN}yes${R}"
+    else
+        say "  tuned by PortBridge: ${DIM}no${R}"
+    fi
+    if [ "$(current net.ipv4.tcp_congestion_control)" = bbr ]; then
+        ok "  BBR is active, which is what you want on a long-distance link."
+    else
+        say "  ${DIM}BBR is not active. Turning it on usually helps a lot on a lossy${R}"
+        say "  ${DIM}route between countries.${R}"
+    fi
+}
+
+cmd_apply() {
+    local cc=cubic qd
+    if bbr_available; then
+        cc=bbr
+    else
+        warn "This kernel has no BBR, so the rest of the tuning is applied without it."
+    fi
+
+    # fq pairs with BBR. fq_codel is the sensible fallback.
+    if grep -qw fq /proc/sys/net/core/default_qdisc 2>/dev/null; then qd=fq; else qd=fq; fi
+
+    cat >"$CONF" <<EOF
+$MARK
+# Remove this file and reboot (or run: portbridge-tune undo) to go back.
+
+# Judge the link by measured speed rather than by counting lost packets. On a
+# route between continents, loss is usually interference, not congestion, and
+# the default reaction of slowing down sharply destroys throughput.
+net.ipv4.tcp_congestion_control = $cc
+net.core.default_qdisc = $qd
+
+# Allow big enough buffers to keep a long-distance link full. The defaults are
+# sized for short hops, which caps speed no matter how fast the line is.
+net.core.rmem_max = 16777216
+net.core.wmem_max = 16777216
+net.ipv4.tcp_rmem = 4096 87380 16777216
+net.ipv4.tcp_wmem = 4096 65536 16777216
+
+# Keep a healthy backlog so bursts of new users are not dropped.
+net.core.somaxconn = 8192
+net.ipv4.tcp_max_syn_backlog = 8192
+net.core.netdev_max_backlog = 16384
+
+# Reuse closed connections quickly. A busy tunnel opens and closes a lot of them.
+net.ipv4.tcp_fin_timeout = 15
+net.ipv4.tcp_tw_reuse = 1
+net.ipv4.ip_local_port_range = 10240 65535
+
+# Saves a round trip on repeat connections where both ends support it.
+net.ipv4.tcp_fastopen = 3
+
+# Do not shrink back to a slow start after a quiet moment; on a long link,
+# ramping up again takes noticeably long.
+net.ipv4.tcp_slow_start_after_idle = 0
+
+# Plenty of file handles: each session uses two connections.
+fs.file-max = 2097152
+EOF
+
+    sysctl --system >/dev/null 2>&1 || sysctl -p "$CONF" >/dev/null 2>&1
+
+    if [ "$cc" = bbr ] && [ "$(current net.ipv4.tcp_congestion_control)" != bbr ]; then
+        warn "BBR was requested but did not take effect. The kernel may not support it."
+    fi
+    # Make the module load again after a reboot.
+    if [ "$cc" = bbr ] && [ -d /etc/modules-load.d ]; then
+        printf 'tcp_bbr\n' >/etc/modules-load.d/portbridge-bbr.conf
+    fi
+
+    ok "Tuning applied, and it stays after a reboot."
+    say ""
+    cmd_status
+}
+
+cmd_undo() {
+    rm -f "$CONF" /etc/modules-load.d/portbridge-bbr.conf
+    sysctl --system >/dev/null 2>&1
+    ok "Tuning removed. Settings return fully to the system defaults after a reboot."
+    say ""
+    cmd_status
+}
+
+case "${1-status}" in
+    status) cmd_status ;;
+    apply) cmd_apply ;;
+    undo) cmd_undo ;;
+    *)
+        say "Usage: portbridge-tune [status|apply|undo]"
+        exit 2
+        ;;
+esac

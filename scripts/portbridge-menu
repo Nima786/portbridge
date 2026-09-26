@@ -16,9 +16,17 @@ set -uo pipefail
 VERSION_FALLBACK="unknown"
 BIN=/usr/local/bin/portbridge
 FIREWALL=/usr/local/bin/portbridge-firewall
+TUNE=/usr/local/bin/portbridge-tune
 CONF_DIR=/etc/portbridge/tunnels
 RUN_DIR=/run/portbridge
-DEFAULT_TUNNEL_PORT=8388
+# 443 is the port ordinary secure websites use, so a connection to it looks
+# unremarkable. The previous default was 8388, which is the well-known
+# Shadowsocks port and therefore one of the first things filtering looks for.
+DEFAULT_TUNNEL_PORT=443
+
+# Ports strongly associated with proxy and VPN software. Using one of these for
+# the link between the two servers is an easy giveaway, so the menu warns.
+SUSPICIOUS_PORTS="8388 1080 1081 9050 9051 8388 8080 8880 2080 2052 2082 2086 2095 8008 8081 3128 1194 500 4500 51820 8388 9000 10000 7100 8964 2222"
 
 # ---------------------------------------------------------------- presentation
 
@@ -178,6 +186,20 @@ port_owner() {
     return 1
 }
 
+# warn_if_suspicious_port <port> - a port known for proxy software makes the link
+# between the two servers easy to pick out.
+warn_if_suspicious_port() {
+    local p
+    for p in $SUSPICIOUS_PORTS; do
+        if [ "$p" = "$1" ]; then
+            warn "  Port $1 is well known for proxy software, which makes this link"
+            warn "  easy to spot. Port 443 looks like an ordinary website instead."
+            return 0
+        fi
+    done
+    return 1
+}
+
 port_in_use_by_system() {
     ss -lntH 2>/dev/null | awk '{print $4}' | sed -E 's/.*:([0-9]+)$/\1/' | grep -qx "$1"
 }
@@ -248,6 +270,9 @@ ask_port() {
             warn "  Something is already listening on port $p."
             confirm "  Use it anyway?" || continue
         fi
+        if [ "${4-}" = link ] && warn_if_suspicious_port "$p"; then
+            confirm "  Use it anyway?" || continue
+        fi
         printf '%s' "$p"
         return 0
     done
@@ -282,13 +307,115 @@ explain_modes() {
     hr
 }
 
+# ------------------------------------------------------------------ disguise
+#
+# What the link between the two servers looks like to anyone watching it.
+#
+# The plain option is the fastest, and also the easiest to spot: the link opens
+# with a burst of random-looking bytes that matches no known protocol, which is
+# exactly what filtering looks for. The other options make it look like ordinary
+# web traffic instead.
+#
+# Chosen on the Iran server and carried in the code, so both ends always agree.
+# DG_* are set by ask_disguise and read by write_tunnel.
+DG_TRANSPORT=plain
+DG_SERVERNAME=""
+DG_WSPATH=""
+DG_CDN=off
+
+explain_disguise() {
+    hr
+    say "${B}How should the link between the two servers look?${R}"
+    say "${DIM}This is about the connection between your two servers only. Your users'${R}"
+    say "${DIM}own traffic is already encrypted by Xray and is not changed by this.${R}"
+    say ""
+    say "  ${B}1) Plain${R}"
+    say "     ${DIM}Nothing added. Slightly faster, but the link matches no normal${R}"
+    say "     ${DIM}pattern, which is the easiest kind of traffic to single out.${R}"
+    say ""
+    say "  ${B}2) Look like a normal website${R} ${DIM}(recommended)${R}"
+    say "     ${DIM}The link is wrapped so it appears to be an ordinary secure website${R}"
+    say "     ${DIM}connection. Costs a little speed and hides the link well.${R}"
+    say ""
+    say "  ${B}3) Go through Cloudflare or another CDN${R}"
+    say "     ${DIM}As above, and routed through a CDN, so your foreign server's IP${R}"
+    say "     ${DIM}never appears on the link and cannot simply be blocked. Needs a${R}"
+    say "     ${DIM}domain name you control, pointed at the CDN.${R}"
+    hr
+}
+
+# ask_disguise <mode> - fills the DG_* variables.
+ask_disguise() {
+    local mode=$1 choice host
+
+    explain_disguise
+    choice=$(choose "Choose 1, 2 or 3" "2" 1 2 3)
+
+    DG_SERVERNAME=""
+    DG_WSPATH=""
+    DG_CDN=off
+
+    case "$choice" in
+        1)
+            DG_TRANSPORT=plain
+            warn "Chosen: plain. Nothing is hidden."
+            return 0
+            ;;
+        2) DG_TRANSPORT=tls ;;
+        3) DG_TRANSPORT=wss; DG_CDN=on ;;
+    esac
+
+    if [ "$DG_CDN" = on ]; then
+        say ""
+        info "A CDN routes by name, so this needs a domain you control which is"
+        info "already pointed at the CDN, with its proxy turned on."
+        while :; do
+            host=$(ask "Your domain name" "")
+            case "$host" in
+                '' | *[!a-zA-Z0-9.-]* | *.*) ;;
+                *) err "  That does not look like a domain name."; continue ;;
+            esac
+            case "$host" in
+                *.*) break ;;
+                *) err "  Please give a full domain name, such as link.example.com." ;;
+            esac
+        done
+        DG_SERVERNAME=$host
+        DG_WSPATH="/$(head -c 9 /dev/urandom | base64 | tr -dc 'a-zA-Z0-9' | head -c 10)"
+        say ""
+        info "Using the web address $DG_SERVERNAME$DG_WSPATH for the link."
+        if [ "$mode" = reverse ]; then
+            warn "Note: a CDN only carries connections towards your domain, so with"
+            warn "reverse this only works if the domain points at THIS Iran server."
+        fi
+    else
+        say ""
+        info "The link will claim to be a website. Any believable name works, and it"
+        info "does not need to be a domain you own or one that really exists."
+        DG_SERVERNAME=$(ask "Name for it to claim" "www.bing.com")
+        [ -n "$DG_SERVERNAME" ] || DG_SERVERNAME=www.bing.com
+    fi
+}
+
+# describe_disguise <transport> <cdn> - one short phrase for summaries.
+describe_disguise() {
+    case "$1:$2" in
+        tls:*) printf 'looks like a normal website' ;;
+        wss:on) printf 'through a CDN' ;;
+        wss:*) printf 'looks like a website, websocket' ;;
+        *) printf 'plain, not hidden' ;;
+    esac
+}
+
 # -------------------------------------------------------------- pairing code
 
 # The code carries everything the foreign server needs, so it asks nothing.
 make_pairing_code() {
     local name=$1 mode=$2 tport=$3 relay_ip=$4 server_ip=$5 inbound_port=$6 pool=$7 secret=$8
-    printf 'v=2\nname=%s\nmode=%s\ntunnel_port=%s\nrelay_ip=%s\nserver_ip=%s\ninbound_port=%s\npool=%s\nsecret=%s\n' \
-        "$name" "$mode" "$tport" "$relay_ip" "$server_ip" "$inbound_port" "$pool" "$secret" |
+    local transport=$9 servername=${10} wspath=${11} cdn=${12}
+    printf 'v=3\nname=%s\nmode=%s\ntunnel_port=%s\nrelay_ip=%s\nserver_ip=%s\ninbound_port=%s\npool=%s\ntransport=%s\nserver_name=%s\nws_path=%s\ncdn=%s\nsecret=%s\n' \
+        "$name" "$mode" "$tport" "$relay_ip" "$server_ip" "$inbound_port" "$pool" \
+        "$transport" "$servername" "$wspath" "$cdn" "$secret" |
         base64 | tr -d '\n'
 }
 
@@ -308,7 +435,14 @@ show_pairing_code() {
     inbound_port=$(read_conf "$name" server_inbound_port)
     pool=$(read_conf "$name" pool_size)
 
-    code=$(make_pairing_code "$name" "$mode" "$tport" "$relay_ip" "$server_ip" "$inbound_port" "$pool" "$secret")
+    local transport servername wspath cdn
+    transport=$(read_conf "$name" transport); [ -n "$transport" ] || transport=plain
+    servername=$(read_conf "$name" server_name)
+    wspath=$(read_conf "$name" ws_path)
+    cdn=$(read_conf "$name" cdn); [ -n "$cdn" ] || cdn=off
+
+    code=$(make_pairing_code "$name" "$mode" "$tport" "$relay_ip" "$server_ip" "$inbound_port" \
+        "$pool" "$secret" "$transport" "$servername" "$wspath" "$cdn")
 
     hr
     say "${B}Code for your foreign server${R}"
@@ -360,6 +494,16 @@ write_tunnel() {
         printf '# on = only the other machine may use the tunnel port. Change from the menu.\n'
         printf 'firewall = on\n'
         [ -n "$localip" ] && printf 'local_ip = %s\n' "$localip"
+        printf '\n# What the link looks like to anyone watching it. See the menu.\n'
+        printf 'transport = %s\n' "${DG_TRANSPORT:-plain}"
+        if [ "${DG_TRANSPORT:-plain}" != plain ]; then
+            [ -n "${DG_SERVERNAME-}" ] && printf 'server_name = %s\n' "$DG_SERVERNAME"
+            [ -n "${DG_WSPATH-}" ] && printf 'ws_path = %s\n' "$DG_WSPATH"
+            printf 'cdn = %s\n' "${DG_CDN:-off}"
+            printf 'cert_file = %s/%s.crt\n' "$CONF_DIR" "$name"
+            printf 'key_file = %s/%s.key\n' "$CONF_DIR" "$name"
+        fi
+
         printf '\npool_size = %s\n' "$pool"
         printf 'max_conn = 2000\n'
         printf 'max_pending = 512\n'
@@ -379,7 +523,8 @@ write_tunnel() {
 # the firewall view while never being able to run.
 discard_tunnel() {
     systemctl disable --now "$(unit_of "$1")" >/dev/null 2>&1
-    rm -f "$(conf_of "$1")" "$(secret_of "$1")" "$RUN_DIR/$1.json"
+    rm -f "$(conf_of "$1")" "$(secret_of "$1")" "$RUN_DIR/$1.json" \
+        "$CONF_DIR/$1.crt" "$CONF_DIR/$1.key"
     systemctl daemon-reload
 }
 
@@ -416,8 +561,15 @@ ask_remote_port() {
     local p
     while :; do
         p=$(ask "$1" "${2-}")
-        valid_port "$p" && { printf '%s' "$p"; return 0; }
-        err "  A port must be a number from 1 to 65535."
+        if ! valid_port "$p"; then
+            err "  A port must be a number from 1 to 65535."
+            continue
+        fi
+        if [ "${3-}" = link ] && warn_if_suspicious_port "$p"; then
+            confirm "  Use it anyway?" || continue
+        fi
+        printf '%s' "$p"
+        return 0
     done
 }
 
@@ -496,20 +648,23 @@ create_tunnel() {
     uport=$(ask_port "Port for your users" "$inport")
     ulisten="0.0.0.0:$uport"
 
+    ask_disguise "$mode"
+
     say ""
     info "Last port: a private one the two servers use between themselves."
-    info "Your users never see it. Any free port will do."
+    info "Your users never see it. 443 is suggested because it is the port normal"
+    info "websites use, so this link does not stand out."
     while :; do
         if [ "$mode" = reverse ]; then
             # Reverse: it is opened here on the Iran server, so check it here.
-            tport=$(ask_port "Port between the two servers" "$DEFAULT_TUNNEL_PORT")
+            tport=$(ask_port "Port between the two servers" "$DEFAULT_TUNNEL_PORT" "" link)
             if [ "$tport" = "$uport" ]; then
                 err "  It cannot be the same as your users' port."
                 continue
             fi
         else
             # Direct: it is opened on the foreign server, so it cannot be checked here.
-            tport=$(ask_remote_port "Port between the two servers" "$DEFAULT_TUNNEL_PORT")
+            tport=$(ask_remote_port "Port between the two servers" "$DEFAULT_TUNNEL_PORT" link)
         fi
         break
     done
@@ -546,6 +701,8 @@ create_tunnel() {
         say "  connection         reverse: $peer connects in to this Iran server on port $tport"
         say "  firewall           port $tport here open to $peer only"
     fi
+    say "  link appearance    $(describe_disguise "$DG_TRANSPORT" "$DG_CDN")"
+    [ -n "$DG_SERVERNAME" ] && say "  claims to be       $DG_SERVERNAME$DG_WSPATH"
     hr
     confirm "Set it up?" || { say "Cancelled. Nothing was changed."; return 1; }
 
@@ -582,8 +739,9 @@ join_tunnel() {
     get() { printf '%s\n' "$decoded" | sed -nE "s/^$1=(.*)$/\1/p" | head -1; }
 
     v=$(get v)
-    if [ "$v" = 1 ]; then
-        err "That code comes from an older version of PortBridge."
+    if [ "$v" = 1 ] || [ "$v" = 2 ]; then
+        err "That code comes from an older version of PortBridge, before the link"
+        err "could be disguised, so it does not say how the link should look."
         err "Update the Iran server, then create the tunnel there again for a new code."
         return 1
     fi
@@ -591,7 +749,13 @@ join_tunnel() {
     relay_ip=$(get relay_ip); server_ip=$(get server_ip)
     inport=$(get inbound_port); pool=$(get pool); secret=$(get secret)
 
-    if [ "$v" != 2 ] || [ -z "$name" ] || [ -z "$mode" ] || [ -z "$secret" ] ||
+    # The disguise comes from the code, so both ends always match.
+    DG_TRANSPORT=$(get transport); [ -n "$DG_TRANSPORT" ] || DG_TRANSPORT=plain
+    DG_SERVERNAME=$(get server_name)
+    DG_WSPATH=$(get ws_path)
+    DG_CDN=$(get cdn); [ -n "$DG_CDN" ] || DG_CDN=off
+
+    if [ "$v" != 3 ] || [ -z "$name" ] || [ -z "$mode" ] || [ -z "$secret" ] ||
         ! valid_port "${tport:-x}" || ! valid_port "${inport:-x}" || [ -z "$relay_ip" ]; then
         err "That is not a valid PortBridge code."
         return 1
@@ -621,6 +785,8 @@ join_tunnel() {
         say "  connection         reverse: this server connects out to $relay_ip:$tport"
         say "                     so this server needs no open port for it"
     fi
+    say "  link appearance    $(describe_disguise "$DG_TRANSPORT" "$DG_CDN")"
+    [ -n "$DG_SERVERNAME" ] && say "  claims to be       $DG_SERVERNAME$DG_WSPATH"
     hr
 
     # Nothing to ask, but two things are worth checking before going ahead.
@@ -674,7 +840,7 @@ join_tunnel() {
 # ------------------------------------------------------------------- list/status
 
 status_line() {
-    local name=$1 unit active parked active_s mode role
+    local name=$1 unit active parked active_s mode role transport cdn
     unit=$(unit_of "$name")
     active=$(systemctl is-active "$unit" 2>/dev/null)
     mode=$(read_conf "$name" mode)
@@ -698,8 +864,18 @@ status_line() {
     local job
     [ "$role" = edge ] && job="Iran side" || job="foreign side"
 
-    printf '  %-16s %-9s %-13s %s%-8s%s users:%-5s spares:%s\n' \
-        "$name" "$mode" "$job" "$colour" "$state" "$R" "$active_s" "$parked"
+    transport=$(read_conf "$name" transport); [ -n "$transport" ] || transport=plain
+    cdn=$(read_conf "$name" cdn); [ -n "$cdn" ] || cdn=off
+    local look
+    case "$transport:$cdn" in
+        tls:*) look=website ;;
+        wss:on) look=cdn ;;
+        wss:*) look=websocket ;;
+        *) look=plain ;;
+    esac
+
+    printf '  %-14s %-8s %-12s %s%-8s%s %-10s users:%-5s spares:%s\n' \
+        "$name" "$mode" "$job" "$colour" "$state" "$R" "$look" "$active_s" "$parked"
 }
 
 list_tunnels() {
@@ -970,6 +1146,24 @@ test_tunnel() {
         note "pasted on the foreign server, and that both clocks are correct."
     fi
 
+    local transport cdn
+    transport=$(read_conf "$name" transport); [ -n "$transport" ] || transport=plain
+    cdn=$(read_conf "$name" cdn); [ -n "$cdn" ] || cdn=off
+    result "link appearance" note "$(describe_disguise "$transport" "$cdn")"
+
+    # A mismatched disguise looks exactly like a wrong password from the log, so
+    # call it out separately or it sends people hunting the wrong problem.
+    local tlsfail
+    tlsfail=$(journalctl -u "$(unit_of "$name")" --since "-10 min" --no-pager 2>/dev/null |
+        grep -ciE 'securing the link failed|websocket upgrade' || true)
+    if [ "${tlsfail:-0}" -gt 0 ]; then
+        say ""
+        printf '  %s%s%s\n' "$RED" "The two servers disagree about how the link should look." "$R"
+        note "Delete this tunnel on your foreign server and join again with a fresh"
+        note "code from your Iran server, so both ends match."
+        fail=$((fail + 1))
+    fi
+
     local empties
     empties=$(json_field "$f" empty_connections 2>/dev/null)
     if [ -n "$empties" ] && [ "$empties" -gt 0 ] 2>/dev/null; then
@@ -1020,7 +1214,9 @@ uninstall_all() {
     rm -f /etc/systemd/system/portbridge@.service
     systemctl daemon-reload
     rm -rf /etc/portbridge "$RUN_DIR"
-    rm -f "$BIN" "$FIREWALL" /usr/local/bin/portbridge-menu
+    # Put the network settings back before removing the helper that manages them.
+    [ -x "$TUNE" ] && "$TUNE" undo >/dev/null 2>&1
+    rm -f "$BIN" "$FIREWALL" "$TUNE" /usr/local/bin/portbridge-menu
     ok "PortBridge has been removed."
     say "${DIM}Any firewall rules it added have been taken out too.${R}"
     exit 0
@@ -1045,7 +1241,8 @@ main_menu() {
         say "  ${B}9${R}) View a tunnel's log"
         say " ${B}10${R}) Delete a tunnel"
         say " ${B}11${R}) Firewall"
-        say " ${B}12${R}) Uninstall PortBridge"
+        say " ${B}12${R}) Speed tuning           ${DIM}run on both servers${R}"
+        say " ${B}13${R}) Uninstall PortBridge"
         say "  ${B}0${R}) Quit"
         hr
         local choice name
@@ -1062,7 +1259,8 @@ main_menu() {
             9) name=$(pick_tunnel) && show_logs "$name"; pause ;;
             10) name=$(pick_tunnel) && delete_tunnel "$name"; pause ;;
             11) firewall_menu ;;
-            12) uninstall_all ;;
+            12) tuning_menu; pause ;;
+            13) uninstall_all ;;
             0 | q | Q) say "Bye."; exit 0 ;;
             *) err "Not a valid choice."; sleep 1 ;;
         esac
@@ -1073,6 +1271,32 @@ main_menu() {
 set_firewall() {
     write_conf "$1" firewall "$2"
     "$FIREWALL" apply "$1"
+}
+
+tuning_menu() {
+    hr
+    say "${B}Speed tuning${R}"
+    say "${DIM}Linux assumes a lost packet means the line is busy, so it slows down hard.${R}"
+    say "${DIM}On a route between countries most loss is just interference, so that${R}"
+    say "${DIM}reaction throws away speed for no reason. A setting called BBR measures${R}"
+    say "${DIM}the real speed instead, and on a poor route it is often several times${R}"
+    say "${DIM}faster. This affects the whole server and can be undone.${R}"
+    hr
+    "$TUNE" status | sed 's/^/  /'
+    hr
+    say "  ${B}1${R}) Turn the tuning on"
+    say "  ${B}2${R}) Turn it off again"
+    say "  ${B}0${R}) Back"
+    hr
+    case "$(ask "Choose" "0")" in
+        1)
+            "$TUNE" apply
+            say ""
+            info "Do the same on your other server to get the full benefit."
+            ;;
+        2) "$TUNE" undo ;;
+        *) return 0 ;;
+    esac
 }
 
 firewall_menu() {

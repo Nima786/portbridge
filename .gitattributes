@@ -13,3 +13,4 @@ LICENSE         text eol=lf
 # Extensionless scripts.
 scripts/portbridge-menu     text eol=lf
 scripts/portbridge-firewall text eol=lf
+scripts/portbridge-tune     text eol=lf

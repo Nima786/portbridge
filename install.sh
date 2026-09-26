@@ -14,6 +14,7 @@ REPO=Nima786/portbridge
 BIN=/usr/local/bin/portbridge
 MENU=/usr/local/bin/portbridge-menu
 FIREWALL=/usr/local/bin/portbridge-firewall
+TUNE=/usr/local/bin/portbridge-tune
 UNIT=/etc/systemd/system/portbridge@.service
 CONF_DIR=/etc/portbridge/tunnels
 RAW="https://raw.githubusercontent.com/$REPO/main"
@@ -197,6 +198,7 @@ get_script() {
 
 get_script portbridge-menu "$MENU" || die "Could not install the menu."
 get_script portbridge-firewall "$FIREWALL" || die "Could not install the firewall helper."
+get_script portbridge-tune "$TUNE" || die "Could not install the tuning helper."
 
 if [ -f "$TMP/packaging/portbridge@.service" ]; then
     install -m 644 "$TMP/packaging/portbridge@.service" "$UNIT"

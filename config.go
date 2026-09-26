@@ -75,7 +75,72 @@ type Config struct {
 	SecretFile string
 	StatusFile string
 
+	// Transport is what the link between the two servers looks like on the wire.
+	// See transport.go for why this is worth having.
+	Transport Transport
+
+	// ServerName is the hostname the disguise claims to be, sent in the TLS
+	// handshake. With a CDN it must be a real name pointed at the CDN; otherwise
+	// it can be anything plausible.
+	ServerName string
+
+	// WSPath is the web address path used by the websocket disguise.
+	WSPath string
+
+	// CDN routes the link through a content delivery network, by dialling
+	// ServerName instead of the other server's address. The other server's
+	// address then never appears on the link, so it cannot simply be blocked.
+	CDN bool
+
+	// CertFile and KeyFile hold the certificate the accepting side presents. They
+	// are created automatically if missing.
+	CertFile string
+	KeyFile  string
+
 	secret []byte
+}
+
+// effectiveServerName falls back to the peer address when no name was given, so
+// a plain TLS link still works without any extra setup.
+func (c *Config) effectiveServerName() string {
+	if c.ServerName != "" {
+		return c.ServerName
+	}
+	if host, _, err := net.SplitHostPort(c.TunnelAddr); err == nil && host != "" &&
+		host != "0.0.0.0" && host != "::" {
+		return host
+	}
+	if c.PeerIP != "" {
+		return c.PeerIP
+	}
+	return "localhost"
+}
+
+// dialTarget is the address the dialling side actually connects to.
+//
+// Normally that is simply the other server. Only when routing through a CDN does
+// it become the hostname, so the name resolves to the CDN's addresses and the
+// other server's address never appears on the link, which is the point.
+//
+// This is deliberately tied to the CDN setting rather than to the hostname.
+// Wanting a hostname for the disguise and wanting traffic routed through a CDN
+// are separate intentions, and quietly changing the destination because a
+// hostname was given would be a nasty surprise.
+func (c *Config) dialTarget() string {
+	if c.CDN && c.ServerName != "" {
+		_, port, err := net.SplitHostPort(c.TunnelAddr)
+		if err == nil && port != "" {
+			return net.JoinHostPort(c.ServerName, port)
+		}
+	}
+	return c.TunnelAddr
+}
+
+func (c *Config) effectiveWSPath() string {
+	if c.WSPath != "" {
+		return c.WSPath
+	}
+	return defaultWSPath
 }
 
 // Dials reports whether this process opens the cross-border connection.
@@ -92,6 +157,10 @@ func defaultConfig() *Config {
 		SpareTTL:    10 * time.Minute,
 		ParkTimeout: 15 * time.Minute,
 		Drain:       5 * time.Second,
+		// Plain stays the default so that upgrading never silently changes how
+		// an existing tunnel appears on the wire, which would break it until
+		// both ends were updated together.
+		Transport: TransportPlain,
 	}
 }
 
@@ -170,6 +239,28 @@ func (c *Config) set(key, val string) error {
 		c.PeerIP = val
 	case "local_ip":
 		c.LocalIP = val
+	case "transport":
+		c.Transport = Transport(strings.ToLower(val))
+	case "server_name":
+		c.ServerName = val
+	case "ws_path":
+		if !strings.HasPrefix(val, "/") {
+			return fmt.Errorf("ws_path must start with /")
+		}
+		c.WSPath = val
+	case "cert_file":
+		c.CertFile = val
+	case "key_file":
+		c.KeyFile = val
+	case "cdn":
+		switch strings.ToLower(val) {
+		case "on", "yes", "true":
+			c.CDN = true
+		case "off", "no", "false":
+			c.CDN = false
+		default:
+			return fmt.Errorf("cdn must be on or off, got %q", val)
+		}
 	case "server_inbound_port":
 		// Recorded on the relay by the menu, purely so it can rebuild the code
 		// for the server later. The engine does not use it.
@@ -286,6 +377,32 @@ func (c *Config) Validate() error {
 	if c.SecretFile == "" {
 		return fmt.Errorf("secret_file is required")
 	}
+
+	if !validTransport(c.Transport) {
+		return fmt.Errorf("transport must be %q, %q or %q, got %q",
+			TransportPlain, TransportTLS, TransportWSS, c.Transport)
+	}
+	if c.Transport != TransportPlain {
+		// Only the accepting side presents a certificate, and it is created on
+		// demand, so a missing path is a configuration gap rather than a
+		// missing file.
+		if !c.Dials() && (c.CertFile == "" || c.KeyFile == "") {
+			return fmt.Errorf("cert_file and key_file are required for the %s disguise on the side that accepts", c.Transport)
+		}
+	}
+	if c.CDN {
+		// A CDN only carries a connection that arrives as a websocket over TLS.
+		if c.Transport != TransportWSS {
+			return fmt.Errorf("cdn needs transport %q, got %q", TransportWSS, c.Transport)
+		}
+		// It also routes by hostname, so an address cannot stand in for one.
+		if c.ServerName == "" {
+			return fmt.Errorf("server_name is required when using a cdn: it needs a hostname pointed at the cdn")
+		}
+		if ip := net.ParseIP(c.ServerName); ip != nil {
+			return fmt.Errorf("server_name must be a hostname when using a cdn, not the address %s", c.ServerName)
+		}
+	}
 	return nil
 }
 
@@ -319,6 +436,7 @@ func (c *Config) Summary() string {
 	} else {
 		fmt.Fprintf(&b, "Publishing local service %s. ", c.InboundAddr)
 	}
+	fmt.Fprintf(&b, "Link is %s. ", describeTransport(c))
 	fmt.Fprintf(&b, "Spares %d (life %s), capacity %d, drain %s",
 		c.PoolSize, c.SpareTTL, c.MaxConn, c.Drain)
 	return b.String()

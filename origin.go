@@ -2,7 +2,9 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
+	"fmt"
 	"io"
 	"log"
 	"net"
@@ -29,6 +31,7 @@ type origin struct {
 	wg      sync.WaitGroup
 
 	guard *replayGuard
+	cert  *tls.Certificate
 
 	logAccept   *throttled
 	logAuth     *throttled
@@ -59,6 +62,13 @@ func runOrigin(ctx context.Context, cfg *Config, st *status) error {
 
 // runDirect accepts tunnel connections from the edge.
 func (o *origin) runDirect(ctx context.Context) error {
+	if o.cfg.Transport != TransportPlain {
+		cert, err := ensureCert(o.cfg.CertFile, o.cfg.KeyFile, o.cfg.effectiveServerName())
+		if err != nil {
+			return fmt.Errorf("preparing the disguise: %w", err)
+		}
+		o.cert = &cert
+	}
 	ln, err := net.Listen("tcp", o.cfg.TunnelAddr)
 	if err != nil {
 		return err
@@ -82,7 +92,7 @@ func (o *origin) runDirect(ctx context.Context) error {
 		select {
 		case o.pending <- struct{}{}:
 			o.wg.Add(1)
-			go func(c net.Conn) {
+			go func(raw net.Conn) {
 				defer o.wg.Done()
 				released := false
 				release := func() {
@@ -93,14 +103,20 @@ func (o *origin) runDirect(ctx context.Context) error {
 				}
 				defer release()
 
-				tuneSocket(c)
+				tuneSocket(raw)
+				c, err := wrapAccept(raw, o.cfg, o.cert)
+				if err != nil {
+					o.logAuth.printf("refused a tunnel connection from %s: %v", raw.RemoteAddr(), err)
+					_ = raw.Close()
+					return
+				}
 				if err := recvAuth(c, o.cfg.secret, o.guard); err != nil {
 					o.logAuth.printf("refused a tunnel connection from %s: %v", c.RemoteAddr(), err)
 					_ = c.Close()
 					return
 				}
 				atomic.AddInt64(&o.st.parkedSpares, 1)
-				err := o.parkUntilActivated(ctx, c, o.cfg.ParkTimeout)
+				err = o.parkUntilActivated(ctx, c, o.cfg.ParkTimeout)
 				atomic.AddInt64(&o.st.parkedSpares, -1)
 				if err != nil {
 					_ = c.Close()
@@ -213,11 +229,17 @@ func (o *origin) reverseWorker(ctx context.Context, n int) {
 
 func (o *origin) dialEdge() (net.Conn, error) {
 	d := net.Dialer{Timeout: 10 * time.Second}
-	c, err := d.Dial("tcp", o.cfg.TunnelAddr)
+	raw, err := d.Dial("tcp", o.cfg.dialTarget())
 	if err != nil {
 		return nil, err
 	}
-	tuneSocket(c)
+	tuneSocket(raw)
+	// Apply the disguise before sending anything of ours.
+	c, err := wrapDial(raw, o.cfg)
+	if err != nil {
+		_ = raw.Close()
+		return nil, err
+	}
 	if err := sendAuth(c, o.cfg.secret); err != nil {
 		_ = c.Close()
 		return nil, err

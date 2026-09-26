@@ -49,6 +49,9 @@ type pool struct {
 
 	log *throttled
 
+	// lastErr remembers why the most recent attempt to build a spare failed.
+	lastErr atomic.Value
+
 	// Counters, read by the status writer.
 	statParked    int64
 	statOffered   int64
@@ -224,6 +227,10 @@ func (p *pool) maintain(ctx context.Context) {
 						c, err := p.dial()
 						if err != nil {
 							atomic.AddInt32(&failures, 1)
+							// Keep the reason. Counting failures without saying
+							// why turns a clear problem, such as a refused
+							// disguise, into a silent one.
+							p.lastErr.Store(err.Error())
 							return
 						}
 						if !p.offerLocal(c) {
@@ -245,7 +252,12 @@ func (p *pool) maintain(ctx context.Context) {
 					backoff = refillBackoffM
 				}
 			}
-			p.log.printf("could not build %d spare tunnel connections; retrying in %s", failures, backoff)
+			reason, _ := p.lastErr.Load().(string)
+			if reason == "" {
+				reason = "no reason reported"
+			}
+			p.log.printf("could not build %d spare tunnel connections: %s; retrying in %s",
+				failures, reason, backoff)
 			wait = backoff
 		} else {
 			backoff = 0

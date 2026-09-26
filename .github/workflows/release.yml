@@ -52,7 +52,7 @@ jobs:
             CGO_ENABLED=0 GOOS=linux GOARCH="$arch" \
               go build -trimpath -ldflags="-s -w -X main.version=$TAG" -o "$stage/portbridge" .
 
-            cp scripts/portbridge-menu scripts/portbridge-firewall "$stage/scripts/"
+            cp scripts/portbridge-menu scripts/portbridge-firewall scripts/portbridge-tune "$stage/scripts/"
             cp packaging/portbridge@.service "$stage/packaging/"
             cp README.md LICENSE "$stage/"
             chmod 755 "$stage/portbridge" "$stage/scripts/"*

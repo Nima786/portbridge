@@ -7,8 +7,15 @@ import (
 	"sync"
 )
 
-// Only reached for non-TCP connections. TCP-to-TCP on Linux goes through
-// splice(2) inside io.CopyBuffer, which ignores the buffer entirely.
+// closeWriter is anything that can finish sending without closing the whole
+// connection: plain TCP, TLS, and our websocket wrapper all can.
+type closeWriter interface {
+	CloseWrite() error
+}
+
+// Used whenever the kernel's own copy path does not apply, which now includes
+// every disguised link. Plain TCP on Linux still goes through splice(2) inside
+// io.CopyBuffer, which ignores the buffer entirely.
 var bufPool = sync.Pool{
 	New: func() interface{} {
 		b := make([]byte, 32*1024)
@@ -39,8 +46,12 @@ func relay(a, b net.Conn) {
 
 		_, _ = io.CopyBuffer(dst, src, *buf)
 
-		if tc, ok := dst.(*net.TCPConn); ok {
-			_ = tc.CloseWrite()
+		// Close only our own write half. Asking by capability rather than for a
+		// plain TCP connection matters once the link is wrapped in TLS or a
+		// websocket: those can half-close too, and falling back to closing the
+		// whole thing would truncate the other direction.
+		if cw, ok := dst.(closeWriter); ok {
+			_ = cw.CloseWrite()
 		} else {
 			_ = dst.Close()
 		}

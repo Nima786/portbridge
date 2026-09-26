@@ -51,9 +51,10 @@ jobs:
           bash -n install.sh
           bash -n scripts/portbridge-menu
           bash -n scripts/portbridge-firewall
+          bash -n scripts/portbridge-tune
 
       - name: ShellCheck
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq shellcheck
-          shellcheck -s bash -S warning install.sh scripts/portbridge-menu scripts/portbridge-firewall
+          shellcheck -s bash -S warning install.sh scripts/portbridge-menu scripts/portbridge-firewall scripts/portbridge-tune

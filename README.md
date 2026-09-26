@@ -82,6 +82,47 @@ for different inbounds. Each tunnel is separate, with its own settings and its o
 password, so they cannot interfere. The only rule is that two tunnels cannot share
 a port, and the menu checks that for you.
 
+## What the link looks like
+
+Plain TCP carrying already-encrypted traffic looks like a burst of random bytes
+matching no known protocol, and that is one of the easiest things to single out.
+So when you create a tunnel the menu asks how the link should appear, and carries
+your answer in the pairing code so both ends always agree.
+
+| Choice | What anyone watching the link sees |
+|---|---|
+| **Plain** | Random-looking bytes. Slightly faster, easiest to spot. |
+| **Look like a normal website** (recommended) | An ordinary secure website connection, including a real handshake if anyone probes the port. |
+| **Through Cloudflare or another CDN** | A normal secure websocket request to your domain, with your foreign server's IP never appearing on the link. |
+
+The middle option needs nothing from you but a name for the link to claim, and
+that name does not have to be real or yours. A certificate is generated on the
+spot. It is not checked for trust, because the shared password already proves who
+is who; the certificate is only there to make the handshake look normal.
+
+The CDN option does need a domain you control, pointed at the CDN with its proxy
+turned on. It is the only option that hides your foreign server's address.
+
+None of this touches your users' own traffic, which Xray has already encrypted.
+
+The default port for the link is 443, because that is the one port nobody finds
+odd. The menu warns you if you pick a port that is a known default for something
+else.
+
+## Speed tuning
+
+The menu has a **Speed tuning** option. It switches the server to BBR and widens
+the network buffers, which matters on a long route between countries: Linux
+assumes lost packets mean congestion and slows down hard, and on an intercontinental
+link loss is usually just interference. The default reaction throttles a link that
+is actually fine. BBR measures how fast data really arrives instead, and on a bad
+path the difference is often several times the throughput.
+
+It applies to the whole server, not only to PortBridge, and everything it changes
+lives in one file, so the same menu option removes it cleanly.
+
+Worth running on both servers.
+
 ## How a connection is actually made
 
 This is the part that makes it quick and keeps it honest.
@@ -114,9 +155,9 @@ avoids that entirely.
   other server's address automatically. The rule is reapplied on every start, so
   it survives a reboot.
 - The port your users connect to is deliberately left open.
-- Traffic is passed through untouched. PortBridge does not add its own
-  encryption, because what it carries is normally already encrypted end to end.
-  If you need the link itself disguised, this is not the right tool.
+- Traffic is passed through untouched. What PortBridge carries is normally
+  already encrypted end to end, so the website disguise is camouflage rather
+  than a second layer of protection, and is described that way on purpose.
 
 ## Requirements
 
@@ -130,9 +171,12 @@ avoids that entirely.
 /usr/local/bin/portbridge              the engine
 /usr/local/bin/portbridge-menu         the menu
 /usr/local/bin/portbridge-firewall     port locking helper
+/usr/local/bin/portbridge-tune         speed tuning helper
 /etc/systemd/system/portbridge@.service one template for all tunnels
 /etc/portbridge/tunnels/<name>.conf    one tunnel's settings
 /etc/portbridge/tunnels/<name>.secret  one tunnel's password
+/etc/portbridge/tunnels/<name>.crt/.key the disguise certificate, if used
+/etc/sysctl.d/99-portbridge-tuning.conf the speed tuning, if applied
 /run/portbridge/<name>.json            live status
 ```
 
@@ -181,7 +225,6 @@ added, and deletes everything it installed.
 ## Not included
 
 - No multiplexing. Each user connection uses its own connection across the link.
-- No disguise. The link is plain TCP and looks like plain TCP.
 - No UDP. TCP services only.
 
 ## Licence

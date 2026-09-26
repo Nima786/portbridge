@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"io"
@@ -65,6 +66,7 @@ type edge struct {
 	wg      sync.WaitGroup
 
 	guard *replayGuard
+	cert  *tls.Certificate
 
 	logAccept   *throttled
 	logCapacity *throttled
@@ -91,11 +93,18 @@ func runEdge(ctx context.Context, cfg *Config, st *status) error {
 	if cfg.Mode == ModeDirect {
 		dial = func() (net.Conn, error) {
 			d := net.Dialer{Timeout: 5 * time.Second}
-			c, err := d.Dial("tcp", cfg.TunnelAddr)
+			raw, err := d.Dial("tcp", cfg.dialTarget())
 			if err != nil {
 				return nil, err
 			}
-			tuneSocket(c)
+			tuneSocket(raw)
+			// Apply the disguise before anything of ours is sent, so the first
+			// thing on the wire is whatever the transport expects.
+			c, err := wrapDial(raw, cfg)
+			if err != nil {
+				_ = raw.Close()
+				return nil, err
+			}
 			if err := sendAuth(c, cfg.secret); err != nil {
 				_ = c.Close()
 				return nil, err
@@ -109,6 +118,13 @@ func runEdge(ctx context.Context, cfg *Config, st *status) error {
 
 	// In reverse mode we also listen for the origin's incoming connections.
 	if cfg.Mode == ModeReverse {
+		if cfg.Transport != TransportPlain {
+			cert, err := ensureCert(cfg.CertFile, cfg.KeyFile, cfg.effectiveServerName())
+			if err != nil {
+				return fmt.Errorf("preparing the disguise: %w", err)
+			}
+			e.cert = &cert
+		}
 		tunnelLn, err := net.Listen("tcp", cfg.TunnelAddr)
 		if err != nil {
 			return err
@@ -195,9 +211,15 @@ func (e *edge) acceptTunnel(ctx context.Context, ln net.Listener) {
 
 		select {
 		case e.pending <- struct{}{}:
-			go func(c net.Conn) {
+			go func(raw net.Conn) {
 				defer func() { <-e.pending }()
-				tuneSocket(c)
+				tuneSocket(raw)
+				c, err := wrapAccept(raw, e.cfg, e.cert)
+				if err != nil {
+					e.logAuth.printf("refused a tunnel connection from %s: %v", raw.RemoteAddr(), err)
+					_ = raw.Close()
+					return
+				}
 				if err := recvAuth(c, e.cfg.secret, e.guard); err != nil {
 					e.logAuth.printf("refused a tunnel connection from %s: %v", c.RemoteAddr(), err)
 					_ = c.Close()
