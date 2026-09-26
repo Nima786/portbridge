@@ -1245,7 +1245,10 @@ delete_tunnel() {
 
     systemctl disable --now "$(unit_of "$name")" >/dev/null 2>&1
     "$FIREWALL" remove "$name" >/dev/null 2>&1
-    rm -f "$(conf_of "$name")" "$(secret_of "$name")" "$RUN_DIR/$name.json"
+    # The certificate goes too. Left behind, a later tunnel with the same name
+    # would pick it up and claim whatever hostname this one claimed.
+    rm -f "$(conf_of "$name")" "$(secret_of "$name")" "$RUN_DIR/$name.json" \
+        "$CONF_DIR/$name.crt" "$CONF_DIR/$name.key"
     systemctl daemon-reload
     ok "Tunnel '$name' removed."
 }
