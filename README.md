@@ -109,6 +109,29 @@ The default port for the link is 443, because that is the one port nobody finds
 odd. The menu warns you if you pick a port that is a known default for something
 else.
 
+## One connection per user, or a few shared
+
+The other question the menu asks when you create a tunnel. It is a real trade,
+not an upgrade, so it defaults to the way things have always worked.
+
+**One connection per user** is the default. Every user session gets its own
+connection across the border. On a poor route this is the faster choice, because
+one user's lost packet never holds anybody else up.
+
+**Shared connections** put everyone on a handful of connections that stay open
+for hours. Two things get better: the number of connections between your two
+servers stops depending on how busy you are, and a hundred simultaneous users no
+longer look like a hundred simultaneous connections to the same address, which is
+a pattern no disguise hides. The cost is that a lost packet stalls everyone
+riding that connection until it is resent, so on a lossy route a hiccup is felt
+by several people at once rather than one.
+
+Four shared connections is the default when you turn it on, which limits how
+much of your traffic a single stall can affect.
+
+Keep the default unless you have reason to think the sheer number of connections
+is what is getting your tunnel noticed.
+
 ## Speed tuning
 
 The menu has a **Speed tuning** option. It switches the server to BBR and widens
@@ -144,6 +167,11 @@ Step 4 matters more than it sounds. A spare that had already connected to your
 service would show up in its logs as a connection that never says anything, and
 your service would eventually hang up on it. Waiting until a real user exists
 avoids that entirely.
+
+With shared connections the middle of that changes a little: there are no spares
+to wake, so the user's opening bytes and the announcement of a new session go out
+together on a connection that is already up. Steps 4 and 5 are the same, including
+the retry, which then moves the user to a different shared connection.
 
 ## Security
 
@@ -224,8 +252,8 @@ added, and deletes everything it installed.
 
 ## Not included
 
-- No multiplexing. Each user connection uses its own connection across the link.
 - No UDP. TCP services only.
+- No automatic switching between direct and reverse if one stops working.
 
 ## Licence
 

@@ -97,6 +97,15 @@ type Config struct {
 	CertFile string
 	KeyFile  string
 
+	// Mux carries every session inside a few long-lived connections instead of
+	// opening one per session. See mux.go for what that buys and what it costs.
+	Mux bool
+
+	// MuxLinks is how many of those long-lived connections to keep up. More than
+	// one on purpose: everything sharing a single connection means one lost
+	// packet stalls every session on it.
+	MuxLinks int
+
 	secret []byte
 }
 
@@ -161,6 +170,10 @@ func defaultConfig() *Config {
 		// an existing tunnel appears on the wire, which would break it until
 		// both ends were updated together.
 		Transport: TransportPlain,
+		// Off for the same reason, and because sharing connections costs speed
+		// on a lossy route. It is a choice, not an improvement.
+		Mux:      false,
+		MuxLinks: 4,
 	}
 }
 
@@ -261,6 +274,17 @@ func (c *Config) set(key, val string) error {
 		default:
 			return fmt.Errorf("cdn must be on or off, got %q", val)
 		}
+	case "mux":
+		switch strings.ToLower(val) {
+		case "on", "yes", "true":
+			c.Mux = true
+		case "off", "no", "false":
+			c.Mux = false
+		default:
+			return fmt.Errorf("mux must be on or off, got %q", val)
+		}
+	case "mux_links":
+		return num(&c.MuxLinks)
 	case "server_inbound_port":
 		// Recorded on the relay by the menu, purely so it can rebuild the code
 		// for the server later. The engine does not use it.
@@ -390,6 +414,14 @@ func (c *Config) Validate() error {
 			return fmt.Errorf("cert_file and key_file are required for the %s disguise on the side that accepts", c.Transport)
 		}
 	}
+	if c.Mux {
+		if c.MuxLinks < 1 {
+			return fmt.Errorf("mux_links must be at least 1")
+		}
+		if c.MuxLinks > 64 {
+			return fmt.Errorf("mux_links of %d is far more than any link needs", c.MuxLinks)
+		}
+	}
 	if c.CDN {
 		// A CDN only carries a connection that arrives as a websocket over TLS.
 		if c.Transport != TransportWSS {
@@ -437,7 +469,12 @@ func (c *Config) Summary() string {
 		fmt.Fprintf(&b, "Publishing local service %s. ", c.InboundAddr)
 	}
 	fmt.Fprintf(&b, "Link is %s. ", describeTransport(c))
-	fmt.Fprintf(&b, "Spares %d (life %s), capacity %d, drain %s",
-		c.PoolSize, c.SpareTTL, c.MaxConn, c.Drain)
+	if c.Mux {
+		fmt.Fprintf(&b, "All sessions share %d long-lived connections, capacity %d, drain %s",
+			c.MuxLinks, c.MaxConn, c.Drain)
+	} else {
+		fmt.Fprintf(&b, "Spares %d (life %s), capacity %d, drain %s",
+			c.PoolSize, c.SpareTTL, c.MaxConn, c.Drain)
+	}
 	return b.String()
 }

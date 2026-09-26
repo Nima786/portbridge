@@ -407,15 +407,79 @@ describe_disguise() {
     esac
 }
 
+# ------------------------------------------------------------------- sharing
+#
+# Whether every user session gets its own connection across the border, or they
+# all share a few that stay open.
+#
+# This is a genuine trade, not an improvement, which is why it is asked plainly
+# and left off by default. Sharing hides how busy the tunnel is and holds far
+# fewer connections open, which is harder to single out. It also means a lost
+# packet holds up everyone sharing that connection, and on a bad route that is
+# felt.
+#
+# Chosen on the Iran server and carried in the code, so both ends always agree.
+MX_MUX=off
+MX_LINKS=4
+
+explain_sharing() {
+    hr
+    say "${B}Should all users share a few connections, or get one each?${R}"
+    say ""
+    say "  ${B}1) One connection per user${R} ${DIM}(recommended)${R}"
+    say "     ${DIM}How it has always worked. Fastest on a poor route, because one${R}"
+    say "     ${DIM}user's lost packet never holds up anybody else.${R}"
+    say ""
+    say "  ${B}2) Share a few connections${R}"
+    say "     ${DIM}Everyone rides on $MX_LINKS connections that stay open for hours. Far${R}"
+    say "     ${DIM}fewer connections between your servers, so the tunnel is harder to${R}"
+    say "     ${DIM}pick out, and busy times do not show. The cost is real: on a lossy${R}"
+    say "     ${DIM}route a hiccup is felt by everyone on that connection at once.${R}"
+    say ""
+    say "  ${DIM}If your tunnel works well today, keep option 1. Choose 2 if you think${R}"
+    say "  ${DIM}the number of connections is what is getting your tunnel noticed.${R}"
+    hr
+}
+
+ask_sharing() {
+    explain_sharing
+    case "$(choose "Choose 1 or 2" "1" 1 2)" in
+        1) MX_MUX=off; MX_LINKS=4 ;;
+        2)
+            MX_MUX=on
+            say ""
+            info "More connections spread the risk of a hiccup; fewer hide the tunnel"
+            info "better. Four is a sensible middle."
+            while :; do
+                MX_LINKS=$(ask "How many shared connections" "4")
+                case "$MX_LINKS" in
+                    '' | *[!0-9]*) err "  Give a number between 1 and 16." ;;
+                    *) [ "$MX_LINKS" -ge 1 ] && [ "$MX_LINKS" -le 16 ] && break
+                       err "  Give a number between 1 and 16." ;;
+                esac
+            done
+            ;;
+    esac
+}
+
+# describe_sharing <mux> <links> - one short phrase for summaries.
+describe_sharing() {
+    if [ "$1" = on ]; then
+        printf 'all users share %s connections' "${2:-4}"
+    else
+        printf 'one connection per user'
+    fi
+}
+
 # -------------------------------------------------------------- pairing code
 
 # The code carries everything the foreign server needs, so it asks nothing.
 make_pairing_code() {
     local name=$1 mode=$2 tport=$3 relay_ip=$4 server_ip=$5 inbound_port=$6 pool=$7 secret=$8
-    local transport=$9 servername=${10} wspath=${11} cdn=${12}
-    printf 'v=3\nname=%s\nmode=%s\ntunnel_port=%s\nrelay_ip=%s\nserver_ip=%s\ninbound_port=%s\npool=%s\ntransport=%s\nserver_name=%s\nws_path=%s\ncdn=%s\nsecret=%s\n' \
+    local transport=$9 servername=${10} wspath=${11} cdn=${12} mux=${13} muxlinks=${14}
+    printf 'v=4\nname=%s\nmode=%s\ntunnel_port=%s\nrelay_ip=%s\nserver_ip=%s\ninbound_port=%s\npool=%s\ntransport=%s\nserver_name=%s\nws_path=%s\ncdn=%s\nmux=%s\nmux_links=%s\nsecret=%s\n' \
         "$name" "$mode" "$tport" "$relay_ip" "$server_ip" "$inbound_port" "$pool" \
-        "$transport" "$servername" "$wspath" "$cdn" "$secret" |
+        "$transport" "$servername" "$wspath" "$cdn" "${mux:-off}" "${muxlinks:-4}" "$secret" |
         base64 | tr -d '\n'
 }
 
@@ -435,14 +499,16 @@ show_pairing_code() {
     inbound_port=$(read_conf "$name" server_inbound_port)
     pool=$(read_conf "$name" pool_size)
 
-    local transport servername wspath cdn
+    local transport servername wspath cdn mux muxlinks
     transport=$(read_conf "$name" transport); [ -n "$transport" ] || transport=plain
     servername=$(read_conf "$name" server_name)
     wspath=$(read_conf "$name" ws_path)
     cdn=$(read_conf "$name" cdn); [ -n "$cdn" ] || cdn=off
+    mux=$(read_conf "$name" mux); [ -n "$mux" ] || mux=off
+    muxlinks=$(read_conf "$name" mux_links); [ -n "$muxlinks" ] || muxlinks=4
 
     code=$(make_pairing_code "$name" "$mode" "$tport" "$relay_ip" "$server_ip" "$inbound_port" \
-        "$pool" "$secret" "$transport" "$servername" "$wspath" "$cdn")
+        "$pool" "$secret" "$transport" "$servername" "$wspath" "$cdn" "$mux" "$muxlinks")
 
     hr
     say "${B}Code for your foreign server${R}"
@@ -502,6 +568,12 @@ write_tunnel() {
             printf 'cdn = %s\n' "${DG_CDN:-off}"
             printf 'cert_file = %s/%s.crt\n' "$CONF_DIR" "$name"
             printf 'key_file = %s/%s.key\n' "$CONF_DIR" "$name"
+        fi
+
+        printf '\n# on = every user session shares a few long-lived connections.\n'
+        printf 'mux = %s\n' "${MX_MUX:-off}"
+        if [ "${MX_MUX:-off}" = on ]; then
+            printf 'mux_links = %s\n' "${MX_LINKS:-4}"
         fi
 
         printf '\npool_size = %s\n' "$pool"
@@ -649,6 +721,7 @@ create_tunnel() {
     ulisten="0.0.0.0:$uport"
 
     ask_disguise "$mode"
+    ask_sharing
 
     say ""
     info "Last port: a private one the two servers use between themselves."
@@ -703,6 +776,7 @@ create_tunnel() {
     fi
     say "  link appearance    $(describe_disguise "$DG_TRANSPORT" "$DG_CDN")"
     [ -n "$DG_SERVERNAME" ] && say "  claims to be       $DG_SERVERNAME$DG_WSPATH"
+    say "  connections        $(describe_sharing "$MX_MUX" "$MX_LINKS")"
     hr
     confirm "Set it up?" || { say "Cancelled. Nothing was changed."; return 1; }
 
@@ -739,9 +813,9 @@ join_tunnel() {
     get() { printf '%s\n' "$decoded" | sed -nE "s/^$1=(.*)$/\1/p" | head -1; }
 
     v=$(get v)
-    if [ "$v" = 1 ] || [ "$v" = 2 ]; then
-        err "That code comes from an older version of PortBridge, before the link"
-        err "could be disguised, so it does not say how the link should look."
+    if [ "$v" = 1 ] || [ "$v" = 2 ] || [ "$v" = 3 ]; then
+        err "That code was made by an older version of PortBridge, and does not say"
+        err "everything this one needs to know about the link."
         err "Update the Iran server, then create the tunnel there again for a new code."
         return 1
     fi
@@ -755,7 +829,12 @@ join_tunnel() {
     DG_WSPATH=$(get ws_path)
     DG_CDN=$(get cdn); [ -n "$DG_CDN" ] || DG_CDN=off
 
-    if [ "$v" != 3 ] || [ -z "$name" ] || [ -z "$mode" ] || [ -z "$secret" ] ||
+    # So does whether connections are shared: it must match on both ends or
+    # neither side would understand the other.
+    MX_MUX=$(get mux); [ -n "$MX_MUX" ] || MX_MUX=off
+    MX_LINKS=$(get mux_links); [ -n "$MX_LINKS" ] || MX_LINKS=4
+
+    if [ "$v" != 4 ] || [ -z "$name" ] || [ -z "$mode" ] || [ -z "$secret" ] ||
         ! valid_port "${tport:-x}" || ! valid_port "${inport:-x}" || [ -z "$relay_ip" ]; then
         err "That is not a valid PortBridge code."
         return 1
@@ -787,6 +866,7 @@ join_tunnel() {
     fi
     say "  link appearance    $(describe_disguise "$DG_TRANSPORT" "$DG_CDN")"
     [ -n "$DG_SERVERNAME" ] && say "  claims to be       $DG_SERVERNAME$DG_WSPATH"
+    say "  connections        $(describe_sharing "$MX_MUX" "$MX_LINKS")"
     hr
 
     # Nothing to ask, but two things are worth checking before going ahead.
@@ -817,12 +897,15 @@ join_tunnel() {
     say ""
     # In direct mode the Iran server has been retrying since it was set up and
     # backs off to one attempt every thirty seconds, so allow longer for that.
-    local i spares="" wait_for=15
+    local i spares="" wait_for=15 field=parked_spares
     [ "$mode" = direct ] && wait_for=40
+    # With shared connections there are no spares to count, so being linked shows
+    # up as a link being open instead.
+    [ "$MX_MUX" = on ] && field=links
     printf '%s' "${DIM}Waiting for the two servers to find each other...${R}" >&2
     for i in $(seq 1 "$wait_for"); do
         sleep 1
-        spares=$(json_field "$RUN_DIR/$name.json" parked_spares 2>/dev/null)
+        spares=$(json_field "$RUN_DIR/$name.json" "$field" 2>/dev/null)
         [ -n "$spares" ] && [ "$spares" -gt 0 ] 2>/dev/null && break
     done
     printf '\r%*s\r' 55 '' >&2
@@ -856,7 +939,17 @@ status_line() {
         *)        colour=$YELLOW; state=${active:-unknown} ;;
     esac
 
-    parked=$(json_field "$RUN_DIR/$name.json" parked_spares 2>/dev/null)
+    # With shared connections, how many links are open is the useful number;
+    # spares do not exist. Reporting an ever-present zero would read as broken.
+    local mux label
+    mux=$(read_conf "$name" mux); [ -n "$mux" ] || mux=off
+    if [ "$mux" = on ]; then
+        parked=$(json_field "$RUN_DIR/$name.json" links 2>/dev/null)
+        label=links
+    else
+        parked=$(json_field "$RUN_DIR/$name.json" parked_spares 2>/dev/null)
+        label=spares
+    fi
     active_s=$(json_field "$RUN_DIR/$name.json" active_sessions 2>/dev/null)
     [ -n "$parked" ] || parked="-"
     [ -n "$active_s" ] || active_s="-"
@@ -874,8 +967,8 @@ status_line() {
         *) look=plain ;;
     esac
 
-    printf '  %-14s %-8s %-12s %s%-8s%s %-10s users:%-5s spares:%s\n' \
-        "$name" "$mode" "$job" "$colour" "$state" "$R" "$look" "$active_s" "$parked"
+    printf '  %-14s %-8s %-12s %s%-8s%s %-10s users:%-5s %s:%s\n' \
+        "$name" "$mode" "$job" "$colour" "$state" "$R" "$look" "$active_s" "$label" "$parked"
 }
 
 list_tunnels() {
@@ -892,7 +985,8 @@ list_tunnels() {
         status_line "$n"
     done
     hr
-    say "${DIM}spares = ready connections waiting. users = sessions right now.${R}"
+    say "${DIM}users = sessions right now. spares = ready connections waiting,${R}"
+    say "${DIM}or links = shared connections open, for tunnels set up that way.${R}"
 }
 
 pick_tunnel() {
@@ -943,7 +1037,12 @@ show_details() {
         say "${B}Live${R}"
         printf '  running for    %s seconds\n' "$(json_field "$f" uptime_seconds)"
         printf '  users now      %s\n' "$(json_field "$f" active_sessions)"
-        printf '  spares ready   %s of %s\n' "$(json_field "$f" parked_spares)" "$(json_field "$f" pool_target)"
+        if [ "$(read_conf "$name" mux)" = on ]; then
+            printf '  links open     %s of %s\n' "$(json_field "$f" links)" "$(json_field "$f" link_target)"
+            printf '  riding on them %s\n' "$(json_field "$f" link_sessions)"
+        else
+            printf '  spares ready   %s of %s\n' "$(json_field "$f" parked_spares)" "$(json_field "$f" pool_target)"
+        fi
         printf '  failed         %s\n' "$(json_field "$f" failed_sessions)"
         printf '  turned away    %s\n' "$(json_field "$f" dropped_sessions)"
         printf '  retried        %s\n' "$(json_field "$f" retries)"
@@ -966,17 +1065,27 @@ edit_tunnel() {
     backup=$(mktemp)
     cp "$(conf_of "$name")" "$backup"
 
-    cur=$(read_conf "$name" pool_size)
-    new=$(ask "Connections to keep ready" "$cur")
-    [ "$new" != "$cur" ] && { write_conf "$name" pool_size "$new"; changed=1; }
+    # Which of these makes sense depends on how the tunnel was set up. Asking
+    # about spares on a tunnel that has none is just confusing.
+    if [ "$(read_conf "$name" mux)" = on ]; then
+        say "${DIM}This tunnel shares a few connections between all users. Changing how${R}"
+        say "${DIM}many is safe on its own; the other server does not have to match.${R}"
+        cur=$(read_conf "$name" mux_links); [ -n "$cur" ] || cur=4
+        new=$(ask "Shared connections between the servers" "$cur")
+        [ "$new" != "$cur" ] && { write_conf "$name" mux_links "$new"; changed=1; }
+    else
+        cur=$(read_conf "$name" pool_size)
+        new=$(ask "Connections to keep ready" "$cur")
+        [ "$new" != "$cur" ] && { write_conf "$name" pool_size "$new"; changed=1; }
+
+        cur=$(read_conf "$name" spare_ttl)
+        new=$(ask "How long a spare lives before being replaced" "$cur")
+        [ "$new" != "$cur" ] && { write_conf "$name" spare_ttl "$new"; changed=1; }
+    fi
 
     cur=$(read_conf "$name" max_conn)
     new=$(ask "Maximum users at once" "$cur")
     [ "$new" != "$cur" ] && { write_conf "$name" max_conn "$new"; changed=1; }
-
-    cur=$(read_conf "$name" spare_ttl)
-    new=$(ask "How long a spare lives before being replaced" "$cur")
-    [ "$new" != "$cur" ] && { write_conf "$name" spare_ttl "$new"; changed=1; }
 
     cur=$(read_conf "$name" drain)
     new=$(ask "How long to let sessions finish when restarting" "$cur")
@@ -1135,11 +1244,18 @@ test_tunnel() {
         fi
     fi
 
-    local f spares
+    local f spares mux ready
     f="$RUN_DIR/$name.json"
-    spares=$(json_field "$f" parked_spares 2>/dev/null)
+    mux=$(read_conf "$name" mux); [ -n "$mux" ] || mux=off
+    if [ "$mux" = on ]; then
+        spares=$(json_field "$f" links 2>/dev/null)
+        ready="shared connections open"
+    else
+        spares=$(json_field "$f" parked_spares 2>/dev/null)
+        ready="connections ready"
+    fi
     if [ -n "$spares" ] && [ "$spares" -gt 0 ] 2>/dev/null; then
-        result "both servers linked" good "yes, $spares connections ready"
+        result "both servers linked" good "yes, $spares $ready"
     else
         result "both servers linked" bad "no, the two servers are not talking"
         note "Make sure the tunnel is set up on both servers, that the code was"
@@ -1150,6 +1266,7 @@ test_tunnel() {
     transport=$(read_conf "$name" transport); [ -n "$transport" ] || transport=plain
     cdn=$(read_conf "$name" cdn); [ -n "$cdn" ] || cdn=off
     result "link appearance" note "$(describe_disguise "$transport" "$cdn")"
+    result "connections" note "$(describe_sharing "$mux" "$(read_conf "$name" mux_links)")"
 
     # A mismatched disguise looks exactly like a wrong password from the log, so
     # call it out separately or it sends people hunting the wrong problem.

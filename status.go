@@ -15,6 +15,7 @@ type status struct {
 	cfg     *Config
 	started time.Time
 	pool    *pool
+	links   *carrierSet
 
 	activeSessions   int64
 	failedSessions   int64
@@ -25,22 +26,28 @@ type status struct {
 }
 
 type statusFile struct {
-	Name            string `json:"name"`
-	Mode            string `json:"mode"`
-	Role            string `json:"role"`
-	Dials           bool   `json:"dials_out"`
-	TunnelAddr      string `json:"tunnel_addr"`
-	UserListen      string `json:"user_listen,omitempty"`
-	InboundAddr     string `json:"inbound_addr,omitempty"`
-	PID             int    `json:"pid"`
-	StartedAt       string `json:"started_at"`
-	UptimeSeconds   int64  `json:"uptime_seconds"`
-	ActiveSessions  int64  `json:"active_sessions"`
-	ParkedSpares    int64  `json:"parked_spares"`
-	PoolTarget      int    `json:"pool_target"`
-	FailedSessions  int64  `json:"failed_sessions"`
-	DroppedSessions int64  `json:"dropped_sessions"`
-	Retries         int64  `json:"retries"`
+	Name           string `json:"name"`
+	Mode           string `json:"mode"`
+	Role           string `json:"role"`
+	Dials          bool   `json:"dials_out"`
+	TunnelAddr     string `json:"tunnel_addr"`
+	UserListen     string `json:"user_listen,omitempty"`
+	InboundAddr    string `json:"inbound_addr,omitempty"`
+	PID            int    `json:"pid"`
+	StartedAt      string `json:"started_at"`
+	UptimeSeconds  int64  `json:"uptime_seconds"`
+	ActiveSessions int64  `json:"active_sessions"`
+	ParkedSpares   int64  `json:"parked_spares"`
+	PoolTarget     int    `json:"pool_target"`
+	// Mux and the two counts below replace the spare pool when sessions share a
+	// few long-lived connections, so the menu can describe either arrangement.
+	Mux             bool  `json:"mux"`
+	Links           int   `json:"links,omitempty"`
+	LinkTarget      int   `json:"link_target,omitempty"`
+	LinkSessions    int   `json:"link_sessions,omitempty"`
+	FailedSessions  int64 `json:"failed_sessions"`
+	DroppedSessions int64 `json:"dropped_sessions"`
+	Retries         int64 `json:"retries"`
 	// EmptyConnections counts connections that arrived and left without sending
 	// anything, which is mostly internet background scanning.
 	EmptyConnections int64  `json:"empty_connections"`
@@ -83,6 +90,15 @@ func (s *status) writeOnce() {
 		parked = int64(s.pool.parkedCount())
 	}
 
+	var links, linkSessions, linkTarget int
+	if s.links != nil {
+		links, linkSessions = s.links.stats()
+		linkTarget = s.cfg.MuxLinks
+		// With shared links there are no spares to report, and leaving a stale
+		// count in place would read as a broken tunnel.
+		parked = 0
+	}
+
 	sf := statusFile{
 		Name:             s.cfg.Name,
 		Mode:             string(s.cfg.Mode),
@@ -97,6 +113,10 @@ func (s *status) writeOnce() {
 		ActiveSessions:   atomic.LoadInt64(&s.activeSessions),
 		ParkedSpares:     parked,
 		PoolTarget:       s.cfg.PoolSize,
+		Mux:              s.cfg.Mux,
+		Links:            links,
+		LinkTarget:       linkTarget,
+		LinkSessions:     linkSessions,
 		FailedSessions:   atomic.LoadInt64(&s.failedSessions),
 		DroppedSessions:  atomic.LoadInt64(&s.droppedSessions),
 		Retries:          atomic.LoadInt64(&s.retries),

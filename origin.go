@@ -26,6 +26,10 @@ type origin struct {
 	cfg *Config
 	st  *status
 
+	// links is set instead of the one-connection-per-session machinery when
+	// sessions share a few long-lived connections.
+	links *carrierSet
+
 	active  chan struct{}
 	pending chan struct{}
 	wg      sync.WaitGroup
@@ -60,6 +64,20 @@ func runOrigin(ctx context.Context, cfg *Config, st *status) error {
 	return o.runDirect(ctx)
 }
 
+// serveStream handles one session that arrived inside a shared link. It is the
+// same two steps as a parked connection being woken: wait to be told a user is
+// there, then reach the service and confirm it.
+func (o *origin) serveStream(tunnel net.Conn) {
+	o.wg.Add(1)
+	defer o.wg.Done()
+
+	if err := o.awaitActivation(tunnel, muxActivateWait); err != nil {
+		_ = tunnel.Close()
+		return
+	}
+	o.handleActivated(tunnel)
+}
+
 // runDirect accepts tunnel connections from the edge.
 func (o *origin) runDirect(ctx context.Context) error {
 	if o.cfg.Transport != TransportPlain {
@@ -69,6 +87,13 @@ func (o *origin) runDirect(ctx context.Context) error {
 		}
 		o.cert = &cert
 	}
+	if o.cfg.Mux {
+		// The edge starts the sessions, so this side only has to receive them.
+		o.links = newCarrierSet(o.cfg.MuxLinks, nil, o.serveStream)
+		o.st.links = o.links
+		go o.links.maintain(ctx.Done())
+	}
+
 	ln, err := net.Listen("tcp", o.cfg.TunnelAddr)
 	if err != nil {
 		return err
@@ -115,6 +140,15 @@ func (o *origin) runDirect(ctx context.Context) error {
 					_ = c.Close()
 					return
 				}
+				if o.links != nil {
+					// One connection, many sessions: hold it and let the
+					// sessions arrive inside it.
+					release()
+					if !o.links.add(c) {
+						_ = c.Close()
+					}
+					return
+				}
 				atomic.AddInt64(&o.st.parkedSpares, 1)
 				err = o.parkUntilActivated(ctx, c, o.cfg.ParkTimeout)
 				atomic.AddInt64(&o.st.parkedSpares, -1)
@@ -135,6 +169,9 @@ func (o *origin) runDirect(ctx context.Context) error {
 	if !waitTimeout(&o.wg, o.cfg.Drain) {
 		log.Printf("drain time ran out; exiting with sessions still open")
 	}
+	if o.links != nil {
+		o.links.closeAll()
+	}
 	return nil
 }
 
@@ -145,6 +182,10 @@ func (o *origin) runDirect(ctx context.Context) error {
 // replacement, so the number of ready spares waiting at the edge stays constant
 // instead of dropping for the length of every session.
 func (o *origin) runReverse(ctx context.Context) error {
+	if o.cfg.Mux {
+		return o.runReverseMux(ctx)
+	}
+
 	workers := o.cfg.PoolSize
 	if workers < 1 {
 		workers = 1
@@ -171,6 +212,25 @@ func (o *origin) runReverse(ctx context.Context) error {
 	if !waitTimeout(&o.wg, o.cfg.Drain) {
 		log.Printf("drain time ran out; exiting with sessions still open")
 	}
+	return nil
+}
+
+// runReverseMux is the reversed direction with sessions shared over a few links:
+// this side dials them and keeps them up, and the sessions arrive inside.
+func (o *origin) runReverseMux(ctx context.Context) error {
+	log.Printf("opening %d shared connections into the edge at %s",
+		o.cfg.MuxLinks, o.cfg.TunnelAddr)
+
+	o.links = newCarrierSet(o.cfg.MuxLinks, o.dialEdge, o.serveStream)
+	o.st.links = o.links
+	go o.links.maintain(ctx.Done())
+
+	<-ctx.Done()
+	log.Printf("shutting down; letting live sessions finish for up to %s", o.cfg.Drain)
+	if !waitTimeout(&o.wg, o.cfg.Drain) {
+		log.Printf("drain time ran out; exiting with sessions still open")
+	}
+	o.links.closeAll()
 	return nil
 }
 

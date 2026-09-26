@@ -61,6 +61,10 @@ type edge struct {
 	pool *pool
 	st   *status
 
+	// links is set instead of pool when sessions share a few long-lived
+	// connections. Only one of the two is ever in use.
+	links *carrierSet
+
 	active  chan struct{}
 	pending chan struct{}
 	wg      sync.WaitGroup
@@ -87,8 +91,8 @@ func runEdge(ctx context.Context, cfg *Config, st *status) error {
 		logAuth:     newThrottled(),
 	}
 
-	// Direct mode: we dial the origin ourselves, so the pool can refill itself.
-	// Reverse mode: we cannot dial anywhere, so the pool is fed by accepts.
+	// Direct mode: we dial the origin ourselves, so connections can be built on
+	// demand. Reverse mode: we cannot dial anywhere, so we wait to be called.
 	var dial func() (net.Conn, error)
 	if cfg.Mode == ModeDirect {
 		dial = func() (net.Conn, error) {
@@ -112,9 +116,18 @@ func runEdge(ctx context.Context, cfg *Config, st *status) error {
 			return c, nil
 		}
 	}
-	e.pool = newPool(cfg.PoolSize, cfg.SpareTTL, reverseWaitForSpare, dial)
-	st.pool = e.pool
-	go e.pool.maintain(ctx)
+
+	if cfg.Mux {
+		// The edge is always the side that starts sessions, whichever side
+		// dialled, so it never needs a handler for incoming ones.
+		e.links = newCarrierSet(cfg.MuxLinks, dial, nil)
+		st.links = e.links
+		go e.links.maintain(ctx.Done())
+	} else {
+		e.pool = newPool(cfg.PoolSize, cfg.SpareTTL, reverseWaitForSpare, dial)
+		st.pool = e.pool
+		go e.pool.maintain(ctx)
+	}
 
 	// In reverse mode we also listen for the origin's incoming connections.
 	if cfg.Mode == ModeReverse {
@@ -188,9 +201,16 @@ func runEdge(ctx context.Context, cfg *Config, st *status) error {
 	}
 
 	log.Printf("shutting down; letting live sessions finish for up to %s", e.cfg.Drain)
-	e.pool.closeAll()
+	if e.pool != nil {
+		e.pool.closeAll()
+	}
 	if !waitTimeout(&e.wg, e.cfg.Drain) {
 		log.Printf("drain time ran out; exiting with sessions still open")
+	}
+	// Shared links are closed last, after live sessions have had their chance to
+	// finish inside them.
+	if e.links != nil {
+		e.links.closeAll()
 	}
 	return nil
 }
@@ -223,6 +243,14 @@ func (e *edge) acceptTunnel(ctx context.Context, ln net.Listener) {
 				if err := recvAuth(c, e.cfg.secret, e.guard); err != nil {
 					e.logAuth.printf("refused a tunnel connection from %s: %v", c.RemoteAddr(), err)
 					_ = c.Close()
+					return
+				}
+				if e.links != nil {
+					// This one connection will carry every session that comes,
+					// so it is kept rather than parked.
+					if !e.links.add(c) {
+						_ = c.Close()
+					}
 					return
 				}
 				if !e.pool.offer(c) {
@@ -261,7 +289,7 @@ func (e *edge) serve(ctx context.Context, user net.Conn) error {
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
-		tunnel, err := e.pool.take(ctx)
+		tunnel, err := e.takeTunnel(ctx)
 		if err != nil {
 			lastErr = err
 			// Nothing to retry against in reverse mode with the origin away.
@@ -280,6 +308,16 @@ func (e *edge) serve(ctx context.Context, user net.Conn) error {
 		return nil
 	}
 	return lastErr
+}
+
+// takeTunnel produces something to carry one user across the border: either a
+// ready spare connection, or a new session inside a shared link. Both behave the
+// same from here on, which is why the rest of this file does not care which.
+func (e *edge) takeTunnel(ctx context.Context) (net.Conn, error) {
+	if e.links != nil {
+		return e.links.open(ctx.Done())
+	}
+	return e.pool.take(ctx)
 }
 
 // activate wakes a parked connection, pushes the user's opening bytes in the
