@@ -98,6 +98,7 @@ func runEdge(ctx context.Context, cfg *Config, st *status) error {
 	var dial func() (net.Conn, error)
 	if cfg.Mode == ModeDirect {
 		routes := newRouter(cfg)
+		st.routes = routes
 		log.Printf("reaching the other server at %s", routes.describe())
 		dial = func() (net.Conn, error) {
 			raw, claim, err := routes.dial(5 * time.Second)

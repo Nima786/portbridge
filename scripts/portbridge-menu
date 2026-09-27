@@ -1436,10 +1436,14 @@ test_tunnel() {
             note "Check the domain points at your CDN with its proxy turned on, and"
             note "that the CDN is set to forward this port."
         fi
-        # Which route is actually carrying the tunnel right now is worth saying.
-        if journalctl -u "$(unit_of "$name")" --since "-1 h" --no-pager 2>/dev/null |
-            grep -q "instead of"; then
-            result "route in use" note "the backup, the main address was unreachable"
+        # Which route is carrying the tunnel right now comes from the engine,
+        # which is the only thing that knows. Reading it out of the log instead
+        # got it wrong as soon as a tunnel recovered: it would go on reporting
+        # the backup long after the main address came back.
+        local backup
+        backup=$(json_field "$f" on_backup_route 2>/dev/null)
+        if [ "$backup" = true ]; then
+            result "route in use" note "the backup, $(json_field "$f" route_in_use)"
         else
             result "route in use" note "the main address"
         fi

@@ -84,6 +84,26 @@ func (r *router) settle(i int) {
 	r.lastGood = time.Now()
 }
 
+// inUse is the route connections are being made over at the moment, and whether
+// it is the preferred one.
+//
+// Published rather than left to be guessed at from the log. Working it out by
+// reading log lines gets it wrong the moment a tunnel recovers: it would still
+// be reporting the fallback long after the direct route came back.
+func (r *router) inUse() (addr string, preferred bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.current >= len(r.targets) {
+		return "", true
+	}
+	return r.targets[r.current].addr, r.current == 0
+}
+
+// hasFallback reports whether there is a second route at all.
+func (r *router) hasFallback() bool {
+	return len(r.targets) > 1
+}
+
 // dial tries each route in turn, beginning with whichever is currently preferred,
 // and reports the hostname the caller should claim on the connection it gets.
 func (r *router) dial(timeout time.Duration) (net.Conn, string, error) {

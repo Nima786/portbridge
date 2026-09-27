@@ -66,6 +66,7 @@ func runOrigin(ctx context.Context, cfg *Config, st *status) error {
 
 	if cfg.Mode == ModeReverse {
 		o.routes = newRouter(cfg)
+		st.routes = o.routes
 		log.Printf("reaching the other server at %s", o.routes.describe())
 		return o.runReverse(ctx)
 	}

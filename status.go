@@ -16,6 +16,7 @@ type status struct {
 	started time.Time
 	pool    *pool
 	links   *carrierSet
+	routes  *router
 
 	activeSessions   int64
 	failedSessions   int64
@@ -50,8 +51,14 @@ type statusFile struct {
 	Retries         int64 `json:"retries"`
 	// EmptyConnections counts connections that arrived and left without sending
 	// anything, which is mostly internet background scanning.
-	EmptyConnections int64  `json:"empty_connections"`
-	UpdatedAt        string `json:"updated_at"`
+	EmptyConnections int64 `json:"empty_connections"`
+	// RouteInUse is the address being dialled at the moment, on the side that
+	// dials and only when there is more than one to choose from. Reported by the
+	// engine because it is the only thing that actually knows.
+	RouteInUse    string `json:"route_in_use,omitempty"`
+	OnMainRoute   bool   `json:"on_main_route,omitempty"`
+	OnBackupRoute bool   `json:"on_backup_route,omitempty"`
+	UpdatedAt     string `json:"updated_at"`
 }
 
 func newStatus(cfg *Config) *status {
@@ -90,6 +97,14 @@ func (s *status) writeOnce() {
 		parked = int64(s.pool.parkedCount())
 	}
 
+	var routeInUse string
+	var onMain, onBackup bool
+	if s.routes != nil && s.routes.hasFallback() {
+		addr, preferred := s.routes.inUse()
+		routeInUse = addr
+		onMain, onBackup = preferred, !preferred
+	}
+
 	var links, linkSessions, linkTarget int
 	if s.links != nil {
 		links, linkSessions = s.links.stats()
@@ -121,6 +136,9 @@ func (s *status) writeOnce() {
 		DroppedSessions:  atomic.LoadInt64(&s.droppedSessions),
 		Retries:          atomic.LoadInt64(&s.retries),
 		EmptyConnections: atomic.LoadInt64(&s.emptyConnections),
+		RouteInUse:       routeInUse,
+		OnMainRoute:      onMain,
+		OnBackupRoute:    onBackup,
 		UpdatedAt:        time.Now().UTC().Format(time.RFC3339),
 	}
 

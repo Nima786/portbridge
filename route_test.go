@@ -3,6 +3,8 @@ package main
 import (
 	"context"
 	"net"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -446,5 +448,106 @@ func TestRouteFallbackWithItsOwnNameCarriesTraffic(t *testing.T) {
 	}
 	if got != "OVER-THE-CDN-NAME" {
 		t.Fatalf("got %q", got)
+	}
+}
+
+// Which route is in use must be reported from what is actually happening, and
+// must stop saying "the backup" once the preferred route is working again.
+func TestRouteReportsWhichOneIsInUse(t *testing.T) {
+	dead, stopDead := listenAt(t)
+	stopDead()
+	alive, stopAlive := listenAt(t)
+	defer stopAlive()
+
+	// One route only: nothing to report.
+	solo := defaultConfig()
+	solo.TunnelAddr = alive
+	if newRouter(solo).hasFallback() {
+		t.Fatal("a single route was reported as having a fallback")
+	}
+
+	cfg := defaultConfig()
+	cfg.TunnelAddr = dead
+	cfg.AltTarget = alive
+	r := newRouter(cfg)
+
+	if !r.hasFallback() {
+		t.Fatal("two routes were not reported as having a fallback")
+	}
+
+	// Before anything has been dialled it should not claim to be on the backup.
+	if _, preferred := r.inUse(); !preferred {
+		t.Fatal("it claimed to be on the backup before dialling anything")
+	}
+
+	// Falling back must show up.
+	c, _, err := r.dial(2 * time.Second)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	_ = c.Close()
+	addr, preferred := r.inUse()
+	if preferred {
+		t.Fatal("it reported the main route while using the backup")
+	}
+	if addr != alive {
+		t.Fatalf("it reported %q as the route in use", addr)
+	}
+
+	// And recovering must show up too, which is the part that reading the log
+	// got wrong: it would keep saying the backup for ever.
+	r.settle(0)
+	if addr, preferred = r.inUse(); !preferred || addr != dead {
+		t.Fatalf("after recovering it still reports %q, preferred=%v", addr, preferred)
+	}
+}
+
+// The status file is what the menu reads, so the route has to reach it.
+func TestRouteAppearsInTheStatusFile(t *testing.T) {
+	dead, stopDead := listenAt(t)
+	stopDead()
+	alive, stopAlive := listenAt(t)
+	defer stopAlive()
+
+	cfg := defaultConfig()
+	cfg.Name = "st"
+	cfg.Mode = ModeDirect
+	cfg.Role = RoleEdge
+	cfg.TunnelAddr = dead
+	cfg.AltTarget = alive
+	cfg.UserListen = "127.0.0.1:0"
+	cfg.StatusFile = filepath.Join(t.TempDir(), "st.json")
+
+	st := newStatus(cfg)
+	r := newRouter(cfg)
+	st.routes = r
+
+	// Nothing dialled yet: on the main route as far as anyone knows.
+	st.writeOnce()
+	body, err := os.ReadFile(cfg.StatusFile)
+	if err != nil {
+		t.Fatalf("reading the status: %v", err)
+	}
+	if strings.Contains(string(body), `"on_backup_route": true`) {
+		t.Fatal("the status claimed the backup before anything was dialled")
+	}
+
+	// Now make it fall back, and the status must say so.
+	c, _, err := r.dial(2 * time.Second)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	_ = c.Close()
+
+	st.writeOnce()
+	body, err = os.ReadFile(cfg.StatusFile)
+	if err != nil {
+		t.Fatalf("reading the status: %v", err)
+	}
+	if !strings.Contains(string(body), `"on_backup_route": true`) {
+		t.Fatalf("the status does not mention the backup:\n%s", body)
+	}
+	if !strings.Contains(string(body), alive) {
+		t.Fatalf("the status does not name the route in use:\n%s", body)
 	}
 }
