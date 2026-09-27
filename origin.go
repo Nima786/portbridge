@@ -296,13 +296,14 @@ func (o *origin) reverseWorker(ctx context.Context, n int) {
 }
 
 func (o *origin) dialEdge() (net.Conn, error) {
-	raw, err := o.routes.dial(10 * time.Second)
+	raw, claim, err := o.routes.dial(10 * time.Second)
 	if err != nil {
 		return nil, err
 	}
 	tuneSocket(raw)
-	// Apply the disguise before sending anything of ours.
-	c, err := wrapDial(raw, o.cfg)
+	// Apply the disguise before sending anything of ours, claiming whatever name
+	// belongs to the route we got.
+	c, err := wrapDial(raw, o.cfg.withClaimedName(claim))
 	if err != nil {
 		_ = raw.Close()
 		return nil, err

@@ -41,7 +41,7 @@ func TestRouteSingleTarget(t *testing.T) {
 	if len(r.targets) != 1 {
 		t.Fatalf("expected one route, got %v", r.targets)
 	}
-	c, err := r.dial(2 * time.Second)
+	c, _, err := r.dial(2 * time.Second)
 	if err != nil {
 		t.Fatalf("dial: %v", err)
 	}
@@ -63,7 +63,7 @@ func TestRoutePrefersTheFirst(t *testing.T) {
 	cfg.AltTarget = second
 	r := newRouter(cfg)
 
-	c, err := r.dial(2 * time.Second)
+	c, _, err := r.dial(2 * time.Second)
 	if err != nil {
 		t.Fatalf("dial: %v", err)
 	}
@@ -87,7 +87,7 @@ func TestRouteFallsBackWhenTheFirstIsUnreachable(t *testing.T) {
 	cfg.AltTarget = alive
 	r := newRouter(cfg)
 
-	c, err := r.dial(2 * time.Second)
+	c, _, err := r.dial(2 * time.Second)
 	if err != nil {
 		t.Fatalf("both routes failed: %v", err)
 	}
@@ -115,9 +115,68 @@ func TestRouteBothUnreachable(t *testing.T) {
 	cfg.AltTarget = b
 	r := newRouter(cfg)
 
-	if c, err := r.dial(time.Second); err == nil {
+	if c, _, err := r.dial(time.Second); err == nil {
 		_ = c.Close()
 		t.Fatal("a connection was reported when neither route works")
+	}
+}
+
+// Each route claims its own hostname.
+//
+// This matters for what an onlooker can put together. The direct route must not
+// name the domain that only exists for the CDN, because that domain's records
+// point at the CDN rather than at the server being dialled, and a name that does
+// not match the destination is more telling than either on its own.
+func TestRouteEachRouteClaimsItsOwnName(t *testing.T) {
+	dead, stopDead := listenAt(t)
+	stopDead()
+	alive, stopAlive := listenAt(t)
+	defer stopAlive()
+
+	cfg := defaultConfig()
+	cfg.Transport = TransportWSS
+	cfg.TunnelAddr = alive
+	cfg.ServerName = "www.bing.com"
+	cfg.AltTarget = "link.example.com:443"
+	cfg.AltServerName = "link.example.com"
+
+	r := newRouter(cfg)
+	if len(r.targets) != 2 {
+		t.Fatalf("expected two routes, got %d", len(r.targets))
+	}
+	if r.targets[0].name != "www.bing.com" {
+		t.Fatalf("the direct route claims %q", r.targets[0].name)
+	}
+	if r.targets[1].name != "link.example.com" {
+		t.Fatalf("the fallback route claims %q", r.targets[1].name)
+	}
+
+	// Taking the direct route hands back the innocuous name.
+	c, claim, err := r.dial(2 * time.Second)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	_ = c.Close()
+	if claim != "www.bing.com" {
+		t.Fatalf("the direct route asked to claim %q", claim)
+	}
+
+	// And the name really does change what goes on the wire.
+	if got := cfg.withClaimedName("link.example.com").effectiveServerName(); got != "link.example.com" {
+		t.Fatalf("claiming a different name gave %q", got)
+	}
+	if cfg.ServerName != "www.bing.com" {
+		t.Fatal("claiming a name for one route changed the tunnel's own setting")
+	}
+
+	// With no separate name given, the fallback claims the same as the first.
+	cfg2 := defaultConfig()
+	cfg2.TunnelAddr = dead
+	cfg2.ServerName = "www.bing.com"
+	cfg2.AltTarget = alive
+	r2 := newRouter(cfg2)
+	if r2.targets[1].name != "www.bing.com" {
+		t.Fatalf("the fallback claims %q when nothing else was given", r2.targets[1].name)
 	}
 }
 
@@ -186,6 +245,21 @@ func TestRouteSettingValidation(t *testing.T) {
 	if err := cfg.Validate(); err == nil {
 		t.Fatal("a fallback was accepted on the side that only waits")
 	}
+
+	// A name for the fallback only means something when there is a fallback.
+	cfg = base()
+	cfg.AltServerName = "link.example.com"
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("a name for a fallback that does not exist was accepted")
+	}
+
+	// And it has to be a name, since naming is the entire point of it.
+	cfg = base()
+	cfg.AltTarget = "link.example.com:443"
+	cfg.AltServerName = "203.0.113.9"
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("an address was accepted as the name to claim")
+	}
 }
 
 // The startup line must mention the fallback, so which routes exist is visible
@@ -250,13 +324,28 @@ func TestRouteTunnelComesUpOnTheFallback(t *testing.T) {
 	}
 }
 
-// startTunnelRoutes brings up a direct-mode tunnel where the edge is told to
-// dial primary and fall back to alt, while the origin actually listens on bind.
-func startTunnelRoutes(t *testing.T, serviceAddr, bind, primary, alt string) *tunnel {
+// routeSetup is what a route test varies: where the edge dials, where it falls
+// back to, and what each of those claims to be.
+type routeSetup struct {
+	bind      string // where the origin really listens
+	primary   string // what the edge dials first
+	alt       string // and what it falls back to
+	transport Transport
+	name      string // claimed on the first route
+	altName   string // claimed on the fallback
+}
+
+// startTunnelRoutes brings up a direct-mode tunnel with the given arrangement of
+// routes.
+func startTunnelRoutes(t *testing.T, serviceAddr string, s routeSetup) *tunnel {
 	t.Helper()
 
 	userAddr := freeAddr(t)
 	secretPath := writeSecret(t, testSecret)
+	certFile, keyFile := certPaths(t)
+	if s.transport == "" {
+		s.transport = TransportPlain
+	}
 
 	mk := func(role Role) *Config {
 		cfg := defaultConfig()
@@ -269,12 +358,16 @@ func startTunnelRoutes(t *testing.T, serviceAddr, bind, primary, alt string) *tu
 		cfg.Drain = 2 * time.Second
 		cfg.SecretFile = secretPath
 		cfg.StatusFile = ""
+		cfg.Transport = s.transport
+		cfg.ServerName = s.name
+		cfg.CertFile, cfg.KeyFile = certFile, keyFile
 		if role == RoleEdge {
-			cfg.TunnelAddr = primary
-			cfg.AltTarget = alt
+			cfg.TunnelAddr = s.primary
+			cfg.AltTarget = s.alt
+			cfg.AltServerName = s.altName
 			cfg.UserListen = userAddr
 		} else {
-			cfg.TunnelAddr = bind
+			cfg.TunnelAddr = s.bind
 			cfg.InboundAddr = serviceAddr
 		}
 		if err := cfg.Validate(); err != nil {
@@ -313,7 +406,7 @@ func startTunnelRoutes(t *testing.T, serviceAddr, bind, primary, alt string) *tu
 func startTunnelAlt(t *testing.T, serviceAddr, deadAlt string) *tunnel {
 	t.Helper()
 	bind := freeAddr(t)
-	return startTunnelRoutes(t, serviceAddr, bind, bind, deadAlt)
+	return startTunnelRoutes(t, serviceAddr, routeSetup{bind: bind, primary: bind, alt: deadAlt})
 }
 
 // startTunnelDeadPrimary: the preferred route is dead, so only the fallback can
@@ -323,5 +416,35 @@ func startTunnelDeadPrimary(t *testing.T, serviceAddr string) *tunnel {
 	bind := freeAddr(t)
 	dead, stop := listenAt(t)
 	stop()
-	return startTunnelRoutes(t, serviceAddr, bind, dead, bind)
+	return startTunnelRoutes(t, serviceAddr, routeSetup{bind: bind, primary: dead, alt: bind})
+}
+
+// The fallback must work when it also has to claim a different hostname, which is
+// the real arrangement: go straight to the server under an innocuous name, and
+// through the CDN under the real domain.
+func TestRouteFallbackWithItsOwnNameCarriesTraffic(t *testing.T) {
+	svc := startService(t)
+	defer svc.stop()
+
+	bind := freeAddr(t)
+	dead, stop := listenAt(t)
+	stop()
+
+	tun := startTunnelRoutes(t, svc.addr, routeSetup{
+		bind:      bind,
+		primary:   dead,
+		alt:       bind,
+		transport: TransportWSS,
+		name:      "www.bing.com",
+		altName:   "link.example.com",
+	})
+	defer tun.stop()
+
+	got, err := roundTrip(t, tun.userAddr, "over-the-cdn-name", 20*time.Second)
+	if err != nil {
+		t.Fatalf("the fallback did not carry traffic under its own name: %v", err)
+	}
+	if got != "OVER-THE-CDN-NAME" {
+		t.Fatalf("got %q", got)
+	}
 }

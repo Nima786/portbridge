@@ -100,14 +100,16 @@ func runEdge(ctx context.Context, cfg *Config, st *status) error {
 		routes := newRouter(cfg)
 		log.Printf("reaching the other server at %s", routes.describe())
 		dial = func() (net.Conn, error) {
-			raw, err := routes.dial(5 * time.Second)
+			raw, claim, err := routes.dial(5 * time.Second)
 			if err != nil {
 				return nil, err
 			}
 			tuneSocket(raw)
 			// Apply the disguise before anything of ours is sent, so the first
-			// thing on the wire is whatever the transport expects.
-			c, err := wrapDial(raw, cfg)
+			// thing on the wire is whatever the transport expects. The name comes
+			// from the route, because a fallback route may have to claim a
+			// different one.
+			c, err := wrapDial(raw, cfg.withClaimedName(claim))
 			if err != nil {
 				_ = raw.Close()
 				return nil, err

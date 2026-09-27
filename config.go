@@ -96,6 +96,17 @@ type Config struct {
 	// first cannot be reached. Only the side that dials uses it. See route.go.
 	AltTarget string
 
+	// AltServerName is the hostname to claim while using that second route.
+	//
+	// It is separate from ServerName on purpose. The second route is a CDN, and
+	// reaching it requires naming the real domain, because that is how a CDN
+	// knows whose server to forward to. The first route goes straight to the
+	// other server, where naming that same domain would be a slip: the domain's
+	// own records point at the CDN, not at that address, so the name and the
+	// destination would not agree and the pair of them together says more than
+	// either alone.
+	AltServerName string
+
 	// CertFile and KeyFile hold the certificate the accepting side presents. They
 	// are created automatically if missing.
 	CertFile string
@@ -147,6 +158,21 @@ func (c *Config) dialTarget() string {
 		}
 	}
 	return c.TunnelAddr
+}
+
+// withClaimedName returns this configuration with a different hostname claimed
+// on the wire, leaving everything else alone.
+//
+// Used when a second route has to name itself differently from the first. The
+// side that accepts does not care which name was used: it presents its
+// certificate to whoever asks and checks the shared password, not the name.
+func (c *Config) withClaimedName(name string) *Config {
+	if name == "" || name == c.ServerName {
+		return c
+	}
+	alt := *c
+	alt.ServerName = name
+	return &alt
 }
 
 func (c *Config) effectiveWSPath() string {
@@ -280,6 +306,8 @@ func (c *Config) set(key, val string) error {
 		}
 	case "alt_target":
 		c.AltTarget = val
+	case "alt_server_name":
+		c.AltServerName = val
 	case "mux":
 		switch strings.ToLower(val) {
 		case "on", "yes", "true":
@@ -432,6 +460,14 @@ func (c *Config) Validate() error {
 			return fmt.Errorf("alt_target is only used by the side that dials, and this side waits to be called")
 		}
 	}
+	if c.AltServerName != "" {
+		if c.AltTarget == "" {
+			return fmt.Errorf("alt_server_name means nothing without alt_target")
+		}
+		if ip := net.ParseIP(c.AltServerName); ip != nil {
+			return fmt.Errorf("alt_server_name must be a hostname, not the address %s", c.AltServerName)
+		}
+	}
 	if c.Mux {
 		if c.MuxLinks < 1 {
 			return fmt.Errorf("mux_links must be at least 1")
@@ -480,6 +516,9 @@ func (c *Config) Summary() string {
 		fmt.Fprintf(&b, "Dialling out to %s", c.TunnelAddr)
 		if c.AltTarget != "" {
 			fmt.Fprintf(&b, ", falling back to %s if that cannot be reached", c.AltTarget)
+			if c.AltServerName != "" && c.AltServerName != c.ServerName {
+				fmt.Fprintf(&b, " and claiming to be %s when it does", c.AltServerName)
+			}
 		}
 		b.WriteString(". ")
 	} else {

@@ -27,10 +27,24 @@ const (
 	routeRecheck = 2 * time.Minute
 )
 
-// router holds the addresses to try, in order of preference, and remembers which
+// route is one way to reach the other server: an address, and the hostname to
+// claim while using it.
+//
+// The name belongs to the route rather than to the tunnel because the two routes
+// are seen differently. Going through a CDN means naming the real domain, since
+// that is how the CDN knows whose server to forward to. Going straight to the
+// server, that same domain would not match the address, and a name that does not
+// match where the traffic is going is worth more to an onlooker than either fact
+// on its own.
+type route struct {
+	addr string
+	name string
+}
+
+// router holds the routes to try, in order of preference, and remembers which
 // one last worked.
 type router struct {
-	targets []string
+	targets []route
 
 	mu       sync.Mutex
 	current  int
@@ -40,9 +54,13 @@ type router struct {
 }
 
 func newRouter(cfg *Config) *router {
-	targets := []string{cfg.dialTarget()}
-	if alt := cfg.AltTarget; alt != "" && alt != targets[0] {
-		targets = append(targets, alt)
+	targets := []route{{addr: cfg.dialTarget(), name: cfg.ServerName}}
+	if alt := cfg.AltTarget; alt != "" && alt != targets[0].addr {
+		name := cfg.AltServerName
+		if name == "" {
+			name = cfg.ServerName
+		}
+		targets = append(targets, route{addr: alt, name: name})
 	}
 	return &router{targets: targets, log: newThrottled()}
 }
@@ -66,15 +84,16 @@ func (r *router) settle(i int) {
 	r.lastGood = time.Now()
 }
 
-// dial tries each route in turn, beginning with whichever is currently preferred.
-func (r *router) dial(timeout time.Duration) (net.Conn, error) {
+// dial tries each route in turn, beginning with whichever is currently preferred,
+// and reports the hostname the caller should claim on the connection it gets.
+func (r *router) dial(timeout time.Duration) (net.Conn, string, error) {
 	start := r.pick()
 	var lastErr error
 
 	for n := 0; n < len(r.targets); n++ {
 		i := (start + n) % len(r.targets)
 		d := net.Dialer{Timeout: timeout}
-		c, err := d.Dial("tcp", r.targets[i])
+		c, err := d.Dial("tcp", r.targets[i].addr)
 		if err != nil {
 			lastErr = err
 			continue
@@ -84,10 +103,10 @@ func (r *router) dial(timeout time.Duration) (net.Conn, error) {
 			// is exactly what someone looking into a slow or missing tunnel
 			// needs to know, and it changes rarely.
 			log.Printf("reaching the other server via %s instead of %s",
-				r.targets[i], r.targets[start])
+				r.targets[i].addr, r.targets[start].addr)
 		}
 		r.settle(i)
-		return c, nil
+		return c, r.targets[i].name, nil
 	}
 
 	if lastErr == nil {
@@ -97,14 +116,14 @@ func (r *router) dial(timeout time.Duration) (net.Conn, error) {
 		r.log.printf("none of the %d routes to the other server worked; last error: %v",
 			len(r.targets), lastErr)
 	}
-	return nil, lastErr
+	return nil, "", lastErr
 }
 
-// describeRoutes is what the startup log says, so the second route is visible
-// without reading the settings file.
+// describe is what the startup log says, so the second route is visible without
+// reading the settings file.
 func (r *router) describe() string {
 	if len(r.targets) < 2 {
-		return r.targets[0]
+		return r.targets[0].addr
 	}
-	return r.targets[0] + ", falling back to " + r.targets[1]
+	return r.targets[0].addr + ", falling back to " + r.targets[1].addr
 }

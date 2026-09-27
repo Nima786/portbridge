@@ -101,10 +101,32 @@ that name does not have to be real or yours. A certificate is generated on the
 spot. It is not checked for trust, because the shared password already proves who
 is who; the certificate is only there to make the handshake look normal.
 
-The two CDN options need a domain you control, pointed at the CDN with its proxy
-turned on. Only the third option hides your foreign server's address; the fourth
-keeps the CDN in reserve and uses the direct address while it works, which is
-faster.
+Be clear about what that option does and does not do. It stops the link being
+picked out for matching no known protocol, and it answers a genuine handshake if
+the port is probed. It does not hide where the traffic is going: your foreign
+server's address is still plainly visible, and a name claimed on the way to an
+address that does not own it is a mismatch anyone comparing the two can see. Nor
+does it help once the address itself is blocked. That is what the CDN options are
+for.
+
+The two CDN options need a domain **you** control, pointed at your foreign server
+with the CDN's proxy turned on. Somebody else's domain behind the same CDN cannot
+work: the CDN routes by name, so your traffic would be handed to their server,
+which does not have your password and would turn it away.
+
+Two more things the CDN needs, both of which the menu states at setup time:
+
+- Its encryption mode must be **Full**. Flexible sends plain traffic to your
+  server, which this refuses. Full (strict) demands a publicly trusted
+  certificate, which is unnecessary here because the shared password is what
+  proves identity.
+- The port the two servers use between themselves must be one the CDN forwards.
+  For Cloudflare that is 443, 2053, 2083, 2087, 2096 or 8443 ([their port
+  list](https://developers.cloudflare.com/fundamentals/reference/network-ports/)).
+  The menu only accepts those once you pick a CDN option.
+
+Only the third option hides your foreign server's address; the fourth keeps the
+CDN in reserve and uses the direct address while it works, which is faster.
 
 The fourth option is the answer to the most common way a working tunnel dies:
 nothing is wrong with either server, but the foreign one's address stops being
@@ -112,6 +134,14 @@ reachable. No tunnel software can fix that from the inside. Reaching the same
 server by a different name, through addresses nobody wants to block, can. When
 that happens the log says which route it moved to, and it tries the direct one
 again every couple of minutes.
+
+With that option the link claims a different name on each route, and the
+difference is deliberate. Going through the CDN it has to name your domain,
+because that is how a CDN knows whose server to forward to. Going straight to
+your server it names something ordinary instead, because your domain's own
+records point at the CDN rather than at that address, and a name that does not
+match where the traffic is going says more to an onlooker than either fact on its
+own.
 
 Either CDN option has one consequence worth knowing: the link can arrive from
 the CDN rather than from your other server, so the tunnel port cannot be locked

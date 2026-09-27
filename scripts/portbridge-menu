@@ -405,16 +405,44 @@ ask_disguise() {
     if [ "$choice" = 3 ] || [ "$choice" = 4 ]; then
         say ""
         info "A CDN routes by name, so this needs a domain you control which is"
-        info "already pointed at the CDN, with its proxy turned on."
-        DG_SERVERNAME=$(ask_domain)
+        info "already pointed at your foreign server, with the CDN's proxy turned on."
+        info "Somebody else's domain behind the same CDN cannot work: the CDN would"
+        info "hand your traffic to their server, not yours."
+        local domain
+        domain=$(ask_domain)
         DG_WSPATH="/$(head -c 9 /dev/urandom | base64 | tr -dc 'a-zA-Z0-9' | head -c 10)"
-        [ "$choice" = 4 ] && DG_ALTHOST=$DG_SERVERNAME
-        say ""
-        info "Using the web address $DG_SERVERNAME$DG_WSPATH for the link."
-        if [ "$choice" = 3 ] && [ "$mode" = reverse ]; then
-            warn "Note: a CDN only carries connections towards your domain, so with"
-            warn "reverse this only works if the domain points at THIS Iran server."
+
+        if [ "$choice" = 4 ]; then
+            # Two routes, two names. Going straight to the server must not name
+            # the domain, because that domain's records point at the CDN and not
+            # at the address being dialled, and the two not matching says more
+            # than either on its own.
+            DG_ALTHOST=$domain
+            say ""
+            info "While it is connecting straight to your foreign server it will claim"
+            info "to be some ordinary site instead of your domain, because your domain"
+            info "points at the CDN and naming it there would not add up."
+            DG_SERVERNAME=$(ask "Name to claim on the direct route" "www.bing.com")
+            [ -n "$DG_SERVERNAME" ] || DG_SERVERNAME=www.bing.com
+            say ""
+            info "Direct: claims $DG_SERVERNAME. Falling back: $domain$DG_WSPATH."
+        else
+            DG_SERVERNAME=$domain
+            say ""
+            info "Using the web address $DG_SERVERNAME$DG_WSPATH for the link."
+            if [ "$mode" = reverse ]; then
+                warn "Note: a CDN only carries connections towards your domain, so with"
+                warn "reverse this only works if the domain points at THIS Iran server."
+            fi
         fi
+
+        say ""
+        warn "Two things to set on the CDN, or the link will not come up:"
+        warn "  - its encryption mode must be Full, not Flexible and not Full Strict."
+        warn "    Flexible sends plain traffic to your server, which this refuses."
+        warn "    Strict demands a publicly trusted certificate, which this has no"
+        warn "    need for, because the shared password is what proves who is who."
+        warn "  - the port below must be one it forwards: $CDN_PORTS"
         say ""
         warn "Because the link can arrive from the CDN rather than from your other"
         warn "server, the tunnel port cannot be locked to one address, so it is left"
@@ -450,6 +478,26 @@ describe_disguise() {
 # address, because the address it arrives from is the CDN's.
 cdn_involved() {
     [ "$1" = on ] || [ -n "${2-}" ]
+}
+
+# The only ports a CDN's proxy will carry a secure connection on. A CDN is a web
+# front end, not a general forwarder: ask it for anything else and the connection
+# is simply not passed through, which looks exactly like a tunnel that does not
+# work for no reason. Cloudflare's list; the other big ones match it closely.
+CDN_PORTS="443 2053 2083 2087 2096 8443"
+
+cdn_port_ok() {
+    local p
+    for p in $CDN_PORTS; do
+        [ "$1" = "$p" ] && return 0
+    done
+    return 1
+}
+
+explain_cdn_ports() {
+    err "  A CDN will not carry a secure connection on port $1."
+    info "  It only forwards these: $CDN_PORTS"
+    info "  Pick one of those, or go back and choose a link that does not use a CDN."
 }
 
 # ------------------------------------------------------------------- sharing
@@ -631,6 +679,9 @@ write_tunnel() {
             { [ "$mode:$role" = "direct:edge" ] || [ "$mode:$role" = "reverse:origin" ]; }; then
             printf '\n# If the address above cannot be reached, try this instead.\n'
             printf 'alt_target = %s:%s\n' "$DG_ALTHOST" "${taddr##*:}"
+            printf '# The CDN routes by name, so this route has to name the domain,\n'
+            printf '# while the direct route above deliberately does not.\n'
+            printf 'alt_server_name = %s\n' "$DG_ALTHOST"
         fi
 
         printf '\n# on = every user session shares a few long-lived connections.\n'
@@ -790,6 +841,9 @@ create_tunnel() {
     info "Last port: a private one the two servers use between themselves."
     info "Your users never see it. 443 is suggested because it is the port normal"
     info "websites use, so this link does not stand out."
+    if cdn_involved "$DG_CDN" "$DG_ALTHOST"; then
+        info "With a CDN in the picture it has to be one of: $CDN_PORTS"
+    fi
     while :; do
         if [ "$mode" = reverse ]; then
             # Reverse: it is opened here on the Iran server, so check it here.
@@ -801,6 +855,12 @@ create_tunnel() {
         else
             # Direct: it is opened on the foreign server, so it cannot be checked here.
             tport=$(ask_remote_port "Port between the two servers" "$DEFAULT_TUNNEL_PORT" link)
+        fi
+        # A CDN only forwards a handful of ports, so anything else would leave the
+        # tunnel silently unable to come up.
+        if cdn_involved "$DG_CDN" "$DG_ALTHOST" && ! cdn_port_ok "$tport"; then
+            explain_cdn_ports "$tport"
+            continue
         fi
         break
     done
@@ -844,7 +904,10 @@ create_tunnel() {
     fi
     say "  link appearance    $(describe_disguise "$DG_TRANSPORT" "$DG_CDN" "$DG_ALTHOST")"
     [ -n "$DG_SERVERNAME" ] && say "  claims to be       $DG_SERVERNAME$DG_WSPATH"
-    [ -n "$DG_ALTHOST" ] && say "  if that is blocked  it moves to $DG_ALTHOST:$tport by itself"
+    if [ -n "$DG_ALTHOST" ]; then
+        say "  if that is blocked it moves to $DG_ALTHOST:$tport through the CDN,"
+        say "                     claiming $DG_ALTHOST$DG_WSPATH from then on"
+    fi
     say "  connections        $(describe_sharing "$MX_MUX" "$MX_LINKS")"
     hr
     confirm "Set it up?" || { say "Cancelled. Nothing was changed."; return 1; }
@@ -1356,6 +1419,14 @@ test_tunnel() {
     result "link appearance" note "$(describe_disguise "$transport" "$cdn" "$alt")"
     result "connections" note "$(describe_sharing "$mux" "$(read_conf "$name" mux_links)")"
 
+    # A tunnel made before this check existed, or edited by hand, can end up on a
+    # port no CDN will carry. That looks like a tunnel broken for no reason.
+    if cdn_involved "$cdn" "$alt" && ! cdn_port_ok "${taddr##*:}"; then
+        result "port a CDN will carry" bad "no, ${taddr##*:} is not one of them"
+        note "A CDN only forwards these: $CDN_PORTS"
+        note "Make the tunnel again on one of those, or the CDN route cannot work."
+    fi
+
     if [ -n "$alt" ]; then
         if timeout 8 bash -c "echo > /dev/tcp/${alt%:*}/${alt##*:}" 2>/dev/null; then
             result "backup route" good "ready, $alt"
@@ -1376,9 +1447,15 @@ test_tunnel() {
 
     # A mismatched disguise looks exactly like a wrong password from the log, so
     # call it out separately or it sends people hunting the wrong problem.
-    local tlsfail
-    tlsfail=$(journalctl -u "$(unit_of "$name")" --since "-10 min" --no-pager 2>/dev/null |
-        grep -ciE 'securing the link failed|websocket upgrade' || true)
+    #
+    # Only worth raising while the two servers are not talking. If the link is up,
+    # they evidently agree, and complaining about it on the strength of an old log
+    # line sends someone to rebuild a tunnel that is working perfectly well.
+    local tlsfail=0
+    if [ -z "$spares" ] || [ "$spares" -le 0 ] 2>/dev/null; then
+        tlsfail=$(journalctl -u "$(unit_of "$name")" --since "-10 min" --no-pager 2>/dev/null |
+            grep -ciE 'securing the link failed|websocket upgrade' || true)
+    fi
     if [ "${tlsfail:-0}" -gt 0 ]; then
         say ""
         printf '  %s%s%s\n' "$RED" "The two servers disagree about how the link should look." "$R"
@@ -1399,14 +1476,23 @@ test_tunnel() {
     skew=$(journalctl -u "$(unit_of "$name")" --since "-10 min" --no-pager 2>/dev/null |
         grep -ci 'clocks differ' || true)
 
+    # Same reasoning as above: while the link is up, refusals are strangers
+    # knocking on a public port, not the other server failing to get in.
+    local linked=no
+    [ -n "$spares" ] && [ "$spares" -gt 0 ] 2>/dev/null && linked=yes
+
     if [ "${rejects:-0}" -gt 0 ]; then
-        say ""
-        printf '  %s%s%s\n' "$RED" "The password does not match: $rejects refusals in the last 10 minutes." "$R"
-        note "Delete this tunnel on your foreign server, then join again with the"
-        note "code from 'Show a tunnel's code' on your Iran server."
-        fail=$((fail + 1))
+        if [ "$linked" = yes ]; then
+            result "turned away wrong password" note "$rejects, from somewhere that is not your other server"
+        else
+            say ""
+            printf '  %s%s%s\n' "$RED" "The password does not match: $rejects refusals in the last 10 minutes." "$R"
+            note "Delete this tunnel on your foreign server, then join again with the"
+            note "code from 'Show a tunnel's code' on your Iran server."
+            fail=$((fail + 1))
+        fi
     fi
-    if [ "${skew:-0}" -gt 0 ]; then
+    if [ "${skew:-0}" -gt 0 ] && [ "$linked" = no ]; then
         say ""
         printf '  %s%s%s\n' "$RED" "The two servers' clocks disagree." "$R"
         note "Run this on both: timedatectl set-ntp true"
