@@ -6,6 +6,7 @@ import (
 	"io"
 	"math/rand"
 	"net"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -424,5 +425,65 @@ func TestMuxDeadlineHelper(t *testing.T) {
 	case <-d.wait():
 	case <-time.After(2 * time.Second):
 		t.Fatal("never fired")
+	}
+}
+
+// If one end shares connections and the other does not, they must fail plainly
+// rather than half-work.
+//
+// The pairing code stops the two ends disagreeing by accident, so this guards
+// against a settings file edited by hand. It is worth guarding: when the frame
+// numbers overlapped the session signals, the side not sharing read the first
+// frame as a valid instruction, went off and opened a real connection to the
+// service, and replied. Nothing failed until much later, and what surfaced was an
+// unexplained end-of-file rather than anything pointing at the cause.
+func TestMuxFrameTypesCannotBeMistakenForSessionSignals(t *testing.T) {
+	// protoVersion shares its value with the activate signal already, which is
+	// harmless because they are never read in the same place. Listed once.
+	sessionBytes := map[byte]string{
+		msgActivate:  "activate",
+		msgAck:       "acknowledgement",
+		rejClockSkew: "clock skew refusal",
+		rejReplay:    "replay refusal",
+	}
+	frames := map[byte]string{
+		muxOpen:   "open",
+		muxData:   "data",
+		muxCredit: "credit",
+		muxFin:    "finished",
+		muxReset:  "reset",
+		muxPing:   "ping",
+		muxPong:   "pong",
+	}
+
+	for value, frame := range frames {
+		if name, clash := sessionBytes[value]; clash {
+			t.Fatalf("the %s frame uses %#x, which is also the %s signal", frame, value, name)
+		}
+	}
+
+	// And the other way round: a session signal must not read as a known frame,
+	// so the sharing end refuses it instead of acting on it.
+	for value, name := range sessionBytes {
+		if frame, clash := frames[value]; clash {
+			t.Fatalf("the %s signal uses %#x, which is also the %s frame", name, value, frame)
+		}
+	}
+}
+
+// A session signal arriving where a frame was expected must end the link with
+// something a log reader can act on.
+func TestMuxRefusesASessionSignalAsAFrame(t *testing.T) {
+	a, b := net.Pipe()
+	defer a.Close()
+	defer b.Close()
+
+	c := newCarrier(a)
+	err := c.handle(msgAck, 0, nil)
+	if err == nil {
+		t.Fatal("an acknowledgement byte was accepted as a frame")
+	}
+	if !strings.Contains(err.Error(), "unknown frame type") {
+		t.Fatalf("the complaint was %q, which does not say what went wrong", err)
 	}
 }

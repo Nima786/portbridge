@@ -46,14 +46,28 @@ import (
 //	Only the edge ever opens a stream, because only the edge knows when a user
 //	has arrived. That removes any question of the two ends picking the same
 //	stream number, whichever of them dialled.
+//
+// Frame types deliberately start well clear of the one-byte session signals in
+// auth.go, and share no value with them.
+//
+// That is not tidiness. If one end shares connections and the other does not,
+// they will talk past each other, and what happens next depends entirely on these
+// numbers. Overlapping values were read as a valid signal by the other side,
+// which then went on to open a real connection to the service and reply, and the
+// muddle only surfaced later as an unexplained end-of-file. Distinct values mean
+// the first frame either end sees is plainly not what it expected, so it refuses
+// the connection and says so.
+//
+// The pairing code already carries the choice, so the two ends cannot disagree by
+// accident. This is for the case where someone edits a settings file by hand.
 const (
-	muxOpen   byte = 1 // edge -> origin: a new session is starting
-	muxData   byte = 2 // payload for one stream
-	muxCredit byte = 3 // 4B: this many more bytes may be sent to me
-	muxFin    byte = 4 // I have finished sending on this stream
-	muxReset  byte = 5 // this stream is over
-	muxPing   byte = 6 // is this link still alive?
-	muxPong   byte = 7 // yes
+	muxOpen   byte = 0x21 // edge -> origin: a new session is starting
+	muxData   byte = 0x22 // payload for one stream
+	muxCredit byte = 0x23 // 4B: this many more bytes may be sent to me
+	muxFin    byte = 0x24 // I have finished sending on this stream
+	muxReset  byte = 0x25 // this stream is over
+	muxPing   byte = 0x26 // is this link still alive?
+	muxPong   byte = 0x27 // yes
 )
 
 const (
