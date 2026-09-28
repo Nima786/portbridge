@@ -8,6 +8,11 @@ import (
 	"time"
 )
 
+// hasKernelCopy says the kernel can move bytes straight from one socket to
+// another on its own, via splice(2), so a plain link needs no copy buffer of
+// ours at all.
+const hasKernelCopy = true
+
 // tuneSocket enables keepalive aggressive enough to notice a silently dropped
 // path within roughly 45 seconds: probe after 30s idle, then three probes five
 // seconds apart.

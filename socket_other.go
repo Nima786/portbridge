@@ -10,6 +10,11 @@ import (
 // Portable stand-ins so the program compiles and can be tested off Linux.
 // Production runs on Linux and uses socket_linux.go.
 
+// hasKernelCopy is false here because splice(2) is a Linux facility. Copying
+// goes through a borrowed buffer instead, which is correct everywhere and only
+// slower than the kernel doing it.
+const hasKernelCopy = false
+
 // tuneSocket applies only the portable part of the tuning. Probe interval and
 // probe count need platform-specific calls, so dead-path detection here falls
 // back to the operating system default, which is far slower than on Linux.

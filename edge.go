@@ -53,6 +53,16 @@ var (
 	errUserWentAway = errors.New("user disconnected before sending anything")
 )
 
+// headPool lends out room to read a user's opening bytes into. Reused rather
+// than allocated per user, because on a public port most connections that reach
+// here are port scans that send nothing at all.
+var headPool = sync.Pool{
+	New: func() interface{} {
+		b := make([]byte, headBufferSize)
+		return &b
+	},
+}
+
 // edge faces the users. It holds the pool of ready connections and tells the
 // origin when a user turns up. Its behaviour is the same in both modes; only the
 // way the pool gets filled differs.
@@ -275,20 +285,29 @@ func (e *edge) acceptTunnel(ctx context.Context, ln net.Listener) {
 // serve moves one user across the tunnel, quietly retrying on a fresh connection
 // if a spare turns out to be dead.
 func (e *edge) serve(ctx context.Context, user net.Conn) error {
-	tuneSocket(user)
-
 	// Capture the opening bytes so they can be replayed if the first attempt
 	// fails. Every protocol used here speaks first, so this returns at once.
-	head := make([]byte, headBufferSize)
+	//
+	// The read uses a borrowed buffer and only what arrived is kept. Those
+	// opening bytes have to be held for as long as the session might need a
+	// retry, and every protocol involved opens with tens of bytes, so holding a
+	// whole 16 KB buffer per session to keep sixty bytes would waste tens of
+	// megabytes at capacity for nothing.
+	scratch := headPool.Get().(*[]byte)
 	_ = user.SetReadDeadline(time.Now().Add(headWaitTimeout))
-	n, err := user.Read(head)
+	n, err := user.Read(*scratch)
 	_ = user.SetReadDeadline(time.Time{})
+	var head []byte
+	if n > 0 {
+		head = make([]byte, n)
+		copy(head, (*scratch)[:n])
+	}
+	headPool.Put(scratch)
 	if n == 0 && err != nil && !isTimeout(err) {
 		// Connected then vanished without a word: almost always a port scan.
 		// Do not spend a tunnel connection on it, and do not log it.
 		return fmt.Errorf("%w: %v", errUserWentAway, err)
 	}
-	head = head[:n]
 
 	var lastErr error
 	for attempt := 1; attempt <= maxActivateTries; attempt++ {
