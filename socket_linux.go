@@ -22,21 +22,26 @@ const hasKernelCopy = true
 // traffic keeps stateful firewalls and NAT devices along the route from
 // forgetting a parked spare, which is what makes long-lived spares safe and
 // keeps connection churn across the border low.
+// Everything is set in one go, deliberately. The obvious way, through the
+// standard keepalive helpers, takes three separate trips into the socket and
+// writes two of these values only to have them overwritten a moment later. Every
+// connection on both servers passes through here, so the difference shows up in
+// the processor time per user.
 func tuneSocket(c net.Conn) {
 	tc, ok := c.(*net.TCPConn)
 	if !ok {
 		return
 	}
-	_ = tc.SetKeepAlive(true)
-	_ = tc.SetKeepAlivePeriod(30 * time.Second)
-
 	raw, err := tc.SyscallConn()
 	if err != nil {
+		// Fall back to the portable helpers rather than leaving a connection
+		// with no keepalive at all.
+		_ = tc.SetKeepAlive(true)
+		_ = tc.SetKeepAlivePeriod(30 * time.Second)
 		return
 	}
-	// Applied after SetKeepAlivePeriod, which writes both TCP_KEEPIDLE and
-	// TCP_KEEPINTVL; these calls deliberately override the interval and count.
 	_ = raw.Control(func(fd uintptr) {
+		_ = syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_KEEPALIVE, 1)
 		_ = syscall.SetsockoptInt(int(fd), syscall.IPPROTO_TCP, syscall.TCP_KEEPIDLE, 30)
 		_ = syscall.SetsockoptInt(int(fd), syscall.IPPROTO_TCP, syscall.TCP_KEEPINTVL, 5)
 		_ = syscall.SetsockoptInt(int(fd), syscall.IPPROTO_TCP, syscall.TCP_KEEPCNT, 3)

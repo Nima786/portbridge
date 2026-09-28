@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"crypto/tls"
 	"fmt"
 	"net"
 	"os"
@@ -122,6 +123,13 @@ type Config struct {
 	MuxLinks int
 
 	secret []byte
+
+	// Disguise settings prepared once at startup and only read afterwards. They
+	// are what makes a repeat connection cheap; see prepareTLS in transport.go
+	// for why building them per connection was costing more than everything else
+	// put together.
+	tlsServer  *tls.Config
+	tlsClients map[string]*tls.Config
 }
 
 // effectiveServerName falls back to the peer address when no name was given, so

@@ -621,3 +621,113 @@ func TestSummaryNamesTheDisguise(t *testing.T) {
 		t.Errorf("summary mentions a CDN when none is configured: %s", got)
 	}
 }
+
+// Repeat connections on a disguised link must resume the previous session
+// instead of negotiating from scratch.
+//
+// This is the single most expensive thing either server does: measured on a real
+// machine, setting up the disguise accounted for more than half of all processor
+// time on a disguised tunnel, because one connection is spent per user and a full
+// negotiation was paid to replace it. Resumption only works if both ends keep
+// their settings between connections, which is exactly what is easy to undo by
+// accident, and nothing else in the program would notice if it broke.
+func TestDisguisedLinkResumesInsteadOfRenegotiating(t *testing.T) {
+	for _, tr := range []Transport{TransportTLS, TransportWSS} {
+		t.Run(string(tr), func(t *testing.T) {
+			certFile, keyFile := certPaths(t)
+			cert, err := ensureCert(certFile, keyFile, "www.example.com")
+			if err != nil {
+				t.Fatalf("cert: %v", err)
+			}
+
+			// Both sides, prepared the way a running tunnel prepares them.
+			accepting := defaultConfig()
+			accepting.Transport = tr
+			accepting.ServerName = "www.example.com"
+			accepting.WSPath = "/tunnel"
+			accepting.Mode = ModeDirect
+			accepting.Role = RoleOrigin // accepts in direct mode
+			accepting.prepareTLS(&cert)
+
+			dialling := defaultConfig()
+			dialling.Transport = tr
+			dialling.ServerName = "www.example.com"
+			dialling.WSPath = "/tunnel"
+			dialling.Mode = ModeDirect
+			dialling.Role = RoleEdge // dials in direct mode
+			dialling.TunnelAddr = "127.0.0.1:1"
+			dialling.prepareTLS(nil)
+
+			ln, err := net.Listen("tcp", "127.0.0.1:0")
+			if err != nil {
+				t.Fatalf("listen: %v", err)
+			}
+			defer ln.Close()
+
+			go func() {
+				for {
+					raw, err := ln.Accept()
+					if err != nil {
+						return
+					}
+					go func(raw net.Conn) {
+						c, err := wrapAccept(raw, accepting, &cert)
+						if err != nil {
+							_ = raw.Close()
+							return
+						}
+						// One byte back, as the real handshake does. It matters:
+						// the resumable session is offered by the accepting side
+						// after the negotiation finishes, so the dialling side
+						// only learns of it when it next reads. In the running
+						// tunnel that read is the one waiting to be told a user
+						// has arrived.
+						_, _ = c.Write([]byte{msgAck})
+						time.Sleep(150 * time.Millisecond)
+						_ = c.Close()
+					}(raw)
+				}
+			}()
+
+			resumed := 0
+			const attempts = 4
+			for i := 0; i < attempts; i++ {
+				raw, err := net.Dial("tcp", ln.Addr().String())
+				if err != nil {
+					t.Fatalf("dial %d: %v", i, err)
+				}
+				c, err := wrapDial(raw, dialling)
+				if err != nil {
+					t.Fatalf("connection %d failed: %v", i, err)
+				}
+				var one [1]byte
+				_ = c.SetReadDeadline(time.Now().Add(5 * time.Second))
+				if _, err := io.ReadFull(c, one[:]); err != nil {
+					t.Fatalf("connection %d never heard back: %v", i, err)
+				}
+				_ = c.SetReadDeadline(time.Time{})
+
+				// The websocket disguise wraps the secured connection, so reach
+				// through it for the one underneath.
+				under := c
+				if ws, ok := c.(*wsConn); ok {
+					under = ws.Conn
+				}
+				tc, ok := under.(*tls.Conn)
+				if !ok {
+					t.Fatalf("connection %d is not a secured connection: %T", i, under)
+				}
+				st := tc.ConnectionState()
+				if st.DidResume {
+					resumed++
+				}
+				_ = c.Close()
+				time.Sleep(150 * time.Millisecond)
+			}
+
+			if resumed == 0 {
+				t.Fatalf("none of %d repeat connections resumed, so every user pays for a full negotiation", attempts)
+			}
+		})
+	}
+}

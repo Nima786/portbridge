@@ -103,6 +103,18 @@ func runEdge(ctx context.Context, cfg *Config, st *status) error {
 		logRelay:    newThrottled(),
 	}
 
+	// In reverse mode this side accepts, so it needs a certificate before the
+	// disguise can be prepared. Both are set up together, once, because a
+	// connection that has to build its own is the most expensive kind.
+	if cfg.Transport != TransportPlain && cfg.Mode == ModeReverse {
+		cert, err := ensureCert(cfg.CertFile, cfg.KeyFile, cfg.effectiveServerName())
+		if err != nil {
+			return fmt.Errorf("preparing the disguise: %w", err)
+		}
+		e.cert = &cert
+	}
+	cfg.prepareTLS(e.cert)
+
 	// Direct mode: we dial the origin ourselves, so connections can be built on
 	// demand. Reverse mode: we cannot dial anywhere, so we wait to be called.
 	var dial func() (net.Conn, error)
@@ -147,13 +159,6 @@ func runEdge(ctx context.Context, cfg *Config, st *status) error {
 
 	// In reverse mode we also listen for the origin's incoming connections.
 	if cfg.Mode == ModeReverse {
-		if cfg.Transport != TransportPlain {
-			cert, err := ensureCert(cfg.CertFile, cfg.KeyFile, cfg.effectiveServerName())
-			if err != nil {
-				return fmt.Errorf("preparing the disguise: %w", err)
-			}
-			e.cert = &cert
-		}
 		tunnelLn, err := net.Listen("tcp", cfg.TunnelAddr)
 		if err != nil {
 			return err

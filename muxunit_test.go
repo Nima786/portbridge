@@ -2,7 +2,9 @@ package main
 
 import (
 	"bytes"
+	"encoding/binary"
 	"errors"
+	"fmt"
 	"io"
 	"math/rand"
 	"net"
@@ -370,7 +372,8 @@ func TestMuxPingIsAnswered(t *testing.T) {
 		t.Fatalf("handling a ping: %v", err)
 	}
 	select {
-	case frame := <-c.ctrl:
+	case queued := <-c.ctrl:
+		frame := *queued
 		if len(frame) != muxHeaderLen || frame[0] != muxPong {
 			t.Fatalf("expected a pong, got %v", frame)
 		}
@@ -606,5 +609,215 @@ func TestMuxWindowGrowthIsReturnedOnClose(t *testing.T) {
 	_ = down.Close()
 	if again := atomic.LoadInt64(&cb.growLeft); again != after {
 		t.Fatalf("closing again changed the budget from %d to %d", after, again)
+	}
+}
+
+// The receive buffer was reworked from appending to a slice into a pair of
+// offsets, which is the sort of change that silently loses or duplicates bytes.
+// This drives it through the awkward cases: partial reads, refills while data is
+// still unread, and a reader that drains exactly to the end.
+func TestMuxReceiveBufferKeepsEveryByteInOrder(t *testing.T) {
+	t.Parallel()
+
+	a, b := net.Pipe()
+	defer a.Close()
+	defer b.Close()
+	c := newCarrier(a)
+	s := newMuxStream(c, 1, false)
+
+	var want []byte
+	var got []byte
+
+	// Deliver in uneven pieces and read back in uneven pieces, so the offsets
+	// are rarely aligned with anything.
+	piece := 0
+	for round := 0; round < 200; round++ {
+		for i := 0; i < 3; i++ {
+			piece++
+			chunk := bytes.Repeat([]byte{byte(piece)}, 1+piece%997)
+			if err := s.deliver(chunk); err != nil {
+				t.Fatalf("delivering piece %d: %v", piece, err)
+			}
+			want = append(want, chunk...)
+		}
+		// Read back less than was delivered, so a backlog builds and the buffer
+		// has to make room around unread bytes.
+		out := make([]byte, 1+round%500)
+		n, err := s.Read(out)
+		if err != nil {
+			t.Fatalf("read in round %d: %v", round, err)
+		}
+		got = append(got, out[:n]...)
+	}
+
+	s.finish()
+	for {
+		out := make([]byte, 4096)
+		n, err := s.Read(out)
+		got = append(got, out[:n]...)
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			t.Fatalf("draining: %v", err)
+		}
+	}
+
+	if !bytes.Equal(got, want) {
+		t.Fatalf("read back %d bytes, expected %d, and they do not match", len(got), len(want))
+	}
+}
+
+// Once a reader has taken everything, the buffer must go back to the start
+// rather than creep forward, or a long session would grow a buffer for ever.
+func TestMuxReceiveBufferResetsWhenDrained(t *testing.T) {
+	t.Parallel()
+
+	a, b := net.Pipe()
+	defer a.Close()
+	defer b.Close()
+	c := newCarrier(a)
+	s := newMuxStream(c, 1, false)
+
+	chunk := bytes.Repeat([]byte("x"), 8192)
+	out := make([]byte, 8192)
+
+	for i := 0; i < 50; i++ {
+		if err := s.deliver(chunk); err != nil {
+			t.Fatalf("deliver: %v", err)
+		}
+		if _, err := io.ReadFull(s, out); err != nil {
+			t.Fatalf("read: %v", err)
+		}
+	}
+
+	s.rmu.Lock()
+	start, end, size := s.rstart, s.rend, len(s.rbuf)
+	s.rmu.Unlock()
+
+	if start != 0 || end != 0 {
+		t.Fatalf("a drained buffer still points at %d:%d", start, end)
+	}
+	if size > muxMaxPayload {
+		t.Fatalf("a drained buffer grew to %d bytes after steady traffic", size)
+	}
+}
+
+// The window is the promise of how much may be in flight. Breaking it has to be
+// caught, because it is the only thing bounding memory per session.
+func TestMuxOverflowStillRefused(t *testing.T) {
+	t.Parallel()
+
+	a, b := net.Pipe()
+	defer a.Close()
+	defer b.Close()
+	c := newCarrier(a)
+	s := newMuxStream(c, 1, false)
+
+	chunk := bytes.Repeat([]byte("y"), muxMaxPayload)
+	delivered := 0
+	for {
+		err := s.deliver(chunk)
+		if err == nil {
+			delivered += len(chunk)
+			if delivered > muxWindowStart*4 {
+				t.Fatal("the window was never enforced")
+			}
+			continue
+		}
+		if !errors.Is(err, errMuxOverflow) {
+			t.Fatalf("got %v, expected the overflow refusal", err)
+		}
+		break
+	}
+	if delivered > muxWindowStart {
+		t.Fatalf("accepted %d bytes against a window of %d", delivered, muxWindowStart)
+	}
+}
+
+// Frame buffers are now borrowed and returned. If one were returned while still
+// queued, two frames would share memory and the link would carry nonsense, so
+// check that what comes off the wire is exactly what was sent.
+func TestMuxFrameBuffersAreSafeToReuse(t *testing.T) {
+	t.Parallel()
+
+	a, b := net.Pipe()
+	defer a.Close()
+	defer b.Close()
+
+	c := newCarrier(a)
+	c.start()
+	defer c.fail(errMuxClosed)
+
+	const streams = 8
+	const rounds = 40
+
+	// Read the wire and check each frame as it arrives. Checking here rather
+	// than collecting first matters: nothing may hold the wire up, or the link
+	// would conclude it had gone quiet and tear itself down.
+	var seen int64
+	bad := make(chan string, 1)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		hdr := make([]byte, muxHeaderLen)
+		body := make([]byte, 64*1024)
+		for atomic.LoadInt64(&seen) < streams*rounds {
+			if _, err := io.ReadFull(b, hdr); err != nil {
+				return
+			}
+			n := int(binary.BigEndian.Uint16(hdr[5:7]))
+			if n > 0 {
+				if _, err := io.ReadFull(b, body[:n]); err != nil {
+					return
+				}
+			}
+			if hdr[0] != muxData {
+				continue
+			}
+			id := binary.BigEndian.Uint32(hdr[1:5])
+			// Every byte of a data frame must be the number of the session that
+			// sent it. Anything else means two frames shared a buffer.
+			for _, ch := range body[:n] {
+				if uint32(ch) != id {
+					select {
+					case bad <- fmt.Sprintf("session %d carried a byte belonging to %d", id, ch):
+					default:
+					}
+					return
+				}
+			}
+			atomic.AddInt64(&seen, 1)
+		}
+	}()
+
+	var wg sync.WaitGroup
+	for i := 1; i <= streams; i++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			s := newMuxStream(c, uint32(id), false)
+			for r := 0; r < rounds; r++ {
+				body := bytes.Repeat([]byte{byte(id)}, 1000+r)
+				if _, err := s.Write(body); err != nil {
+					return
+				}
+			}
+		}(i)
+	}
+	wg.Wait()
+
+	select {
+	case <-done:
+	case <-time.After(15 * time.Second):
+		t.Fatalf("only %d of %d frames arrived", atomic.LoadInt64(&seen), streams*rounds)
+	}
+	select {
+	case msg := <-bad:
+		t.Fatal(msg)
+	default:
+	}
+	if got := atomic.LoadInt64(&seen); got != streams*rounds {
+		t.Fatalf("saw %d frames, expected %d", got, streams*rounds)
 	}
 }

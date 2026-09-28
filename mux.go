@@ -225,9 +225,20 @@ type muxStream struct {
 	id uint32
 	c  *carrier
 
-	// Receiving.
+	// Receiving. Unread bytes are rbuf[rstart:rend], and rbuf is always kept at
+	// its full length so the space after rend can be written into directly.
+	//
+	// An explicit pair of offsets rather than appending to a slice and reslicing
+	// it. Appending looked harmless and was the single most expensive thing on
+	// this path: growing the slice and shifting its contents accounted for
+	// nearly a third of the processor time on a large transfer. With offsets, a
+	// reader that keeps up leaves the buffer empty each time, so it is reset to
+	// the start instead of growing, and one frame's worth of space serves the
+	// whole session.
 	rmu        sync.Mutex
 	rbuf       []byte
+	rstart     int
+	rend       int
 	uncredited int  // consumed by the reader, not yet credited back
 	finished   bool // the far side has finished sending
 	rwin       int  // how much the far side may have in flight to us
@@ -302,17 +313,59 @@ func (s *muxStream) reason() error {
 
 // deliver hands the stream data that arrived for it. Called only from the
 // carrier's reader, so it must never block.
+//
+// It copies, and has to: the reader hands over a buffer it reuses for the next
+// frame, so anything kept must be kept somewhere of our own.
 func (s *muxStream) deliver(p []byte) error {
 	s.rmu.Lock()
-	if len(s.rbuf)+len(p) > s.rwin {
+	if s.rend-s.rstart+len(p) > s.rwin {
 		s.rmu.Unlock()
 		return errMuxOverflow
 	}
-	s.rbuf = append(s.rbuf, p...)
+	s.stash(p)
 	s.rmu.Unlock()
 	poke(s.rready)
 	return nil
 }
+
+// stash puts p at the end of the receive buffer, making room first. Called with
+// rmu held.
+//
+// Room is found in the cheapest way that works: usually there is space already;
+// otherwise sliding the unread bytes back to the front is enough, which is the
+// normal case for a reader that is keeping up; only a reader falling behind
+// makes the buffer bigger.
+func (s *muxStream) stash(p []byte) {
+	held := s.rend - s.rstart
+
+	if len(s.rbuf)-s.rend < len(p) {
+		switch {
+		case len(s.rbuf)-held >= len(p):
+			copy(s.rbuf, s.rbuf[s.rstart:s.rend])
+		default:
+			// Doubling, so a steady stream stops reallocating after a couple of
+			// rounds while a short session keeps a buffer its own size. A fixed
+			// floor of one frame's worth was tried and was worse: the many short
+			// sessions each churned thirty-two kilobytes to hold a few hundred
+			// bytes.
+			size := held + len(p)
+			if grow := 2 * len(s.rbuf); size < grow {
+				size = grow
+			}
+			grown := make([]byte, size)
+			copy(grown, s.rbuf[s.rstart:s.rend])
+			s.rbuf = grown
+		}
+		s.rstart, s.rend = 0, held
+	}
+
+	copy(s.rbuf[s.rend:], p)
+	s.rend += len(p)
+}
+
+// buffered reports how much has arrived and not yet been read. Called with rmu
+// held.
+func (s *muxStream) buffered() int { return s.rend - s.rstart }
 
 // finish records that the far side has stopped sending. Anything already
 // buffered is still readable first, which is what makes a clean half-close work.
@@ -326,14 +379,19 @@ func (s *muxStream) finish() {
 func (s *muxStream) Read(p []byte) (int, error) {
 	for {
 		s.rmu.Lock()
-		if len(s.rbuf) > 0 {
-			n := copy(p, s.rbuf)
-			s.rbuf = s.rbuf[n:]
-			// Drop the backing array once drained, so a long session does not
-			// hold on to a peak-sized buffer for ever.
-			drained := len(s.rbuf) == 0
+		if s.buffered() > 0 {
+			n := copy(p, s.rbuf[s.rstart:s.rend])
+			s.rstart += n
+			drained := s.rstart == s.rend
 			if drained {
-				s.rbuf = nil
+				s.rstart, s.rend = 0, 0
+				// Let go of a buffer that only grew to absorb a backlog, so a
+				// long session does not hold its peak size for ever. Anything up
+				// to one frame's worth is kept, because that is the buffer being
+				// reused from one frame to the next.
+				if len(s.rbuf) > muxMaxPayload {
+					s.rbuf = nil
+				}
 			}
 			s.uncredited += n
 			give := 0
@@ -379,7 +437,7 @@ func (s *muxStream) Read(p []byte) (int, error) {
 			// Buffered data still counts: loop once more so the last of it is
 			// handed over before reporting the end.
 			s.rmu.Lock()
-			pending := len(s.rbuf) > 0
+			pending := s.buffered() > 0
 			s.rmu.Unlock()
 			if pending {
 				continue
@@ -534,21 +592,72 @@ type muxFrame struct {
 	payload []byte
 }
 
-func encodeFrames(frames ...muxFrame) []byte {
+// frameBufSize is the size of a pooled frame buffer: a session-opening frame
+// followed by a full frame of data, which is the largest thing ever queued.
+const frameBufSize = 2*muxHeaderLen + muxMaxPayload
+
+// framePool lends out the buffers data frames are assembled in.
+//
+// A frame has to be copied rather than pointed at, because it is queued for the
+// one goroutine that owns the wire while the caller goes back to reusing its own
+// buffer. The copy is unavoidable; allocating fresh room for it every time was
+// not.
+//
+// Only large frames come from here. Handing a credit or a keepalive a buffer
+// meant for a full frame of data was measurably worse than letting it allocate
+// its own dozen bytes: those small frames are the most frequent thing on a busy
+// link, and each one was churning thirty-two kilobytes.
+var framePool = sync.Pool{
+	New: func() interface{} {
+		b := make([]byte, 0, frameBufSize)
+		return &b
+	},
+}
+
+// frameSmall is the size below which a frame is cheaper to allocate outright
+// than to borrow room for. Every control frame is far below it.
+const frameSmall = 512
+
+func encodeFrames(frames ...muxFrame) *[]byte {
 	total := 0
 	for _, f := range frames {
 		total += muxHeaderLen + len(f.payload)
 	}
-	buf := make([]byte, 0, total)
+
+	var buf *[]byte
+	switch {
+	case total <= frameSmall:
+		small := make([]byte, 0, total)
+		buf = &small
+	default:
+		buf = framePool.Get().(*[]byte)
+		if cap(*buf) < total {
+			grown := make([]byte, 0, total)
+			buf = &grown
+		}
+	}
+
+	b := (*buf)[:0]
 	for _, f := range frames {
 		var hdr [muxHeaderLen]byte
 		hdr[0] = f.typ
 		binary.BigEndian.PutUint32(hdr[1:5], f.id)
 		binary.BigEndian.PutUint16(hdr[5:7], uint16(len(f.payload)))
-		buf = append(buf, hdr[:]...)
-		buf = append(buf, f.payload...)
+		b = append(b, hdr[:]...)
+		b = append(b, f.payload...)
 	}
+	*buf = b
 	return buf
+}
+
+// recycleFrame returns a frame buffer for reuse. Only the goroutine that has
+// finished with a buffer may call it, which is the one that wrote it to the wire
+// or the one that gave up on queueing it.
+func recycleFrame(b *[]byte) {
+	if cap(*b) == frameBufSize {
+		*b = (*b)[:0]
+		framePool.Put(b)
+	}
 }
 
 // carrier is one real connection across the border, carrying many streams.
@@ -560,8 +669,8 @@ func encodeFrames(frames ...muxFrame) []byte {
 type carrier struct {
 	conn net.Conn
 
-	ctrl chan []byte
-	data chan []byte
+	ctrl chan *[]byte
+	data chan *[]byte
 
 	mu      sync.Mutex
 	streams map[uint32]*muxStream
@@ -612,8 +721,8 @@ func (c *carrier) returnGrow(n int) {
 func newCarrier(conn net.Conn) *carrier {
 	c := &carrier{
 		conn:     conn,
-		ctrl:     make(chan []byte, muxCtrlQueue),
-		data:     make(chan []byte, muxDataQueue),
+		ctrl:     make(chan *[]byte, muxCtrlQueue),
+		data:     make(chan *[]byte, muxDataQueue),
 		streams:  make(map[uint32]*muxStream),
 		nextID:   1,
 		incoming: make(chan *muxStream, 64),
@@ -634,10 +743,13 @@ func (c *carrier) start() {
 // queue is full the link is wedged beyond use, so it is torn down rather than
 // left to hang.
 func (c *carrier) sendControl(frames ...muxFrame) {
+	buf := encodeFrames(frames...)
 	select {
-	case c.ctrl <- encodeFrames(frames...):
+	case c.ctrl <- buf:
 	case <-c.done:
+		recycleFrame(buf)
 	default:
+		recycleFrame(buf)
 		c.fail(errMuxBacklog)
 	}
 }
@@ -650,10 +762,13 @@ func (c *carrier) sendData(s *muxStream, frames ...muxFrame) error {
 	case c.data <- buf:
 		return nil
 	case <-s.dead:
+		recycleFrame(buf)
 		return s.reason()
 	case <-c.done:
+		recycleFrame(buf)
 		return errMuxClosed
 	case <-s.wdl.wait():
+		recycleFrame(buf)
 		return timeoutError{}
 	}
 }
@@ -675,7 +790,9 @@ func (c *carrier) sendOrdered(frames ...muxFrame) {
 	select {
 	case c.data <- buf:
 	case <-c.done:
+		recycleFrame(buf)
 	case <-timer.C:
+		recycleFrame(buf)
 		c.fail(errMuxBacklog)
 	}
 }
@@ -708,8 +825,13 @@ func (c *carrier) writeLoop() {
 	}
 }
 
-func (c *carrier) put(b []byte) bool {
-	if _, err := c.conn.Write(b); err != nil {
+// put writes one queued frame buffer and hands it back for reuse. The write
+// goroutine is the only one left holding it by this point, so returning it here
+// is safe.
+func (c *carrier) put(b *[]byte) bool {
+	_, err := c.conn.Write(*b)
+	recycleFrame(b)
+	if err != nil {
 		c.fail(err)
 		return false
 	}
@@ -781,6 +903,13 @@ func (c *carrier) open() (*muxStream, error) {
 // readLoop is the only reader of the underlying connection.
 func (c *carrier) readLoop() {
 	hdr := make([]byte, muxHeaderLen)
+
+	// One buffer for every frame's payload, instead of fresh room each time.
+	// Reuse is safe because each frame is finished with before the next is read:
+	// data is copied into the receiving session's own buffer, and a credit is
+	// acted on immediately.
+	body := make([]byte, muxMaxPayload)
+
 	for {
 		if _, err := io.ReadFull(c.conn, hdr); err != nil {
 			c.fail(err)
@@ -792,7 +921,13 @@ func (c *carrier) readLoop() {
 
 		var payload []byte
 		if length > 0 {
-			payload = make([]byte, length)
+			if length > len(body) {
+				// Nothing this program sends is larger than one frame's worth,
+				// so the other end is either broken or not speaking to us.
+				c.fail(fmt.Errorf("the other end sent an oversized frame of %d bytes", length))
+				return
+			}
+			payload = body[:length]
 			if _, err := io.ReadFull(c.conn, payload); err != nil {
 				c.fail(err)
 				return

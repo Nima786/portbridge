@@ -65,6 +65,10 @@ func runOrigin(ctx context.Context, cfg *Config, st *status) error {
 	}
 
 	if cfg.Mode == ModeReverse {
+		// This side dials, so it needs no certificate, only the settings it will
+		// present. Prepared once: see prepareTLS for why per-connection settings
+		// were the single most expensive thing on a disguised link.
+		cfg.prepareTLS(nil)
 		o.routes = newRouter(cfg)
 		st.routes = o.routes
 		log.Printf("reaching the other server at %s", o.routes.describe())
@@ -96,6 +100,8 @@ func (o *origin) runDirect(ctx context.Context) error {
 		}
 		o.cert = &cert
 	}
+	o.cfg.prepareTLS(o.cert)
+
 	if o.cfg.Mux {
 		// The edge starts the sessions, so this side only has to receive them.
 		o.links = newCarrierSet(o.cfg.MuxLinks, nil, o.serveStream)

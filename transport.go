@@ -43,6 +43,11 @@ const (
 const (
 	tlsHandshakeTimeout = 15 * time.Second
 	defaultWSPath       = "/tunnel"
+
+	// How many resumable sessions the dialling side remembers. One per link is
+	// all that is ever needed, but a handful costs nothing and covers a fallback
+	// route being used alongside the main one.
+	tlsResumeCache = 32
 )
 
 func validTransport(t Transport) bool {
@@ -131,6 +136,121 @@ func fileExists(p string) bool {
 }
 
 // ---------------------------------------------------------------------------
+// Preparing the disguise once, rather than per connection
+// ---------------------------------------------------------------------------
+
+// Why this exists
+//
+// A disguised link used to build its TLS settings from scratch for every
+// connection, and that turned out to be the most expensive thing either server
+// did. Measured on a real machine, the handshake accounted for more than half of
+// all the processor time spent on a disguised tunnel, because a connection is
+// spent on each user and a full handshake is paid to replace it.
+//
+// Settings built fresh each time cannot be improved on, for a reason that is
+// easy to miss: resuming a session requires both ends to remember something
+// between connections. The side that accepts issues a ticket under a key held in
+// its settings, and the side that dials keeps the ticket in a cache held in
+// its settings. Throw the settings away after every connection and there is
+// nothing left to resume from, so every connection pays in full, for ever.
+//
+// Preparing them once gives the resumption that was always meant to happen: the
+// certificate no longer has to be sent and checked, a signature no longer has to
+// be made and verified, and a round trip disappears from the time a user waits.
+// It is also the more ordinary thing to look like, since a browser resumes
+// sessions constantly.
+
+// prepareTLS builds the settings this tunnel will reuse for every connection.
+// Safe to call once at startup, before anything dials or accepts; after that the
+// prepared values are only read.
+//
+// cert is required only on the side that accepts, and is ignored elsewhere.
+func (c *Config) prepareTLS(cert *tls.Certificate) {
+	if c.Transport == TransportPlain {
+		return
+	}
+
+	if cert != nil {
+		c.tlsServer = &tls.Config{
+			Certificates: []tls.Certificate{*cert},
+			NextProtos:   alpnFor(c.Transport),
+			MinVersion:   tls.VersionTLS12,
+		}
+	}
+
+	if !c.Dials() {
+		return
+	}
+
+	// One cache shared by every name, so a fallback route does not start from
+	// nothing.
+	cache := tls.NewLRUClientSessionCache(tlsResumeCache)
+	c.tlsClients = make(map[string]*tls.Config, 2)
+	for _, name := range c.claimedNames() {
+		c.tlsClients[name] = newClientTLS(name, c.Transport, cache)
+	}
+}
+
+// claimedNames is every hostname this side may present, which is the main one
+// and, where a fallback route names itself differently, that one too.
+func (c *Config) claimedNames() []string {
+	names := []string{c.effectiveClientName()}
+	if c.AltServerName != "" && c.AltServerName != names[0] {
+		names = append(names, c.AltServerName)
+	}
+	return names
+}
+
+// effectiveClientName is the name the dialling side puts in the handshake.
+func (c *Config) effectiveClientName() string {
+	if c.ServerName != "" {
+		return c.ServerName
+	}
+	host, _, _ := net.SplitHostPort(c.TunnelAddr)
+	return host
+}
+
+func newClientTLS(name string, t Transport, cache tls.ClientSessionCache) *tls.Config {
+	return &tls.Config{
+		ServerName:         name,
+		NextProtos:         alpnFor(t),
+		MinVersion:         tls.VersionTLS12,
+		ClientSessionCache: cache,
+		// The certificate is not what proves identity here; the shared secret
+		// is, and it is checked immediately after. Requiring a publicly trusted
+		// certificate would mean needing a real domain and a renewal process for
+		// no security gain. Verified against the secret, a forged certificate
+		// gets an attacker nothing.
+		InsecureSkipVerify: true,
+	}
+}
+
+// clientTLS returns the prepared settings for a name, building throwaway ones if
+// this configuration was never prepared. The fallback keeps the function total
+// for callers that build a Config by hand; it simply forgoes resumption.
+func (c *Config) clientTLS(name string) *tls.Config {
+	if cfg, ok := c.tlsClients[name]; ok {
+		return cfg
+	}
+	return newClientTLS(name, c.Transport, nil)
+}
+
+// serverTLS returns the prepared settings for the accepting side.
+func (c *Config) serverTLS(cert *tls.Certificate) (*tls.Config, error) {
+	if c.tlsServer != nil {
+		return c.tlsServer, nil
+	}
+	if cert == nil {
+		return nil, errors.New("no certificate loaded")
+	}
+	return &tls.Config{
+		Certificates: []tls.Certificate{*cert},
+		NextProtos:   alpnFor(c.Transport),
+		MinVersion:   tls.VersionTLS12,
+	}, nil
+}
+
+// ---------------------------------------------------------------------------
 // Wrapping a connection
 // ---------------------------------------------------------------------------
 
@@ -142,21 +262,7 @@ func wrapDial(raw net.Conn, cfg *Config) (net.Conn, error) {
 		return raw, nil
 
 	case TransportTLS, TransportWSS:
-		name := cfg.ServerName
-		if name == "" {
-			name, _, _ = net.SplitHostPort(cfg.TunnelAddr)
-		}
-		tc := tls.Client(raw, &tls.Config{
-			ServerName: name,
-			NextProtos: alpnFor(cfg.Transport),
-			MinVersion: tls.VersionTLS12,
-			// The certificate is not what proves identity here; the shared
-			// secret is, and it is checked immediately after. Requiring a
-			// publicly trusted certificate would mean needing a real domain and
-			// a renewal process for no security gain. Verified against the
-			// secret, a forged certificate gets an attacker nothing.
-			InsecureSkipVerify: true,
-		})
+		tc := tls.Client(raw, cfg.clientTLS(cfg.effectiveClientName()))
 		if err := raw.SetDeadline(time.Now().Add(tlsHandshakeTimeout)); err != nil {
 			return nil, err
 		}
@@ -184,14 +290,11 @@ func wrapAccept(raw net.Conn, cfg *Config, cert *tls.Certificate) (net.Conn, err
 		return raw, nil
 
 	case TransportTLS, TransportWSS:
-		if cert == nil {
-			return nil, errors.New("no certificate loaded")
+		serverCfg, err := cfg.serverTLS(cert)
+		if err != nil {
+			return nil, err
 		}
-		ts := tls.Server(raw, &tls.Config{
-			Certificates: []tls.Certificate{*cert},
-			NextProtos:   alpnFor(cfg.Transport),
-			MinVersion:   tls.VersionTLS12,
-		})
+		ts := tls.Server(raw, serverCfg)
 		if err := raw.SetDeadline(time.Now().Add(tlsHandshakeTimeout)); err != nil {
 			return nil, err
 		}

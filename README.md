@@ -178,6 +178,14 @@ much of your traffic a single stall can affect.
 Keep the default unless you have reason to think the sheer number of connections
 is what is getting your tunnel noticed.
 
+One measured exception is worth knowing. If you are using a disguise **and** your
+users make many short-lived connections, shared connections do about a quarter of
+the work per user. A connection that carries one user and is then thrown away has
+to set the disguise up again for the next one, and that setup is the most
+expensive thing either server does. Sharing pays it once and then stops paying.
+For large steady transfers it is the other way round, and one connection per user
+is cheaper. On a plain link with no disguise the two are about even.
+
 ## Many users at once
 
 The number of ready connections is the setting that matters here, and it is worth
