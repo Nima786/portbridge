@@ -77,15 +77,27 @@ const (
 	// shifting bytes, so a full read becomes exactly one frame.
 	muxMaxPayload = 32 * 1024
 
-	// How much a sender may have outstanding on one stream before waiting for
-	// the reader to catch up. Without this, one user downloading fast would let
-	// the far side queue unbounded data in memory for a slow user.
-	muxWindow = 512 * 1024
+	// How much a sender may have outstanding on one stream before waiting for the
+	// reader to catch up. Without a limit, one fast download would let the far
+	// side pile up unbounded data in memory on behalf of a slow user.
+	//
+	// The limit cannot be a single fixed number, and getting that wrong was
+	// costly. A sender may have at most one window in flight per round trip, so
+	// the window divided by the round trip IS the speed ceiling: 512 KB across a
+	// 90 ms route caps one session near 45 Mbit/s no matter how fast the link is.
+	// Measured against another tunnel on a real route, that made a large download
+	// five times slower than it should have been while the link sat idle.
+	//
+	// So a session starts small and doubles, but only while its reader is keeping
+	// up, and only while the link it rides on has memory to spare. A session that
+	// wants speed gets it; the many short ones stay cheap; and the total a link
+	// can tie up stays bounded.
+	muxWindowStart = 256 * 1024
+	muxWindowMax   = 4 * 1024 * 1024
 
-	// Credit is returned in chunks rather than after every read, to avoid a
-	// frame per read. Half the window keeps the sender from ever stalling on a
-	// healthy stream.
-	muxCreditChunk = muxWindow / 2
+	// How much extra buffering all the sessions on one link may take between
+	// them. This is the real memory limit, and it is why growing is safe.
+	muxGrowBudget = 16 * 1024 * 1024
 
 	// A link with nothing on it is indistinguishable from a link that has
 	// silently died, which on these routes happens often. Pinging proves it
@@ -218,6 +230,8 @@ type muxStream struct {
 	rbuf       []byte
 	uncredited int  // consumed by the reader, not yet credited back
 	finished   bool // the far side has finished sending
+	rwin       int  // how much the far side may have in flight to us
+	rtaken     int  // how much of the link's grow budget this session holds
 	rready     chan struct{}
 
 	// Sending.
@@ -240,7 +254,8 @@ func newMuxStream(c *carrier, id uint32, opener bool) *muxStream {
 		id:       id,
 		c:        c,
 		rready:   make(chan struct{}, 1),
-		window:   muxWindow,
+		rwin:     muxWindowStart,
+		window:   muxWindowStart,
 		windowUp: make(chan struct{}, 1),
 		needOpen: opener,
 		dead:     make(chan struct{}),
@@ -262,9 +277,20 @@ func (s *muxStream) kill(err error) {
 			s.err.Store(err)
 		}
 		close(s.dead)
+		s.releaseGrow()
 	})
 	poke(s.rready)
 	poke(s.windowUp)
+}
+
+// releaseGrow hands this session's share of the link's buffering back, once, so
+// a long-lived link does not run out of room for later sessions.
+func (s *muxStream) releaseGrow() {
+	s.rmu.Lock()
+	taken := s.rtaken
+	s.rtaken = 0
+	s.rmu.Unlock()
+	s.c.returnGrow(taken)
 }
 
 func (s *muxStream) reason() error {
@@ -278,7 +304,7 @@ func (s *muxStream) reason() error {
 // carrier's reader, so it must never block.
 func (s *muxStream) deliver(p []byte) error {
 	s.rmu.Lock()
-	if len(s.rbuf)+len(p) > muxWindow {
+	if len(s.rbuf)+len(p) > s.rwin {
 		s.rmu.Unlock()
 		return errMuxOverflow
 	}
@@ -305,14 +331,29 @@ func (s *muxStream) Read(p []byte) (int, error) {
 			s.rbuf = s.rbuf[n:]
 			// Drop the backing array once drained, so a long session does not
 			// hold on to a peak-sized buffer for ever.
-			if len(s.rbuf) == 0 {
+			drained := len(s.rbuf) == 0
+			if drained {
 				s.rbuf = nil
 			}
 			s.uncredited += n
 			give := 0
-			if s.uncredited >= muxCreditChunk {
+			if s.uncredited >= s.rwin/2 {
 				give = s.uncredited
 				s.uncredited = 0
+			}
+			// The reader has taken everything there was, so the far side is
+			// being held back by the window rather than by us. Widen it, if the
+			// link can spare the memory, and pass the extra on as credit.
+			if drained && s.rwin < muxWindowMax {
+				want := s.rwin
+				if want > muxWindowMax-s.rwin {
+					want = muxWindowMax - s.rwin
+				}
+				if got := s.c.takeGrow(want); got > 0 {
+					s.rwin += got
+					s.rtaken += got
+					give += got
+				}
 			}
 			s.rmu.Unlock()
 
@@ -441,6 +482,7 @@ func (s *muxStream) Close() error {
 		first = true
 		s.err.Store(errMuxClosed)
 		close(s.dead)
+		s.releaseGrow()
 	})
 	poke(s.rready)
 	poke(s.windowUp)
@@ -531,6 +573,40 @@ type carrier struct {
 	doneOnce sync.Once
 
 	lastHeard int64 // unix nano, read and written atomically
+
+	// growLeft is the extra buffering the sessions on this link may still take
+	// between them. It is what keeps widening a window safe: a session can only
+	// grow while this lasts, so the memory one link can tie up has a ceiling
+	// however many sessions ask for speed at once.
+	growLeft int64
+}
+
+// takeGrow hands out up to n bytes of this link's grow budget, returning how much
+// was actually available.
+func (c *carrier) takeGrow(n int) int {
+	if n <= 0 {
+		return 0
+	}
+	for {
+		left := atomic.LoadInt64(&c.growLeft)
+		if left <= 0 {
+			return 0
+		}
+		take := int64(n)
+		if take > left {
+			take = left
+		}
+		if atomic.CompareAndSwapInt64(&c.growLeft, left, left-take) {
+			return int(take)
+		}
+	}
+}
+
+// returnGrow gives budget back when a session ends, so later sessions can grow.
+func (c *carrier) returnGrow(n int) {
+	if n > 0 {
+		atomic.AddInt64(&c.growLeft, int64(n))
+	}
 }
 
 func newCarrier(conn net.Conn) *carrier {
@@ -542,6 +618,7 @@ func newCarrier(conn net.Conn) *carrier {
 		nextID:   1,
 		incoming: make(chan *muxStream, 64),
 		done:     make(chan struct{}),
+		growLeft: muxGrowBudget,
 	}
 	atomic.StoreInt64(&c.lastHeard, time.Now().UnixNano())
 	return c

@@ -8,6 +8,7 @@ import (
 	"net"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -123,9 +124,14 @@ func TestMuxSenderWaitsForTheReader(t *testing.T) {
 	}
 	down := acceptOne(t, cb)
 
+	// More than the window a session starts with. The window only widens while
+	// the reader is keeping up, and this reader is deliberately not, so the
+	// sender has to stop.
+	payload := muxWindowStart + 64<<10
+
 	done := make(chan int, 1)
 	go func() {
-		n, _ := up.Write(make([]byte, muxWindow+64<<10))
+		n, _ := up.Write(make([]byte, payload))
 		done <- n
 	}()
 
@@ -140,7 +146,7 @@ func TestMuxSenderWaitsForTheReader(t *testing.T) {
 	read := 0
 	buf := make([]byte, 32<<10)
 	deadline := time.After(10 * time.Second)
-	for read < muxWindow+64<<10 {
+	for read < payload {
 		select {
 		case <-deadline:
 			t.Fatalf("only %d bytes arrived", read)
@@ -485,5 +491,120 @@ func TestMuxRefusesASessionSignalAsAFrame(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "unknown frame type") {
 		t.Fatalf("the complaint was %q, which does not say what went wrong", err)
+	}
+}
+
+// A session whose reader keeps up must be allowed to go faster than its starting
+// window would permit.
+//
+// This is the fault that made shared connections five times slower than they
+// should have been on a real route. A sender may only have one window in flight
+// per round trip, so a fixed window is a fixed speed limit: 256 KB across a 90 ms
+// route is about 22 Mbit/s however fast the link really is. The window has to
+// widen for sessions that can use it.
+func TestMuxWindowWidensForAFastReader(t *testing.T) {
+	ca, cb := carrierPair(t)
+
+	up, _ := ca.open()
+	// A payload far larger than the starting window, read as fast as it arrives.
+	payload := make([]byte, 8<<20)
+	rnd := rand.New(rand.NewSource(23))
+	rnd.Read(payload)
+
+	go func() {
+		_, _ = up.Write(payload)
+		_ = up.CloseWrite()
+	}()
+
+	down := acceptOne(t, cb)
+	got, err := io.ReadAll(down)
+	if err != nil {
+		t.Fatalf("read all: %v", err)
+	}
+	if !bytes.Equal(got, payload) {
+		t.Fatalf("%d bytes arrived of %d, and they differ", len(got), len(payload))
+	}
+
+	ms := down
+	ms.rmu.Lock()
+	win := ms.rwin
+	ms.rmu.Unlock()
+	if win <= muxWindowStart {
+		t.Fatalf("the window never widened; still %d", win)
+	}
+	if win > muxWindowMax {
+		t.Fatalf("the window grew past its ceiling: %d", win)
+	}
+}
+
+// Widening must be bounded by what the link can spare, or many fast sessions at
+// once would between them tie up more memory than the machine has.
+func TestMuxWindowGrowthIsBoundedPerLink(t *testing.T) {
+	a, b := net.Pipe()
+	defer a.Close()
+	defer b.Close()
+	c := newCarrier(a)
+
+	// Take the whole budget in pieces and check no more is handed out.
+	taken := 0
+	for i := 0; i < 10000; i++ {
+		got := c.takeGrow(1 << 20)
+		if got == 0 {
+			break
+		}
+		taken += got
+	}
+	if taken != muxGrowBudget {
+		t.Fatalf("handed out %d of a %d budget", taken, muxGrowBudget)
+	}
+	if extra := c.takeGrow(1 << 20); extra != 0 {
+		t.Fatalf("handed out %d more than the budget", extra)
+	}
+
+	// Giving it back must make it available again, so a long-lived link does not
+	// starve the sessions that come later.
+	c.returnGrow(taken)
+	if got := c.takeGrow(1 << 20); got != 1<<20 {
+		t.Fatalf("after returning the budget only %d was available", got)
+	}
+}
+
+// A session that grew must hand its share back when it ends.
+func TestMuxWindowGrowthIsReturnedOnClose(t *testing.T) {
+	ca, cb := carrierPair(t)
+
+	up, _ := ca.open()
+	go func() {
+		_, _ = up.Write(make([]byte, 4<<20))
+		_ = up.CloseWrite()
+	}()
+
+	down := acceptOne(t, cb)
+	if _, err := io.ReadAll(down); err != nil {
+		t.Fatalf("read all: %v", err)
+	}
+
+	ms := down
+	ms.rmu.Lock()
+	held := ms.rtaken
+	ms.rmu.Unlock()
+	if held == 0 {
+		t.Fatal("the session never took any of the link's budget, so it cannot have grown")
+	}
+
+	before := atomic.LoadInt64(&cb.growLeft)
+	_ = down.Close()
+	after := atomic.LoadInt64(&cb.growLeft)
+	if after != before+int64(held) {
+		t.Fatalf("closing returned %d of the %d it held", after-before, held)
+	}
+	if after > muxGrowBudget {
+		t.Fatalf("more budget came back than ever existed: %d", after)
+	}
+
+	// Closing twice must not hand the budget back twice.
+	_ = down.Close()
+	if again := atomic.LoadInt64(&cb.growLeft); again != after {
+		t.Fatalf("closing again changed the budget from %d to %d", after, again)
 	}
 }
