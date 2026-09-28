@@ -1220,6 +1220,27 @@ edit_tunnel() {
         new=$(ask "Shared connections between the servers" "$cur")
         [ "$new" != "$cur" ] && { write_conf "$name" mux_links "$new"; changed=1; }
     else
+        # How many are ready is agreed by both servers, and whichever asks for
+        # fewer decides. Saying so matters: changing it on one server only looks
+        # like it worked and does nothing, which is easy to do and hard to spot.
+        local mode role
+        mode=$(read_conf "$name" mode)
+        role=$(read_conf "$name" role)
+        say ""
+        if [ "$mode:$role" = "reverse:edge" ]; then
+            info "The foreign server is the one that opens these, so it has the same"
+            info "setting and the lower of the two wins. Change it there as well or"
+            info "this will appear to work and nothing will happen."
+        elif [ "$mode:$role" = "reverse:origin" ]; then
+            info "This server is the one that opens these. The Iran server has the"
+            info "same setting and will not keep more than its own number, so change"
+            info "it there to match."
+        else
+            info "The other server has the same setting and the lower of the two wins,"
+            info "so change it there to match."
+        fi
+        info "Worth raising if you have more users arriving at once than this number:"
+        info "the ones beyond it wait while fresh connections are opened."
         cur=$(read_conf "$name" pool_size)
         new=$(ask "Connections to keep ready" "$cur")
         [ "$new" != "$cur" ] && { write_conf "$name" pool_size "$new"; changed=1; }

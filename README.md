@@ -178,6 +178,31 @@ much of your traffic a single stall can affect.
 Keep the default unless you have reason to think the sheer number of connections
 is what is getting your tunnel noticed.
 
+## Many users at once
+
+The number of ready connections is the setting that matters here, and it is worth
+understanding before a busy day rather than during one.
+
+A user who arrives when a connection is already waiting is served immediately.
+Once they are used up, the next users wait while fresh ones are opened across the
+border, which costs a round trip or two. The default of 25 is plenty for a handful
+of people and not enough for a crowd arriving together.
+
+Measured on a real pair of servers about 90 ms apart, 100 users arriving at the
+same instant: with 25 ready, the slowest users waited about three times as long to
+be connected as the quickest. With the number raised above the user count, that
+gap disappeared.
+
+Two things to know when raising it:
+
+- **Both servers must be changed.** They each hold the same setting and the lower
+  of the two decides. Changing one side only appears to work and does nothing.
+  The menu says so when you edit it.
+- **More ready connections mean more connections held open between your servers**,
+  which is a slightly larger pattern for anyone watching. If that worries you more
+  than the wait does, the shared-connections option is the other way to handle a
+  crowd.
+
 ## Speed tuning
 
 The menu has a **Speed tuning** option. It switches the server to BBR and widens
