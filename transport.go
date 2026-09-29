@@ -38,6 +38,14 @@ const (
 	// expects. That lets the link be routed through a provider such as
 	// Cloudflare, so the foreign server's own address never appears on it.
 	TransportWSS Transport = "wss"
+
+	// TransportH2 wraps the link in HTTP/2 streaming frames over TLS, appearing
+	// as an active HTTP/2 web connection.
+	TransportH2 Transport = "h2"
+
+	// TransportGRPC wraps the link in gRPC envelope streaming over HTTP/2,
+	// enabling direct compatibility with Cloudflare gRPC proxying and evading DPI.
+	TransportGRPC Transport = "grpc"
 )
 
 const (
@@ -52,7 +60,7 @@ const (
 
 func validTransport(t Transport) bool {
 	switch t {
-	case TransportPlain, TransportTLS, TransportWSS:
+	case TransportPlain, TransportTLS, TransportWSS, TransportH2, TransportGRPC:
 		return true
 	}
 	return false
@@ -61,10 +69,14 @@ func validTransport(t Transport) bool {
 // alpnFor keeps the advertised protocols consistent with what the disguise
 // claims to be. An HTTPS site offers these; anything else would be a giveaway.
 func alpnFor(t Transport) []string {
-	if t == TransportWSS {
+	switch t {
+	case TransportWSS:
 		return []string{"http/1.1"}
+	case TransportH2, TransportGRPC:
+		return []string{"h2"}
+	default:
+		return []string{"h2", "http/1.1"}
 	}
-	return []string{"h2", "http/1.1"}
 }
 
 // ---------------------------------------------------------------------------
@@ -261,7 +273,7 @@ func wrapDial(raw net.Conn, cfg *Config) (net.Conn, error) {
 	case TransportPlain:
 		return raw, nil
 
-	case TransportTLS, TransportWSS:
+	case TransportTLS, TransportWSS, TransportH2, TransportGRPC:
 		tc := tls.Client(raw, cfg.clientTLS(cfg.effectiveClientName()))
 		if err := raw.SetDeadline(time.Now().Add(tlsHandshakeTimeout)); err != nil {
 			return nil, err
@@ -276,7 +288,10 @@ func wrapDial(raw net.Conn, cfg *Config) (net.Conn, error) {
 		if cfg.Transport == TransportTLS {
 			return tc, nil
 		}
-		return wsDial(tc, cfg)
+		if cfg.Transport == TransportWSS {
+			return wsDial(tc, cfg)
+		}
+		return h2Dial(tc, cfg)
 
 	default:
 		return nil, fmt.Errorf("unknown transport %q", cfg.Transport)
@@ -289,7 +304,7 @@ func wrapAccept(raw net.Conn, cfg *Config, cert *tls.Certificate) (net.Conn, err
 	case TransportPlain:
 		return raw, nil
 
-	case TransportTLS, TransportWSS:
+	case TransportTLS, TransportWSS, TransportH2, TransportGRPC:
 		serverCfg, err := cfg.serverTLS(cert)
 		if err != nil {
 			return nil, err
@@ -308,7 +323,10 @@ func wrapAccept(raw net.Conn, cfg *Config, cert *tls.Certificate) (net.Conn, err
 		if cfg.Transport == TransportTLS {
 			return ts, nil
 		}
-		return wsAccept(ts, cfg)
+		if cfg.Transport == TransportWSS {
+			return wsAccept(ts, cfg)
+		}
+		return h2Accept(ts, cfg)
 
 	default:
 		return nil, fmt.Errorf("unknown transport %q", cfg.Transport)
@@ -327,6 +345,18 @@ func describeTransport(cfg *Config) string {
 		}
 		return fmt.Sprintf("disguised as a websocket over HTTPS (%s%s)",
 			cfg.effectiveServerName(), cfg.effectiveWSPath())
+	case TransportH2:
+		if cfg.CDN {
+			return fmt.Sprintf("disguised as HTTP/2 (%s%s) and routed through a CDN, so this server's address never appears on it",
+				cfg.effectiveServerName(), cfg.effectiveWSPath())
+		}
+		return fmt.Sprintf("disguised as HTTP/2 (%s)", cfg.effectiveServerName())
+	case TransportGRPC:
+		if cfg.CDN {
+			return fmt.Sprintf("disguised as gRPC over HTTP/2 (%s) and routed through a CDN, so this server's address never appears on it",
+				cfg.effectiveServerName())
+		}
+		return fmt.Sprintf("disguised as gRPC over HTTP/2 (%s)", cfg.effectiveServerName())
 	default:
 		return "plain, no disguise"
 	}

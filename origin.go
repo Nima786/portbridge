@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"crypto/tls"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
@@ -84,11 +85,17 @@ func (o *origin) serveStream(tunnel net.Conn) {
 	o.wg.Add(1)
 	defer o.wg.Done()
 
-	if err := o.awaitActivation(tunnel, muxActivateWait); err != nil {
+	port, err := o.awaitActivation(tunnel, muxActivateWait)
+	if err != nil {
 		_ = tunnel.Close()
 		return
 	}
-	o.handleActivated(tunnel)
+	if port == 0 {
+		if pt, ok := tunnel.(interface{ TargetPort() uint16 }); ok {
+			port = pt.TargetPort()
+		}
+	}
+	o.handleActivated(tunnel, port)
 }
 
 // runDirect accepts tunnel connections from the edge.
@@ -165,14 +172,14 @@ func (o *origin) runDirect(ctx context.Context) error {
 					return
 				}
 				atomic.AddInt64(&o.st.parkedSpares, 1)
-				err = o.parkUntilActivated(ctx, c, o.cfg.ParkTimeout)
+				targetPort, err := o.parkUntilActivated(ctx, c, o.cfg.ParkTimeout)
 				atomic.AddInt64(&o.st.parkedSpares, -1)
 				if err != nil {
 					_ = c.Close()
 					return
 				}
 				release()
-				o.handleActivated(c)
+				o.handleActivated(c, targetPort)
 			}(c)
 		default:
 			o.logCapacity.printf("too many unestablished tunnel connections (%d); dropping one", o.cfg.MaxPending)
@@ -278,7 +285,7 @@ func (o *origin) reverseWorker(ctx context.Context, n int) {
 		// when it expires we replace the connection rather than trusting a route
 		// that a firewall may quietly have forgotten about.
 		atomic.AddInt64(&o.st.parkedSpares, 1)
-		err = o.parkUntilActivated(ctx, c, o.cfg.SpareTTL)
+		targetPort, err := o.parkUntilActivated(ctx, c, o.cfg.SpareTTL)
 		atomic.AddInt64(&o.st.parkedSpares, -1)
 
 		if err != nil {
@@ -295,10 +302,10 @@ func (o *origin) reverseWorker(ctx context.Context, n int) {
 
 		// Hand the session off and immediately rebuild this spare.
 		o.wg.Add(1)
-		go func(c net.Conn) {
+		go func(c net.Conn, targetPort uint16) {
 			defer o.wg.Done()
-			o.handleActivated(c)
-		}(c)
+			o.handleActivated(c, targetPort)
+		}(c, targetPort)
 	}
 }
 
@@ -329,7 +336,7 @@ func (o *origin) dialEdge() (net.Conn, error) {
 // Cancelling a context does not interrupt a blocked socket read, so without this
 // the process would appear to hang on shutdown until that deadline expired.
 // Moving the deadline to "now" makes the read return immediately.
-func (o *origin) parkUntilActivated(ctx context.Context, c net.Conn, timeout time.Duration) error {
+func (o *origin) parkUntilActivated(ctx context.Context, c net.Conn, timeout time.Duration) (uint16, error) {
 	unpark := make(chan struct{})
 	go func() {
 		select {
@@ -345,31 +352,37 @@ func (o *origin) parkUntilActivated(ctx context.Context, c net.Conn, timeout tim
 
 // awaitActivation blocks until the edge says a user has arrived. Anything other
 // than the activation byte means the connection is finished with.
-func (o *origin) awaitActivation(c net.Conn, timeout time.Duration) error {
+func (o *origin) awaitActivation(c net.Conn, timeout time.Duration) (uint16, error) {
 	if err := c.SetReadDeadline(time.Now().Add(timeout)); err != nil {
-		return err
+		return 0, err
 	}
 	var sig [1]byte
 	if _, err := io.ReadFull(c, sig[:]); err != nil {
-		return err
+		return 0, err
 	}
 	if err := c.SetReadDeadline(time.Time{}); err != nil {
-		return err
+		return 0, err
 	}
 	switch sig[0] {
 	case msgActivate:
-		return nil
+		return 0, nil
+	case msgActivatePort:
+		var portBuf [2]byte
+		if _, err := io.ReadFull(c, portBuf[:]); err != nil {
+			return 0, err
+		}
+		return binary.BigEndian.Uint16(portBuf[:]), nil
 	case rejClockSkew, rejReplay:
 		err := describeRejection(sig[0])
 		o.logAuth.printf("the edge refused our credentials: %v", err)
-		return err
+		return 0, err
 	default:
-		return errBadAck
+		return 0, errBadAck
 	}
 }
 
 // handleActivated is reached only once a real user is waiting on the other side.
-func (o *origin) handleActivated(tunnel net.Conn) {
+func (o *origin) handleActivated(tunnel net.Conn, targetPort uint16) {
 	select {
 	case o.active <- struct{}{}:
 	default:
@@ -383,10 +396,11 @@ func (o *origin) handleActivated(tunnel net.Conn) {
 	atomic.AddInt64(&o.st.activeSessions, 1)
 	defer atomic.AddInt64(&o.st.activeSessions, -1)
 
-	svc, err := net.DialTimeout("tcp", o.cfg.InboundAddr, inboundDialTimeout)
+	inboundAddr := o.cfg.InboundFor(targetPort)
+	svc, err := net.DialTimeout("tcp", inboundAddr, inboundDialTimeout)
 	if err != nil {
 		atomic.AddInt64(&o.st.failedSessions, 1)
-		o.logDial.printf("cannot reach the local service at %s: %v", o.cfg.InboundAddr, err)
+		o.logDial.printf("cannot reach the local service at %s: %v", inboundAddr, err)
 		_ = tunnel.Close()
 		return
 	}

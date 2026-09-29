@@ -100,7 +100,7 @@ func startTunnelT(t *testing.T, mode Mode, tr Transport, serverName, serviceAddr
 
 // Traffic must flow over every disguise, in both modes.
 func TestTrafficFlowsOverEveryTransport(t *testing.T) {
-	for _, tr := range []Transport{TransportPlain, TransportTLS, TransportWSS} {
+	for _, tr := range []Transport{TransportPlain, TransportTLS, TransportWSS, TransportH2, TransportGRPC} {
 		for _, mode := range []Mode{ModeDirect, ModeReverse} {
 			t.Run(string(tr)+"/"+string(mode), func(t *testing.T) {
 				svc := startService(t)
@@ -128,7 +128,7 @@ func TestTrafficFlowsOverEveryTransport(t *testing.T) {
 func TestLargeTransferOverEveryTransport(t *testing.T) {
 	payload := bytes.Repeat([]byte("PortBridge"), 120_000) // 1.2 MB
 
-	for _, tr := range []Transport{TransportTLS, TransportWSS} {
+	for _, tr := range []Transport{TransportTLS, TransportWSS, TransportH2, TransportGRPC} {
 		t.Run(string(tr), func(t *testing.T) {
 			ln, err := net.Listen("tcp", "127.0.0.1:0")
 			if err != nil {
@@ -611,6 +611,8 @@ func TestSummaryNamesTheDisguise(t *testing.T) {
 		{TransportTLS, false, "disguised as an HTTPS site"},
 		{TransportWSS, false, "websocket over HTTPS"},
 		{TransportWSS, true, "routed through a CDN"},
+		{TransportH2, false, "disguised as HTTP/2"},
+		{TransportGRPC, false, "disguised as gRPC over HTTP/2"},
 	} {
 		if got := mk(tc.tr, tc.cdn); !strings.Contains(got, tc.want) {
 			t.Errorf("%s (cdn=%v) summary missing %q: %s", tc.tr, tc.cdn, tc.want, got)
@@ -632,7 +634,7 @@ func TestSummaryNamesTheDisguise(t *testing.T) {
 // their settings between connections, which is exactly what is easy to undo by
 // accident, and nothing else in the program would notice if it broke.
 func TestDisguisedLinkResumesInsteadOfRenegotiating(t *testing.T) {
-	for _, tr := range []Transport{TransportTLS, TransportWSS} {
+	for _, tr := range []Transport{TransportTLS, TransportWSS, TransportH2, TransportGRPC} {
 		t.Run(string(tr), func(t *testing.T) {
 			certFile, keyFile := certPaths(t)
 			cert, err := ensureCert(certFile, keyFile, "www.example.com")
@@ -707,11 +709,14 @@ func TestDisguisedLinkResumesInsteadOfRenegotiating(t *testing.T) {
 				}
 				_ = c.SetReadDeadline(time.Time{})
 
-				// The websocket disguise wraps the secured connection, so reach
+				// The disguise wraps the secured connection, so reach
 				// through it for the one underneath.
 				under := c
 				if ws, ok := c.(*wsConn); ok {
 					under = ws.Conn
+				}
+				if h2, ok := c.(*h2Conn); ok {
+					under = h2.Conn
 				}
 				tc, ok := under.(*tls.Conn)
 				if !ok {

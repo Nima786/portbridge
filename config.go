@@ -47,11 +47,23 @@ type Config struct {
 	// address to dial; on the side that accepts it is the address to bind.
 	TunnelAddr string
 
-	// UserListen is where end users connect. Edge only.
+	// UserListen is where end users connect. Edge only. Can be a single address
+	// or a comma-separated list of addresses/ports.
 	UserListen string
 
-	// InboundAddr is the local service being published. Origin only.
+	// InboundAddr is the local service being published. Origin only. Can be a
+	// single address or a comma-separated list of addresses/ports.
 	InboundAddr string
+
+	// ServerInboundPort is kept on the edge for multi-port target mapping.
+	ServerInboundPort string
+
+	// Parsed addresses and mappings for multi-port operation.
+	UserListens   []string
+	InboundAddrs  []string
+	listenToPort  map[string]uint16
+	portToInbound map[uint16]string
+	defaultTarget uint16
 
 	// PeerIP is the other server's address. Used to lock the tunnel port down to
 	// a single source, and to warn about obvious misconfiguration.
@@ -328,11 +340,7 @@ func (c *Config) set(key, val string) error {
 	case "mux_links":
 		return num(&c.MuxLinks)
 	case "server_inbound_port":
-		// Recorded on the relay by the menu, purely so it can rebuild the code
-		// for the server later. The engine does not use it.
-		if _, err := strconv.Atoi(val); err != nil {
-			return fmt.Errorf("%s: %w", key, err)
-		}
+		c.ServerInboundPort = val
 	case "firewall":
 		// Read by the firewall helper, not by the engine. Accepted here so the
 		// engine does not refuse a config that contains it.
@@ -407,18 +415,65 @@ func (c *Config) Validate() error {
 		if c.UserListen == "" {
 			return fmt.Errorf("user_listen is required for the edge")
 		}
-		if _, _, err := net.SplitHostPort(c.UserListen); err != nil {
-			return fmt.Errorf("user_listen must be host:port: %w", err)
+		listens, err := parseAddressList(c.UserListen, "0.0.0.0")
+		if err != nil || len(listens) == 0 {
+			return fmt.Errorf("user_listen: %w", err)
 		}
-		if c.UserListen == c.TunnelAddr {
-			return fmt.Errorf("user_listen and tunnel_addr cannot be the same address")
+		c.UserListens = listens
+		c.listenToPort = make(map[string]uint16, len(listens))
+
+		var sinPorts []uint16
+		if c.ServerInboundPort != "" {
+			for _, sp := range strings.Split(c.ServerInboundPort, ",") {
+				sp = strings.TrimSpace(sp)
+				if sp == "" {
+					continue
+				}
+				p, err := strconv.Atoi(sp)
+				if err != nil || p < 1 || p > 65535 {
+					return fmt.Errorf("invalid server_inbound_port %q", sp)
+				}
+				sinPorts = append(sinPorts, uint16(p))
+			}
 		}
+
+		for i, u := range listens {
+			if u == c.TunnelAddr {
+				return fmt.Errorf("user_listen and tunnel_addr cannot be the same address")
+			}
+			_, pStr, _ := net.SplitHostPort(u)
+			pNum, _ := strconv.Atoi(pStr)
+			tp := uint16(pNum)
+			if i < len(sinPorts) {
+				tp = sinPorts[i]
+			}
+			c.listenToPort[u] = tp
+			c.listenToPort[pStr] = tp
+			c.listenToPort[":"+pStr] = tp
+		}
+		if len(listens) > 0 {
+			c.defaultTarget = c.listenToPort[listens[0]]
+		}
+
 	case RoleOrigin:
 		if c.InboundAddr == "" {
 			return fmt.Errorf("inbound_addr is required for the origin")
 		}
-		if _, _, err := net.SplitHostPort(c.InboundAddr); err != nil {
-			return fmt.Errorf("inbound_addr must be host:port: %w", err)
+		inbounds, err := parseAddressList(c.InboundAddr, "127.0.0.1")
+		if err != nil || len(inbounds) == 0 {
+			return fmt.Errorf("inbound_addr: %w", err)
+		}
+		c.InboundAddrs = inbounds
+		c.portToInbound = make(map[uint16]string, len(inbounds))
+		for _, in := range inbounds {
+			_, pStr, _ := net.SplitHostPort(in)
+			pNum, _ := strconv.Atoi(pStr)
+			c.portToInbound[uint16(pNum)] = in
+		}
+		if len(inbounds) > 0 {
+			_, pStr, _ := net.SplitHostPort(inbounds[0])
+			pNum, _ := strconv.Atoi(pStr)
+			c.defaultTarget = uint16(pNum)
 		}
 	}
 
@@ -445,8 +500,8 @@ func (c *Config) Validate() error {
 	}
 
 	if !validTransport(c.Transport) {
-		return fmt.Errorf("transport must be %q, %q or %q, got %q",
-			TransportPlain, TransportTLS, TransportWSS, c.Transport)
+		return fmt.Errorf("transport must be %q, %q, %q, %q or %q, got %q",
+			TransportPlain, TransportTLS, TransportWSS, TransportH2, TransportGRPC, c.Transport)
 	}
 	if c.Transport != TransportPlain {
 		// Only the accepting side presents a certificate, and it is created on
@@ -485,9 +540,9 @@ func (c *Config) Validate() error {
 		}
 	}
 	if c.CDN {
-		// A CDN only carries a connection that arrives as a websocket over TLS.
-		if c.Transport != TransportWSS {
-			return fmt.Errorf("cdn needs transport %q, got %q", TransportWSS, c.Transport)
+		if c.Transport != TransportWSS && c.Transport != TransportH2 && c.Transport != TransportGRPC {
+			return fmt.Errorf("cdn needs transport %q, %q or %q, got %q",
+				TransportWSS, TransportH2, TransportGRPC, c.Transport)
 		}
 		// It also routes by hostname, so an address cannot stand in for one.
 		if c.ServerName == "" {
@@ -533,9 +588,17 @@ func (c *Config) Summary() string {
 		fmt.Fprintf(&b, "Accepting tunnel connections on %s. ", c.TunnelAddr)
 	}
 	if c.Role == RoleEdge {
-		fmt.Fprintf(&b, "Users connect to %s. ", c.UserListen)
+		if len(c.UserListens) > 1 {
+			fmt.Fprintf(&b, "Users connect to %s (%d ports). ", strings.Join(c.UserListens, ", "), len(c.UserListens))
+		} else {
+			fmt.Fprintf(&b, "Users connect to %s. ", c.UserListen)
+		}
 	} else {
-		fmt.Fprintf(&b, "Publishing local service %s. ", c.InboundAddr)
+		if len(c.InboundAddrs) > 1 {
+			fmt.Fprintf(&b, "Publishing local services on %s. ", strings.Join(c.InboundAddrs, ", "))
+		} else {
+			fmt.Fprintf(&b, "Publishing local service %s. ", c.InboundAddr)
+		}
 	}
 	fmt.Fprintf(&b, "Link is %s. ", describeTransport(c))
 	if c.Mux {
@@ -547,3 +610,67 @@ func (c *Config) Summary() string {
 	}
 	return b.String()
 }
+
+func parseAddressList(raw, defaultHost string) ([]string, error) {
+	parts := strings.Split(raw, ",")
+	var result []string
+	for _, p := range parts {
+		item := strings.TrimSpace(p)
+		if item == "" {
+			continue
+		}
+		if _, err := strconv.Atoi(item); err == nil {
+			item = net.JoinHostPort(defaultHost, item)
+		} else if strings.HasPrefix(item, ":") {
+			item = defaultHost + item
+		}
+		host, port, err := net.SplitHostPort(item)
+		if err != nil {
+			return nil, fmt.Errorf("invalid address %q: %w", item, err)
+		}
+		pNum, err := strconv.Atoi(port)
+		if err != nil || pNum < 1 || pNum > 65535 {
+			return nil, fmt.Errorf("invalid port in %q", item)
+		}
+		if host == "" {
+			host = defaultHost
+		}
+		result = append(result, net.JoinHostPort(host, port))
+	}
+	return result, nil
+}
+
+// TargetPortFor returns the target port for a given listen address or port.
+func (c *Config) TargetPortFor(addr string) uint16 {
+	if c.listenToPort != nil {
+		if p, ok := c.listenToPort[addr]; ok {
+			return p
+		}
+		if _, pStr, err := net.SplitHostPort(addr); err == nil {
+			if p, ok := c.listenToPort[pStr]; ok {
+				return p
+			}
+			if p, ok := c.listenToPort[":"+pStr]; ok {
+				return p
+			}
+			if n, err := strconv.Atoi(pStr); err == nil && n > 0 && n <= 65535 {
+				return uint16(n)
+			}
+		}
+	}
+	return c.defaultTarget
+}
+
+// InboundFor returns the dial target for a given destination port.
+func (c *Config) InboundFor(port uint16) string {
+	if port > 0 && c.portToInbound != nil {
+		if addr, ok := c.portToInbound[port]; ok {
+			return addr
+		}
+	}
+	if len(c.InboundAddrs) > 0 {
+		return c.InboundAddrs[0]
+	}
+	return c.InboundAddr
+}
+

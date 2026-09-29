@@ -978,3 +978,111 @@ func TestStatusFileIsWrittenAndRemoved(t *testing.T) {
 	}
 	t.Fatal("status file was left behind after shutdown, so a stopped tunnel would look alive")
 }
+
+func TestMultiPortForwarding(t *testing.T) {
+	for _, mode := range []Mode{ModeDirect, ModeReverse} {
+		for _, mux := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s-mux=%v", mode, mux), func(t *testing.T) {
+				svc1 := startService(t)
+				defer svc1.stop()
+				svc2 := startService(t)
+				defer svc2.stop()
+
+				userAddr1 := freeAddr(t)
+				userAddr2 := freeAddr(t)
+				tunnelAddr := freeAddr(t)
+
+				mk := func(role Role) *Config {
+					cfg := defaultConfig()
+					cfg.Name = "test" + string(role)
+					cfg.Mode = mode
+					cfg.Role = role
+					cfg.Mux = mux
+					cfg.PoolSize = 4
+					cfg.MuxLinks = 2
+					cfg.MaxConn = 100
+					cfg.MaxPending = 64
+					cfg.SpareTTL = 10 * time.Minute
+					cfg.ParkTimeout = 15 * time.Minute
+					cfg.Drain = 2 * time.Second
+					cfg.SecretFile = writeSecret(t, testSecret)
+					cfg.StatusFile = ""
+					cfg.TunnelAddr = tunnelAddr
+					if role == RoleEdge {
+						cfg.UserListen = userAddr1 + ", " + userAddr2
+						_, p1, _ := net.SplitHostPort(svc1.addr)
+						_, p2, _ := net.SplitHostPort(svc2.addr)
+						cfg.ServerInboundPort = p1 + ", " + p2
+					} else {
+						cfg.InboundAddr = svc1.addr + ", " + svc2.addr
+					}
+					if err := cfg.Validate(); err != nil {
+						t.Fatalf("config for %s/%s: %v", mode, role, err)
+					}
+					if err := cfg.LoadSecret(); err != nil {
+						t.Fatalf("secret for %s/%s: %v", mode, role, err)
+					}
+					return cfg
+				}
+
+				edgeCfg := mk(RoleEdge)
+				originCfg := mk(RoleOrigin)
+
+				ctx, cancel := context.WithCancel(context.Background())
+				var wg sync.WaitGroup
+				wg.Add(2)
+
+				startEdge := func() {
+					go func() {
+						defer wg.Done()
+						if err := runEdge(ctx, edgeCfg, newStatus(edgeCfg)); err != nil {
+							t.Logf("edge exited: %v", err)
+						}
+					}()
+				}
+				startOrigin := func() {
+					go func() {
+						defer wg.Done()
+						if err := runOrigin(ctx, originCfg, newStatus(originCfg)); err != nil {
+							t.Logf("origin exited: %v", err)
+						}
+					}()
+				}
+
+				if mode == ModeDirect {
+					startOrigin()
+					time.Sleep(150 * time.Millisecond)
+					startEdge()
+				} else {
+					startEdge()
+					time.Sleep(150 * time.Millisecond)
+					startOrigin()
+				}
+
+				time.Sleep(600 * time.Millisecond)
+				defer func() {
+					cancel()
+					wg.Wait()
+				}()
+
+				// Request to userAddr1 should hit svc1
+				got1, err := roundTrip(t, userAddr1, "service-one", 8*time.Second)
+				if err != nil {
+					t.Fatalf("round trip to svc1 failed: %v", err)
+				}
+				if got1 != "SERVICE-ONE" {
+					t.Fatalf("svc1 got %q, want SERVICE-ONE", got1)
+				}
+
+				// Request to userAddr2 should hit svc2
+				got2, err := roundTrip(t, userAddr2, "service-two", 8*time.Second)
+				if err != nil {
+					t.Fatalf("round trip to svc2 failed: %v", err)
+				}
+				if got2 != "SERVICE-TWO" {
+					t.Fatalf("svc2 got %q, want SERVICE-TWO", got2)
+				}
+			})
+		}
+	}
+}

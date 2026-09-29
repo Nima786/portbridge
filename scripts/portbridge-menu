@@ -165,6 +165,22 @@ valid_port() {
     esac
 }
 
+valid_ports_list() {
+    local list=$1 item
+    [ -n "$list" ] || return 1
+    local old_ifs=$IFS
+    IFS=','
+    for item in $list; do
+        item=$(printf '%s' "$item" | tr -d '[:space:]')
+        if ! valid_port "$item"; then
+            IFS=$old_ifs
+            return 1
+        fi
+    done
+    IFS=$old_ifs
+    return 0
+}
+
 valid_host() {
     case "$1" in
         '' ) return 1 ;;
@@ -372,6 +388,11 @@ explain_disguise() {
         say "     ${DIM}to your domain through the CDN on its own and keeps working.${R}"
         say "     ${DIM}Also needs a domain pointed at the CDN.${R}"
     fi
+    say ""
+    say "  ${B}5) HTTP/2 / gRPC stream${R}"
+    say "     ${DIM}Wraps the link in HTTP/2 streaming frames over TLS, appearing${R}"
+    say "     ${DIM}as active HTTP/2 web/gRPC traffic. Resists DPI protocol inspection${R}"
+    say "     ${DIM}and works with Cloudflare gRPC mode.${R}"
     hr
 }
 
@@ -381,9 +402,9 @@ ask_disguise() {
 
     explain_disguise "$mode"
     if [ "$mode" = direct ]; then
-        choice=$(choose "Choose 1, 2, 3 or 4" "2" 1 2 3 4)
+        choice=$(choose "Choose 1, 2, 3, 4 or 5" "2" 1 2 3 4 5)
     else
-        choice=$(choose "Choose 1, 2 or 3" "2" 1 2 3)
+        choice=$(choose "Choose 1, 2, 3 or 5" "2" 1 2 3 5)
     fi
 
     DG_SERVERNAME=""
@@ -400,6 +421,7 @@ ask_disguise() {
         2) DG_TRANSPORT=tls ;;
         3) DG_TRANSPORT=wss; DG_CDN=on ;;
         4) DG_TRANSPORT=wss; DG_CDN=off ;;
+        5) DG_TRANSPORT=grpc ;;
     esac
 
     if [ "$choice" = 3 ] || [ "$choice" = 4 ]; then
@@ -461,6 +483,8 @@ ask_disguise() {
 describe_disguise() {
     case "$1:$2" in
         tls:*) printf 'looks like a normal website' ;;
+        h2:*) printf 'looks like HTTP/2 web traffic' ;;
+        grpc:*) printf 'looks like gRPC over HTTP/2' ;;
         wss:on) printf 'through a CDN' ;;
         wss:*)
             if [ -n "${3-}" ]; then
@@ -759,6 +783,57 @@ ask_remote_port() {
     done
 }
 
+# ask_remote_ports <prompt> <default> - one port or comma-separated list
+ask_remote_ports() {
+    local p
+    while :; do
+        p=$(ask "$1" "${2-}")
+        if ! valid_ports_list "$p"; then
+            err "  Each port must be a number from 1 to 65535 (e.g. 443, 8443, 2083)."
+            continue
+        fi
+        printf '%s' "$p" | sed -E 's/[[:space:]]+//g'
+        return 0
+    done
+}
+
+# ask_user_ports <prompt> <default> [skip_name]
+ask_user_ports() {
+    local prompt=$1 def=$2 skip_name=${3-} p item owner
+    while :; do
+        p=$(ask "$prompt" "$def")
+        if ! valid_ports_list "$p"; then
+            err "  Each port must be a number from 1 to 65535 (e.g. 443, 8443, 2083)."
+            continue
+        fi
+        local clean=""
+        local old_ifs=$IFS
+        local conflict=0
+        IFS=','
+        for item in $p; do
+            item=$(printf '%s' "$item" | tr -d '[:space:]')
+            owner=$(port_owner "$item" || true)
+            if [ -n "$owner" ] && [ "$owner" != "$skip_name" ]; then
+                err "  Port $item is already used by tunnel '$owner'. Pick another."
+                conflict=1
+                break
+            fi
+            if port_in_use_by_system "$item"; then
+                warn "  Something is already listening on port $item."
+                if ! confirm "  Use it anyway?"; then
+                    conflict=1
+                    break
+                fi
+            fi
+            [ -n "$clean" ] && clean="$clean, $item" || clean="$item"
+        done
+        IFS=$old_ifs
+        [ "$conflict" -eq 1 ] && continue
+        printf '%s' "$clean"
+        return 0
+    done
+}
+
 # this_machine_has_ip <ip> - true if the address is bound to one of our interfaces
 this_machine_has_ip() {
     ip -o addr show 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | grep -qx "$1"
@@ -817,22 +892,25 @@ create_tunnel() {
 
     say ""
     info "The port of your inbound on the foreign server, as shown in your panel."
-    inport=$(ask_remote_port "Inbound port" "")
+    info "For multiple ports/services, separate them with commas (e.g. 443, 8443, 2083)."
+    inport=$(ask_remote_ports "Inbound port(s)" "")
 
     # The inbound port being busy HERE almost always means Xray is running here,
     # so this is the foreign server and the user is on the wrong machine.
-    if looks_like_foreign_server "$inport"; then
-        warn "Port $inport is already in use on this machine. That usually means this"
+    local first_inport=${inport%%,*}
+    first_inport=$(printf '%s' "$first_inport" | tr -d '[:space:]')
+    if looks_like_foreign_server "$first_inport"; then
+        warn "Port $first_inport is already in use on this machine. That usually means this"
         warn "is your foreign server, not your Iran server."
         warn "Create a tunnel should be run on the Iran server instead."
         confirm "Carry on here anyway?" || { say "Cancelled. Nothing was changed."; return 1; }
     fi
 
     say ""
-    info "The port your users put in their configs, next to this Iran server's IP."
-    info "Keeping it the same as the inbound port is simplest, so that is suggested."
-    uport=$(ask_port "Port for your users" "$inport")
-    ulisten="0.0.0.0:$uport"
+    info "The port(s) your users put in their configs, next to this Iran server's IP."
+    info "Keeping it the same as the inbound port(s) is simplest, so that is suggested."
+    uport=$(ask_user_ports "Port(s) for your users" "$inport")
+    ulisten="$uport"
 
     ask_disguise "$mode"
     ask_sharing
@@ -848,7 +926,7 @@ create_tunnel() {
         if [ "$mode" = reverse ]; then
             # Reverse: it is opened here on the Iran server, so check it here.
             tport=$(ask_port "Port between the two servers" "$DEFAULT_TUNNEL_PORT" "" link)
-            if [ "$tport" = "$uport" ]; then
+            if printf ',%s,' "$uport" | tr -d ' ' | grep -q ",$tport,"; then
                 err "  It cannot be the same as your users' port."
                 continue
             fi
@@ -970,7 +1048,7 @@ join_tunnel() {
     MX_LINKS=$(get mux_links); [ -n "$MX_LINKS" ] || MX_LINKS=4
 
     if [ "$v" != 5 ] || [ -z "$name" ] || [ -z "$mode" ] || [ -z "$secret" ] ||
-        ! valid_port "${tport:-x}" || ! valid_port "${inport:-x}" || [ -z "$relay_ip" ]; then
+        ! valid_port "${tport:-x}" || ! valid_ports_list "${inport:-x}" || [ -z "$relay_ip" ]; then
         err "That is not a valid PortBridge code."
         return 1
     fi
@@ -1010,9 +1088,11 @@ join_tunnel() {
     hr
 
     # Nothing to ask, but two things are worth checking before going ahead.
-    inbound="127.0.0.1:$inport"
-    if ! timeout 3 bash -c "echo > /dev/tcp/127.0.0.1/$inport" 2>/dev/null; then
-        warn "Nothing is answering on port $inport on this server."
+    inbound=$(echo "$inport" | awk -F',' '{for(i=1;i<=NF;i++){gsub(/^[ \t]+|[ \t]+$/,"",$i); printf (i==1?"":", ") "127.0.0.1:" $i}}')
+    local first_inport=${inport%%,*}
+    first_inport=$(printf '%s' "$first_inport" | tr -d '[:space:]')
+    if ! timeout 3 bash -c "echo > /dev/tcp/127.0.0.1/$first_inport" 2>/dev/null; then
+        warn "Nothing is answering on port $first_inport on this server."
         warn "Is Xray running, and is this the server with your panel on it?"
         confirm "Carry on anyway?" || { say "Cancelled. Nothing was changed."; return 1; }
     fi
@@ -1102,6 +1182,8 @@ status_line() {
     local look
     case "$transport:$cdn" in
         tls:*) look=website ;;
+        h2:*) look=http2 ;;
+        grpc:*) look=grpc ;;
         wss:on) look=cdn ;;
         wss:*)
             if [ -n "$(read_conf "$name" alt_target)" ]; then

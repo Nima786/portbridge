@@ -171,55 +171,34 @@ func runEdge(ctx context.Context, cfg *Config, st *status) error {
 		log.Printf("waiting for the origin to connect in on %s", cfg.TunnelAddr)
 	}
 
-	userLn, err := net.Listen("tcp", cfg.UserListen)
-	if err != nil {
-		return err
+	var userLns []net.Listener
+	for _, addr := range cfg.UserListens {
+		ln, err := net.Listen("tcp", addr)
+		if err != nil {
+			for _, prev := range userLns {
+				_ = prev.Close()
+			}
+			return fmt.Errorf("listening for users on %s: %w", addr, err)
+		}
+		userLns = append(userLns, ln)
 	}
 	go func() {
 		<-ctx.Done()
-		_ = userLn.Close()
+		for _, ln := range userLns {
+			_ = ln.Close()
+		}
 	}()
 
-	for {
-		c, err := userLn.Accept()
-		if err != nil {
-			if ctx.Err() != nil || errors.Is(err, net.ErrClosed) {
-				break
-			}
-			// Most often the open-file limit. Logged, throttled, so the cause is
-			// visible without flooding the journal.
-			e.logAccept.printf("accepting a user failed (check the open-file limit): %v", err)
-			time.Sleep(50 * time.Millisecond)
-			continue
-		}
-
-		select {
-		case e.active <- struct{}{}:
-			e.wg.Add(1)
-			atomic.AddInt64(&st.activeSessions, 1)
-			go func(user net.Conn) {
-				defer e.wg.Done()
-				defer func() {
-					atomic.AddInt64(&st.activeSessions, -1)
-					<-e.active
-				}()
-				if err := e.serve(ctx, user); err != nil {
-					_ = user.Close()
-					if errors.Is(err, errUserWentAway) {
-						// Background noise on a public port. Counted, not logged.
-						atomic.AddInt64(&st.emptyConnections, 1)
-						return
-					}
-					atomic.AddInt64(&st.failedSessions, 1)
-					e.logSession.printf("could not put a user on the tunnel: %v", err)
-				}
-			}(c)
-		default:
-			atomic.AddInt64(&st.droppedSessions, 1)
-			e.logCapacity.printf("at capacity (%d sessions); dropping a user", e.cfg.MaxConn)
-			_ = c.Close()
-		}
+	var listenerWg sync.WaitGroup
+	for _, ln := range userLns {
+		listenerWg.Add(1)
+		go func(ln net.Listener) {
+			defer listenerWg.Done()
+			e.acceptUsers(ctx, ln, st)
+		}(ln)
 	}
+
+	listenerWg.Wait()
 
 	log.Printf("shutting down; letting live sessions finish for up to %s", e.cfg.Drain)
 	if e.pool != nil {
@@ -287,9 +266,55 @@ func (e *edge) acceptTunnel(ctx context.Context, ln net.Listener) {
 	}
 }
 
+func (e *edge) acceptUsers(ctx context.Context, ln net.Listener, st *status) {
+	listenAddr := ln.Addr().String()
+	targetPort := e.cfg.TargetPortFor(listenAddr)
+
+	for {
+		c, err := ln.Accept()
+		if err != nil {
+			if ctx.Err() != nil || errors.Is(err, net.ErrClosed) {
+				break
+			}
+			// Most often the open-file limit. Logged, throttled, so the cause is
+			// visible without flooding the journal.
+			e.logAccept.printf("accepting a user failed (check the open-file limit): %v", err)
+			time.Sleep(50 * time.Millisecond)
+			continue
+		}
+
+		select {
+		case e.active <- struct{}{}:
+			e.wg.Add(1)
+			atomic.AddInt64(&st.activeSessions, 1)
+			go func(user net.Conn) {
+				defer e.wg.Done()
+				defer func() {
+					atomic.AddInt64(&st.activeSessions, -1)
+					<-e.active
+				}()
+				if err := e.serve(ctx, user, targetPort); err != nil {
+					_ = user.Close()
+					if errors.Is(err, errUserWentAway) {
+						// Background noise on a public port. Counted, not logged.
+						atomic.AddInt64(&st.emptyConnections, 1)
+						return
+					}
+					atomic.AddInt64(&st.failedSessions, 1)
+					e.logSession.printf("could not put a user on the tunnel: %v", err)
+				}
+			}(c)
+		default:
+			atomic.AddInt64(&st.droppedSessions, 1)
+			e.logCapacity.printf("at capacity (%d sessions); dropping a user", e.cfg.MaxConn)
+			_ = c.Close()
+		}
+	}
+}
+
 // serve moves one user across the tunnel, quietly retrying on a fresh connection
 // if a spare turns out to be dead.
-func (e *edge) serve(ctx context.Context, user net.Conn) error {
+func (e *edge) serve(ctx context.Context, user net.Conn, targetPort uint16) error {
 	// Capture the opening bytes so they can be replayed if the first attempt
 	// fails. Every protocol used here speaks first, so this returns at once.
 	//
@@ -319,7 +344,7 @@ func (e *edge) serve(ctx context.Context, user net.Conn) error {
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
-		tunnel, err := e.takeTunnel(ctx)
+		tunnel, err := e.takeTunnel(ctx, targetPort)
 		if err != nil {
 			lastErr = err
 			// Nothing to retry against in reverse mode with the origin away.
@@ -328,7 +353,7 @@ func (e *edge) serve(ctx context.Context, user net.Conn) error {
 			}
 			continue
 		}
-		if err := activate(tunnel, head); err != nil {
+		if err := activate(tunnel, head, targetPort); err != nil {
 			_ = tunnel.Close()
 			lastErr = err
 			atomic.AddInt64(&e.st.retries, 1)
@@ -348,9 +373,9 @@ func (e *edge) serve(ctx context.Context, user net.Conn) error {
 // takeTunnel produces something to carry one user across the border: either a
 // ready spare connection, or a new session inside a shared link. Both behave the
 // same from here on, which is why the rest of this file does not care which.
-func (e *edge) takeTunnel(ctx context.Context) (net.Conn, error) {
+func (e *edge) takeTunnel(ctx context.Context, targetPort uint16) (net.Conn, error) {
 	if e.links != nil {
-		return e.links.open(ctx.Done())
+		return e.links.open(ctx.Done(), targetPort)
 	}
 	return e.pool.take(ctx)
 }
@@ -363,9 +388,13 @@ func (e *edge) takeTunnel(ctx context.Context) (net.Conn, error) {
 // acknowledgement rides along inside that wait. And because those bytes are
 // still held locally, the connection stays safe to throw away if no
 // acknowledgement arrives.
-func activate(tunnel net.Conn, head []byte) error {
-	opening := make([]byte, 0, 1+len(head))
-	opening = append(opening, msgActivate)
+func activate(tunnel net.Conn, head []byte, targetPort uint16) error {
+	opening := make([]byte, 0, 3+len(head))
+	if targetPort > 0 {
+		opening = append(opening, msgActivatePort, byte(targetPort>>8), byte(targetPort))
+	} else {
+		opening = append(opening, msgActivate)
+	}
 	opening = append(opening, head...)
 
 	if err := tunnel.SetWriteDeadline(time.Now().Add(activateWriteTimeout)); err != nil {

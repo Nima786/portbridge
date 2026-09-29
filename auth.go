@@ -35,8 +35,9 @@ const (
 	authSignLen  = 1 + authTimeLen + authNonceLen
 	authFrameLen = authSignLen + authMACLen
 
-	msgActivate = 0x01
-	msgAck      = 0x06
+	msgActivate     = 0x01
+	msgActivatePort = 0x02 // followed by 2B target port uint16 BE, then opening bytes
+	msgAck          = 0x06
 
 	// Sent before closing, but only once the MAC has already verified, so these
 	// never leak information to a peer that does not hold the secret.

@@ -252,6 +252,8 @@ type muxStream struct {
 	needOpen bool // the open frame has not been sent yet
 	wClosed  bool
 
+	targetPort uint16
+
 	dead     chan struct{} // the stream or its carrier has finished
 	deadOnce sync.Once
 	err      atomic.Value // error: why it finished
@@ -259,6 +261,8 @@ type muxStream struct {
 	rdl *deadline
 	wdl *deadline
 }
+
+func (s *muxStream) TargetPort() uint16 { return s.targetPort }
 
 func newMuxStream(c *carrier, id uint32, opener bool) *muxStream {
 	return &muxStream{
@@ -494,7 +498,13 @@ func (s *muxStream) Write(p []byte) (int, error) {
 			// costs one write rather than two. Nothing waits on the open by
 			// itself, so there is no reason to send it alone.
 			s.needOpen = false
-			frames = []muxFrame{{typ: muxOpen, id: s.id}, frames[0]}
+			var openPayload []byte
+			if s.targetPort > 0 {
+				var pb [2]byte
+				binary.BigEndian.PutUint16(pb[:], s.targetPort)
+				openPayload = pb[:]
+			}
+			frames = []muxFrame{{typ: muxOpen, id: s.id, payload: openPayload}, frames[0]}
 		}
 		if err := s.c.sendData(s, frames...); err != nil {
 			return sent, err
@@ -886,7 +896,7 @@ func (c *carrier) streamCount() int {
 }
 
 // open starts a new stream. Nothing goes on the wire until the first write.
-func (c *carrier) open() (*muxStream, error) {
+func (c *carrier) open(targetPort ...uint16) (*muxStream, error) {
 	c.mu.Lock()
 	if c.closed {
 		c.mu.Unlock()
@@ -895,6 +905,9 @@ func (c *carrier) open() (*muxStream, error) {
 	id := c.nextID
 	c.nextID++
 	s := newMuxStream(c, id, true)
+	if len(targetPort) > 0 {
+		s.targetPort = targetPort[0]
+	}
 	c.streams[id] = s
 	c.mu.Unlock()
 	return s, nil
@@ -962,6 +975,9 @@ func (c *carrier) handle(typ byte, id uint32, payload []byte) error {
 			return fmt.Errorf("the other end reused session number %d", id)
 		}
 		s := newMuxStream(c, id, false)
+		if len(payload) >= 2 {
+			s.targetPort = binary.BigEndian.Uint16(payload[:2])
+		}
 		c.streams[id] = s
 		c.mu.Unlock()
 
@@ -1164,13 +1180,17 @@ func (cs *carrierSet) best() *carrier {
 // open starts one session across the border. Unlike a spare connection this
 // needs no round trip: the session is announced along with the user's opening
 // bytes, so there is nothing to wait for.
-func (cs *carrierSet) open(done <-chan struct{}) (net.Conn, error) {
+func (cs *carrierSet) open(done <-chan struct{}, targetPort ...uint16) (net.Conn, error) {
+	var tp uint16
+	if len(targetPort) > 0 {
+		tp = targetPort[0]
+	}
 	giveUp := time.NewTimer(muxWaitForLink)
 	defer giveUp.Stop()
 
 	for {
 		if c := cs.best(); c != nil {
-			s, err := c.open()
+			s, err := c.open(tp)
 			if err == nil {
 				return s, nil
 			}

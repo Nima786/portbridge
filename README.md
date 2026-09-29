@@ -95,6 +95,9 @@ your answer in the pairing code so both ends always agree.
 | **Look like a normal website** (recommended) | An ordinary secure website connection, including a real handshake if anyone probes the port. |
 | **Through Cloudflare or another CDN** | A normal secure websocket request to your domain, with your foreign server's IP never appearing on the link. |
 | **Look like a website, with a CDN standing by** | As the second option, but if your foreign server's address ever stops being reachable the link moves to your domain through the CDN by itself. Direct mode only. |
+| **HTTP/2 or gRPC stream** | Wraps the link in HTTP/2 streaming frames over TLS, appearing as active HTTP/2 or gRPC traffic to defeat DPI deep-packet inspection and support Cloudflare gRPC mode. |
+
+A single tunnel can forward multiple ports / services at once: enter comma-separated ports (e.g. `443, 8443, 2083`) when creating or editing the tunnel.
 
 The middle option needs nothing from you but a name for the link to claim, and
 that name does not have to be real or yours. A certificate is generated on the
