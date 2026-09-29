@@ -470,6 +470,43 @@ ask_disguise() {
         warn "server, the tunnel port cannot be locked to one address, so it is left"
         warn "open. Anything that knocks on it without the right web address and"
         warn "password gets an ordinary 404 and nothing else."
+    elif [ "$choice" = 5 ]; then
+        say ""
+        info "HTTP/2 / gRPC stream can connect directly to your foreign server, or"
+        info "route through Cloudflare CDN (with the gRPC setting turned on in Cloudflare)."
+        say ""
+        say "  ${B}1${R}) Direct to foreign server IP ${DIM}(claims any normal website name, e.g. www.google.com)${R}"
+        say "  ${B}2${R}) Through Cloudflare CDN ${DIM}(needs your domain pointed to Cloudflare with gRPC enabled)${R}"
+        local grpc_choice
+        grpc_choice=$(choose "Choose 1 or 2" "1" 1 2)
+        if [ "$grpc_choice" = 2 ]; then
+            DG_CDN=on
+            say ""
+            info "Needs a domain you control pointed at your foreign server behind Cloudflare."
+            info "Make sure Cloudflare -> Network -> gRPC is toggled ON, and SSL is Full."
+            local domain
+            domain=$(ask_domain)
+            DG_SERVERNAME=$domain
+            DG_WSPATH=""
+            say ""
+            info "Routing gRPC through Cloudflare using domain: $DG_SERVERNAME"
+            if [ "$mode" = reverse ]; then
+                warn "Note: a CDN only carries connections towards your domain, so with"
+                warn "reverse this only works if the domain points at THIS Iran server."
+            fi
+            say ""
+            warn "Three things to set on Cloudflare for gRPC mode:"
+            warn "  - Network -> gRPC must be turned ON."
+            warn "  - SSL/TLS encryption mode must be Full."
+            warn "  - The port below must be one Cloudflare forwards: $CDN_PORTS"
+        else
+            DG_CDN=off
+            say ""
+            info "The direct gRPC stream will claim to be a website/API service."
+            info "Any believable name works (e.g. www.google.com, www.bing.com)."
+            DG_SERVERNAME=$(ask "Name for it to claim" "www.google.com")
+            [ -n "$DG_SERVERNAME" ] || DG_SERVERNAME=www.google.com
+        fi
     else
         say ""
         info "The link will claim to be a website. Any believable name works, and it"
@@ -483,7 +520,9 @@ ask_disguise() {
 describe_disguise() {
     case "$1:$2" in
         tls:*) printf 'looks like a normal website' ;;
+        h2:on) printf 'HTTP/2 stream through Cloudflare' ;;
         h2:*) printf 'looks like HTTP/2 web traffic' ;;
+        grpc:on) printf 'gRPC stream through Cloudflare' ;;
         grpc:*) printf 'looks like gRPC over HTTP/2' ;;
         wss:on) printf 'through a CDN' ;;
         wss:*)
