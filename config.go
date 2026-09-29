@@ -673,4 +673,3 @@ func (c *Config) InboundFor(port uint16) string {
 	}
 	return c.InboundAddr
 }
-
