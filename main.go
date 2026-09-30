@@ -215,9 +215,6 @@ func teardownFromEdge(cfg *Config) error {
 				if res == "ok" {
 					return nil
 				}
-				if strings.HasPrefix(res, "err: ") {
-					return errors.New(strings.TrimPrefix(res, "err: "))
-				}
 			}
 		}
 	}
@@ -226,39 +223,65 @@ func teardownFromEdge(cfg *Config) error {
 	return teardownDirectStandalone(cfg)
 }
 
+func tryTeardownConn(raw net.Conn, claim string, cfg *Config) error {
+	defer raw.Close()
+	tuneSocket(raw)
+	c, err := wrapDial(raw, cfg.withClaimedName(claim))
+	if err != nil {
+		return fmt.Errorf("wrapping dial: %w", err)
+	}
+	defer c.Close()
+	if err := sendAuth(c, cfg.secret); err != nil {
+		return fmt.Errorf("auth: %w", err)
+	}
+	if cfg.Mux {
+		cs := newCarrierSet(1, nil, nil)
+		if !cs.add(c) {
+			return errors.New("cannot create mux link")
+		}
+		defer cs.closeAll()
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		stream, err := cs.open(ctx.Done())
+		if err != nil {
+			return fmt.Errorf("opening mux stream: %w", err)
+		}
+		defer stream.Close()
+		return sendTeardown(stream)
+	}
+	return sendTeardown(c)
+}
+
 func teardownDirectStandalone(cfg *Config) error {
 	if cfg.Mode == ModeDirect {
 		routes := newRouter(cfg)
 		raw, claim, err := routes.dial(5 * time.Second)
+		if err == nil {
+			if err := tryTeardownConn(raw, claim, cfg); err == nil {
+				return nil
+			}
+		}
+		// If routed dial failed or was closed by CDN, and PeerIP is known, connect directly to foreign server IP
+		directAddr := cfg.TunnelAddr
+		if cfg.PeerIP != "" {
+			_, port, splitErr := net.SplitHostPort(cfg.TunnelAddr)
+			if splitErr == nil {
+				directAddr = net.JoinHostPort(cfg.PeerIP, port)
+			}
+		}
+		if directAddr != "" && directAddr != cfg.dialTarget() {
+			d := net.Dialer{Timeout: 5 * time.Second}
+			if directRaw, dErr := d.Dial("tcp", directAddr); dErr == nil {
+				claim := cfg.effectiveServerName()
+				if err := tryTeardownConn(directRaw, claim, cfg); err == nil {
+					return nil
+				}
+			}
+		}
 		if err != nil {
 			return fmt.Errorf("dialing %s: %w", cfg.TunnelAddr, err)
 		}
-		defer raw.Close()
-		tuneSocket(raw)
-		c, err := wrapDial(raw, cfg.withClaimedName(claim))
-		if err != nil {
-			return fmt.Errorf("wrapping dial: %w", err)
-		}
-		defer c.Close()
-		if err := sendAuth(c, cfg.secret); err != nil {
-			return fmt.Errorf("auth: %w", err)
-		}
-		if cfg.Mux {
-			cs := newCarrierSet(1, nil, nil)
-			if !cs.add(c) {
-				return errors.New("cannot create mux link")
-			}
-			defer cs.closeAll()
-			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			defer cancel()
-			stream, err := cs.open(ctx.Done())
-			if err != nil {
-				return fmt.Errorf("opening mux stream: %w", err)
-			}
-			defer stream.Close()
-			return sendTeardown(stream)
-		}
-		return sendTeardown(c)
+		return errors.New("remote teardown failed")
 	}
 
 	// ModeReverse: edge listens, origin dials in

@@ -441,20 +441,33 @@ func activate(tunnel net.Conn, head []byte, targetPort uint16) error {
 
 // TeardownRemote contacts the origin to delete its half of the tunnel.
 func (e *edge) TeardownRemote(ctx context.Context) error {
-	var conn net.Conn
-	var err error
-	if e.links != nil {
-		conn, err = e.links.open(ctx.Done())
-	} else if e.pool != nil {
-		conn, err = e.pool.take(ctx)
-	} else {
-		return errors.New("no active links or pool")
+	var lastErr error
+	for attempt := 1; attempt <= maxActivateTries; attempt++ {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		var conn net.Conn
+		var err error
+		if e.links != nil {
+			conn, err = e.links.open(ctx.Done())
+		} else if e.pool != nil {
+			conn, err = e.pool.take(ctx)
+		} else {
+			return errors.New("no active links or pool")
+		}
+		if err != nil {
+			lastErr = fmt.Errorf("obtaining tunnel connection: %w", err)
+			continue
+		}
+		if err := sendTeardown(conn); err != nil {
+			_ = conn.Close()
+			lastErr = err
+			continue
+		}
+		_ = conn.Close()
+		return nil
 	}
-	if err != nil {
-		return fmt.Errorf("obtaining tunnel connection: %w", err)
-	}
-	defer conn.Close()
-	return sendTeardown(conn)
+	return lastErr
 }
 
 func sendTeardown(tunnel net.Conn) error {
