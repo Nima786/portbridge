@@ -37,6 +37,8 @@ const (
 
 	msgActivate     = 0x01
 	msgActivatePort = 0x02 // followed by 2B target port uint16 BE, then opening bytes
+	msgTeardown     = 0x03 // request origin to delete this tunnel
+	msgTeardownAck  = 0x04 // origin confirms teardown request
 	msgAck          = 0x06
 
 	// Sent before closing, but only once the MAC has already verified, so these
@@ -53,11 +55,12 @@ const (
 )
 
 var (
-	errAuthMAC     = errors.New("wrong or missing secret")
-	errAuthVersion = errors.New("peer speaks a different protocol version")
-	errAuthSkew    = errors.New("the two servers' clocks differ by more than two minutes; check time sync")
-	errAuthReplay  = errors.New("auth frame replayed")
-	errRejected    = errors.New("peer rejected our credentials")
+	errAuthMAC           = errors.New("wrong or missing secret")
+	errAuthVersion       = errors.New("peer speaks a different protocol version")
+	errAuthSkew          = errors.New("the two servers' clocks differ by more than two minutes; check time sync")
+	errAuthReplay        = errors.New("auth frame replayed")
+	errRejected          = errors.New("peer rejected our credentials")
+	errTeardownRequested = errors.New("remote teardown requested")
 )
 
 func hmacFor(secret, data []byte) []byte {

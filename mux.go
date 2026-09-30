@@ -66,8 +66,10 @@ const (
 	muxCredit byte = 0x23 // 4B: this many more bytes may be sent to me
 	muxFin    byte = 0x24 // I have finished sending on this stream
 	muxReset  byte = 0x25 // this stream is over
-	muxPing   byte = 0x26 // is this link still alive?
-	muxPong   byte = 0x27 // yes
+	muxPing        byte = 0x26 // is this link still alive?
+	muxPong        byte = 0x27 // yes
+	muxTeardown    byte = 0x28 // edge -> origin: delete this tunnel
+	muxTeardownAck byte = 0x29 // origin -> edge: confirm teardown
 )
 
 const (
@@ -693,6 +695,9 @@ type carrier struct {
 
 	lastHeard int64 // unix nano, read and written atomically
 
+	// onTeardown is called if the remote peer asks to teardown the tunnel.
+	onTeardown func()
+
 	// growLeft is the extra buffering the sessions on this link may still take
 	// between them. It is what keeps widening a window safe: a session can only
 	// grow while this lasts, so the memory one link can tie up has a ceiling
@@ -1029,6 +1034,16 @@ func (c *carrier) handle(typ byte, id uint32, payload []byte) error {
 		}
 		return nil
 
+	case muxTeardown:
+		c.sendControl(muxFrame{typ: muxTeardownAck})
+		if c.onTeardown != nil {
+			c.onTeardown()
+		}
+		return nil
+
+	case muxTeardownAck:
+		return nil
+
 	default:
 		return fmt.Errorf("unknown frame type %d on the link", typ)
 	}
@@ -1086,9 +1101,20 @@ type carrierSet struct {
 	// connection.
 	onStream func(net.Conn)
 
+	onTeardown func()
+
 	added   chan struct{}
 	log     *throttled
 	lastErr atomic.Value
+}
+
+func (cs *carrierSet) SetOnTeardown(fn func()) {
+	cs.mu.Lock()
+	defer cs.mu.Unlock()
+	cs.onTeardown = fn
+	for _, c := range cs.items {
+		c.onTeardown = fn
+	}
 }
 
 func newCarrierSet(target int, dial func() (net.Conn, error), onStream func(net.Conn)) *carrierSet {
@@ -1114,6 +1140,7 @@ func (cs *carrierSet) add(conn net.Conn) bool {
 		cs.mu.Unlock()
 		return false
 	}
+	c.onTeardown = cs.onTeardown
 	cs.items = append(cs.items, c)
 	cs.mu.Unlock()
 

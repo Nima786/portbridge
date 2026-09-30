@@ -8,6 +8,9 @@ import (
 	"io"
 	"log"
 	"net"
+	"os"
+	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -155,6 +158,13 @@ func runEdge(ctx context.Context, cfg *Config, st *status) error {
 		e.pool = newPool(cfg.PoolSize, cfg.SpareTTL, reverseWaitForSpare, dial)
 		st.pool = e.pool
 		go e.pool.maintain(ctx)
+	}
+
+	ctrl, err := startControlServer(ctx, cfg, e)
+	if err != nil {
+		log.Printf("warning: could not start local control socket: %v", err)
+	} else if ctrl != nil {
+		defer ctrl.Close()
 	}
 
 	// In reverse mode we also listen for the origin's incoming connections.
@@ -427,4 +437,99 @@ func activate(tunnel net.Conn, head []byte, targetPort uint16) error {
 		}
 	}
 	return nil
+}
+
+// TeardownRemote contacts the origin to delete its half of the tunnel.
+func (e *edge) TeardownRemote(ctx context.Context) error {
+	var conn net.Conn
+	var err error
+	if e.links != nil {
+		conn, err = e.links.open(ctx.Done())
+	} else if e.pool != nil {
+		conn, err = e.pool.take(ctx)
+	} else {
+		return errors.New("no active links or pool")
+	}
+	if err != nil {
+		return fmt.Errorf("obtaining tunnel connection: %w", err)
+	}
+	defer conn.Close()
+	return sendTeardown(conn)
+}
+
+func sendTeardown(tunnel net.Conn) error {
+	if err := tunnel.SetWriteDeadline(time.Now().Add(activateWriteTimeout)); err != nil {
+		return err
+	}
+	if _, err := tunnel.Write([]byte{msgTeardown}); err != nil {
+		return fmt.Errorf("sending teardown: %w", err)
+	}
+	if err := tunnel.SetReadDeadline(time.Now().Add(ackWaitTimeout)); err != nil {
+		return err
+	}
+	var ack [1]byte
+	if _, err := io.ReadFull(tunnel, ack[:]); err != nil {
+		return fmt.Errorf("reading teardown ack: %w", err)
+	}
+	if ack[0] != msgTeardownAck {
+		return fmt.Errorf("unexpected teardown reply: 0x%02x", ack[0])
+	}
+	return nil
+}
+
+func startControlServer(ctx context.Context, cfg *Config, e *edge) (io.Closer, error) {
+	sockPath := cfg.ControlSocketPath()
+	if sockPath == "" {
+		return nil, nil
+	}
+	_ = os.Remove(sockPath)
+	if err := os.MkdirAll(filepath.Dir(sockPath), 0755); err != nil {
+		return nil, err
+	}
+	ln, err := net.Listen("unix", sockPath)
+	if err != nil {
+		return nil, err
+	}
+	_ = os.Chmod(sockPath, 0600)
+
+	go func() {
+		<-ctx.Done()
+		_ = ln.Close()
+		_ = os.Remove(sockPath)
+	}()
+
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go handleControlConn(c, e)
+		}
+	}()
+
+	return ln, nil
+}
+
+func handleControlConn(c net.Conn, e *edge) {
+	defer c.Close()
+	_ = c.SetDeadline(time.Now().Add(10 * time.Second))
+	buf := make([]byte, 128)
+	n, err := c.Read(buf)
+	if err != nil {
+		return
+	}
+	cmd := strings.TrimSpace(string(buf[:n]))
+	switch cmd {
+	case "teardown":
+		ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+		defer cancel()
+		if err := e.TeardownRemote(ctx); err != nil {
+			_, _ = fmt.Fprintf(c, "err: %v\n", err)
+			return
+		}
+		_, _ = fmt.Fprintln(c, "ok")
+	default:
+		_, _ = fmt.Fprintln(c, "unknown command")
+	}
 }

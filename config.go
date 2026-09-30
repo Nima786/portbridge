@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -40,6 +41,7 @@ const (
 // menu script and this program can handle it without extra tooling.
 type Config struct {
 	Name string
+	Path string
 	Mode Mode
 	Role Role
 
@@ -264,7 +266,16 @@ func LoadConfig(path string) (*Config, error) {
 	if cfg.StatusFile == "" && cfg.Name != "" {
 		cfg.StatusFile = "/run/portbridge/" + cfg.Name + ".json"
 	}
+	cfg.Path = path
 	return cfg, nil
+}
+
+// ControlSocketPath returns the path to the Unix domain socket used for local IPC.
+func (c *Config) ControlSocketPath() string {
+	if c.StatusFile != "" {
+		return filepath.Join(filepath.Dir(c.StatusFile), c.Name+".sock")
+	}
+	return "/run/portbridge/" + c.Name + ".sock"
 }
 
 func (c *Config) set(key, val string) error {

@@ -1442,18 +1442,38 @@ edit_tunnel() {
 
 delete_tunnel() {
     local name=$1
+    local role
+    role=$(read_conf "$name" role)
+
     hr
     warn "This will stop and remove tunnel '$name' on this server."
-    say "${DIM}The other server's half is untouched, so remember to remove it there too.${R}"
+    if [ "$role" = edge ]; then
+        say "${DIM}It will also automatically remove the corresponding tunnel from the foreign server.${R}"
+    else
+        say "${DIM}The other server's half is untouched, so remember to remove it there too.${R}"
+    fi
     hr
     confirm "Delete '$name'?" || { say "Cancelled."; return 1; }
+
+    if [ "$role" = edge ]; then
+        say ""
+        info "Contacting foreign server to delete its tunnel half..."
+        if "$BIN" teardown -config "$(conf_of "$name")"; then
+            ok "Foreign server: tunnel '$name' successfully deleted."
+        else
+            warn "Could not reach or delete the tunnel on the foreign server."
+            warn "The foreign server might be unreachable or already removed."
+            warn "Remember to clean it up manually if needed."
+        fi
+        say ""
+    fi
 
     systemctl disable --now "$(unit_of "$name")" >/dev/null 2>&1
     "$FIREWALL" remove "$name" >/dev/null 2>&1
     # The certificate goes too. Left behind, a later tunnel with the same name
     # would pick it up and claim whatever hostname this one claimed.
     rm -f "$(conf_of "$name")" "$(secret_of "$name")" "$RUN_DIR/$name.json" \
-        "$CONF_DIR/$name.crt" "$CONF_DIR/$name.key"
+        "$RUN_DIR/$name.sock" "$CONF_DIR/$name.crt" "$CONF_DIR/$name.key"
     systemctl daemon-reload
     ok "Tunnel '$name' removed."
 }

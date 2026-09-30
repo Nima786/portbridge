@@ -1086,3 +1086,135 @@ func TestMultiPortForwarding(t *testing.T) {
 		}
 	}
 }
+
+func TestRemoteTeardown(t *testing.T) {
+	for _, mode := range []Mode{ModeDirect, ModeReverse} {
+		for _, mux := range []bool{false, true} {
+			name := fmt.Sprintf("%s-mux=%v", mode, mux)
+			t.Run(name, func(t *testing.T) {
+				svc := startService(t)
+				defer svc.stop()
+
+				tunnelAddr := freeAddr(t)
+				userAddr := freeAddr(t)
+				secretFile := writeSecret(t, testSecret)
+
+				tmpDir := t.TempDir()
+				confFile := filepath.Join(tmpDir, "tunnel.conf")
+				_ = os.WriteFile(confFile, []byte("# test config"), 0600)
+
+				edgeCfg := defaultConfig()
+				edgeCfg.Name = "testteardown"
+				edgeCfg.Mode = mode
+				edgeCfg.Role = RoleEdge
+				edgeCfg.TunnelAddr = tunnelAddr
+				edgeCfg.UserListen = userAddr
+				edgeCfg.SecretFile = secretFile
+				edgeCfg.PoolSize = 2
+				edgeCfg.MaxConn = 10
+				edgeCfg.MaxPending = 10
+				edgeCfg.SpareTTL = 10 * time.Minute
+				edgeCfg.ParkTimeout = 15 * time.Minute
+				edgeCfg.Drain = 1 * time.Second
+				edgeCfg.Mux = mux
+				edgeCfg.MuxLinks = 2
+				edgeCfg.StatusFile = filepath.Join(tmpDir, "edge_status.json")
+				if err := edgeCfg.Validate(); err != nil {
+					t.Fatal(err)
+				}
+				if err := edgeCfg.LoadSecret(); err != nil {
+					t.Fatal(err)
+				}
+
+				originCfg := defaultConfig()
+				originCfg.Name = "testteardown"
+				originCfg.Path = confFile
+				originCfg.Mode = mode
+				originCfg.Role = RoleOrigin
+				originCfg.TunnelAddr = tunnelAddr
+				originCfg.InboundAddr = svc.addr
+				originCfg.SecretFile = secretFile
+				originCfg.PoolSize = 2
+				originCfg.MaxConn = 10
+				originCfg.MaxPending = 10
+				originCfg.SpareTTL = 10 * time.Minute
+				originCfg.ParkTimeout = 15 * time.Minute
+				originCfg.Drain = 1 * time.Second
+				originCfg.Mux = mux
+				originCfg.MuxLinks = 2
+				originCfg.StatusFile = filepath.Join(tmpDir, "origin_status.json")
+				if err := originCfg.Validate(); err != nil {
+					t.Fatal(err)
+				}
+				if err := originCfg.LoadSecret(); err != nil {
+					t.Fatal(err)
+				}
+
+				ctx, cancel := context.WithCancel(context.Background())
+				defer cancel()
+
+				var wg sync.WaitGroup
+				originDone := make(chan struct{})
+
+				startOrigin := func() {
+					wg.Add(1)
+					go func() {
+						defer wg.Done()
+						defer close(originDone)
+						_ = runOrigin(ctx, originCfg, newStatus(originCfg))
+					}()
+				}
+
+				startEdge := func() {
+					wg.Add(1)
+					go func() {
+						defer wg.Done()
+						_ = runEdge(ctx, edgeCfg, newStatus(edgeCfg))
+					}()
+				}
+
+				if mode == ModeDirect {
+					startOrigin()
+					time.Sleep(100 * time.Millisecond)
+					startEdge()
+				} else {
+					startEdge()
+					time.Sleep(100 * time.Millisecond)
+					startOrigin()
+				}
+
+				time.Sleep(400 * time.Millisecond)
+
+				// Verify roundtrip works before teardown
+				got, err := roundTrip(t, userAddr, "hello", 5*time.Second)
+				if err != nil {
+					t.Fatalf("roundtrip before teardown failed: %v", err)
+				}
+				if got != "HELLO" {
+					t.Fatalf("got %q, want HELLO", got)
+				}
+
+				// Now trigger teardown from edge
+				if err := teardownFromEdge(edgeCfg); err != nil {
+					t.Fatalf("teardown failed: %v", err)
+				}
+
+				// Verify origin terminates on its own
+				select {
+				case <-originDone:
+					// Origin stopped as requested!
+				case <-time.After(5 * time.Second):
+					t.Fatal("origin did not stop after teardown")
+				}
+
+				// Verify confFile was deleted by selfDelete()
+				if _, err := os.Stat(confFile); !os.IsNotExist(err) {
+					t.Errorf("expected confFile to be deleted, but it still exists")
+				}
+
+				cancel()
+				wg.Wait()
+			})
+		}
+	}
+}

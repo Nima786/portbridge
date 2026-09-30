@@ -9,6 +9,9 @@ import (
 	"io"
 	"log"
 	"net"
+	"os"
+	"os/exec"
+	"path/filepath"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -48,12 +51,19 @@ type origin struct {
 	logDial     *throttled
 	logConnect  *throttled
 	logRelay    *throttled
+
+	cancel       context.CancelFunc
+	teardownOnce sync.Once
 }
 
 func runOrigin(ctx context.Context, cfg *Config, st *status) error {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
 	o := &origin{
 		cfg:         cfg,
 		st:          st,
+		cancel:      cancel,
 		active:      make(chan struct{}, cfg.MaxConn),
 		pending:     make(chan struct{}, cfg.MaxPending),
 		guard:       newReplayGuard(ctx),
@@ -112,6 +122,7 @@ func (o *origin) runDirect(ctx context.Context) error {
 	if o.cfg.Mux {
 		// The edge starts the sessions, so this side only has to receive them.
 		o.links = newCarrierSet(o.cfg.MuxLinks, nil, o.serveStream)
+		o.links.SetOnTeardown(o.triggerTeardown)
 		o.st.links = o.links
 		go o.links.maintain(ctx.Done())
 	}
@@ -244,6 +255,7 @@ func (o *origin) runReverseMux(ctx context.Context) error {
 		o.cfg.MuxLinks, o.cfg.TunnelAddr)
 
 	o.links = newCarrierSet(o.cfg.MuxLinks, o.dialEdge, o.serveStream)
+	o.links.SetOnTeardown(o.triggerTeardown)
 	o.st.links = o.links
 	go o.links.maintain(ctx.Done())
 
@@ -290,7 +302,7 @@ func (o *origin) reverseWorker(ctx context.Context, n int) {
 
 		if err != nil {
 			_ = c.Close()
-			if ctx.Err() != nil {
+			if ctx.Err() != nil || errors.Is(err, errTeardownRequested) {
 				return
 			}
 			// A timeout here is the normal recycle path, not a problem.
@@ -372,6 +384,11 @@ func (o *origin) awaitActivation(c net.Conn, timeout time.Duration) (uint16, err
 			return 0, err
 		}
 		return binary.BigEndian.Uint16(portBuf[:]), nil
+	case msgTeardown:
+		_ = c.SetWriteDeadline(time.Now().Add(activateWriteTimeout))
+		_, _ = c.Write([]byte{msgTeardownAck})
+		o.triggerTeardown()
+		return 0, errTeardownRequested
 	case rejClockSkew, rejReplay:
 		err := describeRejection(sig[0])
 		o.logAuth.printf("the edge refused our credentials: %v", err)
@@ -421,5 +438,57 @@ func (o *origin) handleActivated(tunnel net.Conn, targetPort uint16) {
 
 	if err := relay(svc, tunnel); err != nil {
 		o.logRelay.printf("a session was cut short taking data from the tunnel: %v", err)
+	}
+}
+
+func (o *origin) triggerTeardown() {
+	o.teardownOnce.Do(func() {
+		log.Printf("remote teardown requested by edge; proceeding with self-deletion")
+		go o.selfDelete()
+	})
+}
+
+func (o *origin) selfDelete() {
+	name := o.cfg.Name
+	log.Printf("[%s] initiating remote teardown and self-cleanup", name)
+
+	// 1. Remove firewall rules
+	fwCmd := exec.Command("/usr/local/bin/portbridge-firewall", "remove", name)
+	if out, err := fwCmd.CombinedOutput(); err != nil {
+		log.Printf("[%s] firewall remove output: %s (err: %v)", name, string(out), err)
+	}
+
+	// 2. Remove configuration, secrets, certificates, and runtime files
+	filesToRemove := []string{
+		o.cfg.Path,
+		o.cfg.SecretFile,
+		o.cfg.StatusFile,
+		o.cfg.ControlSocketPath(),
+		o.cfg.CertFile,
+		o.cfg.KeyFile,
+		filepath.Join("/etc/portbridge/tunnels", name+".conf"),
+		filepath.Join("/etc/portbridge/secrets", name+".key"),
+		filepath.Join("/etc/portbridge/certs", name+".crt"),
+		filepath.Join("/etc/portbridge/certs", name+".key"),
+		filepath.Join("/run/portbridge", name+".json"),
+		filepath.Join("/run/portbridge", name+".sock"),
+	}
+
+	for _, f := range filesToRemove {
+		if f != "" {
+			_ = os.Remove(f)
+		}
+	}
+
+	// 3. Stop and disable systemd unit
+	unit := fmt.Sprintf("portbridge@%s.service", name)
+	_ = exec.Command("systemctl", "stop", "--no-block", unit).Run()
+	_ = exec.Command("systemctl", "disable", unit).Run()
+	_ = exec.Command("systemctl", "reset-failed", unit).Run()
+	_ = exec.Command("systemctl", "daemon-reload").Run()
+
+	// 4. Cancel origin context so running loops exit
+	if o.cancel != nil {
+		o.cancel()
 	}
 }

@@ -290,6 +290,7 @@ the retry, which then moves the user to a different shared connection.
 /etc/portbridge/tunnels/<name>.crt/.key the disguise certificate, if used
 /etc/sysctl.d/99-portbridge-tuning.conf the speed tuning, if applied
 /run/portbridge/<name>.json            live status
+/run/portbridge/<name>.sock            local IPC & remote teardown control
 ```
 
 A tunnel called `home` runs as the service `portbridge@home`, so all the usual
@@ -299,6 +300,10 @@ commands work:
 systemctl status portbridge@home
 journalctl -u portbridge@home -f
 ```
+
+### Automatic Remote Teardown
+
+When you delete a tunnel on your Iran server (via the menu or `portbridge teardown`), PortBridge automatically contacts the corresponding foreign server (authenticated with the tunnel's 32-byte shared HMAC secret). If the foreign server is reachable, PortBridge automatically removes the tunnel configuration, secrets, certificates, and firewall rules on the foreign server and deactivates its systemd service. If the foreign server is unreachable, the local tunnel is still removed cleanly with a warning.
 
 ## Reverse mode depends on your network, not just on this tool
 
