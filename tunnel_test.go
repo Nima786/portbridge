@@ -1117,8 +1117,12 @@ func TestRemoteTeardown(t *testing.T) {
 				edgeCfg.ParkTimeout = 15 * time.Minute
 				edgeCfg.Drain = 1 * time.Second
 				edgeCfg.Mux = mux
-				edgeCfg.MuxLinks = 2
-				edgeCfg.StatusFile = filepath.Join(tmpDir, "edge_status.json")
+				edgeDir := filepath.Join(tmpDir, "edge")
+				originDir := filepath.Join(tmpDir, "origin")
+				_ = os.MkdirAll(edgeDir, 0755)
+				_ = os.MkdirAll(originDir, 0755)
+
+				edgeCfg.StatusFile = filepath.Join(edgeDir, "status.json")
 				if err := edgeCfg.Validate(); err != nil {
 					t.Fatal(err)
 				}
@@ -1142,7 +1146,7 @@ func TestRemoteTeardown(t *testing.T) {
 				originCfg.Drain = 1 * time.Second
 				originCfg.Mux = mux
 				originCfg.MuxLinks = 2
-				originCfg.StatusFile = filepath.Join(tmpDir, "origin_status.json")
+				originCfg.StatusFile = filepath.Join(originDir, "status.json")
 				if err := originCfg.Validate(); err != nil {
 					t.Fatal(err)
 				}
@@ -1217,4 +1221,124 @@ func TestRemoteTeardown(t *testing.T) {
 			})
 		}
 	}
+}
+
+func TestRemoteTeardownGRPC(t *testing.T) {
+	svc := startService(t)
+	defer svc.stop()
+
+	tunnelAddr := freeAddr(t)
+	userAddr := freeAddr(t)
+	secretFile := writeSecret(t, testSecret)
+
+	tmpDir := t.TempDir()
+	confFile := filepath.Join(tmpDir, "tunnel.conf")
+	_ = os.WriteFile(confFile, []byte("# test config"), 0600)
+
+	edgeCfg := defaultConfig()
+	edgeCfg.Name = "testgrpcteardown"
+	edgeCfg.Mode = ModeDirect
+	edgeCfg.Role = RoleEdge
+	edgeCfg.Transport = TransportGRPC
+	edgeCfg.ServerName = "localhost"
+	edgeCfg.TunnelAddr = tunnelAddr
+	edgeCfg.UserListen = userAddr
+	edgeCfg.SecretFile = secretFile
+	edgeCfg.PoolSize = 2
+	edgeCfg.MaxConn = 10
+	edgeCfg.MaxPending = 10
+	edgeCfg.SpareTTL = 10 * time.Minute
+	edgeCfg.ParkTimeout = 15 * time.Minute
+	edgeCfg.Drain = 1 * time.Second
+	edgeCfg.Mux = true
+	edgeCfg.MuxLinks = 2
+
+	grpcEdgeDir := filepath.Join(tmpDir, "edge")
+	grpcOriginDir := filepath.Join(tmpDir, "origin")
+	_ = os.MkdirAll(grpcEdgeDir, 0755)
+	_ = os.MkdirAll(grpcOriginDir, 0755)
+
+	edgeCfg.StatusFile = filepath.Join(grpcEdgeDir, "status.json")
+	if err := edgeCfg.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	if err := edgeCfg.LoadSecret(); err != nil {
+		t.Fatal(err)
+	}
+
+	originCfg := defaultConfig()
+	originCfg.Name = "testgrpcteardown"
+	originCfg.Path = confFile
+	originCfg.Mode = ModeDirect
+	originCfg.Role = RoleOrigin
+	originCfg.Transport = TransportGRPC
+	originCfg.ServerName = "localhost"
+	originCfg.CertFile = filepath.Join(tmpDir, "cert.crt")
+	originCfg.KeyFile = filepath.Join(tmpDir, "cert.key")
+	originCfg.TunnelAddr = tunnelAddr
+	originCfg.InboundAddr = svc.addr
+	originCfg.SecretFile = secretFile
+	originCfg.PoolSize = 2
+	originCfg.MaxConn = 10
+	originCfg.MaxPending = 10
+	originCfg.SpareTTL = 10 * time.Minute
+	originCfg.ParkTimeout = 15 * time.Minute
+	originCfg.Drain = 1 * time.Second
+	originCfg.Mux = true
+	originCfg.MuxLinks = 2
+	originCfg.StatusFile = filepath.Join(grpcOriginDir, "status.json")
+	if err := originCfg.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	if err := originCfg.LoadSecret(); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	var wg sync.WaitGroup
+	originDone := make(chan struct{})
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		defer close(originDone)
+		_ = runOrigin(ctx, originCfg, newStatus(originCfg))
+	}()
+
+	time.Sleep(200 * time.Millisecond)
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		_ = runEdge(ctx, edgeCfg, newStatus(edgeCfg))
+	}()
+
+	time.Sleep(400 * time.Millisecond)
+
+	got, err := roundTrip(t, userAddr, "hello", 5*time.Second)
+	if err != nil {
+		t.Fatalf("roundtrip before teardown failed: %v", err)
+	}
+	if got != "HELLO" {
+		t.Fatalf("got %q, want HELLO", got)
+	}
+
+	if err := teardownFromEdge(edgeCfg); err != nil {
+		t.Fatalf("teardown failed: %v", err)
+	}
+
+	select {
+	case <-originDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("origin did not stop after teardown")
+	}
+
+	if _, err := os.Stat(confFile); !os.IsNotExist(err) {
+		t.Errorf("expected confFile to be deleted, but it still exists")
+	}
+
+	cancel()
+	wg.Wait()
 }

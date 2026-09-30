@@ -1442,32 +1442,30 @@ edit_tunnel() {
 
 delete_tunnel() {
     local name=$1
-    local role
+    local role peer_name
     role=$(read_conf "$name" role)
+    if [ "$role" = edge ]; then
+        peer_name="foreign server"
+    else
+        peer_name="Iran server"
+    fi
 
     hr
     warn "This will stop and remove tunnel '$name' on this server."
-    if [ "$role" = edge ]; then
-        say "${DIM}It will also automatically remove the corresponding tunnel from the foreign server.${R}"
-    else
-        say "${DIM}Note: To remove both servers in one step, delete from your Iran server.${R}"
-        say "${DIM}Deleting here removes the foreign half; the Iran server will be untouched.${R}"
-    fi
+    say "${DIM}It will also automatically remove the corresponding tunnel from the $peer_name.${R}"
     hr
     confirm "Delete '$name'?" || { say "Cancelled."; return 1; }
 
-    if [ "$role" = edge ]; then
-        say ""
-        info "Contacting foreign server to delete its tunnel half..."
-        if "$BIN" teardown -config "$(conf_of "$name")"; then
-            ok "Foreign server: tunnel '$name' successfully deleted."
-        else
-            warn "Could not reach or delete the tunnel on the foreign server."
-            warn "The foreign server might be unreachable or already removed."
-            warn "Remember to clean it up manually if needed."
-        fi
-        say ""
+    say ""
+    info "Contacting $peer_name to delete its tunnel half..."
+    if "$BIN" teardown -config "$(conf_of "$name")"; then
+        ok "$peer_name: tunnel '$name' successfully deleted."
+    else
+        warn "Could not reach or delete the tunnel on the $peer_name."
+        warn "The other server might be unreachable or already removed."
+        warn "Remember to clean it up manually if needed."
     fi
+    say ""
 
     systemctl disable --now "$(unit_of "$name")" >/dev/null 2>&1
     "$FIREWALL" remove "$name" >/dev/null 2>&1

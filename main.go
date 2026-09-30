@@ -188,9 +188,13 @@ func cmdTeardown(args []string) {
 	}
 
 	if cfg.Role == RoleOrigin {
+		if err := teardownFromOrigin(cfg); err != nil {
+			fmt.Fprintf(os.Stderr, "teardown warning: %v\n", err)
+		} else {
+			fmt.Printf("[%s] remote teardown succeeded.\n", cfg.Name)
+		}
 		o := &origin{cfg: cfg}
 		o.selfDelete()
-		fmt.Printf("[%s] origin tunnel deleted.\n", cfg.Name)
 		return
 	}
 
@@ -199,6 +203,28 @@ func cmdTeardown(args []string) {
 		os.Exit(1)
 	}
 	fmt.Printf("[%s] remote teardown succeeded.\n", cfg.Name)
+}
+
+func teardownFromOrigin(cfg *Config) error {
+	sockPath := cfg.ControlSocketPath()
+	if c, err := net.DialTimeout("unix", sockPath, 1*time.Second); err == nil {
+		defer c.Close()
+		_ = c.SetDeadline(time.Now().Add(10 * time.Second))
+		if _, err := fmt.Fprintln(c, "teardown"); err == nil {
+			buf := make([]byte, 256)
+			n, err := c.Read(buf)
+			if err == nil {
+				res := strings.TrimSpace(string(buf[:n]))
+				if res == "ok" {
+					return nil
+				}
+				if strings.HasPrefix(res, "err: ") {
+					return errors.New(strings.TrimPrefix(res, "err: "))
+				}
+			}
+		}
+	}
+	return nil
 }
 
 func teardownFromEdge(cfg *Config) error {
@@ -240,14 +266,9 @@ func tryTeardownConn(raw net.Conn, claim string, cfg *Config) error {
 			return errors.New("cannot create mux link")
 		}
 		defer cs.closeAll()
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
-		stream, err := cs.open(ctx.Done())
-		if err != nil {
-			return fmt.Errorf("opening mux stream: %w", err)
-		}
-		defer stream.Close()
-		return sendTeardown(stream)
+		return cs.Teardown(ctx)
 	}
 	return sendTeardown(c)
 }
@@ -273,6 +294,14 @@ func teardownDirectStandalone(cfg *Config) error {
 			d := net.Dialer{Timeout: 5 * time.Second}
 			if directRaw, dErr := d.Dial("tcp", directAddr); dErr == nil {
 				claim := cfg.effectiveServerName()
+				if cfg.CDN {
+					// Direct connection bypassing CDN must not claim the CDN domain,
+					// which DPI blocks on foreign IPs. Claim a benign ordinary site.
+					claim = "www.bing.com"
+					if cfg.AltServerName != "" {
+						claim = cfg.AltServerName
+					}
+				}
 				if err := tryTeardownConn(directRaw, claim, cfg); err == nil {
 					return nil
 				}
@@ -345,14 +374,9 @@ func teardownDirectStandalone(cfg *Config) error {
 			return errors.New("cannot create mux link")
 		}
 		defer cs.closeAll()
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
-		stream, err := cs.open(ctx.Done())
-		if err != nil {
-			return fmt.Errorf("opening mux stream: %w", err)
-		}
-		defer stream.Close()
-		return sendTeardown(stream)
+		return cs.Teardown(ctx)
 	}
 	return sendTeardown(c)
 }

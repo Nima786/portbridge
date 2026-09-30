@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -696,7 +697,8 @@ type carrier struct {
 	lastHeard int64 // unix nano, read and written atomically
 
 	// onTeardown is called if the remote peer asks to teardown the tunnel.
-	onTeardown func()
+	onTeardown    func()
+	teardownAckCh chan struct{}
 
 	// growLeft is the extra buffering the sessions on this link may still take
 	// between them. It is what keeps widening a window safe: a session can only
@@ -1042,6 +1044,15 @@ func (c *carrier) handle(typ byte, id uint32, payload []byte) error {
 		return nil
 
 	case muxTeardownAck:
+		c.mu.Lock()
+		ch := c.teardownAckCh
+		c.mu.Unlock()
+		if ch != nil {
+			select {
+			case ch <- struct{}{}:
+			default:
+			}
+		}
 		return nil
 
 	default:
@@ -1114,6 +1125,39 @@ func (cs *carrierSet) SetOnTeardown(fn func()) {
 	cs.onTeardown = fn
 	for _, c := range cs.items {
 		c.onTeardown = fn
+	}
+}
+
+// Teardown sends a muxTeardown control frame to the remote peer and waits for muxTeardownAck.
+func (cs *carrierSet) Teardown(ctx context.Context) error {
+	cs.mu.Lock()
+	var live []*carrier
+	for _, c := range cs.items {
+		if !c.isClosed() {
+			live = append(live, c)
+		}
+	}
+	cs.mu.Unlock()
+
+	if len(live) == 0 {
+		return errors.New("no live carrier to send teardown")
+	}
+
+	c := live[0]
+	ackCh := make(chan struct{}, 1)
+	c.mu.Lock()
+	c.teardownAckCh = ackCh
+	c.mu.Unlock()
+
+	c.sendControl(muxFrame{typ: muxTeardown})
+
+	select {
+	case <-ackCh:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-time.After(8 * time.Second):
+		return errors.New("teardown ack timeout")
 	}
 }
 

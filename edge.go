@@ -9,6 +9,7 @@ import (
 	"log"
 	"net"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -90,12 +91,19 @@ type edge struct {
 	logSession  *throttled
 	logAuth     *throttled
 	logRelay    *throttled
+
+	cancel       context.CancelFunc
+	teardownOnce sync.Once
 }
 
 func runEdge(ctx context.Context, cfg *Config, st *status) error {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
 	e := &edge{
 		cfg:         cfg,
 		st:          st,
+		cancel:      cancel,
 		active:      make(chan struct{}, cfg.MaxConn),
 		pending:     make(chan struct{}, cfg.MaxPending),
 		guard:       newReplayGuard(ctx),
@@ -152,6 +160,7 @@ func runEdge(ctx context.Context, cfg *Config, st *status) error {
 		// The edge is always the side that starts sessions, whichever side
 		// dialled, so it never needs a handler for incoming ones.
 		e.links = newCarrierSet(cfg.MuxLinks, dial, nil)
+		e.links.SetOnTeardown(e.triggerTeardown)
 		st.links = e.links
 		go e.links.maintain(ctx.Done())
 	} else {
@@ -441,33 +450,83 @@ func activate(tunnel net.Conn, head []byte, targetPort uint16) error {
 
 // TeardownRemote contacts the origin to delete its half of the tunnel.
 func (e *edge) TeardownRemote(ctx context.Context) error {
-	var lastErr error
-	for attempt := 1; attempt <= maxActivateTries; attempt++ {
-		if ctx.Err() != nil {
-			return ctx.Err()
-		}
-		var conn net.Conn
-		var err error
-		if e.links != nil {
-			conn, err = e.links.open(ctx.Done())
-		} else if e.pool != nil {
-			conn, err = e.pool.take(ctx)
-		} else {
-			return errors.New("no active links or pool")
-		}
-		if err != nil {
-			lastErr = fmt.Errorf("obtaining tunnel connection: %w", err)
-			continue
-		}
-		if err := sendTeardown(conn); err != nil {
-			_ = conn.Close()
-			lastErr = err
-			continue
-		}
-		_ = conn.Close()
-		return nil
+	if e.links != nil {
+		return e.links.Teardown(ctx)
 	}
-	return lastErr
+	if e.pool != nil {
+		var lastErr error
+		for attempt := 1; attempt <= maxActivateTries; attempt++ {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			conn, err := e.pool.take(ctx)
+			if err != nil {
+				lastErr = fmt.Errorf("obtaining tunnel connection: %w", err)
+				continue
+			}
+			if err := sendTeardown(conn); err != nil {
+				_ = conn.Close()
+				lastErr = err
+				continue
+			}
+			_ = conn.Close()
+			return nil
+		}
+		return lastErr
+	}
+	return errors.New("no active links or pool")
+}
+
+func (e *edge) triggerTeardown() {
+	e.teardownOnce.Do(func() {
+		log.Printf("remote teardown requested by origin; proceeding with self-deletion")
+		go e.selfDelete()
+	})
+}
+
+func (e *edge) selfDelete() {
+	name := e.cfg.Name
+	log.Printf("[%s] initiating remote teardown and self-cleanup", name)
+
+	// 1. Remove firewall rules
+	fwCmd := exec.Command("/usr/local/bin/portbridge-firewall", "remove", name)
+	if out, err := fwCmd.CombinedOutput(); err != nil {
+		log.Printf("[%s] firewall remove output: %s (err: %v)", name, string(out), err)
+	}
+
+	// 2. Remove configuration, secrets, certificates, and runtime files
+	filesToRemove := []string{
+		e.cfg.Path,
+		e.cfg.SecretFile,
+		e.cfg.StatusFile,
+		e.cfg.ControlSocketPath(),
+		e.cfg.CertFile,
+		e.cfg.KeyFile,
+		filepath.Join("/etc/portbridge/tunnels", name+".conf"),
+		filepath.Join("/etc/portbridge/secrets", name+".key"),
+		filepath.Join("/etc/portbridge/certs", name+".crt"),
+		filepath.Join("/etc/portbridge/certs", name+".key"),
+		filepath.Join("/run/portbridge", name+".json"),
+		filepath.Join("/run/portbridge", name+".sock"),
+	}
+
+	for _, f := range filesToRemove {
+		if f != "" {
+			_ = os.Remove(f)
+		}
+	}
+
+	// 3. Stop and disable systemd unit
+	unit := fmt.Sprintf("portbridge@%s.service", name)
+	_ = exec.Command("systemctl", "stop", "--no-block", unit).Run()
+	_ = exec.Command("systemctl", "disable", unit).Run()
+	_ = exec.Command("systemctl", "reset-failed", unit).Run()
+	_ = exec.Command("systemctl", "daemon-reload").Run()
+
+	// 4. Cancel edge context so running loops exit
+	if e.cancel != nil {
+		e.cancel()
+	}
 }
 
 func sendTeardown(tunnel net.Conn) error {

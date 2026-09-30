@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -73,6 +74,13 @@ func runOrigin(ctx context.Context, cfg *Config, st *status) error {
 		logDial:     newThrottled(),
 		logConnect:  newThrottled(),
 		logRelay:    newThrottled(),
+	}
+
+	ctrl, err := startOriginControlServer(ctx, cfg, o)
+	if err != nil {
+		log.Printf("warning: could not start local control socket: %v", err)
+	} else if ctrl != nil {
+		defer ctrl.Close()
 	}
 
 	if cfg.Mode == ModeReverse {
@@ -491,4 +499,86 @@ func (o *origin) selfDelete() {
 	if o.cancel != nil {
 		o.cancel()
 	}
+}
+
+func startOriginControlServer(ctx context.Context, cfg *Config, o *origin) (io.Closer, error) {
+	sockPath := cfg.ControlSocketPath()
+	if sockPath == "" {
+		return nil, nil
+	}
+	_ = os.Remove(sockPath)
+	if err := os.MkdirAll(filepath.Dir(sockPath), 0755); err != nil {
+		return nil, err
+	}
+	ln, err := net.Listen("unix", sockPath)
+	if err != nil {
+		return nil, err
+	}
+	_ = os.Chmod(sockPath, 0600)
+
+	go func() {
+		<-ctx.Done()
+		_ = ln.Close()
+		_ = os.Remove(sockPath)
+	}()
+
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go handleOriginControlConn(c, o)
+		}
+	}()
+
+	return ln, nil
+}
+
+func handleOriginControlConn(c net.Conn, o *origin) {
+	defer c.Close()
+	_ = c.SetDeadline(time.Now().Add(10 * time.Second))
+	buf := make([]byte, 128)
+	n, err := c.Read(buf)
+	if err != nil {
+		return
+	}
+	cmd := strings.TrimSpace(string(buf[:n]))
+	switch cmd {
+	case "teardown":
+		ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+		defer cancel()
+		if err := o.TeardownRemote(ctx); err != nil {
+			_, _ = fmt.Fprintf(c, "err: %v\n", err)
+			return
+		}
+		_, _ = fmt.Fprintln(c, "ok")
+	default:
+		_, _ = fmt.Fprintln(c, "unknown command")
+	}
+}
+
+func (o *origin) TeardownRemote(ctx context.Context) error {
+	if o.links != nil {
+		return o.links.Teardown(ctx)
+	}
+	if o.cfg.Mode == ModeReverse {
+		routes := newRouter(o.cfg)
+		raw, claim, err := routes.dial(5 * time.Second)
+		if err != nil {
+			return fmt.Errorf("dialing %s: %w", o.cfg.TunnelAddr, err)
+		}
+		defer raw.Close()
+		tuneSocket(raw)
+		c, err := wrapDial(raw, o.cfg.withClaimedName(claim))
+		if err != nil {
+			return fmt.Errorf("wrapping dial: %w", err)
+		}
+		defer c.Close()
+		if err := sendAuth(c, o.cfg.secret); err != nil {
+			return fmt.Errorf("auth: %w", err)
+		}
+		return sendTeardown(c)
+	}
+	return nil
 }
