@@ -117,15 +117,24 @@ func encodeH2Headers(host, path string, isGRPC bool) []byte {
 		buf.WriteByte(byte(len(ct)))
 		buf.WriteString(ct)
 
-		// te: trailers (name index 57: 0x0f, 0x2a)
-		buf.Write([]byte{0x0f, 0x2a})
-		val := "trailers"
-		buf.WriteByte(byte(len(val)))
-		buf.WriteString(val)
+		// te: trailers
+		// In HPACK (RFC 7541), 'te' is not in the static table (index 57 is transfer-encoding, which is illegal in HTTP/2).
+		// Literal without indexing (0x00): name len 2 "te", val len 8 "trailers"
+		buf.Write([]byte{0x00, 0x02, 't', 'e', 0x08, 't', 'r', 'a', 'i', 'l', 'e', 'r', 's'})
+
+		// user-agent (index 58: 0x0f, 0x2b)
+		ua := "grpc-go/1.50.0"
+		buf.Write([]byte{0x0f, 0x2b, byte(len(ua))})
+		buf.WriteString(ua)
 	} else {
 		ct := "application/octet-stream"
 		buf.WriteByte(byte(len(ct)))
 		buf.WriteString(ct)
+
+		// user-agent (index 58: 0x0f, 0x2b)
+		ua := "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+		buf.Write([]byte{0x0f, 0x2b, byte(len(ua))})
+		buf.WriteString(ua)
 	}
 
 	return buf.Bytes()
@@ -201,9 +210,9 @@ func h2Dial(c net.Conn, cfg *Config) (net.Conn, error) {
 		case h2FrameHeaders:
 			if streamID == 1 {
 				gotHeaders = true
-				// Check for :status: 200 (0x88 in HPACK)
-				if !bytes.Contains(payload, []byte{0x88}) {
-					return nil, fmt.Errorf("%w: server did not return HTTP 200", errH2Handshake)
+				// Check for :status: 200 (0x88 in HPACK or literal with 200)
+				if !bytes.Contains(payload, []byte{0x88}) && !bytes.Contains(payload, []byte("200")) {
+					return nil, fmt.Errorf("%w: server did not return HTTP 200 (headers: %x)", errH2Handshake, payload)
 				}
 			}
 		case h2FrameGoAway, h2FrameRSTStream:
@@ -290,6 +299,9 @@ type h2Conn struct {
 	readMu       sync.Mutex
 	readBuf      []byte
 	remoteClosed bool
+
+	// msgRemaining tracks bytes remaining in the currently deframed gRPC message payload.
+	msgRemaining int
 }
 
 func newH2Conn(c net.Conn, streamID uint32, isGRPC bool) *h2Conn {
@@ -354,35 +366,38 @@ func (h *h2Conn) Read(p []byte) (int, error) {
 	defer h.readMu.Unlock()
 
 	for {
-		// Deliver from internal buffer if available
-		if len(h.readBuf) > 0 {
-			if h.isGRPC {
-				// Process gRPC 5-byte envelope if we have full message
-				if len(h.readBuf) >= 5 {
-					msgLen := int(binary.BigEndian.Uint32(h.readBuf[1:5]))
-					if len(h.readBuf) >= 5+msgLen {
-						data := h.readBuf[5 : 5+msgLen]
-						n := copy(p, data)
-						if n < msgLen {
-							// Partially copied, leave remaining in readBuf
-							h.readBuf = append(h.readBuf[:5], h.readBuf[5+n:]...)
-							binary.BigEndian.PutUint32(h.readBuf[1:5], uint32(msgLen-n))
-						} else {
-							// Entire message consumed
-							h.readBuf = h.readBuf[5+msgLen:]
-						}
-						return n, nil
-					}
-				}
-			} else {
+		if !h.isGRPC {
+			if len(h.readBuf) > 0 {
 				n := copy(p, h.readBuf)
 				h.readBuf = h.readBuf[n:]
 				return n, nil
 			}
+		} else {
+			// gRPC streaming: deliver message bytes if in progress
+			if h.msgRemaining > 0 && len(h.readBuf) > 0 {
+				toCopy := len(h.readBuf)
+				if toCopy > h.msgRemaining {
+					toCopy = h.msgRemaining
+				}
+				n := copy(p, h.readBuf[:toCopy])
+				h.readBuf = h.readBuf[n:]
+				h.msgRemaining -= n
+				return n, nil
+			}
+
+			// If no message in progress, check if we have the 5-byte gRPC envelope
+			if h.msgRemaining == 0 && len(h.readBuf) >= 5 {
+				msgLen := int(binary.BigEndian.Uint32(h.readBuf[1:5]))
+				h.readBuf = h.readBuf[5:]
+				h.msgRemaining = msgLen
+				continue
+			}
 		}
 
 		if h.remoteClosed {
-			return 0, io.EOF
+			if len(h.readBuf) == 0 && (!h.isGRPC || h.msgRemaining == 0) {
+				return 0, io.EOF
+			}
 		}
 
 		// Read next frame from wire

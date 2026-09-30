@@ -73,7 +73,7 @@ func alpnFor(t Transport) []string {
 	case TransportWSS:
 		return []string{"http/1.1"}
 	case TransportH2, TransportGRPC:
-		return []string{"h2"}
+		return []string{"h2", "http/1.1"}
 	default:
 		return []string{"h2", "http/1.1"}
 	}

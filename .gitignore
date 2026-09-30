@@ -11,3 +11,5 @@
 *.secret
 *.conf
 !packaging/*.conf
+*.ppk
+*.pem
