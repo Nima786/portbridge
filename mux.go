@@ -62,11 +62,11 @@ import (
 // The pairing code already carries the choice, so the two ends cannot disagree by
 // accident. This is for the case where someone edits a settings file by hand.
 const (
-	muxOpen   byte = 0x21 // edge -> origin: a new session is starting
-	muxData   byte = 0x22 // payload for one stream
-	muxCredit byte = 0x23 // 4B: this many more bytes may be sent to me
-	muxFin    byte = 0x24 // I have finished sending on this stream
-	muxReset  byte = 0x25 // this stream is over
+	muxOpen        byte = 0x21 // edge -> origin: a new session is starting
+	muxData        byte = 0x22 // payload for one stream
+	muxCredit      byte = 0x23 // 4B: this many more bytes may be sent to me
+	muxFin         byte = 0x24 // I have finished sending on this stream
+	muxReset       byte = 0x25 // this stream is over
 	muxPing        byte = 0x26 // is this link still alive?
 	muxPong        byte = 0x27 // yes
 	muxTeardown    byte = 0x28 // edge -> origin: delete this tunnel
