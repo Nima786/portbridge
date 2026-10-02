@@ -2,8 +2,11 @@ package main
 
 import (
 	"crypto/sha256"
+	"encoding/binary"
 	"fmt"
+	"io"
 	"net"
+	"sync"
 	"sync/atomic"
 
 	"github.com/xtaci/kcp-go/v5"
@@ -21,10 +24,25 @@ func needsKeepalive(c net.Conn) bool {
 	return !isTCP
 }
 
+const (
+	kcpCmdData byte = 0x01
+	kcpCmdFin  byte = 0x02
+	kcpCmdPing byte = 0x03
+	kcpCmdPong byte = 0x04
+
+	kcpMaxFrame = 32 * 1024
+)
+
 type kcpConn struct {
 	*kcp.UDPSession
 	closed      atomic.Bool
 	writeClosed atomic.Bool
+	remoteEOF   atomic.Bool
+
+	rmu     sync.Mutex
+	readBuf []byte
+
+	wmu sync.Mutex
 }
 
 func newKCPConn(sess *kcp.UDPSession) net.Conn {
@@ -36,29 +54,107 @@ func (c *kcpConn) isKCP() bool {
 }
 
 func (c *kcpConn) isAlive() bool {
-	return !c.closed.Load()
+	return !c.closed.Load() && !c.remoteEOF.Load()
 }
 
-// CloseWrite marks the write half of the session as closed without tearing down the
-// connection. This prevents relay() from truncating incoming replies when the client
-// finishes uploading before the response has arrived.
+// CloseWrite sends a FIN frame across the KCP stream and marks the local write
+// half as closed. The session stays open to receive incoming replies until the
+// peer also finishes.
 func (c *kcpConn) CloseWrite() error {
-	c.writeClosed.Store(true)
-	return nil
+	if !c.writeClosed.CompareAndSwap(false, true) {
+		return nil
+	}
+	c.wmu.Lock()
+	defer c.wmu.Unlock()
+	var fin [3]byte
+	fin[0] = kcpCmdFin
+	_, err := c.UDPSession.Write(fin[:])
+	return err
 }
 
 func (c *kcpConn) Write(b []byte) (int, error) {
 	if c.writeClosed.Load() || c.closed.Load() {
 		return 0, net.ErrClosed
 	}
-	return c.UDPSession.Write(b)
+	c.wmu.Lock()
+	defer c.wmu.Unlock()
+
+	total := len(b)
+	for len(b) > 0 {
+		chunk := len(b)
+		if chunk > kcpMaxFrame {
+			chunk = kcpMaxFrame
+		}
+		buf := make([]byte, 3+chunk)
+		buf[0] = kcpCmdData
+		binary.BigEndian.PutUint16(buf[1:], uint16(chunk))
+		copy(buf[3:], b[:chunk])
+		if _, err := c.UDPSession.Write(buf); err != nil {
+			return total - len(b), err
+		}
+		b = b[chunk:]
+	}
+	return total, nil
 }
 
-func (c *kcpConn) Read(b []byte) (int, error) {
-	if c.closed.Load() {
-		return 0, net.ErrClosed
+func (c *kcpConn) Read(p []byte) (int, error) {
+	c.rmu.Lock()
+	defer c.rmu.Unlock()
+
+	for {
+		if len(c.readBuf) > 0 {
+			n := copy(p, c.readBuf)
+			c.readBuf = c.readBuf[n:]
+			return n, nil
+		}
+		if c.remoteEOF.Load() {
+			return 0, io.EOF
+		}
+		if c.closed.Load() {
+			return 0, net.ErrClosed
+		}
+
+		var hdr [3]byte
+		if _, err := io.ReadFull(c.UDPSession, hdr[:]); err != nil {
+			return 0, err
+		}
+		cmd := hdr[0]
+		length := int(binary.BigEndian.Uint16(hdr[1:]))
+
+		switch cmd {
+		case kcpCmdData:
+			if length == 0 {
+				continue
+			}
+			payload := make([]byte, length)
+			if _, err := io.ReadFull(c.UDPSession, payload); err != nil {
+				return 0, err
+			}
+			n := copy(p, payload)
+			if n < length {
+				c.readBuf = payload[n:]
+			}
+			return n, nil
+
+		case kcpCmdFin:
+			c.remoteEOF.Store(true)
+			return 0, io.EOF
+
+		case kcpCmdPing:
+			c.wmu.Lock()
+			var pong [3]byte
+			pong[0] = kcpCmdPong
+			_, _ = c.UDPSession.Write(pong[:])
+			c.wmu.Unlock()
+			continue
+
+		case kcpCmdPong:
+			continue
+
+		default:
+			return 0, fmt.Errorf("unknown kcp frame command: 0x%02x", cmd)
+		}
 	}
-	return c.UDPSession.Read(b)
 }
 
 func (c *kcpConn) Close() error {
