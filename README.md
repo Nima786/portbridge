@@ -89,14 +89,16 @@ matching no known protocol, and that is one of the easiest things to single out.
 So when you create a tunnel the menu asks how the link should appear, and carries
 your answer in the pairing code so both ends always agree.
 
-| Choice | What anyone watching the link sees |
-|---|---|
-| **Plain** | Random-looking bytes. Slightly faster, easiest to spot. |
-| **Look like a normal website** (recommended) | An ordinary secure website connection, including a real handshake if anyone probes the port. |
-| **Through Cloudflare or another CDN** | A normal secure websocket request to your domain, with your foreign server's IP never appearing on the link. |
-| **Look like a website, with a CDN standing by** | As the second option, but if your foreign server's address ever stops being reachable the link moves to your domain through the CDN by itself. Direct mode only. |
-| **HTTP/2 or gRPC stream** | Wraps the link in HTTP/2 streaming frames over TLS, appearing as active HTTP/2 or gRPC traffic to defeat DPI deep-packet inspection and support Cloudflare gRPC mode. |
-| **Loss-resistant KCP over UDP (FEC)** | Fast UDP-based transport powered by KCP with Reed-Solomon Forward Error Correction (10 data, 3 parity shards) and AES encryption. Survives up to 30% packet loss and active TCP RST packet drops on unstable routes. |
+| Menu Option | Applicable Modes | What anyone watching the link sees |
+|---|---|---|
+| **Option 1: Plain** | Direct & Reverse | Random-looking bytes. Slightly faster, easiest to spot. |
+| **Option 2: Look like a normal website** (recommended) | Direct & Reverse | An ordinary secure website connection, including a real handshake if anyone probes the port. |
+| **Option 3: Through Cloudflare or another CDN** | Direct & Reverse | A normal secure websocket request to your domain, with your foreign server's IP never appearing on the link. |
+| **Option 4: Look like a website, with a CDN standing by** | Direct only | As the second option, but if your foreign server's address ever stops being reachable the link moves to your domain through the CDN by itself. |
+| **Option 5: HTTP/2 or gRPC stream** | Direct & Reverse | Wraps the link in HTTP/2 streaming frames over TLS, appearing as active HTTP/2 or gRPC traffic to defeat DPI deep-packet inspection and support Cloudflare gRPC mode. |
+| **Option 6: Loss-resistant KCP over UDP (FEC)** | Direct & Reverse | Fast UDP-based transport powered by KCP with Reed-Solomon Forward Error Correction (10 data, 3 parity shards) and AES encryption. Survives up to 30% packet loss and active TCP RST packet drops on unstable routes. |
+
+*(Note: In Reverse mode, Option 4 (CDN standby) is direct-only, so the reverse menu displays the choices seamlessly as 1 to 5).*
 
 A single tunnel can forward multiple ports / services at once: enter comma-separated ports (e.g. `443, 8443, 2083`) when creating or editing the tunnel.
 

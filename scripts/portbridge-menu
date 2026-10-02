@@ -387,17 +387,28 @@ explain_disguise() {
         say "     ${DIM}fastest way. If that address ever stops being reachable, it moves${R}"
         say "     ${DIM}to your domain through the CDN on its own and keeps working.${R}"
         say "     ${DIM}Also needs a domain pointed at the CDN.${R}"
+        say ""
+        say "  ${B}5) HTTP/2 / gRPC stream${R}"
+        say "     ${DIM}Wraps the link in HTTP/2 streaming frames over TLS, appearing${R}"
+        say "     ${DIM}as active HTTP/2 web/gRPC traffic. Resists DPI protocol inspection${R}"
+        say "     ${DIM}and works with Cloudflare gRPC mode.${R}"
+        say ""
+        say "  ${B}6) Loss-resistant KCP / UDP with FEC${R} ${DIM}(resists packet loss & DPI TCP RSTs)${R}"
+        say "     ${DIM}Runs over UDP with Reed-Solomon Forward Error Correction (10 data / 3 parity shards)${R}"
+        say "     ${DIM}and AES encryption. Drops are repaired instantly without retransmission delays.${R}"
+        say "     ${DIM}Immune to TCP middlebox RST drops; no TLS cert needed.${R}"
+    else
+        say ""
+        say "  ${B}4) HTTP/2 / gRPC stream${R}"
+        say "     ${DIM}Wraps the link in HTTP/2 streaming frames over TLS, appearing${R}"
+        say "     ${DIM}as active HTTP/2 web/gRPC traffic. Resists DPI protocol inspection${R}"
+        say "     ${DIM}and works with Cloudflare gRPC mode.${R}"
+        say ""
+        say "  ${B}5) Loss-resistant KCP / UDP with FEC${R} ${DIM}(resists packet loss & DPI TCP RSTs)${R}"
+        say "     ${DIM}Runs over UDP with Reed-Solomon Forward Error Correction (10 data / 3 parity shards)${R}"
+        say "     ${DIM}and AES encryption. Drops are repaired instantly without retransmission delays.${R}"
+        say "     ${DIM}Immune to TCP middlebox RST drops; no TLS cert needed.${R}"
     fi
-    say ""
-    say "  ${B}5) HTTP/2 / gRPC stream${R}"
-    say "     ${DIM}Wraps the link in HTTP/2 streaming frames over TLS, appearing${R}"
-    say "     ${DIM}as active HTTP/2 web/gRPC traffic. Resists DPI protocol inspection${R}"
-    say "     ${DIM}and works with Cloudflare gRPC mode.${R}"
-    say ""
-    say "  ${B}6) Loss-resistant KCP / UDP with FEC${R} ${DIM}(resists packet loss & DPI TCP RSTs)${R}"
-    say "     ${DIM}Runs over UDP with Reed-Solomon Forward Error Correction (10 data / 3 parity shards)${R}"
-    say "     ${DIM}and AES encryption. Drops are repaired instantly without retransmission delays.${R}"
-    say "     ${DIM}Immune to TCP middlebox RST drops; no TLS cert needed.${R}"
     hr
 }
 
@@ -409,7 +420,11 @@ ask_disguise() {
     if [ "$mode" = direct ]; then
         choice=$(choose "Choose 1, 2, 3, 4, 5 or 6" "2" 1 2 3 4 5 6)
     else
-        choice=$(choose "Choose 1, 2, 3, 5 or 6" "2" 1 2 3 5 6)
+        choice=$(choose "Choose 1, 2, 3, 4 or 5" "2" 1 2 3 4 5 6)
+        case "$choice" in
+            4) choice=5 ;; # gRPC
+            5|6) choice=6 ;; # KCP
+        esac
     fi
 
     DG_SERVERNAME=""
