@@ -795,6 +795,59 @@ func TestAuthFrameChecks(t *testing.T) {
 	}
 }
 
+func TestAuthFrameV2Checks(t *testing.T) {
+	secret := []byte(testSecret)
+	guard := newReplayGuard(context.Background())
+
+	frame, err := buildAuthFrameV2(secret, authPurposeTunnel)
+	if err != nil {
+		t.Fatalf("buildAuthFrameV2: %v", err)
+	}
+	minLen := 8 + authV2HdrLen + 16 + authMACLen
+	maxLen := 8 + authV2HdrLen + 64 + authMACLen
+	if len(frame) < minLen || len(frame) > maxLen {
+		t.Fatalf("frame len %d out of bounds [%d, %d]", len(frame), minLen, maxLen)
+	}
+
+	purpose, err := verifyAuthFrameBytes(frame, secret, guard)
+	if err != nil {
+		t.Fatalf("fresh v2 frame rejected: %v", err)
+	}
+	if purpose != authPurposeTunnel {
+		t.Fatalf("purpose = 0x%02x, want 0x%02x", purpose, authPurposeTunnel)
+	}
+
+	// Replay must be rejected
+	if _, err := verifyAuthFrameBytes(frame, secret, guard); err != errAuthReplay {
+		t.Fatalf("replay gave %v, want %v", err, errAuthReplay)
+	}
+
+	// Tampered frame
+	tampered, _ := buildAuthFrameV2(secret, authPurposeTunnel)
+	tampered[len(tampered)-1] ^= 0xFF
+	if _, err := verifyAuthFrameBytes(tampered, secret, newReplayGuard(context.Background())); err != errAuthMAC {
+		t.Fatalf("tampered frame gave %v, want %v", err, errAuthMAC)
+	}
+
+	// Wrong secret
+	if _, err := verifyAuthFrameBytes(frame, []byte("wrong-secret-which-is-long-enough"), newReplayGuard(context.Background())); err != errAuthMAC {
+		t.Fatalf("wrong secret gave %v, want %v", err, errAuthMAC)
+	}
+
+	// Speedtest purpose
+	speedtestFrame, err := buildAuthFrameV2(secret, authPurposeSpeedtest)
+	if err != nil {
+		t.Fatalf("buildAuthFrameV2 speedtest: %v", err)
+	}
+	p2, err := verifyAuthFrameBytes(speedtestFrame, secret, newReplayGuard(context.Background()))
+	if err != nil {
+		t.Fatalf("speedtest frame rejected: %v", err)
+	}
+	if p2 != authPurposeSpeedtest {
+		t.Fatalf("speedtest purpose = 0x%02x, want 0x%02x", p2, authPurposeSpeedtest)
+	}
+}
+
 func TestConfigValidation(t *testing.T) {
 	base := func() *Config {
 		c := defaultConfig()

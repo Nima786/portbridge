@@ -118,7 +118,7 @@ func (o *origin) serveStream(tunnel net.Conn) {
 
 // runDirect accepts tunnel connections from the edge.
 func (o *origin) runDirect(ctx context.Context) error {
-	if o.cfg.Transport != TransportPlain {
+	if o.cfg.Transport != TransportPlain && o.cfg.Transport != TransportKCP {
 		cert, err := ensureCert(o.cfg.CertFile, o.cfg.KeyFile, o.cfg.effectiveServerName())
 		if err != nil {
 			return fmt.Errorf("preparing the disguise: %w", err)
@@ -135,7 +135,13 @@ func (o *origin) runDirect(ctx context.Context) error {
 		go o.links.maintain(ctx.Done())
 	}
 
-	ln, err := net.Listen("tcp", o.cfg.TunnelAddr)
+	var ln net.Listener
+	var err error
+	if o.cfg.Transport == TransportKCP {
+		ln, err = kcpListen(o.cfg.TunnelAddr, o.cfg)
+	} else {
+		ln, err = net.Listen("tcp", o.cfg.TunnelAddr)
+	}
 	if err != nil {
 		return err
 	}
@@ -170,15 +176,22 @@ func (o *origin) runDirect(ctx context.Context) error {
 				defer release()
 
 				tuneSocket(raw)
-				c, err := wrapAccept(raw, o.cfg, o.cert)
+				c, err := wrapAccept(raw, o.cfg, o.cert, o.guard)
 				if err != nil {
 					o.logAuth.printf("refused a tunnel connection from %s: %v", raw.RemoteAddr(), err)
 					_ = raw.Close()
 					return
 				}
-				if err := recvAuth(c, o.cfg.secret, o.guard); err != nil {
+				purpose, err := recvAuthPurpose(c, o.cfg.secret, o.guard)
+				if err != nil {
 					o.logAuth.printf("refused a tunnel connection from %s: %v", c.RemoteAddr(), err)
 					_ = c.Close()
+					return
+				}
+				if purpose == authPurposeSpeedtest {
+					log.Printf("[%s] connection from %s requested in-tunnel speedtest", o.cfg.Name, c.RemoteAddr())
+					release()
+					runSpeedtestServer(c)
 					return
 				}
 				if o.links != nil {
@@ -397,6 +410,9 @@ func (o *origin) awaitActivation(c net.Conn, timeout time.Duration) (uint16, err
 		_, _ = c.Write([]byte{msgTeardownAck})
 		o.triggerTeardown()
 		return 0, errTeardownRequested
+	case msgSpeedtest:
+		runSpeedtestServer(c)
+		return 0, errSpeedtestFinished
 	case rejClockSkew, rejReplay:
 		err := describeRejection(sig[0])
 		o.logAuth.printf("the edge refused our credentials: %v", err)
@@ -553,6 +569,30 @@ func handleOriginControlConn(c net.Conn, o *origin) {
 			return
 		}
 		_, _ = fmt.Fprintln(c, "ok")
+	case "speedtest":
+		if o.cfg.Mode == ModeReverse {
+			routes := newRouter(o.cfg)
+			raw, claim, err := routes.dial(5 * time.Second)
+			if err != nil {
+				_, _ = fmt.Fprintf(c, "dial error: %v\n", err)
+				return
+			}
+			defer raw.Close()
+			tuneSocket(raw)
+			tc, err := wrapDial(raw, o.cfg.withClaimedName(claim))
+			if err != nil {
+				_, _ = fmt.Fprintf(c, "securing link: %v\n", err)
+				return
+			}
+			defer tc.Close()
+			if err := sendAuthPurpose(tc, o.cfg.secret, authPurposeSpeedtest); err != nil {
+				_, _ = fmt.Fprintf(c, "auth error: %v\n", err)
+				return
+			}
+			_ = runSpeedtestClient(tc, o.cfg, c)
+			return
+		}
+		_, _ = fmt.Fprintln(c, "speedtest must be initiated from the edge in direct mode")
 	default:
 		_, _ = fmt.Fprintln(c, "unknown command")
 	}

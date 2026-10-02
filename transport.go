@@ -46,6 +46,9 @@ const (
 	// TransportGRPC wraps the link in gRPC envelope streaming over HTTP/2,
 	// enabling direct compatibility with Cloudflare gRPC proxying and evading DPI.
 	TransportGRPC Transport = "grpc"
+
+	// TransportKCP wraps the link in encrypted KCP over UDP with Reed-Solomon Forward Error Correction.
+	TransportKCP Transport = "kcp"
 )
 
 const (
@@ -60,7 +63,7 @@ const (
 
 func validTransport(t Transport) bool {
 	switch t {
-	case TransportPlain, TransportTLS, TransportWSS, TransportH2, TransportGRPC:
+	case TransportPlain, TransportTLS, TransportWSS, TransportH2, TransportGRPC, TransportKCP:
 		return true
 	}
 	return false
@@ -270,7 +273,7 @@ func (c *Config) serverTLS(cert *tls.Certificate) (*tls.Config, error) {
 // requires, from the point of view of the side that dialled.
 func wrapDial(raw net.Conn, cfg *Config) (net.Conn, error) {
 	switch cfg.Transport {
-	case TransportPlain:
+	case TransportPlain, TransportKCP:
 		return raw, nil
 
 	case TransportTLS, TransportWSS, TransportH2, TransportGRPC:
@@ -299,9 +302,9 @@ func wrapDial(raw net.Conn, cfg *Config) (net.Conn, error) {
 }
 
 // wrapAccept is the same from the point of view of the side that accepted.
-func wrapAccept(raw net.Conn, cfg *Config, cert *tls.Certificate) (net.Conn, error) {
+func wrapAccept(raw net.Conn, cfg *Config, cert *tls.Certificate, guard ...*replayGuard) (net.Conn, error) {
 	switch cfg.Transport {
-	case TransportPlain:
+	case TransportPlain, TransportKCP:
 		return raw, nil
 
 	case TransportTLS, TransportWSS, TransportH2, TransportGRPC:
@@ -324,7 +327,11 @@ func wrapAccept(raw net.Conn, cfg *Config, cert *tls.Certificate) (net.Conn, err
 			return ts, nil
 		}
 		if cfg.Transport == TransportWSS {
-			return wsAccept(ts, cfg)
+			var g *replayGuard
+			if len(guard) > 0 {
+				g = guard[0]
+			}
+			return wsAccept(ts, cfg, g)
 		}
 		return h2Accept(ts, cfg)
 
@@ -357,6 +364,8 @@ func describeTransport(cfg *Config) string {
 				cfg.effectiveServerName())
 		}
 		return fmt.Sprintf("disguised as gRPC over HTTP/2 (%s)", cfg.effectiveServerName())
+	case TransportKCP:
+		return fmt.Sprintf("loss-resistant KCP/UDP transport with FEC (%d/%d shards)", cfg.KCPDataShards, cfg.KCPParityShards)
 	default:
 		return "plain, no disguise"
 	}

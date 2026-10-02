@@ -117,7 +117,7 @@ func runEdge(ctx context.Context, cfg *Config, st *status) error {
 	// In reverse mode this side accepts, so it needs a certificate before the
 	// disguise can be prepared. Both are set up together, once, because a
 	// connection that has to build its own is the most expensive kind.
-	if cfg.Transport != TransportPlain && cfg.Mode == ModeReverse {
+	if cfg.Transport != TransportPlain && cfg.Transport != TransportKCP && cfg.Mode == ModeReverse {
 		cert, err := ensureCert(cfg.CertFile, cfg.KeyFile, cfg.effectiveServerName())
 		if err != nil {
 			return fmt.Errorf("preparing the disguise: %w", err)
@@ -178,7 +178,12 @@ func runEdge(ctx context.Context, cfg *Config, st *status) error {
 
 	// In reverse mode we also listen for the origin's incoming connections.
 	if cfg.Mode == ModeReverse {
-		tunnelLn, err := net.Listen("tcp", cfg.TunnelAddr)
+		var tunnelLn net.Listener
+		if cfg.Transport == TransportKCP {
+			tunnelLn, err = kcpListen(cfg.TunnelAddr, cfg)
+		} else {
+			tunnelLn, err = net.Listen("tcp", cfg.TunnelAddr)
+		}
 		if err != nil {
 			return err
 		}
@@ -253,15 +258,20 @@ func (e *edge) acceptTunnel(ctx context.Context, ln net.Listener) {
 			go func(raw net.Conn) {
 				defer func() { <-e.pending }()
 				tuneSocket(raw)
-				c, err := wrapAccept(raw, e.cfg, e.cert)
+				c, err := wrapAccept(raw, e.cfg, e.cert, e.guard)
 				if err != nil {
 					e.logAuth.printf("refused a tunnel connection from %s: %v", raw.RemoteAddr(), err)
 					_ = raw.Close()
 					return
 				}
-				if err := recvAuth(c, e.cfg.secret, e.guard); err != nil {
+				purpose, err := recvAuthPurpose(c, e.cfg.secret, e.guard)
+				if err != nil {
 					e.logAuth.printf("refused a tunnel connection from %s: %v", c.RemoteAddr(), err)
 					_ = c.Close()
+					return
+				}
+				if purpose == authPurposeSpeedtest {
+					go runSpeedtestServer(c)
 					return
 				}
 				if e.links != nil {
@@ -601,6 +611,30 @@ func handleControlConn(c net.Conn, e *edge) {
 			return
 		}
 		_, _ = fmt.Fprintln(c, "ok")
+	case "speedtest":
+		if e.cfg.Mode == ModeDirect {
+			routes := newRouter(e.cfg)
+			raw, claim, err := routes.dial(5 * time.Second)
+			if err != nil {
+				_, _ = fmt.Fprintf(c, "dial error: %v\n", err)
+				return
+			}
+			defer raw.Close()
+			tuneSocket(raw)
+			tc, err := wrapDial(raw, e.cfg.withClaimedName(claim))
+			if err != nil {
+				_, _ = fmt.Fprintf(c, "securing link: %v\n", err)
+				return
+			}
+			defer tc.Close()
+			if err := sendAuthPurpose(tc, e.cfg.secret, authPurposeSpeedtest); err != nil {
+				_, _ = fmt.Fprintf(c, "auth error: %v\n", err)
+				return
+			}
+			_ = runSpeedtestClient(tc, e.cfg, c)
+			return
+		}
+		_, _ = fmt.Fprintln(c, "speedtest must be initiated from the origin in reverse mode")
 	default:
 		_, _ = fmt.Fprintln(c, "unknown command")
 	}

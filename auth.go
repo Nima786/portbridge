@@ -15,30 +15,42 @@ import (
 
 // Wire protocol.
 //
-// Whichever side opens the TCP connection sends the auth frame immediately, and
-// the side that accepted it verifies. Authenticating up front rather than at
-// activation time means an unknown peer can never hold resources for longer
-// than authReadTimeout.
+// Whichever side opens the connection authenticates immediately.
 //
-//	auth frame: [1B version][8B unix seconds BE][8B random nonce][32B HMAC]
-//	            HMAC is SHA-256 over the preceding 17 bytes, keyed by the secret.
+// Protocol v1 (legacy):
+//	auth frame: [1B version=1][8B unix seconds BE][8B random nonce][32B HMAC]
 //
-// The connection then parks, authenticated and idle, until a user arrives. The
-// edge sends msgActivate (with the user's opening bytes appended, if any), the
-// origin dials the local service and replies msgAck. Both sides then splice.
+// Protocol v2 (obfuscated, variable padding):
+//	wire: [8B nonce (nonce[0] != 1)]
+//	      [11B masked header: XOR(ver(1B) + purpose(1B) + timestamp(8B) + padLen(1B), mask[:11])]
+//	      [padLen random bytes (16..64 bytes)]
+//	      [32B HMAC over nonce + plaintext header + padding]
+//	Total wire length: 67 to 115 bytes (completely variable, no static signature, no magic byte).
+//	Mask key: HMAC(secret, "portbridge-v2-mask:" + nonce)
+//
+// When using TransportWSS, the v2 auth frame can also be carried in the HTTP Upgrade
+// header (Sec-WebSocket-Protocol: portbridge.v2.<b64>) for 0-RTT instant activation.
+
 const (
-	protoVersion = 1
+	protoVersion  = 1
+	protoVersion2 = 2
+
+	authPurposeTunnel   byte = 0x00
+	authPurposeSpeedtest byte = 0x05
 
 	authTimeLen  = 8
 	authNonceLen = 8
-	authMACLen   = sha256.Size
+	authMACLen   = sha256.Size // 32
 	authSignLen  = 1 + authTimeLen + authNonceLen
-	authFrameLen = authSignLen + authMACLen
+	authFrameLen = authSignLen + authMACLen // 49 (v1)
+
+	authV2HdrLen = 11 // 1B ver + 1B purpose + 8B time + 1B padLen
 
 	msgActivate     = 0x01
 	msgActivatePort = 0x02 // followed by 2B target port uint16 BE, then opening bytes
 	msgTeardown     = 0x03 // request origin to delete this tunnel
 	msgTeardownAck  = 0x04 // origin confirms teardown request
+	msgSpeedtest    = 0x05 // in-tunnel speedtest request
 	msgAck          = 0x06
 
 	// Sent before closing, but only once the MAC has already verified, so these
@@ -61,6 +73,7 @@ var (
 	errAuthReplay        = errors.New("auth frame replayed")
 	errRejected          = errors.New("peer rejected our credentials")
 	errTeardownRequested = errors.New("remote teardown requested")
+	errSpeedtestFinished = errors.New("speedtest completed")
 )
 
 func hmacFor(secret, data []byte) []byte {
@@ -69,7 +82,70 @@ func hmacFor(secret, data []byte) []byte {
 	return mac.Sum(nil)
 }
 
+// buildAuthFrame produces a legacy 49-byte v1 frame.
 func buildAuthFrame(secret []byte) ([]byte, error) {
+	return buildAuthFrameV1(secret)
+}
+
+// buildAuthFrameV2 builds an obfuscated, variable-length auth frame for purpose.
+func buildAuthFrameV2(secret []byte, purpose byte) ([]byte, error) {
+	// Generate random nonce where nonce[0] != protoVersion (1) to guarantee zero clash with v1
+	var nonce [authNonceLen]byte
+	for {
+		if _, err := rand.Read(nonce[:]); err != nil {
+			return nil, err
+		}
+		if nonce[0] != protoVersion {
+			break
+		}
+	}
+
+	// Variable random padding between 16 and 64 bytes
+	var padLenByte [1]byte
+	if _, err := rand.Read(padLenByte[:]); err != nil {
+		return nil, err
+	}
+	padLen := 16 + int(padLenByte[0]%49) // 16..64
+	padding := make([]byte, padLen)
+	if _, err := rand.Read(padding); err != nil {
+		return nil, err
+	}
+
+	// Plaintext header: [ver(1B)][purpose(1B)][timestamp(8B)][padLen(1B)]
+	plainHdr := make([]byte, authV2HdrLen)
+	plainHdr[0] = protoVersion2
+	plainHdr[1] = purpose
+	binary.BigEndian.PutUint64(plainHdr[2:10], uint64(time.Now().Unix()))
+	plainHdr[10] = byte(padLen)
+
+	// Derive stream mask from secret + nonce
+	maskKey := append([]byte("portbridge-v2-mask:"), nonce[:]...)
+	mask := hmacFor(secret, maskKey)
+
+	// XOR mask the header
+	maskedHdr := make([]byte, authV2HdrLen)
+	for i := 0; i < authV2HdrLen; i++ {
+		maskedHdr[i] = plainHdr[i] ^ mask[i]
+	}
+
+	// Compute HMAC over nonce + plainHdr + padding
+	macData := make([]byte, 0, len(nonce)+len(plainHdr)+len(padding))
+	macData = append(macData, nonce[:]...)
+	macData = append(macData, plainHdr...)
+	macData = append(macData, padding...)
+	mac := hmacFor(secret, macData)
+
+	// Full frame: nonce + maskedHdr + padding + mac
+	frame := make([]byte, 0, len(nonce)+len(maskedHdr)+len(padding)+len(mac))
+	frame = append(frame, nonce[:]...)
+	frame = append(frame, maskedHdr...)
+	frame = append(frame, padding...)
+	frame = append(frame, mac...)
+	return frame, nil
+}
+
+// buildAuthFrameV1 produces a legacy 49-byte v1 frame.
+func buildAuthFrameV1(secret []byte) ([]byte, error) {
 	frame := make([]byte, authFrameLen)
 	frame[0] = protoVersion
 	binary.BigEndian.PutUint64(frame[1:1+authTimeLen], uint64(time.Now().Unix()))
@@ -123,40 +199,106 @@ func (g *replayGuard) admit(nonce [authNonceLen]byte) bool {
 	return true
 }
 
-// verifyAuthFrame checks the MAC first, in constant time. Only a peer that
-// already holds the secret can produce the version, clock-skew or replay
-// errors, so those are safe to report in detail.
-func verifyAuthFrame(frame, secret []byte, guard *replayGuard) error {
-	if len(frame) != authFrameLen {
-		return errAuthMAC
-	}
-	if !hmac.Equal(frame[authSignLen:], hmacFor(secret, frame[:authSignLen])) {
-		return errAuthMAC
-	}
-	if frame[0] != protoVersion {
-		return errAuthVersion
+// verifyAuthFrameBytes checks either v1 (49B) or v2 (67-115B) auth frames from a byte slice.
+func verifyAuthFrameBytes(frame, secret []byte, guard *replayGuard) (byte, error) {
+	if len(frame) == authFrameLen && frame[0] == protoVersion {
+		// Legacy v1
+		if !hmac.Equal(frame[authSignLen:], hmacFor(secret, frame[:authSignLen])) {
+			return 0, errAuthMAC
+		}
+		stamp := int64(binary.BigEndian.Uint64(frame[1 : 1+authTimeLen]))
+		drift := time.Since(time.Unix(stamp, 0))
+		if drift < 0 {
+			drift = -drift
+		}
+		if drift > clockSkewWindow {
+			return 0, errAuthSkew
+		}
+		var nonce [authNonceLen]byte
+		copy(nonce[:], frame[1+authTimeLen:authSignLen])
+		if guard != nil && !guard.admit(nonce) {
+			return 0, errAuthReplay
+		}
+		return authPurposeTunnel, nil
 	}
 
-	stamp := int64(binary.BigEndian.Uint64(frame[1 : 1+authTimeLen]))
+	// v2: min length is 8 (nonce) + 11 (maskedHdr) + 16 (min pad) + 32 (mac) = 67
+	// max length is 8 + 11 + 64 (max pad) + 32 = 115
+	if len(frame) < 8+authV2HdrLen+16+authMACLen || len(frame) > 8+authV2HdrLen+64+authMACLen {
+		return 0, errAuthMAC
+	}
+
+	var nonce [authNonceLen]byte
+	copy(nonce[:], frame[:authNonceLen])
+	maskedHdr := frame[authNonceLen : authNonceLen+authV2HdrLen]
+
+	maskKey := append([]byte("portbridge-v2-mask:"), nonce[:]...)
+	mask := hmacFor(secret, maskKey)
+
+	plainHdr := make([]byte, authV2HdrLen)
+	for i := 0; i < authV2HdrLen; i++ {
+		plainHdr[i] = maskedHdr[i] ^ mask[i]
+	}
+
+	if plainHdr[0] != protoVersion2 {
+		return 0, errAuthMAC
+	}
+	purpose := plainHdr[1]
+	padLen := int(plainHdr[10])
+	if padLen < 16 || padLen > 64 {
+		return 0, errAuthMAC
+	}
+
+	expectedLen := authNonceLen + authV2HdrLen + padLen + authMACLen
+	if len(frame) != expectedLen {
+		return 0, errAuthMAC
+	}
+
+	padding := frame[authNonceLen+authV2HdrLen : authNonceLen+authV2HdrLen+padLen]
+	macOnWire := frame[authNonceLen+authV2HdrLen+padLen:]
+
+	macData := make([]byte, 0, len(nonce)+len(plainHdr)+len(padding))
+	macData = append(macData, nonce[:]...)
+	macData = append(macData, plainHdr...)
+	macData = append(macData, padding...)
+	expectedMAC := hmacFor(secret, macData)
+
+	if !hmac.Equal(macOnWire, expectedMAC) {
+		return 0, errAuthMAC
+	}
+
+	stamp := int64(binary.BigEndian.Uint64(plainHdr[2:10]))
 	drift := time.Since(time.Unix(stamp, 0))
 	if drift < 0 {
 		drift = -drift
 	}
 	if drift > clockSkewWindow {
-		return errAuthSkew
+		return 0, errAuthSkew
 	}
 
-	var nonce [authNonceLen]byte
-	copy(nonce[:], frame[1+authTimeLen:authSignLen])
-	if !guard.admit(nonce) {
-		return errAuthReplay
+	if guard != nil && !guard.admit(nonce) {
+		return 0, errAuthReplay
 	}
-	return nil
+	return purpose, nil
+}
+
+// verifyAuthFrame is the backward-compatible check function.
+func verifyAuthFrame(frame, secret []byte, guard *replayGuard) error {
+	_, err := verifyAuthFrameBytes(frame, secret, guard)
+	return err
 }
 
 // sendAuth is used by whichever side dials.
 func sendAuth(c net.Conn, secret []byte) error {
-	frame, err := buildAuthFrame(secret)
+	return sendAuthPurpose(c, secret, authPurposeTunnel)
+}
+
+// sendAuthPurpose sends an auth frame with a specific purpose (tunnel or speedtest).
+func sendAuthPurpose(c net.Conn, secret []byte, purpose byte) error {
+	if ea, ok := c.(interface{ isEarlyAuthed() bool }); ok && ea.isEarlyAuthed() && purpose == authPurposeTunnel {
+		return nil
+	}
+	frame, err := buildAuthFrameV2(secret, purpose)
 	if err != nil {
 		return err
 	}
@@ -169,31 +311,111 @@ func sendAuth(c net.Conn, secret []byte) error {
 	return c.SetWriteDeadline(time.Time{})
 }
 
-// recvAuth is used by whichever side accepts. On a credential problem that the
-// peer could act on, it sends a one-byte reason first so the other end can log
-// something useful instead of a bare disconnect.
+// recvAuth is used by whichever side accepts. Returns nil if valid.
 func recvAuth(c net.Conn, secret []byte, guard *replayGuard) error {
-	frame := make([]byte, authFrameLen)
-	if err := c.SetReadDeadline(time.Now().Add(authReadTimeout)); err != nil {
-		return err
-	}
-	if _, err := io.ReadFull(c, frame); err != nil {
-		return err
-	}
-	if err := c.SetReadDeadline(time.Time{}); err != nil {
-		return err
+	_, err := recvAuthPurpose(c, secret, guard)
+	return err
+}
+
+// recvAuthPurpose reads the auth frame from c and returns the authenticated purpose.
+func recvAuthPurpose(c net.Conn, secret []byte, guard *replayGuard) (byte, error) {
+	if ea, ok := c.(interface{ isEarlyAuthed() bool }); ok && ea.isEarlyAuthed() {
+		return authPurposeTunnel, nil
 	}
 
-	err := verifyAuthFrame(frame, secret, guard)
-	switch err {
-	case nil:
-		return nil
-	case errAuthSkew:
-		writeReason(c, rejClockSkew)
-	case errAuthReplay:
-		writeReason(c, rejReplay)
+	if err := c.SetReadDeadline(time.Now().Add(authReadTimeout)); err != nil {
+		return 0, err
 	}
-	return err
+	defer func() { _ = c.SetReadDeadline(time.Time{}) }()
+
+	var firstByte [1]byte
+	if _, err := io.ReadFull(c, firstByte[:]); err != nil {
+		return 0, err
+	}
+
+	if firstByte[0] == protoVersion {
+		// Legacy v1: read remaining 48 bytes
+		frame := make([]byte, authFrameLen)
+		frame[0] = protoVersion
+		if _, err := io.ReadFull(c, frame[1:]); err != nil {
+			return 0, err
+		}
+		err := verifyAuthFrame(frame, secret, guard)
+		if err != nil {
+			if err == errAuthSkew {
+				writeReason(c, rejClockSkew)
+			} else if err == errAuthReplay {
+				writeReason(c, rejReplay)
+			}
+			return 0, err
+		}
+		return authPurposeTunnel, nil
+	}
+
+	// v2: firstByte is nonce[0]
+	// Read remaining 7 bytes of nonce + 11 bytes of maskedHdr (18 bytes total)
+	hdrBuf := make([]byte, (authNonceLen-1)+authV2HdrLen)
+	if _, err := io.ReadFull(c, hdrBuf); err != nil {
+		return 0, err
+	}
+
+	var nonce [authNonceLen]byte
+	nonce[0] = firstByte[0]
+	copy(nonce[1:], hdrBuf[:authNonceLen-1])
+	maskedHdr := hdrBuf[authNonceLen-1:]
+
+	maskKey := append([]byte("portbridge-v2-mask:"), nonce[:]...)
+	mask := hmacFor(secret, maskKey)
+
+	plainHdr := make([]byte, authV2HdrLen)
+	for i := 0; i < authV2HdrLen; i++ {
+		plainHdr[i] = maskedHdr[i] ^ mask[i]
+	}
+
+	if plainHdr[0] != protoVersion2 {
+		return 0, errAuthMAC
+	}
+	purpose := plainHdr[1]
+	padLen := int(plainHdr[10])
+	if padLen < 16 || padLen > 64 {
+		return 0, errAuthMAC
+	}
+
+	// Read remaining padLen + 32 bytes (padding + mac)
+	remBuf := make([]byte, padLen+authMACLen)
+	if _, err := io.ReadFull(c, remBuf); err != nil {
+		return 0, err
+	}
+
+	padding := remBuf[:padLen]
+	macOnWire := remBuf[padLen:]
+
+	macData := make([]byte, 0, len(nonce)+len(plainHdr)+len(padding))
+	macData = append(macData, nonce[:]...)
+	macData = append(macData, plainHdr...)
+	macData = append(macData, padding...)
+	expectedMAC := hmacFor(secret, macData)
+
+	if !hmac.Equal(macOnWire, expectedMAC) {
+		return 0, errAuthMAC
+	}
+
+	stamp := int64(binary.BigEndian.Uint64(plainHdr[2:10]))
+	drift := time.Since(time.Unix(stamp, 0))
+	if drift < 0 {
+		drift = -drift
+	}
+	if drift > clockSkewWindow {
+		writeReason(c, rejClockSkew)
+		return 0, errAuthSkew
+	}
+
+	if guard != nil && !guard.admit(nonce) {
+		writeReason(c, rejReplay)
+		return 0, errAuthReplay
+	}
+
+	return purpose, nil
 }
 
 func writeReason(c net.Conn, reason byte) {

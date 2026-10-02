@@ -52,6 +52,8 @@ func main() {
 		cmdCheck(os.Args[2:])
 	case "teardown":
 		cmdTeardown(os.Args[2:])
+	case "speedtest":
+		cmdSpeedtest(os.Args[2:])
 	case "version", "-v", "--version":
 		fmt.Println(version)
 	case "help", "-h", "--help":
@@ -67,10 +69,11 @@ func usage() {
 	fmt.Fprintf(os.Stderr, `PortBridge %s
 
 Usage:
-  portbridge run      -config <file>   Run the tunnel described by the config file
-  portbridge check    -config <file>   Check a config file and print what it means
-  portbridge teardown -config <file>   Teardown remote tunnel and delete local files
-  portbridge version                   Print the version
+  portbridge run       -config <file>               Run the tunnel described by the config file
+  portbridge check     -config <file>               Check a config file and print what it means
+  portbridge teardown  -config <file>               Teardown remote tunnel and delete local files
+  portbridge speedtest [name|-config <file>]        Run an in-tunnel latency and throughput test
+  portbridge version                                Print the version
 
 Tunnels are normally created and managed with the menu:
   portbridge-menu

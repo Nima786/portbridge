@@ -44,6 +44,7 @@ type route struct {
 // router holds the routes to try, in order of preference, and remembers which
 // one last worked.
 type router struct {
+	cfg     *Config
 	targets []route
 
 	mu       sync.Mutex
@@ -62,7 +63,7 @@ func newRouter(cfg *Config) *router {
 		}
 		targets = append(targets, route{addr: alt, name: name})
 	}
-	return &router{targets: targets, log: newThrottled()}
+	return &router{cfg: cfg, targets: targets, log: newThrottled()}
 }
 
 // pick decides which route to start from. After a while on a fallback route it
@@ -112,8 +113,14 @@ func (r *router) dial(timeout time.Duration) (net.Conn, string, error) {
 
 	for n := 0; n < len(r.targets); n++ {
 		i := (start + n) % len(r.targets)
-		d := net.Dialer{Timeout: timeout}
-		c, err := d.Dial("tcp", r.targets[i].addr)
+		var c net.Conn
+		var err error
+		if r.cfg != nil && r.cfg.Transport == TransportKCP {
+			c, err = kcpDial(r.targets[i].addr, r.cfg)
+		} else {
+			d := net.Dialer{Timeout: timeout}
+			c, err = d.Dial("tcp", r.targets[i].addr)
+		}
 		if err != nil {
 			lastErr = err
 			continue

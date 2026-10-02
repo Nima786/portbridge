@@ -53,6 +53,8 @@ load() {
     role=$(read_conf "$conf" role)
     tunnel_addr=$(read_conf "$conf" tunnel_addr)
     PEER=$(read_conf "$conf" peer_ip)
+    TRANSPORT=$(read_conf "$conf" transport)
+    [ -n "$TRANSPORT" ] || TRANSPORT=plain
     # Missing means on: tunnels made before this setting existed stay protected.
     ENABLED=$(read_conf "$conf" firewall)
     [ -n "$ENABLED" ] || ENABLED=on
@@ -113,19 +115,24 @@ cmd_apply() {
     purge_port iptables "$TPORT"
     purge_port ip6tables "$TPORT"
 
+    local proto=tcp
+    if [ "$TRANSPORT" = "kcp" ]; then
+        proto=udp
+    fi
+
     # Order matters: the allow rules must sit above the catch-all drop.
-    ensure4 INPUT -p tcp --dport "$TPORT" -s "$PEER" -j ACCEPT
-    ensure4 INPUT -p tcp --dport "$TPORT" -s 127.0.0.1 -j ACCEPT
-    ensure4 INPUT -p tcp --dport "$TPORT" -j DROP
+    ensure4 INPUT -p "$proto" --dport "$TPORT" -s "$PEER" -j ACCEPT
+    ensure4 INPUT -p "$proto" --dport "$TPORT" -s 127.0.0.1 -j ACCEPT
+    ensure4 INPUT -p "$proto" --dport "$TPORT" -j DROP
 
     # The port is bound on IPv6 too. The peer is recorded as IPv4, so close v6
     # rather than leaving an unguarded way in.
     if have ip6tables && [[ "$PEER" != *:* ]]; then
-        ip6tables -C INPUT -p tcp --dport "$TPORT" -j DROP 2>/dev/null ||
-            ip6tables -A INPUT -p tcp --dport "$TPORT" -j DROP
+        ip6tables -C INPUT -p "$proto" --dport "$TPORT" -j DROP 2>/dev/null ||
+            ip6tables -A INPUT -p "$proto" --dport "$TPORT" -j DROP
     fi
 
-    echo "tunnel port $TPORT is restricted to $PEER"
+    echo "tunnel port $TPORT ($proto) is restricted to $PEER"
 }
 
 # Removes every allow and drop rule for a port, whatever source address it
@@ -136,7 +143,7 @@ purge_port() {
     local tool=$1 port=$2 rule
     have "$tool" || return 0
     "$tool" -S INPUT 2>/dev/null |
-        grep -E -- "^-A INPUT( -s [^ ]+)? -p tcp -m tcp --dport $port -j (ACCEPT|DROP)$" |
+        grep -E -- "^-A INPUT( -s [^ ]+)? -p (tcp|udp) -m (tcp|udp) --dport $port -j (ACCEPT|DROP)$" |
         while read -r rule; do
             # shellcheck disable=SC2086 # the rule must be split back into words
             "$tool" ${rule/-A/-D} 2>/dev/null || true

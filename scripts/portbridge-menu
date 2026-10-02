@@ -393,6 +393,11 @@ explain_disguise() {
     say "     ${DIM}Wraps the link in HTTP/2 streaming frames over TLS, appearing${R}"
     say "     ${DIM}as active HTTP/2 web/gRPC traffic. Resists DPI protocol inspection${R}"
     say "     ${DIM}and works with Cloudflare gRPC mode.${R}"
+    say ""
+    say "  ${B}6) Loss-resistant KCP / UDP with FEC${R} ${DIM}(resists packet loss & DPI TCP RSTs)${R}"
+    say "     ${DIM}Runs over UDP with Reed-Solomon Forward Error Correction (10 data / 3 parity shards)${R}"
+    say "     ${DIM}and AES encryption. Drops are repaired instantly without retransmission delays.${R}"
+    say "     ${DIM}Immune to TCP middlebox RST drops; no TLS cert needed.${R}"
     hr
 }
 
@@ -402,9 +407,9 @@ ask_disguise() {
 
     explain_disguise "$mode"
     if [ "$mode" = direct ]; then
-        choice=$(choose "Choose 1, 2, 3, 4 or 5" "2" 1 2 3 4 5)
+        choice=$(choose "Choose 1, 2, 3, 4, 5 or 6" "2" 1 2 3 4 5 6)
     else
-        choice=$(choose "Choose 1, 2, 3 or 5" "2" 1 2 3 5)
+        choice=$(choose "Choose 1, 2, 3, 5 or 6" "2" 1 2 3 5 6)
     fi
 
     DG_SERVERNAME=""
@@ -422,6 +427,15 @@ ask_disguise() {
         3) DG_TRANSPORT=wss; DG_CDN=on ;;
         4) DG_TRANSPORT=wss; DG_CDN=off ;;
         5) DG_TRANSPORT=grpc ;;
+        6)
+            DG_TRANSPORT=kcp
+            DG_CDN=off
+            DG_SERVERNAME=""
+            DG_WSPATH=""
+            say ""
+            ok "Chosen: Loss-resistant KCP over UDP with Reed-Solomon FEC."
+            return 0
+            ;;
     esac
 
     if [ "$choice" = 3 ] || [ "$choice" = 4 ]; then
@@ -524,6 +538,7 @@ describe_disguise() {
         h2:*) printf 'looks like HTTP/2 web traffic' ;;
         grpc:on) printf 'gRPC stream through Cloudflare' ;;
         grpc:*) printf 'looks like gRPC over HTTP/2' ;;
+        kcp:*) printf 'loss-resistant KCP/UDP with FEC' ;;
         wss:on) printf 'through a CDN' ;;
         wss:*)
             if [ -n "${3-}" ]; then
@@ -729,7 +744,7 @@ write_tunnel() {
         [ -n "$localip" ] && printf 'local_ip = %s\n' "$localip"
         printf '\n# What the link looks like to anyone watching it. See the menu.\n'
         printf 'transport = %s\n' "${DG_TRANSPORT:-plain}"
-        if [ "${DG_TRANSPORT:-plain}" != plain ]; then
+        if [ "${DG_TRANSPORT:-plain}" != plain ] && [ "${DG_TRANSPORT:-plain}" != kcp ]; then
             [ -n "${DG_SERVERNAME-}" ] && printf 'server_name = %s\n' "$DG_SERVERNAME"
             [ -n "${DG_WSPATH-}" ] && printf 'ws_path = %s\n' "$DG_WSPATH"
             printf 'cdn = %s\n' "${DG_CDN:-off}"
@@ -1696,6 +1711,13 @@ uninstall_all() {
     exit 0
 }
 
+speedtest_tunnel() {
+    local name=$1
+    hr
+    say "${B}Speed testing tunnel '$name'...${R}"
+    "$BIN" speedtest "$name"
+}
+
 # -------------------------------------------------------------------- main menu
 
 main_menu() {
@@ -1717,6 +1739,7 @@ main_menu() {
         say " ${B}11${R}) Firewall"
         say " ${B}12${R}) Speed tuning           ${DIM}run on both servers${R}"
         say " ${B}13${R}) Uninstall PortBridge"
+        say " ${B}14${R}) Speed test a tunnel"
         say "  ${B}0${R}) Quit"
         hr
         local choice name
@@ -1735,6 +1758,7 @@ main_menu() {
             11) firewall_menu ;;
             12) tuning_menu; pause ;;
             13) uninstall_all ;;
+            14) name=$(pick_tunnel) && speedtest_tunnel "$name"; pause ;;
             0 | q | Q) say "Bye."; exit 0 ;;
             *) err "Not a valid choice."; sleep 1 ;;
         esac
@@ -1860,7 +1884,8 @@ case "${1-}" in
     list) list_tunnels ;;
     check) shift; test_tunnel "${1:?tunnel name required}" ;;
     code) shift; show_pairing_code "${1:?tunnel name required}" ;;
+    speedtest) shift; speedtest_tunnel "${1:?tunnel name required}" ;;
     firewall) "$FIREWALL" status ;;
     '' ) main_menu ;;
-    *) say "Usage: portbridge-menu [list|check <name>|code <name>|firewall]" ;;
+    *) say "Usage: portbridge-menu [list|check <name>|code <name>|speedtest <name>|firewall]" ;;
 esac

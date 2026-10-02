@@ -136,6 +136,10 @@ type Config struct {
 	// packet stalls every session on it.
 	MuxLinks int
 
+	// KCP Forward Error Correction shards
+	KCPDataShards   int
+	KCPParityShards int
+
 	secret []byte
 
 	// Disguise settings prepared once at startup and only read afterwards. They
@@ -224,8 +228,10 @@ func defaultConfig() *Config {
 		Transport: TransportPlain,
 		// Off for the same reason, and because sharing connections costs speed
 		// on a lossy route. It is a choice, not an improvement.
-		Mux:      false,
-		MuxLinks: 4,
+		Mux:             false,
+		MuxLinks:        4,
+		KCPDataShards:   10,
+		KCPParityShards: 3,
 	}
 }
 
@@ -375,6 +381,10 @@ func (c *Config) set(key, val string) error {
 		return dur(&c.SpareTTL)
 	case "park_timeout":
 		return dur(&c.ParkTimeout)
+	case "kcp_data_shards":
+		return num(&c.KCPDataShards)
+	case "kcp_parity_shards":
+		return num(&c.KCPParityShards)
 	case "drain":
 		return dur(&c.Drain)
 	default:
@@ -511,10 +521,10 @@ func (c *Config) Validate() error {
 	}
 
 	if !validTransport(c.Transport) {
-		return fmt.Errorf("transport must be %q, %q, %q, %q or %q, got %q",
-			TransportPlain, TransportTLS, TransportWSS, TransportH2, TransportGRPC, c.Transport)
+		return fmt.Errorf("transport must be %q, %q, %q, %q, %q or %q, got %q",
+			TransportPlain, TransportTLS, TransportWSS, TransportH2, TransportGRPC, TransportKCP, c.Transport)
 	}
-	if c.Transport != TransportPlain {
+	if c.Transport != TransportPlain && c.Transport != TransportKCP {
 		// Only the accepting side presents a certificate, and it is created on
 		// demand, so a missing path is a configuration gap rather than a
 		// missing file.

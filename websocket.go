@@ -50,6 +50,14 @@ func wsDial(c net.Conn, cfg *Config) (net.Conn, error) {
 	host := cfg.effectiveServerName()
 	path := cfg.effectiveWSPath()
 
+	// Build v2 early-data auth frame for 0-RTT handshake
+	var earlyDataProto string
+	if len(cfg.secret) >= 16 {
+		if frame, err := buildAuthFrameV2(cfg.secret, authPurposeTunnel); err == nil {
+			earlyDataProto = "portbridge.v2." + base64.RawURLEncoding.EncodeToString(frame)
+		}
+	}
+
 	// A perfectly ordinary upgrade request. Header order and the user agent are
 	// chosen to look like a normal browser-driven websocket, because a CDN and
 	// anything watching will both see this in the clear if TLS is terminated.
@@ -58,8 +66,11 @@ func wsDial(c net.Conn, cfg *Config) (net.Conn, error) {
 		"Upgrade: websocket\r\n" +
 		"Connection: Upgrade\r\n" +
 		"Sec-WebSocket-Key: " + key + "\r\n" +
-		"Sec-WebSocket-Version: 13\r\n" +
-		"User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
+		"Sec-WebSocket-Version: 13\r\n"
+	if earlyDataProto != "" {
+		req += "Sec-WebSocket-Protocol: " + earlyDataProto + "\r\n"
+	}
+	req += "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
 		"(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36\r\n" +
 		"Accept-Encoding: gzip, deflate, br\r\n" +
 		"Accept-Language: en-US,en;q=0.9\r\n" +
@@ -90,14 +101,15 @@ func wsDial(c net.Conn, cfg *Config) (net.Conn, error) {
 		return nil, err
 	}
 
+	earlyAuthed := resp.Header.Get("Sec-WebSocket-Protocol") == "portbridge.v2"
 	// br may hold bytes already read past the response, so it must be kept.
-	return &wsConn{Conn: c, br: br, mask: true}, nil
+	return &wsConn{Conn: c, br: br, mask: true, earlyAuthed: earlyAuthed}, nil
 }
 
 // wsAccept performs the server half. Anything that is not a correct upgrade for
 // our path gets a plain 404, so a stray visitor sees an unremarkable web server
 // rather than anything that hints at a tunnel.
-func wsAccept(c net.Conn, cfg *Config) (net.Conn, error) {
+func wsAccept(c net.Conn, cfg *Config, guard ...*replayGuard) (net.Conn, error) {
 	if err := c.SetDeadline(time.Now().Add(tlsHandshakeTimeout)); err != nil {
 		return nil, err
 	}
@@ -116,18 +128,42 @@ func wsAccept(c net.Conn, cfg *Config) (net.Conn, error) {
 		return nil, fmt.Errorf("%w: unexpected request for %s", errWSUpgrade, req.URL.Path)
 	}
 
+	earlyAuthed := false
+	protoHeader := req.Header.Get("Sec-WebSocket-Protocol")
+	if strings.HasPrefix(protoHeader, "portbridge.v2.") {
+		token := strings.TrimPrefix(protoHeader, "portbridge.v2.")
+		frame, err := base64.RawURLEncoding.DecodeString(token)
+		if err == nil {
+			var g *replayGuard
+			if len(guard) > 0 && guard[0] != nil {
+				g = guard[0]
+			}
+			_, err = verifyAuthFrameBytes(frame, cfg.secret, g)
+			if err == nil {
+				earlyAuthed = true
+			} else {
+				writeDecoyResponse(c)
+				return nil, fmt.Errorf("%w: early auth failed: %v", errWSUpgrade, err)
+			}
+		}
+	}
+
 	resp := "HTTP/1.1 101 Switching Protocols\r\n" +
 		"Upgrade: websocket\r\n" +
 		"Connection: Upgrade\r\n" +
-		"Sec-WebSocket-Accept: " + wsAcceptKey(key) + "\r\n" +
-		"\r\n"
+		"Sec-WebSocket-Accept: " + wsAcceptKey(key) + "\r\n"
+	if earlyAuthed {
+		resp += "Sec-WebSocket-Protocol: portbridge.v2\r\n"
+	}
+	resp += "\r\n"
+
 	if _, err := io.WriteString(c, resp); err != nil {
 		return nil, err
 	}
 	if err := c.SetDeadline(time.Time{}); err != nil {
 		return nil, err
 	}
-	return &wsConn{Conn: c, br: br, mask: false}, nil
+	return &wsConn{Conn: c, br: br, mask: false, earlyAuthed: earlyAuthed}, nil
 }
 
 // writeDecoyResponse answers anything unexpected the way a small web server
@@ -156,13 +192,18 @@ func wsAcceptKey(key string) string {
 // frames; writes produce one binary frame each.
 type wsConn struct {
 	net.Conn
-	br   *bufio.Reader
-	mask bool // whichever side dialled must mask its frames
+	br          *bufio.Reader
+	mask        bool // whichever side dialled must mask its frames
+	earlyAuthed bool
 
 	readBuf []byte // payload left over from the last frame
 	closed  bool
 
 	wmu sync.Mutex // frames must not interleave
+}
+
+func (w *wsConn) isEarlyAuthed() bool {
+	return w.earlyAuthed
 }
 
 func (w *wsConn) Read(p []byte) (int, error) {
