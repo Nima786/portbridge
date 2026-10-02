@@ -54,6 +54,16 @@ func main() {
 		cmdTeardown(os.Args[2:])
 	case "speedtest":
 		cmdSpeedtest(os.Args[2:])
+	case "agent":
+		if err := cmdAgent(os.Args[2:]); err != nil {
+			fmt.Fprintf(os.Stderr, "agent error: %v\n", err)
+			os.Exit(1)
+		}
+	case "join":
+		if err := cmdJoin(os.Args[2:]); err != nil {
+			fmt.Fprintf(os.Stderr, "join error: %v\n", err)
+			os.Exit(1)
+		}
 	case "version", "-v", "--version":
 		fmt.Println(version)
 	case "help", "-h", "--help":
@@ -73,6 +83,8 @@ Usage:
   portbridge check     -config <file>               Check a config file and print what it means
   portbridge teardown  -config <file>               Teardown remote tunnel and delete local files
   portbridge speedtest [name|-config <file>]        Run an in-tunnel latency and throughput test
+  portbridge agent     [-config <file>]             Run the management agent daemon
+  portbridge join      <code>                       Join and configure tunnel from pairing code
   portbridge version                                Print the version
 
 Tunnels are normally created and managed with the menu:
