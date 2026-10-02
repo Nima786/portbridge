@@ -1395,3 +1395,127 @@ func TestRemoteTeardownGRPC(t *testing.T) {
 	cancel()
 	wg.Wait()
 }
+
+func TestKCPWithoutMux(t *testing.T) {
+	for _, mode := range []Mode{ModeDirect, ModeReverse} {
+		t.Run(string(mode), func(t *testing.T) {
+			svc := startService(t)
+			defer svc.stop()
+
+			tunnelAddr := freeAddr(t)
+			userAddr := freeAddr(t)
+
+			edgeCfg := defaultConfig()
+			edgeCfg.Name = "kcp-edge"
+			edgeCfg.Mode = mode
+			edgeCfg.Role = RoleEdge
+			edgeCfg.Transport = TransportKCP
+			edgeCfg.TunnelAddr = tunnelAddr
+			edgeCfg.UserListen = userAddr
+			edgeCfg.SecretFile = writeSecret(t, testSecret)
+			edgeCfg.PoolSize = 3
+			edgeCfg.MaxConn = 20
+			edgeCfg.MaxPending = 20
+			edgeCfg.SpareTTL = 10 * time.Minute
+			edgeCfg.ParkTimeout = 15 * time.Minute
+			edgeCfg.Drain = 1 * time.Second
+			edgeCfg.Mux = false
+			edgeCfg.StatusFile = ""
+			if err := edgeCfg.Validate(); err != nil {
+				t.Fatal(err)
+			}
+			if err := edgeCfg.LoadSecret(); err != nil {
+				t.Fatal(err)
+			}
+
+			originCfg := defaultConfig()
+			originCfg.Name = "kcp-origin"
+			originCfg.Mode = mode
+			originCfg.Role = RoleOrigin
+			originCfg.Transport = TransportKCP
+			originCfg.TunnelAddr = tunnelAddr
+			originCfg.InboundAddr = svc.addr
+			originCfg.SecretFile = writeSecret(t, testSecret)
+			originCfg.PoolSize = 3
+			originCfg.MaxConn = 20
+			originCfg.MaxPending = 20
+			originCfg.SpareTTL = 10 * time.Minute
+			originCfg.ParkTimeout = 15 * time.Minute
+			originCfg.Drain = 1 * time.Second
+			originCfg.Mux = false
+			originCfg.StatusFile = ""
+			if err := originCfg.Validate(); err != nil {
+				t.Fatal(err)
+			}
+			if err := originCfg.LoadSecret(); err != nil {
+				t.Fatal(err)
+			}
+
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+
+			var wg sync.WaitGroup
+			if mode == ModeDirect {
+				wg.Add(1)
+				go func() {
+					defer wg.Done()
+					_ = runOrigin(ctx, originCfg, newStatus(originCfg))
+				}()
+				time.Sleep(200 * time.Millisecond)
+				wg.Add(1)
+				go func() {
+					defer wg.Done()
+					_ = runEdge(ctx, edgeCfg, newStatus(edgeCfg))
+				}()
+			} else {
+				wg.Add(1)
+				go func() {
+					defer wg.Done()
+					_ = runEdge(ctx, edgeCfg, newStatus(edgeCfg))
+				}()
+				time.Sleep(200 * time.Millisecond)
+				wg.Add(1)
+				go func() {
+					defer wg.Done()
+					_ = runOrigin(ctx, originCfg, newStatus(originCfg))
+				}()
+			}
+
+			time.Sleep(500 * time.Millisecond)
+
+			// 1. Verify standard roundtrip
+			got, err := roundTrip(t, userAddr, "pingkcp", 8*time.Second)
+			if err != nil {
+				t.Fatalf("kcp roundtrip failed: %v", err)
+			}
+			if got != "PINGKCP" {
+				t.Fatalf("got %q, want PINGKCP", got)
+			}
+
+			// 2. Verify half-close does not truncate (the audit bug)
+			c, err := net.DialTimeout("tcp", userAddr, 8*time.Second)
+			if err != nil {
+				t.Fatalf("dial for half-close: %v", err)
+			}
+			defer c.Close()
+			_ = c.SetDeadline(time.Now().Add(10 * time.Second))
+
+			if _, err := c.Write([]byte("halfclose-kcp")); err != nil {
+				t.Fatalf("write: %v", err)
+			}
+			if err := c.(*net.TCPConn).CloseWrite(); err != nil {
+				t.Fatalf("CloseWrite: %v", err)
+			}
+			reply, err := io.ReadAll(c)
+			if err != nil {
+				t.Fatalf("read after CloseWrite: %v", err)
+			}
+			if string(reply) != "HALFCLOSE-KCP" {
+				t.Fatalf("got %q, want HALFCLOSE-KCP", string(reply))
+			}
+
+			cancel()
+			wg.Wait()
+		})
+	}
+}

@@ -29,6 +29,11 @@ func tuneSocket(c net.Conn) {
 // "not known to be dead". Spares are then filtered by age alone, and the
 // activation acknowledgement still catches a broken path before a user is
 // affected.
-func socketAlive(net.Conn) bool {
+func socketAlive(c net.Conn) bool {
+	if lc, ok := c.(interface{ isAlive() bool }); ok {
+		if !lc.isAlive() {
+			return false
+		}
+	}
 	return true
 }

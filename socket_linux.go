@@ -56,6 +56,11 @@ func tuneSocket(c net.Conn) {
 // the backstop. Treat true as "not known to be dead" rather than a guarantee.
 // The activation acknowledgement is what actually proves a path works.
 func socketAlive(c net.Conn) bool {
+	if lc, ok := c.(interface{ isAlive() bool }); ok {
+		if !lc.isAlive() {
+			return false
+		}
+	}
 	tc, ok := c.(*net.TCPConn)
 	if !ok {
 		return true

@@ -451,10 +451,10 @@ ask_disguise() {
     if [ "$mode" = direct ]; then
         choice=$(choose "Choose 1, 2, 3, 4, 5 or 6" "2" 1 2 3 4 5 6)
     else
-        choice=$(choose "Choose 1, 2, 3, 4 or 5" "2" 1 2 3 4 5 6)
+        choice=$(choose "Choose 1, 2, 3, 4 or 5" "2" 1 2 3 4 5)
         case "$choice" in
             4) choice=5 ;; # gRPC
-            5|6) choice=6 ;; # KCP
+            5) choice=6 ;; # KCP
         esac
     fi
 
@@ -640,18 +640,30 @@ MX_MUX=off
 MX_LINKS=4
 
 explain_sharing() {
+    local transport=${DG_TRANSPORT:-plain}
     hr
     say "${B}Should all users share a few connections, or get one each?${R}"
     say ""
-    say "  ${B}1) One connection per user${R} ${DIM}(recommended)${R}"
-    say "     ${DIM}How it has always worked. Fastest on a poor route, because one${R}"
-    say "     ${DIM}user's lost packet never holds up anybody else.${R}"
-    say ""
-    say "  ${B}2) Share a few connections${R}"
-    say "     ${DIM}Everyone rides on $MX_LINKS connections that stay open for hours. Far${R}"
-    say "     ${DIM}fewer connections between your servers, so the tunnel is harder to${R}"
-    say "     ${DIM}pick out, and busy times do not show. The cost is real: on a lossy${R}"
-    say "     ${DIM}route a hiccup is felt by everyone on that connection at once.${R}"
+    if [ "$transport" = kcp ]; then
+        say "  ${B}1) Share a few connections (Mux)${R} ${DIM}(recommended for KCP)${R}"
+        say "     ${DIM}Everyone rides on $MX_LINKS persistent KCP/UDP carriers. Eliminates${R}"
+        say "     ${DIM}per-connection handshakes (0-RTT), keeps UDP NAT alive, and maximizes${R}"
+        say "     ${DIM}Forward Error Correction (FEC) packet repair across connections.${R}"
+        say ""
+        say "  ${B}2) One connection per user${R}"
+        say "     ${DIM}Each user opens their own separate KCP/UDP connection. Uses periodic${R}"
+        say "     ${DIM}keepalive probes to keep NAT alive. Isolated, but higher connection churn.${R}"
+    else
+        say "  ${B}1) One connection per user${R} ${DIM}(recommended)${R}"
+        say "     ${DIM}How it has always worked. Fastest on a poor route, because one${R}"
+        say "     ${DIM}user's lost packet never holds up anybody else.${R}"
+        say ""
+        say "  ${B}2) Share a few connections${R}"
+        say "     ${DIM}Everyone rides on $MX_LINKS connections that stay open for hours. Far${R}"
+        say "     ${DIM}fewer connections between your servers, so the tunnel is harder to${R}"
+        say "     ${DIM}pick out, and busy times do not show. The cost is real: on a lossy${R}"
+        say "     ${DIM}route a hiccup is felt by everyone on that connection at once.${R}"
+    fi
     say ""
     say "  ${DIM}If your tunnel works well today, keep option 1. Choose 2 if you think${R}"
     say "  ${DIM}the number of connections is what is getting your tunnel noticed.${R}"
@@ -660,23 +672,45 @@ explain_sharing() {
 
 ask_sharing() {
     explain_sharing
-    case "$(choose "Choose 1 or 2" "1" 1 2)" in
-        1) MX_MUX=off; MX_LINKS=4 ;;
-        2)
-            MX_MUX=on
-            say ""
-            info "More connections spread the risk of a hiccup; fewer hide the tunnel"
-            info "better. Four is a sensible middle."
-            while :; do
-                MX_LINKS=$(ask "How many shared connections" "4")
-                case "$MX_LINKS" in
-                    '' | *[!0-9]*) err "  Give a number between 1 and 16." ;;
-                    *) [ "$MX_LINKS" -ge 1 ] && [ "$MX_LINKS" -le 16 ] && break
-                       err "  Give a number between 1 and 16." ;;
-                esac
-            done
-            ;;
-    esac
+    if [ "${DG_TRANSPORT:-plain}" = kcp ]; then
+        case "$(choose "Choose 1 or 2" "1" 1 2)" in
+            1)
+                MX_MUX=on
+                say ""
+                info "Four shared KCP carrier links is the standard recommended setting."
+                while :; do
+                    MX_LINKS=$(ask "How many shared connections" "4")
+                    case "$MX_LINKS" in
+                        '' | *[!0-9]*) err "  Give a number between 1 and 16." ;;
+                        *) [ "$MX_LINKS" -ge 1 ] && [ "$MX_LINKS" -le 16 ] && break
+                           err "  Give a number between 1 and 16." ;;
+                    esac
+                done
+                ;;
+            2)
+                MX_MUX=off
+                MX_LINKS=4
+                ;;
+        esac
+    else
+        case "$(choose "Choose 1 or 2" "1" 1 2)" in
+            1) MX_MUX=off; MX_LINKS=4 ;;
+            2)
+                MX_MUX=on
+                say ""
+                info "More connections spread the risk of a hiccup; fewer hide the tunnel"
+                info "better. Four is a sensible middle."
+                while :; do
+                    MX_LINKS=$(ask "How many shared connections" "4")
+                    case "$MX_LINKS" in
+                        '' | *[!0-9]*) err "  Give a number between 1 and 16." ;;
+                        *) [ "$MX_LINKS" -ge 1 ] && [ "$MX_LINKS" -le 16 ] && break
+                           err "  Give a number between 1 and 16." ;;
+                    esac
+                done
+                ;;
+        esac
+    fi
 }
 
 # describe_sharing <mux> <links> - one short phrase for summaries.

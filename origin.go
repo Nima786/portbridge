@@ -386,39 +386,63 @@ func (o *origin) parkUntilActivated(ctx context.Context, c net.Conn, timeout tim
 // awaitActivation blocks until the edge says a user has arrived. Anything other
 // than the activation byte means the connection is finished with.
 func (o *origin) awaitActivation(c net.Conn, timeout time.Duration) (uint16, error) {
-	if err := c.SetReadDeadline(time.Now().Add(timeout)); err != nil {
-		return 0, err
-	}
-	var sig [1]byte
-	if _, err := io.ReadFull(c, sig[:]); err != nil {
-		return 0, err
-	}
-	if err := c.SetReadDeadline(time.Time{}); err != nil {
-		return 0, err
-	}
-	switch sig[0] {
-	case msgActivate:
-		return 0, nil
-	case msgActivatePort:
-		var portBuf [2]byte
-		if _, err := io.ReadFull(c, portBuf[:]); err != nil {
+	for {
+		readTimeout := timeout
+		if needsKeepalive(c) && readTimeout > 45*time.Second {
+			readTimeout = 45 * time.Second
+		}
+		if err := c.SetReadDeadline(time.Now().Add(readTimeout)); err != nil {
 			return 0, err
 		}
-		return binary.BigEndian.Uint16(portBuf[:]), nil
-	case msgTeardown:
-		_ = c.SetWriteDeadline(time.Now().Add(activateWriteTimeout))
-		_, _ = c.Write([]byte{msgTeardownAck})
-		o.triggerTeardown()
-		return 0, errTeardownRequested
-	case msgSpeedtest:
-		runSpeedtestServer(c)
-		return 0, errSpeedtestFinished
-	case rejClockSkew, rejReplay:
-		err := describeRejection(sig[0])
-		o.logAuth.printf("the edge refused our credentials: %v", err)
-		return 0, err
-	default:
-		return 0, errBadAck
+		var sig [1]byte
+		if _, err := io.ReadFull(c, sig[:]); err != nil {
+			return 0, err
+		}
+		switch sig[0] {
+		case msgParkPing:
+			_ = c.SetWriteDeadline(time.Now().Add(activateWriteTimeout))
+			if _, err := c.Write([]byte{msgParkPong}); err != nil {
+				return 0, err
+			}
+			_ = c.SetWriteDeadline(time.Time{})
+			continue
+		case msgActivate:
+			if err := c.SetReadDeadline(time.Time{}); err != nil {
+				return 0, err
+			}
+			return 0, nil
+		case msgActivatePort:
+			if err := c.SetReadDeadline(time.Time{}); err != nil {
+				return 0, err
+			}
+			var portBuf [2]byte
+			if _, err := io.ReadFull(c, portBuf[:]); err != nil {
+				return 0, err
+			}
+			return binary.BigEndian.Uint16(portBuf[:]), nil
+		case msgTeardown:
+			if err := c.SetReadDeadline(time.Time{}); err != nil {
+				return 0, err
+			}
+			_ = c.SetWriteDeadline(time.Now().Add(activateWriteTimeout))
+			_, _ = c.Write([]byte{msgTeardownAck})
+			o.triggerTeardown()
+			return 0, errTeardownRequested
+		case msgSpeedtest:
+			if err := c.SetReadDeadline(time.Time{}); err != nil {
+				return 0, err
+			}
+			runSpeedtestServer(c)
+			return 0, errSpeedtestFinished
+		case rejClockSkew, rejReplay:
+			_ = c.SetReadDeadline(time.Time{})
+			err := describeRejection(sig[0])
+			o.logAuth.printf("the edge refused our credentials: %v", err)
+			return 0, err
+		default:
+			_ = c.SetReadDeadline(time.Time{})
+			return 0, errBadAck
+		}
 	}
 }
 

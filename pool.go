@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"io"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -12,15 +13,18 @@ import (
 var errNoSpare = errors.New("no tunnel connection available from the other server")
 
 const (
-	refillParallel = 8
-	refillIdle     = 300 * time.Millisecond
-	refillBackoff0 = 1 * time.Second
-	refillBackoffM = 30 * time.Second
+	refillParallel   = 8
+	refillIdle       = 300 * time.Millisecond
+	refillBackoff0   = 1 * time.Second
+	refillBackoffM   = 30 * time.Second
+	parkPingInterval = 15 * time.Second
+	parkPingTimeout  = 3 * time.Second
 )
 
 type parked struct {
-	conn net.Conn
-	at   time.Time
+	conn     net.Conn
+	at       time.Time
+	lastPing time.Time
 }
 
 // pool holds authenticated tunnel connections that are ready to carry a user,
@@ -93,7 +97,7 @@ func (p *pool) offer(c net.Conn) bool {
 		p.mu.Unlock()
 		return false
 	}
-	p.items = append(p.items, parked{conn: c, at: time.Now()})
+	p.items = append(p.items, parked{conn: c, at: time.Now(), lastPing: time.Now()})
 	atomic.StoreInt64(&p.statParked, int64(len(p.items)))
 	atomic.AddInt64(&p.statOffered, 1)
 	p.mu.Unlock()
@@ -204,6 +208,7 @@ func (p *pool) maintain(ctx context.Context) {
 			return
 		}
 		p.evict()
+		p.probeKeepalives(ctx)
 
 		var failures int32
 		if p.dial != nil {
@@ -280,7 +285,7 @@ func (p *pool) offerLocal(c net.Conn) bool {
 		p.mu.Unlock()
 		return false
 	}
-	p.items = append(p.items, parked{conn: c, at: time.Now()})
+	p.items = append(p.items, parked{conn: c, at: time.Now(), lastPing: time.Now()})
 	atomic.StoreInt64(&p.statParked, int64(len(p.items)))
 	p.mu.Unlock()
 	return true
@@ -309,6 +314,100 @@ func (p *pool) evict() {
 		atomic.AddInt64(&p.statDiscarded, 1)
 		_ = c.Close()
 	}
+}
+
+func (p *pool) probeKeepalives(ctx context.Context) {
+	// Pick at most 2 items that need keepalive per cycle to avoid blocking users
+	const maxProbesPerCycle = 2
+	var candidates []parked
+
+	p.mu.Lock()
+	now := time.Now()
+	for i := 0; i < len(p.items); i++ {
+		it := p.items[i]
+		if needsKeepalive(it.conn) && now.Sub(it.lastPing) >= parkPingInterval {
+			candidates = append(candidates, it)
+			p.items = append(p.items[:i], p.items[i+1:]...)
+			i--
+			if len(candidates) >= maxProbesPerCycle {
+				break
+			}
+		}
+	}
+	atomic.StoreInt64(&p.statParked, int64(len(p.items)))
+	p.mu.Unlock()
+
+	if len(candidates) == 0 {
+		return
+	}
+
+	for _, it := range candidates {
+		if ctx.Err() != nil {
+			_ = it.conn.Close()
+			continue
+		}
+
+		err := probeParked(it.conn)
+		if err != nil {
+			atomic.AddInt64(&p.statDiscarded, 1)
+			_ = it.conn.Close()
+			continue
+		}
+
+		it.lastPing = time.Now()
+
+		p.mu.Lock()
+		handed := false
+		for len(p.waiters) > 0 {
+			ch := p.waiters[0]
+			p.waiters = p.waiters[1:]
+			select {
+			case ch <- it.conn:
+				handed = true
+				break
+			default:
+			}
+			if handed {
+				break
+			}
+		}
+		if !handed {
+			if len(p.items) < p.maxSize && time.Since(it.at) < p.maxAge && socketAlive(it.conn) {
+				p.items = append(p.items, it)
+				atomic.StoreInt64(&p.statParked, int64(len(p.items)))
+			} else {
+				_ = it.conn.Close()
+				atomic.AddInt64(&p.statDiscarded, 1)
+			}
+		}
+		p.mu.Unlock()
+	}
+}
+
+func probeParked(c net.Conn) error {
+	if err := c.SetWriteDeadline(time.Now().Add(parkPingTimeout)); err != nil {
+		return err
+	}
+	if _, err := c.Write([]byte{msgParkPing}); err != nil {
+		return err
+	}
+	if err := c.SetWriteDeadline(time.Time{}); err != nil {
+		return err
+	}
+	if err := c.SetReadDeadline(time.Now().Add(parkPingTimeout)); err != nil {
+		return err
+	}
+	var pong [1]byte
+	if _, err := io.ReadFull(c, pong[:]); err != nil {
+		return err
+	}
+	if err := c.SetReadDeadline(time.Time{}); err != nil {
+		return err
+	}
+	if pong[0] != msgParkPong {
+		return errBadAck
+	}
+	return nil
 }
 
 func (p *pool) closeAll() {

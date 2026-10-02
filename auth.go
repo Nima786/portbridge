@@ -52,6 +52,8 @@ const (
 	msgTeardownAck  = 0x04 // origin confirms teardown request
 	msgSpeedtest    = 0x05 // in-tunnel speedtest request
 	msgAck          = 0x06
+	msgParkPing     = 0x07 // periodic heartbeat for parked spares (keeps UDP NAT alive)
+	msgParkPong     = 0x08 // heartbeat reply
 
 	// Sent before closing, but only once the MAC has already verified, so these
 	// never leak information to a peer that does not hold the secret.
