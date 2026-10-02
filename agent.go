@@ -204,13 +204,13 @@ func applyPairingData(p *PairingData, confDir string) error {
 		}
 	}
 
-	// Apply firewall rule if helper exists
-	if _, err := os.Stat("/usr/local/bin/portbridge-firewall"); err == nil {
+	// Apply firewall rule if helper exists and running as root
+	if _, err := os.Stat("/usr/local/bin/portbridge-firewall"); err == nil && os.Geteuid() == 0 {
 		_ = exec.Command("/usr/local/bin/portbridge-firewall", "apply", p.Name).Run()
 	}
 
-	// Enable and start systemd unit if systemd is active
-	if _, err := os.Stat("/run/systemd/system"); err == nil {
+	// Enable and start systemd unit if systemd is active and running as root
+	if _, err := os.Stat("/run/systemd/system"); err == nil && os.Geteuid() == 0 {
 		_ = exec.Command("systemctl", "daemon-reload").Run()
 		if out, err := exec.Command("systemctl", "enable", "--now", "portbridge@"+p.Name).CombinedOutput(); err != nil {
 			return fmt.Errorf("starting systemd service: %s: %w", string(out), err)
@@ -233,11 +233,11 @@ func deleteTunnel(name string, confDir string) error {
 	runJSON := filepath.Join("/run/portbridge", name+".json")
 	runSock := filepath.Join("/run/portbridge", name+".sock")
 
-	if _, err := os.Stat("/run/systemd/system"); err == nil {
+	if _, err := os.Stat("/run/systemd/system"); err == nil && os.Geteuid() == 0 {
 		_ = exec.Command("systemctl", "disable", "--now", "portbridge@"+name).Run()
 	}
 
-	if _, err := os.Stat("/usr/local/bin/portbridge-firewall"); err == nil {
+	if _, err := os.Stat("/usr/local/bin/portbridge-firewall"); err == nil && os.Geteuid() == 0 {
 		_ = exec.Command("/usr/local/bin/portbridge-firewall", "remove", name).Run()
 	}
 
@@ -248,7 +248,7 @@ func deleteTunnel(name string, confDir string) error {
 	_ = os.Remove(runJSON)
 	_ = os.Remove(runSock)
 
-	if _, err := os.Stat("/run/systemd/system"); err == nil {
+	if _, err := os.Stat("/run/systemd/system"); err == nil && os.Geteuid() == 0 {
 		_ = exec.Command("systemctl", "daemon-reload").Run()
 	}
 	return nil
