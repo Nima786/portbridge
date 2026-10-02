@@ -96,4 +96,3 @@ func TestSpeedtestKCP(t *testing.T) {
 	out := buf.String()
 	t.Logf("KCP Speedtest output:\n%s", out)
 }
-

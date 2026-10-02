@@ -35,7 +35,7 @@ const (
 	protoVersion  = 1
 	protoVersion2 = 2
 
-	authPurposeTunnel   byte = 0x00
+	authPurposeTunnel    byte = 0x00
 	authPurposeSpeedtest byte = 0x05
 
 	authTimeLen  = 8

@@ -166,7 +166,6 @@ func runSpeedtestClient(c net.Conn, cfg *Config, out io.Writer, sizeMB ...float6
 		float64(avgRTT)/float64(time.Millisecond),
 		jitterMS)
 
-
 	// Phase 2: Download Test
 	mb := 1.0
 	if len(sizeMB) > 0 && sizeMB[0] > 0 {
