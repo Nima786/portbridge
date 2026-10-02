@@ -98,15 +98,15 @@ write_conf() {
 read_file_key() {
     local f=$1 k=$2
     [ -f "$f" ] || return 1
-    sed -nE "s/^[[:space:]]*$k[[:space:]]*=[[:space:]]*\"?([^\"#]*)\"?[[:space:]]*$/\1/p" "$f" |
+    sed -nE "s/^[[:space:]]*${k}[[:space:]]*=[[:space:]]*\"?([^\"#]*)\"?[[:space:]]*$/\1/p" "$f" |
         tail -1 | sed -E 's/[[:space:]]+$//'
 }
 
 write_file_key() {
     local f=$1 k=$2 v=$3
     mkdir -p "$(dirname "$f")"
-    if [ -f "$f" ] && grep -qE "^[[:space:]]*$k[[:space:]]*=" "$f" 2>/dev/null; then
-        sed -i -E "s|^[[:space:]]*$k[[:space:]]*=.*|$k = $v|" "$f"
+    if [ -f "$f" ] && grep -qE "^[[:space:]]*${k}[[:space:]]*=" "$f" 2>/dev/null; then
+        sed -i -E "s|^[[:space:]]*${k}[[:space:]]*=.*|${k} = $v|" "$f"
     else
         printf '%s = %s\n' "$k" "$v" >>"$f"
     fi
@@ -1891,7 +1891,8 @@ regen_agent_token() {
 }
 
 link_foreign_agent() {
-    local default_ip=${1-}
+    local default_ip=${1-} def_url=""
+    [ -n "$default_ip" ] && def_url="https://$default_ip:2096"
     hr
     say "${B}Link to Foreign Management Agent${R}"
     say "${DIM}Enables automated tunnel deployment from this Iran server.${R}"
@@ -1899,7 +1900,7 @@ link_foreign_agent() {
     hr
 
     local input
-    input=$(ask "Agent Link String or URL" "")
+    input=$(ask "Agent Link String or URL" "$def_url")
     [ -n "$input" ] || { err "Nothing entered."; return 1; }
 
     local url="" tok=""
