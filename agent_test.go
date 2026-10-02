@@ -295,4 +295,3 @@ func TestNamedAgentProfile(t *testing.T) {
 		t.Errorf("expected token pba_sampletoken123, got %s", token)
 	}
 }
-
