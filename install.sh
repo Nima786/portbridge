@@ -92,10 +92,14 @@ done
 if [ -n "${MISSING-}" ]; then
     say "  Installing:${MISSING}"
     if command -v apt-get >/dev/null 2>&1; then
-        apt-get update -qq && apt-get install -y -qq $MISSING || die "Could not install:${MISSING}"
+        apt-get update -qq || true
+        # shellcheck disable=SC2086
+        apt-get install -y -qq $MISSING || die "Could not install:${MISSING}"
     elif command -v dnf >/dev/null 2>&1; then
+        # shellcheck disable=SC2086
         dnf install -y -q $MISSING || die "Could not install:${MISSING}"
     elif command -v yum >/dev/null 2>&1; then
+        # shellcheck disable=SC2086
         yum install -y -q $MISSING || die "Could not install:${MISSING}"
     else
         die "Please install${MISSING} and run this again."
@@ -208,8 +212,11 @@ else
     if [ -n "$unitsrc" ]; then
         install -m 644 "$unitsrc" "$UNIT"
     else
-        curl -fsSL --max-time 60 -o "$TMP/unit" "$RAW/packaging/portbridge@.service" &&
+        if curl -fsSL --max-time 60 -o "$TMP/unit" "$RAW/packaging/portbridge@.service"; then
             install -m 644 "$TMP/unit" "$UNIT" || die "Could not install the service template."
+        else
+            die "Could not download the service template."
+        fi
     fi
 fi
 
@@ -220,13 +227,14 @@ else
     if [ -n "$agentsrc" ]; then
         install -m 644 "$agentsrc" "$AGENT_UNIT"
     else
-        curl -fsSL --max-time 60 -o "$TMP/agent_unit" "$RAW/packaging/portbridge-agent.service" 2>/dev/null &&
+        if curl -fsSL --max-time 60 -o "$TMP/agent_unit" "$RAW/packaging/portbridge-agent.service" 2>/dev/null; then
             install -m 644 "$TMP/agent_unit" "$AGENT_UNIT" 2>/dev/null || true
+        fi
     fi
 fi
 
-mkdir -p "$CONF_DIR" /run/portbridge
-chmod 700 /etc/portbridge "$CONF_DIR"
+mkdir -p "$CONF_DIR" /etc/portbridge/agents /run/portbridge
+chmod 700 /etc/portbridge "$CONF_DIR" /etc/portbridge/agents
 systemctl daemon-reload
 
 # Existing tunnels keep working across an upgrade; restart them on the new engine.

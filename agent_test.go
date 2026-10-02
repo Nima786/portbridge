@@ -236,8 +236,8 @@ func TestEnsureAgentConfigFile(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ensureAgentConfigFile failed: %v", err)
 	}
-	if listen != "0.0.0.0:2096" {
-		t.Errorf("expected 0.0.0.0:2096, got %s", listen)
+	if listen != "0.0.0.0:2083" {
+		t.Errorf("expected 0.0.0.0:2083, got %s", listen)
 	}
 	if token == "" || len(token) < 10 {
 		t.Errorf("expected valid generated token, got %q", token)
@@ -259,7 +259,7 @@ func TestEnsureAgentConfigFile(t *testing.T) {
 func TestParseAgentClientConfigFile(t *testing.T) {
 	tmpDir := t.TempDir()
 	clientConfPath := filepath.Join(tmpDir, "agent-client.conf")
-	content := "url = https://1.2.3.4:2096\ntoken = my_secret_token\n"
+	content := "url = https://1.2.3.4:2083\ntoken = my_secret_token\n"
 	if err := os.WriteFile(clientConfPath, []byte(content), 0o600); err != nil {
 		t.Fatalf("write client conf failed: %v", err)
 	}
@@ -268,10 +268,31 @@ func TestParseAgentClientConfigFile(t *testing.T) {
 	if err != nil {
 		t.Fatalf("parseAgentClientConfigFile failed: %v", err)
 	}
-	if url != "https://1.2.3.4:2096" {
-		t.Errorf("expected url https://1.2.3.4:2096, got %s", url)
+	if url != "https://1.2.3.4:2083" {
+		t.Errorf("expected url https://1.2.3.4:2083, got %s", url)
 	}
 	if token != "my_secret_token" {
 		t.Errorf("expected token my_secret_token, got %s", token)
 	}
 }
+
+func TestNamedAgentProfile(t *testing.T) {
+	tmpDir := t.TempDir()
+	profilePath := filepath.Join(tmpDir, "germany.conf")
+	content := "alias = germany\nurl = https://185.139.7.93:2083\ntoken = pba_sampletoken123\nserver_ip = 185.139.7.93\nport = 2083\n"
+	if err := os.WriteFile(profilePath, []byte(content), 0o600); err != nil {
+		t.Fatalf("write profile failed: %v", err)
+	}
+
+	url, token, err := parseAgentClientConfigFile(profilePath)
+	if err != nil {
+		t.Fatalf("parseAgentClientConfigFile on profile failed: %v", err)
+	}
+	if url != "https://185.139.7.93:2083" {
+		t.Errorf("expected url https://185.139.7.93:2083, got %s", url)
+	}
+	if token != "pba_sampletoken123" {
+		t.Errorf("expected token pba_sampletoken123, got %s", token)
+	}
+}
+

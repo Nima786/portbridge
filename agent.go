@@ -302,7 +302,7 @@ func ensureAgentConfigFile(path string) (listen string, token string, certFile s
 		return "", "", "", "", fmt.Errorf("generating agent token: %w", err)
 	}
 	genToken := "pba_" + hex.EncodeToString(tokBytes)
-	defaultListen := "0.0.0.0:2096"
+	defaultListen := "0.0.0.0:2083"
 
 	content := fmt.Sprintf("# PortBridge Management Agent configuration\nlisten = %s\ntoken = %s\n", defaultListen, genToken)
 	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
@@ -360,7 +360,7 @@ func runAgentServer(listenAddr, token, certFile, keyFile, confDir string) error 
 		return errors.New("agent token cannot be empty")
 	}
 	if listenAddr == "" {
-		listenAddr = "0.0.0.0:2096"
+		listenAddr = "0.0.0.0:2083"
 	}
 
 	mux := http.NewServeMux()
@@ -612,11 +612,39 @@ func agentClientJoin(agentURL, token, code string, insecure bool) error {
 	return nil
 }
 
+// listSavedAgents prints all agent profiles found in /etc/portbridge/agents.
+func listSavedAgents() error {
+	agentsDir := "/etc/portbridge/agents"
+	entries, err := os.ReadDir(agentsDir)
+	var count int
+	if err == nil {
+		for _, e := range entries {
+			if strings.HasSuffix(e.Name(), ".conf") {
+				alias := strings.TrimSuffix(e.Name(), ".conf")
+				p := filepath.Join(agentsDir, e.Name())
+				url, _, err := parseAgentClientConfigFile(p)
+				if err == nil {
+					fmt.Printf("- %s: %s\n", alias, url)
+					count++
+				}
+			}
+		}
+	}
+	if count == 0 {
+		if url, _, err := parseAgentClientConfigFile("/etc/portbridge/agent-client.conf"); err == nil && url != "" {
+			fmt.Printf("- default: %s\n", url)
+			return nil
+		}
+		fmt.Println("No foreign agent profiles configured.")
+	}
+	return nil
+}
+
 // cmdAgent handles the "portbridge agent" command line.
 func cmdAgent(args []string) error {
 	fs := flag.NewFlagSet("agent", flag.ExitOnError)
 	confPath := fs.String("config", "/etc/portbridge/agent.conf", "path to agent config file")
-	listen := fs.String("listen", "", "listen address (e.g. 0.0.0.0:2096)")
+	listen := fs.String("listen", "", "listen address (e.g. 0.0.0.0:2083)")
 	token := fs.String("token", "", "management authentication token")
 	cert := fs.String("cert", "", "TLS certificate path")
 	key := fs.String("key", "", "TLS private key path")
@@ -646,7 +674,7 @@ func cmdAgent(args []string) error {
 		return errors.New("agent requires -token or token set in config file")
 	}
 	if *listen == "" {
-		*listen = "0.0.0.0:2096"
+		*listen = "0.0.0.0:2083"
 	}
 
 	return runAgentServer(*listen, *token, *cert, *key, "/etc/portbridge/tunnels")
@@ -655,21 +683,55 @@ func cmdAgent(args []string) error {
 // cmdJoin handles pairing code application locally or against a remote agent.
 func cmdJoin(args []string) error {
 	fs := flag.NewFlagSet("join", flag.ExitOnError)
-	agentURL := fs.String("agent-url", "", "remote agent URL (e.g. https://foreign-ip:2096)")
+	agentURL := fs.String("agent-url", "", "remote agent URL (e.g. https://foreign-ip:2083)")
 	token := fs.String("token", "", "agent bearer token")
 	confPath := fs.String("agent-config", "", "path to client agent config file (e.g. /etc/portbridge/agent-client.conf)")
+	agentAlias := fs.String("agent", "", "named agent profile from /etc/portbridge/agents/<alias>.conf")
 	insecure := fs.Bool("insecure", true, "allow self-signed certificates for agent connection")
 	isDelete := fs.Bool("delete", false, "delete remote tunnel instead of joining")
 	isStatus := fs.Bool("status", false, "check status/connectivity to remote agent")
+	isListAgents := fs.Bool("list-agents", false, "list all saved foreign agent profiles")
 
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 
-	if *confPath == "" {
+	if *isListAgents {
+		return listSavedAgents()
+	}
+
+	if *agentAlias != "" {
+		namedPath := filepath.Join("/etc/portbridge/agents", *agentAlias+".conf")
+		if _, err := os.Stat(namedPath); err != nil {
+			namedPath = *agentAlias
+		}
+		cURL, cToken, err := parseAgentClientConfigFile(namedPath)
+		if err != nil {
+			return fmt.Errorf("reading agent profile %q: %w", *agentAlias, err)
+		}
+		if *agentURL == "" {
+			*agentURL = cURL
+		}
+		if *token == "" {
+			*token = cToken
+		}
+	}
+
+	if *confPath == "" && *agentURL == "" {
 		defaultClientConf := "/etc/portbridge/agent-client.conf"
 		if _, err := os.Stat(defaultClientConf); err == nil {
 			*confPath = defaultClientConf
+		} else {
+			entries, _ := os.ReadDir("/etc/portbridge/agents")
+			var valid []string
+			for _, e := range entries {
+				if strings.HasSuffix(e.Name(), ".conf") {
+					valid = append(valid, filepath.Join("/etc/portbridge/agents", e.Name()))
+				}
+			}
+			if len(valid) == 1 {
+				*confPath = valid[0]
+			}
 		}
 	}
 	if *confPath != "" {
@@ -685,14 +747,14 @@ func cmdJoin(args []string) error {
 
 	if *isStatus {
 		if *agentURL == "" {
-			return errors.New("-agent-url or agent config required for -status")
+			return errors.New("-agent-url, -agent, or agent config required for -status")
 		}
 		return agentClientStatus(*agentURL, *token, *insecure)
 	}
 
 	if *isDelete {
 		if *agentURL == "" {
-			return errors.New("-agent-url or agent config required for -delete")
+			return errors.New("-agent-url, -agent, or agent config required for -delete")
 		}
 		remaining := fs.Args()
 		if len(remaining) < 1 {
