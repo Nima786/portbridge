@@ -343,12 +343,12 @@ PortBridge includes a lightweight, secure management daemon (`portbridge-agent.s
 - **Multi-Server Management from One Iran Server**: Manage multiple Foreign servers (e.g. Germany, Finland, Netherlands) simultaneously from a single Iran server. Each foreign server is saved with a custom nickname/alias (`germany`, `finland`, etc.).
 - **Zero-Copy Deployment**: When creating a tunnel on your Iran server, PortBridge automatically matches or prompts for the foreign server, sending the pairing parameters to the foreign agent over HTTPS. The foreign half is immediately configured, validated, and started via systemd without needing to manually copy/paste codes.
 - **Dedicated Bearer Auth**: Authentication uses a strong 192-bit cryptographic bearer token (`pba_...`). It **never** requires, asks for, or stores SSH keys or Linux passwords.
-- **Conflict-Free Cloudflare Ports**: The agent listens on port `2083` by default (scans and validates ports before binding, customizable to `2087`, `2053`, `8443`, etc.). Because these ports are supported by Cloudflare, the management agent can operate directly or behind Cloudflare CDN proxy even if Iranian ISPs or foreign cloud firewalls block direct IP access!
+- **Flexible Cloudflare-Compatible Ports**: The agent daemon and linking flow allow selecting any custom port freely (e.g. `2083`, `2087`, `2053`, `8443`, `2096`, `443`, etc.). If a port is occupied by another service (such as panels like x-ui), PortBridge detects it in advance and suggests free ports. Because these ports are supported by Cloudflare, the management agent can operate directly or behind Cloudflare CDN proxy even if Iranian ISPs or foreign cloud firewalls block direct IP access!
 - **Automatic Remote Teardown**: When you delete a tunnel on your Iran server, PortBridge automatically wipes the corresponding tunnel config, secrets, certificates, and firewall rules on the specific foreign server via the tunnel socket or the agent API.
 
 Setup takes under 30 seconds:
-1. On your **Foreign server**: Choose **11) Management Agent** -> **5) Enable & start Agent daemon**. It prints your Link String (e.g. `pb-agent://<token>@<ip>:2083`).
-2. On your **Iran server**: Choose **11) Management Agent** -> **2) Link a new Foreign server**, and paste that string. Give it an alias (e.g. `germany`). Repeat for any additional foreign servers!
+1. On your **Foreign server**: Choose **11) Management Agent** -> **5) Enable & start Agent daemon**. Choose any port you like (e.g. `2083`, `2087`, etc.). It prints your Link String (e.g. `pb-agent://<token>@<ip>:<port>`).
+2. On your **Iran server**: Choose **11) Management Agent** -> **2) Link a new Foreign server**, paste that string (or enter host, port, token), and give it an alias (e.g. `germany`). Repeat for any additional foreign servers!
 3. Every tunnel you create or delete from then on is automated end-to-end!
 
 ## Reverse mode depends on your network, not just on this tool

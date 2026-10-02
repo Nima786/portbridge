@@ -23,6 +23,7 @@ AGENT_CONF=/etc/portbridge/agent.conf
 AGENT_CLIENT_CONF=/etc/portbridge/agent-client.conf
 AGENTS_DIR=/etc/portbridge/agents
 AGENT_UNIT=portbridge-agent.service
+LAST_LINKED_AGENT=""
 # 443 is the port ordinary secure websites use, so a connection to it looks
 # unremarkable. The previous default was 8388, which is the well-known
 # Shadowsocks port and therefore one of the first things filtering looks for.
@@ -956,7 +957,7 @@ looks_like_foreign_server() {
 
 create_tunnel() {
     local name mode tport taddr ulisten peer localip secret inport uport
-    local pool=25
+    local pool=25 target_agent="" agent_url="" agent_token=""
 
     hr
     say "${B}Create a tunnel${R}"
@@ -983,17 +984,80 @@ create_tunnel() {
         2) mode=reverse ;;
     esac
 
-    say ""
-    info "Your foreign server's IP, the one with your panel on it."
-    while :; do
-        peer=$(ask "Foreign server IP" "")
-        if this_machine_has_ip "$peer"; then
-            err "  That is this machine's own IP. Enter your foreign server's IP."
-            continue
+    init_agents_dir
+    local count
+    count=$(agent_count)
+
+    if [ "$count" -gt 0 ]; then
+        hr
+        say "${B}Target Foreign Server${R}"
+        say "${DIM}Choose which foreign server this tunnel connects to:${R}"
+        hr
+        local names=() i=1 aname au aip
+        for aname in $(agent_names); do
+            au=$(read_file_key "$(agent_conf_of "$aname")" url)
+            aip=$(read_file_key "$(agent_conf_of "$aname")" server_ip)
+            say "  ${B}$i${R}) $aname ${DIM}($aip, $au)${R}"
+            names+=("$aname")
+            i=$((i + 1))
+        done
+        say "  ${B}$i${R}) Link a new Foreign server now ${DIM}(automated 1-click setup)${R}"
+        say "  ${B}M${R}) Enter IP manually ${DIM}(without agent / manual pairing code)${R}"
+        hr
+        local sel
+        sel=$(ask "Choose [1-$i, M]" "1")
+        if [ "$sel" = "$i" ]; then
+            if link_foreign_agent; then
+                target_agent="$LAST_LINKED_AGENT"
+                if [ -n "$target_agent" ] && [ -f "$(agent_conf_of "$target_agent")" ]; then
+                    peer=$(read_file_key "$(agent_conf_of "$target_agent")" server_ip)
+                    agent_url=$(read_file_key "$(agent_conf_of "$target_agent")" url)
+                    agent_token=$(read_file_key "$(agent_conf_of "$target_agent")" token)
+                    ok "Using newly linked server: $target_agent ($peer)"
+                fi
+            fi
+        elif [ "$sel" -ge 1 ] && [ "$sel" -le "${#names[@]}" ] 2>/dev/null; then
+            target_agent="${names[$((sel - 1))]}"
+            peer=$(read_file_key "$(agent_conf_of "$target_agent")" server_ip)
+            agent_url=$(read_file_key "$(agent_conf_of "$target_agent")" url)
+            agent_token=$(read_file_key "$(agent_conf_of "$target_agent")" token)
+            ok "Selected Foreign server: $target_agent ($peer)"
         fi
-        valid_host "$peer" && break
-        err "  That does not look like an address."
-    done
+    else
+        hr
+        say "${B}Target Foreign Server${R}"
+        say "${DIM}No foreign servers linked yet.${R}"
+        say "  ${B}1${R}) Link a Foreign server now ${DIM}(automated 1-click setup)${R}"
+        say "  ${B}2${R}) Enter Foreign server IP manually ${DIM}(manual pairing code)${R}"
+        hr
+        local sel
+        sel=$(ask "Choose [1-2]" "1")
+        if [ "$sel" = "1" ]; then
+            if link_foreign_agent; then
+                target_agent="$LAST_LINKED_AGENT"
+                if [ -n "$target_agent" ] && [ -f "$(agent_conf_of "$target_agent")" ]; then
+                    peer=$(read_file_key "$(agent_conf_of "$target_agent")" server_ip)
+                    agent_url=$(read_file_key "$(agent_conf_of "$target_agent")" url)
+                    agent_token=$(read_file_key "$(agent_conf_of "$target_agent")" token)
+                    ok "Using newly linked server: $target_agent ($peer)"
+                fi
+            fi
+        fi
+    fi
+
+    if [ -z "${peer-}" ]; then
+        say ""
+        info "Your foreign server's IP, the one with your panel on it."
+        while :; do
+            peer=$(ask "Foreign server IP" "")
+            if this_machine_has_ip "$peer"; then
+                err "  That is this machine's own IP. Enter your foreign server's IP."
+                continue
+            fi
+            valid_host "$peer" && break
+            err "  That does not look like an address."
+        done
+    fi
 
     say ""
     info "The port of your inbound on the foreign server, as shown in your panel."
@@ -1072,6 +1136,11 @@ create_tunnel() {
     hr
     say "${B}Ready to set this up:${R}"
     say "  tunnel name        $name"
+    if [ -n "$target_agent" ]; then
+        say "  foreign server     $target_agent ($peer) ${GREEN}[automated 1-click via agent]${R}"
+    else
+        say "  foreign server     $peer ${DIM}[manual pairing code]${R}"
+    fi
     say "  your users use     $localip port $uport"
     say "  traffic goes to    $peer port $inport"
     if [ "$mode" = direct ]; then
@@ -1102,95 +1171,16 @@ create_tunnel() {
 
     ok "Done. The Iran half of '$name' is running."
     say ""
-    info "Nothing works until the foreign half is set up too. That is normal."
 
-    local target_agent="" agent_url="" agent_token="" auto_ok=0
-    init_agents_dir
-    local matched_agent
-    matched_agent=$(find_agent_by_target "$peer" 2>/dev/null || true)
-
-    if [ -n "$matched_agent" ]; then
-        target_agent="$matched_agent"
-        local af
-        af=$(agent_conf_of "$target_agent")
-        agent_url=$(read_file_key "$af" url)
-        agent_token=$(read_file_key "$af" token)
-        say ""
-        if confirm "Found linked foreign server '$target_agent' ($agent_url). Deploy automatically?"; then
-            : # target_agent and credentials ready
-        else
-            target_agent=""
-            agent_url=""
-            agent_token=""
-        fi
-    else
-        local count
-        count=$(agent_count)
-        if [ "$count" -gt 1 ]; then
-            say ""
-            info "Select which linked foreign server to deploy this tunnel to:"
-            local names=() i=1 aname au
-            for aname in $(agent_names); do
-                au=$(read_file_key "$(agent_conf_of "$aname")" url)
-                say "  ${B}$i${R}) $aname ($au)"
-                names+=("$aname")
-                i=$((i + 1))
-            done
-            say "  ${B}N${R}) Link a new foreign server now"
-            say "  ${B}S${R}) Skip (show manual pairing code)"
-            local sel
-            sel=$(ask "Choose [1-${#names[@]}]" "1")
-            if [ "$sel" = "N" ] || [ "$sel" = "n" ]; then
-                if link_foreign_agent "$peer"; then
-                    target_agent=$(find_agent_by_target "$peer" 2>/dev/null || true)
-                    [ -z "$target_agent" ] && target_agent=$(agent_names | tail -n 1)
-                    if [ -n "$target_agent" ]; then
-                        agent_url=$(read_file_key "$(agent_conf_of "$target_agent")" url)
-                        agent_token=$(read_file_key "$(agent_conf_of "$target_agent")" token)
-                    fi
-                fi
-            elif [ "$sel" -ge 1 ] && [ "$sel" -le "${#names[@]}" ] 2>/dev/null; then
-                target_agent="${names[$((sel - 1))]}"
-                agent_url=$(read_file_key "$(agent_conf_of "$target_agent")" url)
-                agent_token=$(read_file_key "$(agent_conf_of "$target_agent")" token)
-            fi
-        elif [ "$count" -eq 1 ]; then
-            local aname au atok
-            aname=$(agent_names)
-            au=$(read_file_key "$(agent_conf_of "$aname")" url)
-            atok=$(read_file_key "$(agent_conf_of "$aname")" token)
-            say ""
-            if confirm "Deploy this tunnel automatically to '$aname' ($au)?"; then
-                target_agent="$aname"
-                agent_url="$au"
-                agent_token="$atok"
-            fi
-        else
-            say ""
-            info "Tip: PortBridge can deploy to your Foreign server automatically via Agent,"
-            info "so you don't need to copy and paste pairing codes."
-            if confirm "Do you have an Agent Link String for $peer?"; then
-                if link_foreign_agent "$peer"; then
-                    target_agent=$(find_agent_by_target "$peer" 2>/dev/null || true)
-                    [ -z "$target_agent" ] && target_agent=$(agent_names | tail -n 1)
-                    if [ -n "$target_agent" ]; then
-                        agent_url=$(read_file_key "$(agent_conf_of "$target_agent")" url)
-                        agent_token=$(read_file_key "$(agent_conf_of "$target_agent")" token)
-                    fi
-                fi
-            fi
-        fi
-    fi
-
+    local auto_ok=0
     if [ -n "$agent_url" ] && [ -n "$agent_token" ]; then
-        say ""
-        info "Deploying tunnel '$name' on Foreign server via Management Agent ($agent_url)..."
+        info "Deploying tunnel '$name' on Foreign server '$target_agent' ($agent_url)..."
         local code
         code=$(get_tunnel_pairing_code "$name")
         if "$BIN" join -agent-url "$agent_url" -token "$agent_token" "$code"; then
             say ""
             ok "============================================================"
-            ok "SUCCESS: Tunnel '$name' was deployed automatically to Foreign server!"
+            ok "SUCCESS: Tunnel '$name' deployed automatically to '$target_agent'!"
             ok "Both servers are now running and linked."
             ok "============================================================"
             [ -n "$target_agent" ] && write_conf "$name" foreign_agent "$target_agent"
@@ -1989,7 +1979,11 @@ enable_agent() {
     say "Agent listens over TLS. Cloudflare CDN supports: 2083, 2087, 2053, 8443, 2096."
     local p
     while :; do
-        p=$(ask_port "Agent listen port" "$def_port")
+        p=$(ask "Agent listen port" "$def_port")
+        if ! valid_port "$p"; then
+            err "  A port must be a number from 1 to 65535."
+            continue
+        fi
         if port_in_use_by_system "$p"; then
             err "Port $p is already in use by another process on this server!"
             local owner
@@ -2083,9 +2077,16 @@ change_agent_port() {
     cur_port=${cur_listen##*:}
     [ -n "$cur_port" ] || cur_port=2083
     while :; do
-        p=$(ask_port "New Agent listen port" "$cur_port")
+        p=$(ask "New Agent listen port" "$cur_port")
+        if ! valid_port "$p"; then
+            err "  A port must be a number from 1 to 65535."
+            continue
+        fi
         if port_in_use_by_system "$p" && [ "$p" != "$cur_port" ]; then
             err "Port $p is already in use by another process!"
+            local owner
+            owner=$(ss -tulpn 2>/dev/null | grep ":$p " | head -n 1)
+            [ -n "$owner" ] && info "In use by: $owner"
             warn "Please choose a different port."
         else
             break
@@ -2159,50 +2160,63 @@ list_foreign_agents() {
 
 link_foreign_agent() {
     init_agents_dir
-    local default_ip=${1-} def_url=""
-    [ -n "$default_ip" ] && def_url="https://$default_ip:2083"
+    local default_ip=${1-}
+    LAST_LINKED_AGENT=""
 
     hr
     say "${B}Link a new Foreign Management Agent${R}"
     say "${DIM}Enables 1-click automated tunnel deployment to that foreign server.${R}"
-    say "${DIM}Paste the Link String generated on your foreign server (pb-agent://...)${R}"
-    say "${DIM}or enter the HTTPS URL and token.${R}"
+    say "${DIM}You can paste the Link String from the foreign server (pb-agent://...),${R}"
+    say "${DIM}or enter the foreign server IP/domain, agent port, and token manually.${R}"
     hr
 
     local input
-    input=$(ask "Agent Link String or URL" "$def_url")
+    input=$(ask "Agent Link String or Foreign Server IP" "$default_ip")
     [ -n "$input" ] || { err "Nothing entered."; return 1; }
 
-    local url="" tok=""
-    if [[ "$input" =~ ^pb-agent://([^@]+)@([^/]+) ]]; then
+    local target_host="" target_port="" tok=""
+    if [[ "$input" =~ ^pb-agent://([^@]+)@([^/:]+)(:([0-9]+))? ]]; then
         tok="${BASH_REMATCH[1]}"
-        local hostport="${BASH_REMATCH[2]}"
-        url="https://$hostport"
-    elif [[ "$input" =~ ^https?:// ]]; then
-        url="$input"
-    elif [ -n "$input" ]; then
-        url="https://$input"
+        target_host="${BASH_REMATCH[2]}"
+        target_port="${BASH_REMATCH[4]}"
+    elif [[ "$input" =~ ^https?://([^/:]+)(:([0-9]+))? ]]; then
+        target_host="${BASH_REMATCH[1]}"
+        target_port="${BASH_REMATCH[3]}"
+    elif [[ "$input" =~ ^([^/:]+):([0-9]+)$ ]]; then
+        target_host="${BASH_REMATCH[1]}"
+        target_port="${BASH_REMATCH[2]}"
+    else
+        target_host="$input"
     fi
-
-    if [ -z "$tok" ]; then
-        tok=$(ask "Agent Bearer Token" "")
-        [ -n "$tok" ] || { err "Token cannot be empty."; return 1; }
-    fi
-
-    url=$(printf '%s' "$url" | sed -E 's|/+$||')
-
-    local target_hostport="${url#*://}"
-    local target_host="${target_hostport%%:*}"
-    local target_port="${target_hostport##*:}"
-    [ "$target_port" = "$target_host" ] && target_port=443
-
-    local def_alias="$target_host"
-    [ -n "$default_ip" ] && def_alias="$default_ip"
 
     say ""
-    local alias
     while :; do
-        alias=$(ask "Alias / Nickname for this server (e.g. germany, finland, vps1)" "$def_alias")
+        target_host=$(ask "Foreign server IP or Domain" "$target_host")
+        if valid_host "$target_host"; then
+            break
+        fi
+        err "Please enter a valid IP address or domain."
+    done
+
+    say ""
+    info "The port PortBridge Agent daemon is listening on (Foreign Server Option 5/6)."
+    info "Common ports: 2083, 2087, 2053, 8443, 2096, 443."
+    target_port=$(ask_remote_port "Foreign server Agent port" "${target_port:-2083}")
+
+    say ""
+    while :; do
+        tok=$(ask "Agent Bearer Token" "$tok")
+        if [ -n "$tok" ]; then
+            break
+        fi
+        err "Agent token cannot be empty."
+    done
+
+    local def_alias="$target_host"
+    local alias
+    say ""
+    while :; do
+        alias=$(ask "Alias / Nickname for this server (e.g. germany, vps1)" "$def_alias")
         alias=$(printf '%s' "$alias" | tr -dc 'a-zA-Z0-9_-')
         if [ -z "$alias" ]; then
             err "Please enter a valid alias (letters, digits, dashes, underscores)."
@@ -2216,8 +2230,10 @@ link_foreign_agent() {
         break
     done
 
+    local url="https://${target_host}:${target_port}"
+
     say ""
-    info "Testing connection to $url..."
+    info "Testing connection to $url (alias: $alias)..."
     if "$BIN" join -agent-url "$url" -token "$tok" -status; then
         local f
         f=$(agent_conf_of "$alias")
@@ -2231,6 +2247,8 @@ link_foreign_agent() {
         write_file_key "$AGENT_CLIENT_CONF" url "$url"
         write_file_key "$AGENT_CLIENT_CONF" token "$tok"
         chmod 600 "$AGENT_CLIENT_CONF"
+
+        LAST_LINKED_AGENT="$alias"
 
         say ""
         ok "============================================================"
@@ -2254,6 +2272,7 @@ link_foreign_agent() {
             write_file_key "$AGENT_CLIENT_CONF" url "$url"
             write_file_key "$AGENT_CLIENT_CONF" token "$tok"
             chmod 600 "$AGENT_CLIENT_CONF"
+            LAST_LINKED_AGENT="$alias"
             ok "Saved."
             return 0
         fi
