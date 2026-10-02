@@ -206,4 +206,72 @@ func TestAgentServerAPI(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(tmpDir, "agttest.conf")); !os.IsNotExist(err) {
 		t.Errorf("agttest.conf still exists after delete")
 	}
+
+	// 5. Test agent client helper functions directly against the running agent
+	agentURL := "https://" + listenAddr
+	if err := agentClientStatus(agentURL, token, true); err != nil {
+		t.Errorf("agentClientStatus failed: %v", err)
+	}
+
+	if err := agentClientJoin(agentURL, token, pairingCode, true); err != nil {
+		t.Errorf("agentClientJoin failed: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(tmpDir, "agttest.conf")); err != nil {
+		t.Errorf("agttest.conf not found after agentClientJoin: %v", err)
+	}
+
+	if err := agentClientDelete(agentURL, token, "agttest", true); err != nil {
+		t.Errorf("agentClientDelete failed: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(tmpDir, "agttest.conf")); !os.IsNotExist(err) {
+		t.Errorf("agttest.conf still exists after agentClientDelete")
+	}
+}
+
+func TestEnsureAgentConfigFile(t *testing.T) {
+	tmpDir := t.TempDir()
+	confPath := filepath.Join(tmpDir, "agent.conf")
+
+	listen, token, cert, key, err := ensureAgentConfigFile(confPath)
+	if err != nil {
+		t.Fatalf("ensureAgentConfigFile failed: %v", err)
+	}
+	if listen != "0.0.0.0:2096" {
+		t.Errorf("expected 0.0.0.0:2096, got %s", listen)
+	}
+	if token == "" || len(token) < 10 {
+		t.Errorf("expected valid generated token, got %q", token)
+	}
+	if cert != "" || key != "" {
+		t.Errorf("expected empty cert/key, got %s / %s", cert, key)
+	}
+
+	// Calling again should read the same file and return identical values
+	listen2, token2, _, _, err := ensureAgentConfigFile(confPath)
+	if err != nil {
+		t.Fatalf("ensureAgentConfigFile second call failed: %v", err)
+	}
+	if listen2 != listen || token2 != token {
+		t.Errorf("ensureAgentConfigFile returned different values on second call")
+	}
+}
+
+func TestParseAgentClientConfigFile(t *testing.T) {
+	tmpDir := t.TempDir()
+	clientConfPath := filepath.Join(tmpDir, "agent-client.conf")
+	content := "url = https://1.2.3.4:2096\ntoken = my_secret_token\n"
+	if err := os.WriteFile(clientConfPath, []byte(content), 0o600); err != nil {
+		t.Fatalf("write client conf failed: %v", err)
+	}
+
+	url, token, err := parseAgentClientConfigFile(clientConfPath)
+	if err != nil {
+		t.Fatalf("parseAgentClientConfigFile failed: %v", err)
+	}
+	if url != "https://1.2.3.4:2096" {
+		t.Errorf("expected url https://1.2.3.4:2096, got %s", url)
+	}
+	if token != "my_secret_token" {
+		t.Errorf("expected token my_secret_token, got %s", token)
+	}
 }

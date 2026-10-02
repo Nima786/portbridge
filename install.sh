@@ -16,6 +16,7 @@ MENU=/usr/local/bin/portbridge-menu
 FIREWALL=/usr/local/bin/portbridge-firewall
 TUNE=/usr/local/bin/portbridge-tune
 UNIT=/etc/systemd/system/portbridge@.service
+AGENT_UNIT=/etc/systemd/system/portbridge-agent.service
 CONF_DIR=/etc/portbridge/tunnels
 RAW="https://raw.githubusercontent.com/$REPO/main"
 
@@ -212,6 +213,18 @@ else
     fi
 fi
 
+if [ -f "$TMP/packaging/portbridge-agent.service" ]; then
+    install -m 644 "$TMP/packaging/portbridge-agent.service" "$AGENT_UNIT"
+else
+    agentsrc=$(find "$TMP" -maxdepth 3 -type f -name 'portbridge-agent.service' 2>/dev/null | head -1)
+    if [ -n "$agentsrc" ]; then
+        install -m 644 "$agentsrc" "$AGENT_UNIT"
+    else
+        curl -fsSL --max-time 60 -o "$TMP/agent_unit" "$RAW/packaging/portbridge-agent.service" 2>/dev/null &&
+            install -m 644 "$TMP/agent_unit" "$AGENT_UNIT" 2>/dev/null || true
+    fi
+fi
+
 mkdir -p "$CONF_DIR" /run/portbridge
 chmod 700 /etc/portbridge "$CONF_DIR"
 systemctl daemon-reload
@@ -227,6 +240,10 @@ for f in "$CONF_DIR"/*.conf; do
     fi
 done
 [ "$restarted" -gt 0 ] && say "  Restarted $restarted existing tunnel(s) on the new version"
+
+if systemctl is-active portbridge-agent.service >/dev/null 2>&1; then
+    systemctl restart portbridge-agent.service && say "  Restarted management agent on the new version"
+fi
 
 ok "
 PortBridge is installed."

@@ -1,9 +1,12 @@
 package main
 
 import (
+	"bytes"
+	"crypto/rand"
 	"crypto/subtle"
 	"crypto/tls"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -15,6 +18,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"time"
 )
 
 // PairingData represents the decoded attributes from a PortBridge join code.
@@ -193,8 +197,8 @@ func applyPairingData(p *PairingData, confDir string) error {
 		return fmt.Errorf("validating config: %w", err)
 	}
 
-	// In reverse mode with TLS, ensure certificate is prepared
-	if cfg.Transport != TransportPlain && cfg.Transport != TransportKCP && cfg.Mode == ModeReverse {
+	// In direct mode with TLS, origin is listening, so ensure certificate is prepared
+	if cfg.Transport != TransportPlain && cfg.Transport != TransportKCP && cfg.Mode == ModeDirect {
 		if _, err := ensureCert(certFile, keyFile, cfg.effectiveServerName()); err != nil {
 			log.Printf("[%s] warning: preparing cert: %v", p.Name, err)
 		}
@@ -280,6 +284,60 @@ func parseAgentConfigFile(path string) (listen string, token string, certFile st
 		}
 	}
 	return listen, token, certFile, keyFile, nil
+}
+
+// ensureAgentConfigFile reads or creates a default agent config with a secure token.
+func ensureAgentConfigFile(path string) (listen string, token string, certFile string, keyFile string, err error) {
+	if _, err := os.Stat(path); err == nil {
+		return parseAgentConfigFile(path)
+	}
+
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return "", "", "", "", fmt.Errorf("creating agent config directory: %w", err)
+	}
+
+	tokBytes := make([]byte, 24)
+	if _, err := rand.Read(tokBytes); err != nil {
+		return "", "", "", "", fmt.Errorf("generating agent token: %w", err)
+	}
+	genToken := "pba_" + hex.EncodeToString(tokBytes)
+	defaultListen := "0.0.0.0:2096"
+
+	content := fmt.Sprintf("# PortBridge Management Agent configuration\nlisten = %s\ntoken = %s\n", defaultListen, genToken)
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		return "", "", "", "", fmt.Errorf("writing agent config: %w", err)
+	}
+	log.Printf("[agent] generated new agent configuration at %s", path)
+	return defaultListen, genToken, "", "", nil
+}
+
+// parseAgentClientConfigFile parses client config with url and token.
+func parseAgentClientConfigFile(path string) (url string, token string, err error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return "", "", err
+	}
+	lines := strings.Split(string(data), "\n")
+	for _, l := range lines {
+		l = strings.TrimSpace(l)
+		if l == "" || strings.HasPrefix(l, "#") {
+			continue
+		}
+		parts := strings.SplitN(l, "=", 2)
+		if len(parts) != 2 {
+			continue
+		}
+		k := strings.TrimSpace(parts[0])
+		v := strings.TrimSpace(parts[1])
+		switch k {
+		case "url", "agent_url":
+			url = v
+		case "token", "agent_token":
+			token = v
+		}
+	}
+	return url, token, nil
 }
 
 func checkAgentAuth(r *http.Request, token string) bool {
@@ -441,6 +499,119 @@ func runAgentServer(listenAddr, token, certFile, keyFile, confDir string) error 
 	return server.ListenAndServeTLS("", "")
 }
 
+func makeAgentHTTPClient(insecure bool) *http.Client {
+	return &http.Client{
+		Timeout: 20 * time.Second,
+		Transport: &http.Transport{
+			TLSClientConfig: &tls.Config{
+				InsecureSkipVerify: insecure,
+			},
+		},
+	}
+}
+
+func agentClientStatus(agentURL, token string, insecure bool) error {
+	agentURL = strings.TrimRight(agentURL, "/")
+	req, err := http.NewRequest(http.MethodGet, agentURL+"/api/status", nil)
+	if err != nil {
+		return err
+	}
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+	client := makeAgentHTTPClient(insecure)
+	resp, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("connecting to agent at %s: %w", agentURL, err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("agent returned HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+
+	var res struct {
+		OK      bool     `json:"ok"`
+		Version string   `json:"version"`
+		Tunnels []string `json:"tunnels"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&res); err != nil {
+		return fmt.Errorf("decoding agent response: %w", err)
+	}
+	fmt.Printf("Agent status: OK (version: %s, active tunnels: %d: %s)\n", res.Version, len(res.Tunnels), strings.Join(res.Tunnels, ", "))
+	return nil
+}
+
+func agentClientDelete(agentURL, token, tunnelName string, insecure bool) error {
+	agentURL = strings.TrimRight(agentURL, "/")
+	payload, _ := json.Marshal(map[string]string{"name": tunnelName})
+	req, err := http.NewRequest(http.MethodPost, agentURL+"/api/tunnel/delete", bytes.NewReader(payload))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+	client := makeAgentHTTPClient(insecure)
+	resp, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("connecting to agent at %s: %w", agentURL, err)
+	}
+	defer resp.Body.Close()
+
+	var res struct {
+		OK      bool   `json:"ok"`
+		Error   string `json:"error"`
+		Message string `json:"message"`
+	}
+	_ = json.NewDecoder(resp.Body).Decode(&res)
+	if resp.StatusCode != http.StatusOK || !res.OK {
+		if res.Error != "" {
+			return fmt.Errorf("remote delete failed: %s", res.Error)
+		}
+		return fmt.Errorf("remote delete failed with HTTP %d", resp.StatusCode)
+	}
+	fmt.Printf("Remote agent successfully deleted tunnel %q.\n", tunnelName)
+	return nil
+}
+
+func agentClientJoin(agentURL, token, code string, insecure bool) error {
+	agentURL = strings.TrimRight(agentURL, "/")
+	payload, _ := json.Marshal(map[string]string{"code": code})
+	req, err := http.NewRequest(http.MethodPost, agentURL+"/api/tunnel/join", bytes.NewReader(payload))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+	client := makeAgentHTTPClient(insecure)
+	resp, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("connecting to agent at %s: %w", agentURL, err)
+	}
+	defer resp.Body.Close()
+
+	var res struct {
+		OK      bool   `json:"ok"`
+		Name    string `json:"name"`
+		Error   string `json:"error"`
+		Message string `json:"message"`
+	}
+	_ = json.NewDecoder(resp.Body).Decode(&res)
+	if resp.StatusCode != http.StatusOK || !res.OK {
+		if res.Error != "" {
+			return fmt.Errorf("remote join failed: %s", res.Error)
+		}
+		return fmt.Errorf("remote join failed with HTTP %d", resp.StatusCode)
+	}
+	fmt.Printf("Remote agent successfully deployed and started tunnel %q.\n", res.Name)
+	return nil
+}
+
 // cmdAgent handles the "portbridge agent" command line.
 func cmdAgent(args []string) error {
 	fs := flag.NewFlagSet("agent", flag.ExitOnError)
@@ -455,7 +626,7 @@ func cmdAgent(args []string) error {
 	}
 
 	if *confPath != "" {
-		if cListen, cToken, cCert, cKey, err := parseAgentConfigFile(*confPath); err == nil {
+		if cListen, cToken, cCert, cKey, err := ensureAgentConfigFile(*confPath); err == nil {
 			if *listen == "" {
 				*listen = cListen
 			}
@@ -481,12 +652,66 @@ func cmdAgent(args []string) error {
 	return runAgentServer(*listen, *token, *cert, *key, "/etc/portbridge/tunnels")
 }
 
-// cmdJoin handles the "portbridge join <code>" command line.
+// cmdJoin handles pairing code application locally or against a remote agent.
 func cmdJoin(args []string) error {
-	if len(args) < 1 {
-		return errors.New("pairing code is required: portbridge join <code>")
+	fs := flag.NewFlagSet("join", flag.ExitOnError)
+	agentURL := fs.String("agent-url", "", "remote agent URL (e.g. https://foreign-ip:2096)")
+	token := fs.String("token", "", "agent bearer token")
+	confPath := fs.String("agent-config", "", "path to client agent config file (e.g. /etc/portbridge/agent-client.conf)")
+	insecure := fs.Bool("insecure", true, "allow self-signed certificates for agent connection")
+	isDelete := fs.Bool("delete", false, "delete remote tunnel instead of joining")
+	isStatus := fs.Bool("status", false, "check status/connectivity to remote agent")
+
+	if err := fs.Parse(args); err != nil {
+		return err
 	}
-	code := args[0]
+
+	if *confPath == "" {
+		defaultClientConf := "/etc/portbridge/agent-client.conf"
+		if _, err := os.Stat(defaultClientConf); err == nil {
+			*confPath = defaultClientConf
+		}
+	}
+	if *confPath != "" {
+		if cURL, cToken, err := parseAgentClientConfigFile(*confPath); err == nil {
+			if *agentURL == "" {
+				*agentURL = cURL
+			}
+			if *token == "" {
+				*token = cToken
+			}
+		}
+	}
+
+	if *isStatus {
+		if *agentURL == "" {
+			return errors.New("-agent-url or agent config required for -status")
+		}
+		return agentClientStatus(*agentURL, *token, *insecure)
+	}
+
+	if *isDelete {
+		if *agentURL == "" {
+			return errors.New("-agent-url or agent config required for -delete")
+		}
+		remaining := fs.Args()
+		if len(remaining) < 1 {
+			return errors.New("tunnel name required: portbridge join -agent-url <url> -token <token> -delete <tunnel_name>")
+		}
+		name := remaining[0]
+		return agentClientDelete(*agentURL, *token, name, *insecure)
+	}
+
+	remaining := fs.Args()
+	if len(remaining) < 1 {
+		return errors.New("pairing code is required: portbridge join [flags] <code>")
+	}
+	code := remaining[0]
+
+	if *agentURL != "" {
+		return agentClientJoin(*agentURL, *token, code, *insecure)
+	}
+
 	p, err := decodePairingCode(code)
 	if err != nil {
 		return fmt.Errorf("parsing pairing code: %w", err)

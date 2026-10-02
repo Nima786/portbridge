@@ -19,6 +19,9 @@ FIREWALL=/usr/local/bin/portbridge-firewall
 TUNE=/usr/local/bin/portbridge-tune
 CONF_DIR=/etc/portbridge/tunnels
 RUN_DIR=/run/portbridge
+AGENT_CONF=/etc/portbridge/agent.conf
+AGENT_CLIENT_CONF=/etc/portbridge/agent-client.conf
+AGENT_UNIT=portbridge-agent.service
 # 443 is the port ordinary secure websites use, so a connection to it looks
 # unremarkable. The previous default was 8388, which is the well-known
 # Shadowsocks port and therefore one of the first things filtering looks for.
@@ -89,6 +92,32 @@ write_conf() {
         sed -i -E "s|^[[:space:]]*$2[[:space:]]*=.*|$2 = $3|" "$f"
     else
         printf '%s = %s\n' "$2" "$3" >>"$f"
+    fi
+}
+
+read_file_key() {
+    local f=$1 k=$2
+    [ -f "$f" ] || return 1
+    sed -nE "s/^[[:space:]]*$k[[:space:]]*=[[:space:]]*\"?([^\"#]*)\"?[[:space:]]*$/\1/p" "$f" |
+        tail -1 | sed -E 's/[[:space:]]+$//'
+}
+
+write_file_key() {
+    local f=$1 k=$2 v=$3
+    mkdir -p "$(dirname "$f")"
+    if [ -f "$f" ] && grep -qE "^[[:space:]]*$k[[:space:]]*=" "$f" 2>/dev/null; then
+        sed -i -E "s|^[[:space:]]*$k[[:space:]]*=.*|$k = $v|" "$f"
+    else
+        printf '%s = %s\n' "$k" "$v" >>"$f"
+    fi
+    chmod 600 "$f"
+}
+
+gen_agent_token() {
+    if command -v openssl >/dev/null 2>&1; then
+        printf 'pba_%s' "$(openssl rand -hex 24)"
+    else
+        printf 'pba_%s' "$(head -c 24 /dev/urandom | xxd -p -c 48 2>/dev/null || head -c 24 /dev/urandom | base64 | tr -dc 'a-zA-Z0-9' | head -c 48)"
     fi
 }
 
@@ -670,11 +699,10 @@ make_pairing_code() {
         base64 | tr -d '\n'
 }
 
-show_pairing_code() {
-    local name=$1 role mode tport secret relay_ip server_ip inbound_port pool code
+get_tunnel_pairing_code() {
+    local name=$1 role mode tport secret relay_ip server_ip inbound_port pool
     role=$(read_conf "$name" role)
     if [ "$role" != edge ]; then
-        warn "Codes are made on the Iran server. Use 'Show a tunnel's code' there instead."
         return 1
     fi
     mode=$(read_conf "$name" mode)
@@ -693,13 +721,20 @@ show_pairing_code() {
     cdn=$(read_conf "$name" cdn); [ -n "$cdn" ] || cdn=off
     mux=$(read_conf "$name" mux); [ -n "$mux" ] || mux=off
     muxlinks=$(read_conf "$name" mux_links); [ -n "$muxlinks" ] || muxlinks=4
-    # The other side does not dial, so it needs the second route only to know
-    # that the link may arrive from a CDN and its port must stay open.
     alt=$(read_conf "$name" alt_target)
     althost=${alt%:*}
 
-    code=$(make_pairing_code "$name" "$mode" "$tport" "$relay_ip" "$server_ip" "$inbound_port" \
-        "$pool" "$secret" "$transport" "$servername" "$wspath" "$cdn" "$mux" "$muxlinks" "$althost")
+    make_pairing_code "$name" "$mode" "$tport" "$relay_ip" "$server_ip" "$inbound_port" \
+        "$pool" "$secret" "$transport" "$servername" "$wspath" "$cdn" "$mux" "$muxlinks" "$althost"
+}
+
+show_pairing_code() {
+    local name=$1 code server_ip
+    code=$(get_tunnel_pairing_code "$name") || {
+        warn "Codes are made on the Iran server. Use 'Show a tunnel's code' there instead."
+        return 1
+    }
+    server_ip=$(read_conf "$name" peer_ip)
 
     hr
     say "${B}Code for your foreign server${R}"
@@ -1067,7 +1102,45 @@ create_tunnel() {
     ok "Done. The Iran half of '$name' is running."
     say ""
     info "Nothing works until the foreign half is set up too. That is normal."
-    show_pairing_code "$name"
+
+    local agent_url agent_token auto_ok=0
+    agent_url=$(read_file_key "$AGENT_CLIENT_CONF" url)
+    agent_token=$(read_file_key "$AGENT_CLIENT_CONF" token)
+
+    if [ -z "$agent_url" ]; then
+        say ""
+        info "Tip: PortBridge can deploy to your Foreign server automatically via Agent,"
+        info "so you don't need to copy and paste pairing codes."
+        if confirm "Do you have an Agent Link String or Token for $peer?"; then
+            link_foreign_agent "$peer" && {
+                agent_url=$(read_file_key "$AGENT_CLIENT_CONF" url)
+                agent_token=$(read_file_key "$AGENT_CLIENT_CONF" token)
+            }
+        fi
+    fi
+
+    if [ -n "$agent_url" ]; then
+        say ""
+        info "Deploying tunnel '$name' on Foreign server via Management Agent ($agent_url)..."
+        local code
+        code=$(get_tunnel_pairing_code "$name")
+        if "$BIN" join -agent-url "$agent_url" -token "$agent_token" "$code"; then
+            say ""
+            ok "============================================================"
+            ok "SUCCESS: Tunnel '$name' was deployed automatically to Foreign server!"
+            ok "Both servers are now running and linked."
+            ok "============================================================"
+            auto_ok=1
+        else
+            say ""
+            warn "Could not automatically deploy to Foreign server via Agent."
+            warn "Falling back to manual pairing code:"
+        fi
+    fi
+
+    if [ "$auto_ok" -eq 0 ]; then
+        show_pairing_code "$name"
+    fi
 }
 
 # ------------------------------------------------------------------ join flow
@@ -1488,7 +1561,23 @@ delete_tunnel() {
 
     say ""
     info "Contacting $peer_name to delete its tunnel half..."
-    if "$BIN" teardown -config "$(conf_of "$name")"; then
+    local deleted_remote=no
+    if "$BIN" teardown -config "$(conf_of "$name")" 2>/dev/null; then
+        deleted_remote=yes
+    fi
+
+    if [ "$deleted_remote" = no ] && [ "$role" = edge ]; then
+        local agent_url agent_token
+        agent_url=$(read_file_key "$AGENT_CLIENT_CONF" url)
+        agent_token=$(read_file_key "$AGENT_CLIENT_CONF" token)
+        if [ -n "$agent_url" ]; then
+            if "$BIN" join -agent-url "$agent_url" -token "$agent_token" -delete "$name" >/dev/null 2>&1; then
+                deleted_remote=yes
+            fi
+        fi
+    fi
+
+    if [ "$deleted_remote" = yes ]; then
         ok "$peer_name: tunnel '$name' successfully deleted."
     else
         warn "Could not reach or delete the tunnel on the $peer_name."
@@ -1715,7 +1804,8 @@ uninstall_all() {
         systemctl disable --now "$(unit_of "$n")" >/dev/null 2>&1
         "$FIREWALL" remove "$n" >/dev/null 2>&1
     done
-    rm -f /etc/systemd/system/portbridge@.service
+    systemctl disable --now "$AGENT_UNIT" >/dev/null 2>&1
+    rm -f /etc/systemd/system/portbridge@.service /etc/systemd/system/portbridge-agent.service
     systemctl daemon-reload
     rm -rf /etc/portbridge "$RUN_DIR"
     # Put the network settings back before removing the helper that manages them.
@@ -1731,6 +1821,206 @@ speedtest_tunnel() {
     hr
     say "${B}Speed testing tunnel '$name'...${R}"
     "$BIN" speedtest "$name"
+}
+
+# ------------------------------------------------------------- management agent
+
+enable_agent() {
+    hr
+    say "${B}Enable Foreign Management Agent${R}"
+    say "${DIM}Runs the PortBridge HTTPS management daemon on this server.${R}"
+    hr
+    if [ ! -f "$AGENT_CONF" ]; then
+        local tok
+        tok=$(gen_agent_token)
+        write_file_key "$AGENT_CONF" listen "0.0.0.0:2096"
+        write_file_key "$AGENT_CONF" token "$tok"
+    fi
+    systemctl daemon-reload
+    systemctl enable --now "$AGENT_UNIT" >/dev/null 2>&1 || {
+        err "Could not start $AGENT_UNIT. Check systemctl status $AGENT_UNIT."
+        return 1
+    }
+    sleep 1
+    if [ "$(systemctl is-active "$AGENT_UNIT" 2>/dev/null)" = active ]; then
+        ok "Foreign Management Agent is now active and running."
+    else
+        err "Agent failed to start. Recent log:"
+        journalctl -u "$AGENT_UNIT" -n 20 --no-pager
+        return 1
+    fi
+}
+
+disable_agent() {
+    hr
+    confirm "Stop and disable the Foreign Management Agent?" || return 0
+    systemctl disable --now "$AGENT_UNIT" >/dev/null 2>&1
+    ok "Agent stopped and disabled."
+}
+
+change_agent_port() {
+    hr
+    say "${B}Change Agent Listen Port${R}"
+    say "${DIM}Note: Cloudflare HTTPS supports ports 443, 2053, 2083, 2087, 2096, 8443.${R}"
+    hr
+    local cur_listen cur_port p
+    cur_listen=$(read_file_key "$AGENT_CONF" listen)
+    cur_port=${cur_listen##*:}
+    [ -n "$cur_port" ] || cur_port=2096
+    p=$(ask_port "New Agent listen port" "$cur_port")
+    write_file_key "$AGENT_CONF" listen "0.0.0.0:$p"
+    if [ "$(systemctl is-active "$AGENT_UNIT" 2>/dev/null)" = active ]; then
+        systemctl restart "$AGENT_UNIT"
+        ok "Agent restarted on port $p."
+    else
+        ok "Saved. Start agent to apply."
+    fi
+}
+
+regen_agent_token() {
+    hr
+    warn "Regenerating the token will disconnect any Iran server currently linked with the old token."
+    confirm "Generate a new Agent token?" || return 0
+    local tok
+    tok=$(gen_agent_token)
+    write_file_key "$AGENT_CONF" token "$tok"
+    if [ "$(systemctl is-active "$AGENT_UNIT" 2>/dev/null)" = active ]; then
+        systemctl restart "$AGENT_UNIT"
+    fi
+    ok "New token generated: $tok"
+}
+
+link_foreign_agent() {
+    local default_ip=${1-}
+    hr
+    say "${B}Link to Foreign Management Agent${R}"
+    say "${DIM}Enables automated tunnel deployment from this Iran server.${R}"
+    say "${DIM}Paste the link string from Foreign server or enter URL and token.${R}"
+    hr
+
+    local input
+    input=$(ask "Agent Link String or URL" "")
+    [ -n "$input" ] || { err "Nothing entered."; return 1; }
+
+    local url="" tok=""
+    if [[ "$input" =~ ^pb-agent://([^@]+)@([^/]+) ]]; then
+        tok="${BASH_REMATCH[1]}"
+        local hostport="${BASH_REMATCH[2]}"
+        url="https://$hostport"
+    elif [[ "$input" =~ ^https?:// ]]; then
+        url="$input"
+    elif [ -n "$input" ]; then
+        url="https://$input"
+    fi
+
+    if [ -z "$tok" ]; then
+        tok=$(ask "Agent Bearer Token" "")
+        [ -n "$tok" ] || { err "Token cannot be empty."; return 1; }
+    fi
+
+    url=$(printf '%s' "$url" | sed -E 's|/+$||')
+
+    say ""
+    info "Testing connection to $url..."
+    if "$BIN" join -agent-url "$url" -token "$tok" -status; then
+        write_file_key "$AGENT_CLIENT_CONF" url "$url"
+        write_file_key "$AGENT_CLIENT_CONF" token "$tok"
+        chmod 600 "$AGENT_CLIENT_CONF"
+        say ""
+        ok "Foreign Agent linked successfully! Future tunnels will be deployed automatically."
+        return 0
+    else
+        warn "Could not verify connection to $url with the provided token."
+        if confirm "Save this configuration anyway?"; then
+            write_file_key "$AGENT_CLIENT_CONF" url "$url"
+            write_file_key "$AGENT_CLIENT_CONF" token "$tok"
+            chmod 600 "$AGENT_CLIENT_CONF"
+            ok "Saved."
+            return 0
+        fi
+        return 1
+    fi
+}
+
+test_foreign_agent() {
+    hr
+    say "${B}Test Foreign Management Agent Connection${R}"
+    hr
+    local url tok
+    url=$(read_file_key "$AGENT_CLIENT_CONF" url)
+    tok=$(read_file_key "$AGENT_CLIENT_CONF" token)
+    if [ -z "$url" ]; then
+        warn "No foreign agent configured on this server yet."
+        warn "Use option 'Link to a Foreign Agent' first."
+        return 1
+    fi
+    info "Connecting to $url..."
+    "$BIN" join -agent-url "$url" -token "$tok" -status
+}
+
+unlink_foreign_agent() {
+    hr
+    confirm "Unlink and remove Foreign Agent configuration from this server?" || return 0
+    rm -f "$AGENT_CLIENT_CONF"
+    ok "Foreign Agent unlinked. Tunnels will require manual pairing codes."
+}
+
+agent_menu() {
+    while :; do
+        hr
+        say "${B}Management Agent (Cross-Server Automation)${R}"
+        say "${DIM}The Management Agent allows your Iran server to automatically configure${R}"
+        say "${DIM}and start tunnels on this Foreign server, without copying pairing codes.${R}"
+        hr
+        local agent_active agent_listen agent_token
+        agent_active=$(systemctl is-active "$AGENT_UNIT" 2>/dev/null || echo "inactive")
+        if [ "$agent_active" = active ]; then
+            agent_listen=$(read_file_key "$AGENT_CONF" listen)
+            agent_token=$(read_file_key "$AGENT_CONF" token)
+            local my_ip
+            my_ip=$(public_ip)
+            ok "  Foreign Agent: RUNNING"
+            say "  Listen address:  ${agent_listen:-0.0.0.0:2096}"
+            say "  Agent Token:     ${agent_token}"
+            say "  Agent URL:       https://${my_ip}:${agent_listen##*:}"
+            say ""
+            say "  ${B}Iran Link String:${R}"
+            say "  ${GREEN}pb-agent://${agent_token}@${my_ip}:${agent_listen##*:}${R}"
+        else
+            warn "  Foreign Agent: NOT RUNNING ($agent_active)"
+        fi
+
+        local client_url
+        client_url=$(read_file_key "$AGENT_CLIENT_CONF" url)
+        say ""
+        if [ -n "$client_url" ]; then
+            ok "  Linked Foreign Agent (Iran side): $client_url"
+        else
+            say "  ${DIM}Linked Foreign Agent (Iran side): none configured${R}"
+        fi
+        hr
+        say "  ${B}1${R}) Enable and start Agent     ${DIM}(Foreign server)${R}"
+        say "  ${B}2${R}) Stop and disable Agent      ${DIM}(Foreign server)${R}"
+        say "  ${B}3${R}) Change Agent listen port     ${DIM}(Foreign server)${R}"
+        say "  ${B}4${R}) Regenerate Agent token      ${DIM}(Foreign server)${R}"
+        say "  ${B}5${R}) Link to a Foreign Agent     ${DIM}(Iran server)${R}"
+        say "  ${B}6${R}) Test connection to Foreign  ${DIM}(Iran server)${R}"
+        say "  ${B}7${R}) Unlink Foreign Agent        ${DIM}(Iran server)${R}"
+        say "  ${B}0${R}) Back"
+        hr
+        local c
+        c=$(ask "Choose" "0")
+        case "$c" in
+            1) enable_agent; pause ;;
+            2) disable_agent; pause ;;
+            3) change_agent_port; pause ;;
+            4) regen_agent_token; pause ;;
+            5) link_foreign_agent; pause ;;
+            6) test_foreign_agent; pause ;;
+            7) unlink_foreign_agent; pause ;;
+            *) return 0 ;;
+        esac
+    done
 }
 
 # -------------------------------------------------------------------- main menu
@@ -1751,10 +2041,11 @@ main_menu() {
         say "  ${B}8${R}) Start, stop or restart a tunnel"
         say "  ${B}9${R}) View a tunnel's log"
         say " ${B}10${R}) Delete a tunnel"
-        say " ${B}11${R}) Firewall"
-        say " ${B}12${R}) Speed tuning           ${DIM}run on both servers${R}"
-        say " ${B}13${R}) Uninstall PortBridge"
-        say " ${B}14${R}) Speed test a tunnel"
+        say " ${B}11${R}) Management Agent     ${DIM}automate foreign setup from Iran${R}"
+        say " ${B}12${R}) Firewall"
+        say " ${B}13${R}) Speed tuning           ${DIM}run on both servers${R}"
+        say " ${B}14${R}) Uninstall PortBridge"
+        say " ${B}15${R}) Speed test a tunnel"
         say "  ${B}0${R}) Quit"
         hr
         local choice name
@@ -1770,10 +2061,11 @@ main_menu() {
             8) name=$(pick_tunnel) && service_menu "$name"; pause ;;
             9) name=$(pick_tunnel) && show_logs "$name"; pause ;;
             10) name=$(pick_tunnel) && delete_tunnel "$name"; pause ;;
-            11) firewall_menu ;;
-            12) tuning_menu; pause ;;
-            13) uninstall_all ;;
-            14) name=$(pick_tunnel) && speedtest_tunnel "$name"; pause ;;
+            11) agent_menu ;;
+            12) firewall_menu ;;
+            13) tuning_menu; pause ;;
+            14) uninstall_all ;;
+            15) name=$(pick_tunnel) && speedtest_tunnel "$name"; pause ;;
             0 | q | Q) say "Bye."; exit 0 ;;
             *) err "Not a valid choice."; sleep 1 ;;
         esac
@@ -1901,6 +2193,7 @@ case "${1-}" in
     code) shift; show_pairing_code "${1:?tunnel name required}" ;;
     speedtest) shift; speedtest_tunnel "${1:?tunnel name required}" ;;
     firewall) "$FIREWALL" status ;;
+    agent) agent_menu ;;
     '' ) main_menu ;;
-    *) say "Usage: portbridge-menu [list|check <name>|code <name>|speedtest <name>|firewall]" ;;
+    *) say "Usage: portbridge-menu [list|check <name>|code <name>|speedtest <name>|firewall|agent]" ;;
 esac

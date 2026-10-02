@@ -22,6 +22,8 @@ Then:
 2. On your **foreign server** (the one with your panel), choose **Join a
    tunnel** and paste that code. It asks nothing else.
 
+> **💡 Zero-Copy Automation**: If you enable the **Management Agent** on your foreign server (menu option 11), your Iran server can automatically provision and start tunnels on the foreign server over HTTPS — completely eliminating manual copy-pasting of pairing codes!
+
 That order is the same for direct and reverse.
 
 After that, the menu is one word:
@@ -314,6 +316,9 @@ the retry, which then moves the user to a different shared connection.
 /usr/local/bin/portbridge-firewall     port locking helper
 /usr/local/bin/portbridge-tune         speed tuning helper
 /etc/systemd/system/portbridge@.service one template for all tunnels
+/etc/systemd/system/portbridge-agent.service management agent daemon service
+/etc/portbridge/agent.conf             foreign management agent configuration & token
+/etc/portbridge/agent-client.conf      Iran server connection info to foreign agent
 /etc/portbridge/tunnels/<name>.conf    one tunnel's settings
 /etc/portbridge/tunnels/<name>.secret  one tunnel's password
 /etc/portbridge/tunnels/<name>.crt/.key the disguise certificate, if used
@@ -330,9 +335,19 @@ systemctl status portbridge@home
 journalctl -u portbridge@home -f
 ```
 
-### Automatic Remote Teardown
+### Management Agent (Cross-Server Automation)
 
-When you delete a tunnel on your Iran server (via the menu or `portbridge teardown`), PortBridge automatically contacts the corresponding foreign server (authenticated with the tunnel's 32-byte shared HMAC secret). If the foreign server is reachable, PortBridge automatically removes the tunnel configuration, secrets, certificates, and firewall rules on the foreign server and deactivates its systemd service. If the foreign server is unreachable, the local tunnel is still removed cleanly with a warning.
+PortBridge includes a lightweight, secure management daemon (`portbridge-agent.service`) that enables automated tunnel deployment and teardown:
+
+- **Zero-Copy Deployment**: When enabled on your foreign server, creating a tunnel on your Iran server automatically sends the pairing parameters to the foreign agent over HTTPS. The foreign half is immediately configured, validated, and started via systemd without needing to manually copy/paste codes.
+- **Dedicated Bearer Auth**: Authentication uses a strong 192-bit cryptographic bearer token (`pba_...`). It **never** requires, asks for, or stores SSH keys or Linux passwords.
+- **Direct or Behind Cloudflare**: The agent listens on port `2096` by default (customizable to any port, e.g. `8443`, `2083`, etc.). Because these ports are supported by Cloudflare, the management agent can operate behind Cloudflare CDN proxy even if Iranian ISPs or foreign cloud firewalls block direct IP access!
+- **Automatic Remote Teardown**: When you delete a tunnel on your Iran server, PortBridge automatically wipes the corresponding tunnel config, secrets, certificates, and firewall rules on the foreign server via the tunnel socket or the agent API.
+
+Setup takes under 30 seconds:
+1. On your **Foreign server**: Choose **11) Management Agent** -> **1) Enable and start Agent**. It prints your Link String (e.g. `pb-agent://<token>@<ip>:2096`).
+2. On your **Iran server**: Choose **11) Management Agent** -> **5) Link to a Foreign Agent**, and paste that string.
+3. Every tunnel you create or delete from then on is automated end-to-end!
 
 ## Reverse mode depends on your network, not just on this tool
 
