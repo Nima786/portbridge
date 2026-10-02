@@ -96,8 +96,11 @@ your answer in the pairing code so both ends always agree.
 | **Through Cloudflare or another CDN** | A normal secure websocket request to your domain, with your foreign server's IP never appearing on the link. |
 | **Look like a website, with a CDN standing by** | As the second option, but if your foreign server's address ever stops being reachable the link moves to your domain through the CDN by itself. Direct mode only. |
 | **HTTP/2 or gRPC stream** | Wraps the link in HTTP/2 streaming frames over TLS, appearing as active HTTP/2 or gRPC traffic to defeat DPI deep-packet inspection and support Cloudflare gRPC mode. |
+| **Loss-resistant KCP over UDP (FEC)** | Fast UDP-based transport powered by KCP with Reed-Solomon Forward Error Correction (10 data, 3 parity shards) and AES encryption. Survives up to 30% packet loss and active TCP RST packet drops on unstable routes. |
 
 A single tunnel can forward multiple ports / services at once: enter comma-separated ports (e.g. `443, 8443, 2083`) when creating or editing the tunnel.
+
+The **KCP / UDP option** replaces the underlying TCP transport between the two servers with turbo-paced KCP packets over UDP. Reed-Solomon FEC (10 data + 3 parity shards) reconstructs dropped packets immediately without waiting for a retransmission round-trip, making it ideal for international links suffering heavy packet loss or middlebox TCP reset injection.
 
 The middle option needs nothing from you but a name for the link to claim, and
 that name does not have to be real or yours. A certificate is generated on the
@@ -228,6 +231,26 @@ lives in one file, so the same menu option removes it cleanly.
 
 Worth running on both servers.
 
+## In-tunnel speed test
+
+PortBridge includes a built-in benchmarking tool to test live latency, jitter, download throughput, and upload throughput directly through an active tunnel without requiring external speedtest scripts or third-party servers:
+
+```bash
+# Using the interactive menu (Option 14)
+portbridge-menu speedtest <tunnel-name>
+
+# Or directly via the CLI
+portbridge speedtest <tunnel-name> [size_in_mb]
+
+# Example: Run a 20 MB throughput test on tunnel "kcp1"
+portbridge speedtest kcp1 20
+```
+
+The speedtest operates across three lockstep phases through the active tunnel:
+1. **RTT & Jitter**: Computes real-time round-trip latency and network jitter.
+2. **Download Test**: Streams high-entropy pseudorandom payload data from the foreign server to the edge server.
+3. **Upload Test**: Streams verified test payload data from the edge server back to the foreign server.
+
 ## How a connection is actually made
 
 This is the part that makes it quick and keeps it honest.
@@ -261,6 +284,10 @@ the retry, which then moves the user to a different shared connection.
   passed on a command line, where other users on the server could read it.
 - The password is never sent as-is. Each connection sends a fresh signed token,
   so capturing one is no use later.
+- **Zero-Magic Protocol v2 Framing**: Cross-border connection framing is disguised with an ephemeral HMAC mask derived from the shared secret. Handshake frames contain no fixed magic bytes or protocol signatures, making them indistinguishable from random encrypted entropy to DPI sniffers.
+- **Randomized Handshake Padding**: Handshake frames append 16 to 64 bytes of cryptographically randomized padding to eliminate static packet size fingerprints.
+- **Anti-Replay Sliding Window**: A timestamp window combined with a bitmask nonces cache ensures captured handshake packets cannot be replayed.
+- **0-RTT Early Data**: When using WebSocket / CDN transports, authentication is carried directly in the HTTP Upgrade handshake (`Sec-WebSocket-Protocol`), establishing authenticated connections with zero round-trip delay.
 - On whichever half accepts the connection, the tunnel port is locked to the
   other server's address automatically. The rule is reapplied on every start, so
   it survives a reboot. The exception is a link that may arrive through a CDN,
@@ -341,7 +368,7 @@ added, and deletes everything it installed.
 
 ## Not included
 
-- No UDP. TCP services only.
+- Forwarding arbitrary raw client UDP ports (while PortBridge provides a loss-resistant UDP-based KCP transport with FEC for the cross-border link, client services forwarded through the tunnel are TCP).
 - No automatic switching between direct and reverse. A blocked address is handled
   by the CDN backup route above; a broken return path is not, and needs the mode
   changed by hand.
