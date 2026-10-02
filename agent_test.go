@@ -5,12 +5,11 @@ import (
 	"crypto/tls"
 	"encoding/base64"
 	"encoding/json"
-	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
-	"strings"
 	"testing"
 	"time"
 )
@@ -67,7 +66,7 @@ func TestApplyPairingData(t *testing.T) {
 	}
 
 	confPath := filepath.Join(tmpDir, "sample.conf")
-	cfg, err := loadConfig(confPath)
+	cfg, err := LoadConfig(confPath)
 	if err != nil {
 		t.Fatalf("loadConfig failed on generated conf: %v", err)
 	}

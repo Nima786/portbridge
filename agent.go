@@ -10,13 +10,11 @@ import (
 	"fmt"
 	"io"
 	"log"
-	"net"
 	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
-	"time"
 )
 
 // PairingData represents the decoded attributes from a PortBridge join code.
@@ -187,8 +185,8 @@ func applyPairingData(p *PairingData, confDir string) error {
 		return fmt.Errorf("writing secret: %w", err)
 	}
 
-	// Validate config syntax with loadConfig
-	cfg, err := loadConfig(confFile)
+	// Validate config syntax with LoadConfig
+	cfg, err := LoadConfig(confFile)
 	if err != nil {
 		_ = os.Remove(confFile)
 		_ = os.Remove(secretFile)
