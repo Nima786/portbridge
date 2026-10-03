@@ -274,7 +274,7 @@ func (c *Config) prepareTLS(cert *tls.Certificate) {
 		c.tlsClients[name] = newClientTLS(name, c.Transport, cache)
 	}
 
-	if c.UTLS {
+	if c.UTLS || (c.CDN && !c.utlsSet) {
 		c.utlsCache = utls.NewLRUClientSessionCache(tlsResumeCache)
 		c.utlsClients = make(map[string]*utls.Config, 2)
 		for _, name := range c.claimedNames() {
@@ -371,11 +371,21 @@ func wrapDial(raw net.Conn, cfg *Config) (net.Conn, error) {
 
 	case TransportTLS, TransportWSS, TransportH2, TransportGRPC:
 		connToWrap := raw
-		if cfg.TLSFragment {
-			connToWrap = newFragmentConn(raw, cfg.TLSFragmentSize, cfg.TLSFragmentSleep)
+		shouldFrag := cfg.TLSFragment || (cfg.CDN && !cfg.fragmentSet)
+		if shouldFrag {
+			size := cfg.TLSFragmentSize
+			if size <= 0 {
+				size = 40
+			}
+			sleep := cfg.TLSFragmentSleep
+			if sleep <= 0 {
+				sleep = 3 * time.Millisecond
+			}
+			connToWrap = newFragmentConn(raw, size, sleep)
 		}
 
-		if cfg.UTLS {
+		shouldUTLS := cfg.UTLS || (cfg.CDN && !cfg.utlsSet)
+		if shouldUTLS {
 			uClient := utls.UClient(connToWrap, cfg.clientUTLS(cfg.effectiveClientName()), utls.HelloChrome_Auto)
 			if err := uClient.BuildHandshakeState(); err == nil {
 				for _, ext := range uClient.Extensions {
@@ -502,10 +512,12 @@ func describeTransport(cfg *Config) string {
 
 	if cfg.Dials() {
 		var stealth []string
-		if cfg.UTLS {
+		shouldUTLS := cfg.UTLS || (cfg.CDN && !cfg.utlsSet)
+		shouldFrag := cfg.TLSFragment || (cfg.CDN && !cfg.fragmentSet)
+		if shouldUTLS {
 			stealth = append(stealth, "uTLS Chrome profile")
 		}
-		if cfg.TLSFragment {
+		if shouldFrag {
 			stealth = append(stealth, "ClientHello fragmentation")
 		}
 		if len(cfg.CleanIPs) > 0 {

@@ -152,6 +152,9 @@ type Config struct {
 	UTLSProfile      string
 	CleanIPs         []string
 
+	fragmentSet bool
+	utlsSet     bool
+
 	// Disguise settings prepared once at startup and only read afterwards. They
 	// are what makes a repeat connection cheap; see prepareTLS in transport.go
 	// for why building them per connection was costing more than everything else
@@ -244,10 +247,10 @@ func defaultConfig() *Config {
 		MuxLinks:        4,
 		KCPDataShards:   10,
 		KCPParityShards: 3,
-		TLSFragment:      true,
+		TLSFragment:      false,
 		TLSFragmentSize:  40,
 		TLSFragmentSleep: 3 * time.Millisecond,
-		UTLS:             true,
+		UTLS:             false,
 		UTLSProfile:      "chrome",
 	}
 }
@@ -405,6 +408,7 @@ func (c *Config) set(key, val string) error {
 	case "drain":
 		return dur(&c.Drain)
 	case "tls_fragment", "fragment":
+		c.fragmentSet = true
 		switch strings.ToLower(val) {
 		case "on", "yes", "true":
 			c.TLSFragment = true
@@ -414,10 +418,13 @@ func (c *Config) set(key, val string) error {
 			return fmt.Errorf("tls_fragment must be on or off, got %q", val)
 		}
 	case "tls_fragment_size", "fragment_size":
+		c.fragmentSet = true
 		return num(&c.TLSFragmentSize)
 	case "tls_fragment_sleep", "fragment_sleep":
+		c.fragmentSet = true
 		return dur(&c.TLSFragmentSleep)
 	case "utls":
+		c.utlsSet = true
 		switch strings.ToLower(val) {
 		case "on", "yes", "true":
 			c.UTLS = true
@@ -427,6 +434,7 @@ func (c *Config) set(key, val string) error {
 			return fmt.Errorf("utls must be on or off, got %q", val)
 		}
 	case "utls_profile":
+		c.utlsSet = true
 		c.UTLSProfile = strings.ToLower(val)
 	case "clean_ips", "clean_ip":
 		parts := strings.Split(val, ",")
@@ -445,6 +453,24 @@ func (c *Config) set(key, val string) error {
 // Validate catches the mistakes that would otherwise show up as a tunnel that
 // silently does nothing.
 func (c *Config) Validate() error {
+	if c.CDN {
+		if !c.utlsSet {
+			c.UTLS = true
+		}
+		if !c.fragmentSet {
+			c.TLSFragment = true
+		}
+	}
+	if c.TLSFragmentSize <= 0 {
+		c.TLSFragmentSize = 40
+	}
+	if c.TLSFragmentSleep <= 0 {
+		c.TLSFragmentSleep = 3 * time.Millisecond
+	}
+	if c.UTLSProfile == "" {
+		c.UTLSProfile = "chrome"
+	}
+
 	if c.Name == "" {
 		return fmt.Errorf("name is required")
 	}
