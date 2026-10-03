@@ -463,6 +463,8 @@ ask_disguise() {
     DG_CDN=off
     DG_ALTHOST=""
     DG_CLEAN_IPS=""
+    DG_UTLS=off
+    DG_FRAGMENT=off
 
     case "$choice" in
         1)
@@ -517,6 +519,7 @@ ask_disguise() {
                 warn "Note: a CDN only carries connections towards your domain, so with"
                 warn "reverse this only works if the domain points at THIS Iran server."
             fi
+        fi
         if [ "$DG_CDN" = on ]; then
             say ""
             info "Clean Cloudflare IPs (optional): If Cloudflare default Anycast IPs are"
@@ -578,6 +581,13 @@ ask_disguise() {
             info "Any believable name works (e.g. www.google.com, www.bing.com)."
             DG_SERVERNAME=$(ask "Name for it to claim" "www.google.com")
             [ -n "$DG_SERVERNAME" ] || DG_SERVERNAME=www.google.com
+            say ""
+            info "Stealth evasion: Use Chrome TLS fingerprint (uTLS) and ClientHello TCP"
+            info "fragmentation to bypass Iranian SNI DPI on direct connections."
+            if confirm "Enable stealth evasion (uTLS & fragmentation)?"; then
+                DG_UTLS=on
+                DG_FRAGMENT=on
+            fi
         fi
     else
         say ""
@@ -585,6 +595,13 @@ ask_disguise() {
         info "does not need to be a domain you own or one that really exists."
         DG_SERVERNAME=$(ask "Name for it to claim" "www.bing.com")
         [ -n "$DG_SERVERNAME" ] || DG_SERVERNAME=www.bing.com
+        say ""
+        info "Stealth evasion: Use Chrome TLS fingerprint (uTLS) and ClientHello TCP"
+        info "fragmentation to bypass Iranian SNI DPI on direct connections."
+        if confirm "Enable stealth evasion (uTLS & fragmentation)?"; then
+            DG_UTLS=on
+            DG_FRAGMENT=on
+        fi
     fi
 }
 
@@ -864,6 +881,13 @@ write_tunnel() {
         if [ -n "${DG_CLEAN_IPS-}" ]; then
             printf '\n# Clean Cloudflare Anycast IPs for bypassing throttling/blocking\n'
             printf 'clean_ips = %s\n' "$DG_CLEAN_IPS"
+        fi
+
+        if [ "${DG_UTLS:-off}" = on ]; then
+            printf 'utls = on\n'
+        fi
+        if [ "${DG_FRAGMENT:-off}" = on ]; then
+            printf 'tls_fragment = on\n'
         fi
 
         printf '\n# on = every user session shares a few long-lived connections.\n'
