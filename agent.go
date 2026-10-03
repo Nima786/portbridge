@@ -133,6 +133,12 @@ func decodePairingCode(code string) (*PairingData, error) {
 // is made first, and if anything fails after that, what was done is undone, so a
 // refused code never leaves a half-made tunnel behind.
 func applyPairingData(p *PairingData, confDir string) error {
+	return applyPairingWarn(p, confDir, nil)
+}
+
+// applyPairingWarn is applyPairingData that also reports things worth knowing
+// that did not stop the tunnel, such as a service that is not running yet.
+func applyPairingWarn(p *PairingData, confDir string, warns *[]string) error {
 	if confDir == "" {
 		confDir = defaultTunnelsDir
 	}
@@ -162,11 +168,14 @@ func applyPairingData(p *PairingData, confDir string) error {
 		}
 	}
 
-	if p.Mode == "direct" {
-		port, _ := portOK(p.TunnelPort)
-		if err := host.PortFree(Transport(p.Transport), port); err != nil {
-			return err
-		}
+	// Both the port between the servers and the service ports are checked before
+	// anything is written, and the reasons are given in full so they can be fixed.
+	notes, err := checkPairingPorts(p, confDir, host, "")
+	if err != nil {
+		return err
+	}
+	if warns != nil {
+		*warns = append(*warns, notes...)
 	}
 
 	// Format inbound ports (e.g. 100 -> 127.0.0.1:100, 100, 200 -> 127.0.0.1:100, 127.0.0.1:200)
@@ -498,51 +507,61 @@ func runAgentServer(listenAddr, token, certFile, keyFile, confDir string) error 
 
 	mux := http.NewServeMux()
 
-	// POST /api/tunnel/join
-	mux.HandleFunc("/api/tunnel/join", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			http.Error(w, `{"error":"method not allowed"}`, http.StatusMethodNotAllowed)
-			return
+	// POST /api/tunnel/join and /api/tunnel/update take the same pairing code. One
+	// makes a tunnel that does not exist yet; the other changes the ports and
+	// settings of one that does.
+	codeHandler := func(update bool) http.HandlerFunc {
+		return func(w http.ResponseWriter, r *http.Request) {
+			if r.Method != http.MethodPost {
+				http.Error(w, `{"error":"method not allowed"}`, http.StatusMethodNotAllowed)
+				return
+			}
+			if !checkAgentAuth(r, token) {
+				http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
+				return
+			}
+			body, err := io.ReadAll(io.LimitReader(r.Body, 64*1024))
+			if err != nil {
+				http.Error(w, `{"error":"reading body"}`, http.StatusBadRequest)
+				return
+			}
+			var req struct {
+				Code string `json:"code"`
+			}
+			if err := json.Unmarshal(body, &req); err != nil || req.Code == "" {
+				http.Error(w, `{"error":"code required in json body"}`, http.StatusBadRequest)
+				return
+			}
+			p, err := decodePairingCode(req.Code)
+			if err != nil {
+				w.WriteHeader(http.StatusBadRequest)
+				_ = json.NewEncoder(w).Encode(map[string]any{"ok": false, "error": err.Error()})
+				return
+			}
+			var warns []string
+			verb := "deployed and started"
+			if update {
+				err = updatePairingData(p, confDir, &warns)
+				verb = "updated and restarted"
+			} else {
+				err = applyPairingWarn(p, confDir, &warns)
+			}
+			if err != nil {
+				w.WriteHeader(http.StatusInternalServerError)
+				_ = json.NewEncoder(w).Encode(map[string]any{"ok": false, "error": err.Error()})
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"ok":       true,
+				"name":     p.Name,
+				"message":  fmt.Sprintf("tunnel %q %s successfully", p.Name, verb),
+				"warnings": warns,
+			})
 		}
-		if !checkAgentAuth(r, token) {
-			http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
-			return
-		}
-
-		body, err := io.ReadAll(io.LimitReader(r.Body, 64*1024))
-		if err != nil {
-			http.Error(w, `{"error":"reading body"}`, http.StatusBadRequest)
-			return
-		}
-
-		var req struct {
-			Code string `json:"code"`
-		}
-		if err := json.Unmarshal(body, &req); err != nil || req.Code == "" {
-			http.Error(w, `{"error":"code required in json body"}`, http.StatusBadRequest)
-			return
-		}
-
-		p, err := decodePairingCode(req.Code)
-		if err != nil {
-			w.WriteHeader(http.StatusBadRequest)
-			_ = json.NewEncoder(w).Encode(map[string]any{"ok": false, "error": err.Error()})
-			return
-		}
-
-		if err := applyPairingData(p, confDir); err != nil {
-			w.WriteHeader(http.StatusInternalServerError)
-			_ = json.NewEncoder(w).Encode(map[string]any{"ok": false, "error": err.Error()})
-			return
-		}
-
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(map[string]any{
-			"ok":      true,
-			"name":    p.Name,
-			"message": fmt.Sprintf("tunnel %q deployed and started successfully", p.Name),
-		})
-	})
+	}
+	mux.HandleFunc("/api/tunnel/join", codeHandler(false))
+	mux.HandleFunc("/api/tunnel/update", codeHandler(true))
 
 	// POST /api/tunnel/delete
 	mux.HandleFunc("/api/tunnel/delete", func(w http.ResponseWriter, r *http.Request) {
@@ -847,9 +866,23 @@ func agentClientDelete(agentURL, token, tunnelName string, trust agentTrust) err
 }
 
 func agentClientJoin(agentURL, token, code string, trust agentTrust) error {
+	return agentClientCode(agentURL, token, code, trust, false)
+}
+
+// agentClientUpdate asks the agent to change the ports and settings of a tunnel it
+// already has, from a fresh pairing code for it.
+func agentClientUpdate(agentURL, token, code string, trust agentTrust) error {
+	return agentClientCode(agentURL, token, code, trust, true)
+}
+
+func agentClientCode(agentURL, token, code string, trust agentTrust, update bool) error {
 	agentURL = strings.TrimRight(agentURL, "/")
+	endpoint, what, done := "/api/tunnel/join", "join", "deployed and started"
+	if update {
+		endpoint, what, done = "/api/tunnel/update", "update", "updated and restarted"
+	}
 	payload, _ := json.Marshal(map[string]string{"code": code})
-	req, err := http.NewRequest(http.MethodPost, agentURL+"/api/tunnel/join", bytes.NewReader(payload))
+	req, err := http.NewRequest(http.MethodPost, agentURL+endpoint, bytes.NewReader(payload))
 	if err != nil {
 		return err
 	}
@@ -865,19 +898,26 @@ func agentClientJoin(agentURL, token, code string, trust agentTrust) error {
 	defer resp.Body.Close()
 
 	var res struct {
-		OK      bool   `json:"ok"`
-		Name    string `json:"name"`
-		Error   string `json:"error"`
-		Message string `json:"message"`
+		OK       bool     `json:"ok"`
+		Name     string   `json:"name"`
+		Error    string   `json:"error"`
+		Message  string   `json:"message"`
+		Warnings []string `json:"warnings"`
 	}
 	_ = json.NewDecoder(resp.Body).Decode(&res)
 	if resp.StatusCode != http.StatusOK || !res.OK {
 		if res.Error != "" {
-			return fmt.Errorf("remote join failed: %s", res.Error)
+			return fmt.Errorf("remote %s failed: %s", what, res.Error)
 		}
-		return fmt.Errorf("remote join failed with HTTP %d", resp.StatusCode)
+		if resp.StatusCode == http.StatusNotFound && update {
+			return errors.New("the agent on that server is too old to change a tunnel; update PortBridge there first")
+		}
+		return fmt.Errorf("remote %s failed with HTTP %d", what, resp.StatusCode)
 	}
-	fmt.Printf("Remote agent successfully deployed and started tunnel %q.\n", res.Name)
+	for _, w := range res.Warnings {
+		fmt.Printf("Note from the remote server: %s\n", w)
+	}
+	fmt.Printf("Remote agent successfully %s tunnel %q.\n", done, res.Name)
 	return nil
 }
 
@@ -975,6 +1015,7 @@ func cmdJoin(args []string) error {
 	fingerprint := fs.String("fingerprint", "", "SHA-256 fingerprint the agent's certificate must have")
 	insecure := fs.Bool("insecure", false, "do not check the agent's certificate at all (not recommended)")
 	fetchFP := fs.Bool("fetch-fingerprint", false, "print the fingerprint of the agent's certificate and exit")
+	isUpdate := fs.Bool("update", false, "change the ports and settings of a tunnel that already exists, from a new code")
 	isDelete := fs.Bool("delete", false, "delete remote tunnel instead of joining")
 	isStatus := fs.Bool("status", false, "check status/connectivity to remote agent")
 	isListAgents := fs.Bool("list-agents", false, "list all saved foreign agent profiles")
@@ -1109,6 +1150,9 @@ func cmdJoin(args []string) error {
 	}
 
 	if *agentURL != "" {
+		if *isUpdate {
+			return agentClientUpdate(*agentURL, *token, code, trust)
+		}
 		return agentClientJoin(*agentURL, *token, code, trust)
 	}
 
@@ -1117,8 +1161,24 @@ func cmdJoin(args []string) error {
 		return fmt.Errorf("parsing pairing code: %w", err)
 	}
 
-	if err := applyPairingData(p, defaultTunnelsDir); err != nil {
+	if *isUpdate {
+		var warns []string
+		if err := updatePairingData(p, defaultTunnelsDir, &warns); err != nil {
+			return err
+		}
+		for _, w := range warns {
+			fmt.Printf("Note: %s\n", w)
+		}
+		fmt.Printf("Updated and restarted tunnel %q.\n", p.Name)
+		return nil
+	}
+
+	var joinWarns []string
+	if err := applyPairingWarn(p, defaultTunnelsDir, &joinWarns); err != nil {
 		return err
+	}
+	for _, w := range joinWarns {
+		fmt.Printf("Note: %s\n", w)
 	}
 	fmt.Printf("Successfully joined and activated tunnel %q (role: origin, mode: %s)\n", p.Name, p.Mode)
 	return nil

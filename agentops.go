@@ -61,6 +61,10 @@ type agentHost interface {
 	// Active reports whether the service is running, with a note on why not.
 	Active(name string) (bool, string)
 	RemoveRuntime(name string)
+	// Restart stops and starts the service again on its current settings.
+	Restart(name string) error
+	// Listening reports whether something on this machine answers on the port.
+	Listening(port int) bool
 }
 
 // agentHostOverride replaces the host for tests that want to watch what would be
@@ -199,6 +203,28 @@ func (systemHost) Active(name string) (bool, string) {
 	return false, fmt.Sprintf("service is %q; recent log: %s", out, logs)
 }
 
+func (systemHost) Restart(name string) error {
+	if !haveSystemd() {
+		return errNoSystemd
+	}
+	if err := needRoot(); err != nil {
+		return err
+	}
+	if out, err := hostRun("systemctl", "restart", "portbridge@"+name); err != nil {
+		return fmt.Errorf("restarting the service: %s: %w", out, err)
+	}
+	return nil
+}
+
+func (systemHost) Listening(port int) bool {
+	c, err := net.DialTimeout("tcp", net.JoinHostPort("127.0.0.1", strconv.Itoa(port)), time.Second)
+	if err != nil {
+		return false
+	}
+	_ = c.Close()
+	return true
+}
+
 func (systemHost) RemoveRuntime(name string) {
 	_ = os.Remove(filepath.Join("/run/portbridge", name+".json"))
 	_ = os.Remove(filepath.Join("/run/portbridge", name+".sock"))
@@ -317,3 +343,6 @@ func validatePairing(p *PairingData) error {
 	}
 	return nil
 }
+
+func (noHost) Restart(string) error { return nil }
+func (noHost) Listening(int) bool   { return true }

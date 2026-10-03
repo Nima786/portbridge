@@ -4,6 +4,7 @@ import (
 	"crypto/tls"
 	"encoding/base64"
 	"errors"
+	"fmt"
 	"net"
 	"os"
 	"path/filepath"
@@ -18,6 +19,8 @@ type recordingHost struct {
 	enableErr   error
 	activeAfter bool // what Active reports
 	portErr     error
+	restartErr  error
+	quiet       bool // nothing listens on any service port
 }
 
 func (h *recordingHost) note(s string) { h.calls = append(h.calls, s) }
@@ -33,6 +36,14 @@ func (h *recordingHost) Active(n string) (bool, string) {
 	return h.activeAfter, "crash looping"
 }
 func (h *recordingHost) RemoveRuntime(n string) { h.note("runtime- " + n) }
+func (h *recordingHost) Restart(n string) error {
+	h.note("restart " + n)
+	return h.restartErr
+}
+func (h *recordingHost) Listening(p int) bool {
+	h.note(fmt.Sprintf("listening %d", p))
+	return !h.quiet
+}
 
 func (h *recordingHost) did(s string) bool {
 	for _, c := range h.calls {
@@ -349,5 +360,245 @@ func TestAgentClientSendsAName(t *testing.T) {
 	_ = agentClientStatus(url, "tok", agentTrust{Fingerprint: certFingerprint(cert)})
 	if got := <-seen; got != agentDisguiseName {
 		t.Fatalf("agent call sent the name %q", got)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Checking ports, and changing a tunnel that exists
+// ---------------------------------------------------------------------------
+
+func TestBusyLinkPortIsExplained(t *testing.T) {
+	h := &recordingHost{activeAfter: true, portErr: errors.New("in use")}
+	withHost(t, h)
+	dir := t.TempDir()
+	err := applyPairingData(goodPairing("busy"), dir)
+	if err == nil || !strings.Contains(err.Error(), "8443") || !strings.Contains(err.Error(), "busy") {
+		t.Fatalf("the error does not say which port is busy: %v", err)
+	}
+	if entries, _ := os.ReadDir(dir); len(entries) != 0 {
+		t.Fatalf("files left behind: %v", entries)
+	}
+}
+
+func TestPortsAreCheckedAgainstOtherTunnels(t *testing.T) {
+	h := &recordingHost{activeAfter: true}
+	withHost(t, h)
+	dir := t.TempDir()
+	if err := applyPairingData(goodPairing("first"), dir); err != nil {
+		t.Fatal(err)
+	}
+
+	// Same link port as the first tunnel.
+	p := goodPairing("second")
+	err := applyPairingData(p, dir)
+	if err == nil || !strings.Contains(err.Error(), `"first"`) {
+		t.Fatalf("a link port used by another tunnel was not refused by name: %v", err)
+	}
+
+	// A service port that is the first tunnel's link port.
+	p = goodPairing("third")
+	p.TunnelPort = "9443"
+	p.InboundPort = "8443"
+	err = applyPairingData(p, dir)
+	if err == nil || !strings.Contains(err.Error(), "service port 8443") {
+		t.Fatalf("a service port used by another tunnel's link was accepted: %v", err)
+	}
+
+	// Service port equal to this tunnel's own link port.
+	p = goodPairing("fourth")
+	p.TunnelPort = "9500"
+	p.InboundPort = "9500"
+	if err := applyPairingData(p, dir); err == nil || !strings.Contains(err.Error(), "different") {
+		t.Fatalf("link port equal to service port accepted: %v", err)
+	}
+}
+
+func TestAllProblemsAreReportedTogether(t *testing.T) {
+	h := &recordingHost{activeAfter: true, portErr: errors.New("in use")}
+	withHost(t, h)
+	dir := t.TempDir()
+	p := goodPairing("many")
+	p.InboundPort = "8443" // also the link port
+	err := applyPairingData(p, dir)
+	if err == nil || strings.Count(err.Error(), "\n  - ") < 2 {
+		t.Fatalf("expected several problems listed, got: %v", err)
+	}
+}
+
+func TestQuietServiceIsANoteNotAnError(t *testing.T) {
+	h := &recordingHost{activeAfter: true, quiet: true}
+	withHost(t, h)
+	var notes []string
+	if err := applyPairingWarn(goodPairing("quiet"), t.TempDir(), &notes); err != nil {
+		t.Fatalf("a service that is not running yet stopped the tunnel: %v", err)
+	}
+	if len(notes) == 0 || !strings.Contains(notes[0], "8080") {
+		t.Fatalf("no note about the quiet service port: %v", notes)
+	}
+}
+
+func deployed(t *testing.T, h *recordingHost, name string) string {
+	t.Helper()
+	withHost(t, h)
+	dir := t.TempDir()
+	if err := applyPairingData(goodPairing(name), dir); err != nil {
+		t.Fatal(err)
+	}
+	return dir
+}
+
+func TestUpdateChangesPortsAndRestarts(t *testing.T) {
+	h := &recordingHost{activeAfter: true}
+	dir := deployed(t, h, "chg")
+
+	p := goodPairing("chg")
+	p.TunnelPort = "9443"
+	p.InboundPort = "9090"
+	if err := updatePairingData(p, dir, nil); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := LoadConfig(filepath.Join(dir, "chg.conf"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.TunnelAddr != "0.0.0.0:9443" || cfg.InboundAddr != "127.0.0.1:9090" {
+		t.Fatalf("settings not changed: %s / %s", cfg.TunnelAddr, cfg.InboundAddr)
+	}
+	if !h.did("restart chg") || !h.did("fw+chg") {
+		t.Fatalf("the service was not restarted on the new ports: %v", h.calls)
+	}
+}
+
+func TestUpdateRefusesAWrongPasswordOrUnknownTunnel(t *testing.T) {
+	h := &recordingHost{activeAfter: true}
+	dir := deployed(t, h, "pw")
+	before, _ := os.ReadFile(filepath.Join(dir, "pw.conf"))
+
+	p := goodPairing("pw")
+	p.Secret = "ffffffffffffffffffffffffffffffff"
+	p.TunnelPort = "9443"
+	if err := updatePairingData(p, dir, nil); err == nil {
+		t.Fatalf("a code with another password changed the tunnel")
+	}
+	after, _ := os.ReadFile(filepath.Join(dir, "pw.conf"))
+	if string(before) != string(after) {
+		t.Fatalf("the settings changed")
+	}
+
+	if err := updatePairingData(goodPairing("nothere"), dir, nil); err == nil {
+		t.Fatalf("updating a tunnel that does not exist succeeded")
+	}
+}
+
+func TestUpdateToABusyPortLeavesTheTunnelAlone(t *testing.T) {
+	h := &recordingHost{activeAfter: true}
+	dir := deployed(t, h, "keep")
+	before, _ := os.ReadFile(filepath.Join(dir, "keep.conf"))
+	h.portErr = errors.New("in use")
+	h.calls = nil
+
+	p := goodPairing("keep")
+	p.TunnelPort = "9443"
+	err := updatePairingData(p, dir, nil)
+	if err == nil || !strings.Contains(err.Error(), "9443") {
+		t.Fatalf("busy port not reported: %v", err)
+	}
+	after, _ := os.ReadFile(filepath.Join(dir, "keep.conf"))
+	if string(before) != string(after) || h.did("restart keep") {
+		t.Fatalf("the tunnel was touched: restart=%v", h.did("restart keep"))
+	}
+
+	// Keeping the port it already has is fine even though "something" holds it:
+	// that something is this tunnel.
+	same := goodPairing("keep")
+	same.InboundPort = "9090"
+	if err := updatePairingData(same, dir, nil); err != nil {
+		t.Fatalf("changing only the service port failed because the tunnel's own port looked busy: %v", err)
+	}
+}
+
+func TestUpdatePutsTheOldSettingsBackIfItWillNotRun(t *testing.T) {
+	h := &recordingHost{activeAfter: true}
+	dir := deployed(t, h, "undo")
+	before, _ := os.ReadFile(filepath.Join(dir, "undo.conf"))
+	h.calls = nil
+	h.activeAfter = false // the changed tunnel does not stay up
+
+	p := goodPairing("undo")
+	p.TunnelPort = "9443"
+	err := updatePairingData(p, dir, nil)
+	if err == nil || !strings.Contains(err.Error(), "put back") {
+		t.Fatalf("expected the old settings to be restored: %v", err)
+	}
+	after, _ := os.ReadFile(filepath.Join(dir, "undo.conf"))
+	if string(before) != string(after) {
+		t.Fatalf("the old settings were not restored")
+	}
+	restarts := 0
+	for _, c := range h.calls {
+		if c == "restart undo" {
+			restarts++
+		}
+	}
+	if restarts < 2 {
+		t.Fatalf("the tunnel was not started again on the old settings: %v", h.calls)
+	}
+}
+
+// The whole path the menu uses: deploy through the agent, change the ports
+// through the agent, and have a busy port come back as a readable refusal with
+// the tunnel left as it was.
+func TestAgentUpdatesPortsAndReportsABusyOne(t *testing.T) {
+	h := &recordingHost{activeAfter: true}
+	withHost(t, h)
+	dir := t.TempDir()
+
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Skip("cannot listen")
+	}
+	addr := l.Addr().String()
+	_ = l.Close()
+	go func() {
+		_ = runAgentServer(addr, "tok", filepath.Join(dir, "a.crt"), filepath.Join(dir, "a.key"), dir)
+	}()
+	var fp string
+	for i := 0; i < 30; i++ {
+		time.Sleep(100 * time.Millisecond)
+		if fp, err = fetchAgentFingerprint("https://" + addr); err == nil {
+			break
+		}
+	}
+	if err != nil {
+		t.Fatalf("agent never came up: %v", err)
+	}
+	trust := agentTrust{Fingerprint: fp}
+	url := "https://" + addr
+
+	codeFor := func(link, service string) string {
+		return encodeCode("v=6\nname=viaagent\nmode=direct\ntunnel_port=" + link + "\nrelay_ip=1.1.1.1\nserver_ip=2.2.2.2\n" +
+			"inbound_port=" + service + "\npool=10\ntransport=plain\nmux=off\nsecret=0123456789abcdef0123456789abcdef\n")
+	}
+
+	if err := agentClientJoin(url, "tok", codeFor("8443", "8080"), trust); err != nil {
+		t.Fatal(err)
+	}
+	if err := agentClientUpdate(url, "tok", codeFor("9443", "9090"), trust); err != nil {
+		t.Fatalf("changing the ports through the agent failed: %v", err)
+	}
+	cfg, err := LoadConfig(filepath.Join(dir, "viaagent.conf"))
+	if err != nil || cfg.TunnelAddr != "0.0.0.0:9443" || cfg.InboundAddr != "127.0.0.1:9090" {
+		t.Fatalf("ports not changed: %v %+v", err, cfg)
+	}
+
+	before, _ := os.ReadFile(filepath.Join(dir, "viaagent.conf"))
+	h.portErr = errors.New("in use")
+	err = agentClientUpdate(url, "tok", codeFor("7777", "9090"), trust)
+	if err == nil || !strings.Contains(err.Error(), "7777") || !strings.Contains(err.Error(), "Change them") {
+		t.Fatalf("a busy port did not come back as a readable refusal: %v", err)
+	}
+	after, _ := os.ReadFile(filepath.Join(dir, "viaagent.conf"))
+	if string(before) != string(after) {
+		t.Fatalf("the tunnel changed even though the port was refused")
 	}
 }

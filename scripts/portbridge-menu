@@ -1284,21 +1284,34 @@ create_tunnel() {
 
     local auto_ok=0
     if [ -n "$agent_url" ] && [ -n "$agent_token" ]; then
+        # Recorded first, so a retry after a refusal knows which server to ask.
+        [ -n "$target_agent" ] && write_conf "$name" foreign_agent "$target_agent"
         info "Deploying tunnel '$name' on Foreign server '$target_agent' ($agent_url)..."
-        local code
+        local code out
         code=$(get_tunnel_pairing_code "$name")
-        if run_agent_join "$target_agent" "$agent_url" "$agent_token" "$code"; then
+        if out=$(run_agent_join "$target_agent" "$agent_url" "$agent_token" "$code" 2>&1); then
+            printf '%s\n' "$out" | sed 's/^/  /' >&2
             say ""
             ok "============================================================"
             ok "SUCCESS: Tunnel '$name' deployed automatically to '$target_agent'!"
             ok "Both servers are now running and linked."
             ok "============================================================"
-            [ -n "$target_agent" ] && write_conf "$name" foreign_agent "$target_agent"
             auto_ok=1
         else
             say ""
-            warn "Could not automatically deploy to Foreign server via Agent."
-            warn "Falling back to manual pairing code:"
+            err "The foreign server could not set this tunnel up:"
+            printf '%s\n' "$out" | sed 's/^/    /' >&2
+            say ""
+            info "If a port is busy there, you can change the ports now and try again."
+            info "Nothing was left behind on the foreign server."
+            if confirm "Change the ports and try again?"; then
+                if edit_tunnel_ports "$name" join; then
+                    auto_ok=1
+                fi
+            fi
+            if [ "$auto_ok" -eq 0 ]; then
+                warn "Not deployed automatically. Falling back to the manual pairing code:"
+            fi
         fi
     fi
 
@@ -1401,7 +1414,54 @@ join_tunnel() {
         return 1
     fi
     if [ -f "$(conf_of "$name")" ]; then
-        err "A tunnel called '$name' already exists here. Delete it first to replace it."
+        # The same tunnel, with the same password, is a request to change its
+        # ports. Any other tunnel of that name is left alone.
+        if [ "$(cat "$(secret_of "$name")" 2>/dev/null)" != "$secret" ]; then
+            err "A tunnel called '$name' already exists here, with a different password."
+            err "Delete it first to replace it."
+            return 1
+        fi
+        hr
+        say "${B}'$name' already exists here. This code changes it to:${R}"
+        say "  link port          $tport"
+        say "  service port(s)    $inport"
+        hr
+        confirm "Change it?" || { say "Cancelled. Nothing was changed."; return 1; }
+        if printf '%s' "$code" | tr -d '[:space:]' | "$BIN" join -update -code-file -; then
+            ok "Done. '$name' is running on the new ports."
+            return 0
+        fi
+        err "It was not changed. The tunnel is still running on its old settings."
+        return 1
+    fi
+
+    # Both ports are checked before anything is written. A service port is meant
+    # to be in use, by the service; what it must not be is the private link port,
+    # or a port one of this server's other tunnels already uses.
+    local p0 owner0 bad0=0
+    if [ "$mode" = direct ]; then
+        owner0=$(port_owner "$tport" || true)
+        if [ -n "$owner0" ]; then
+            err "Port $tport (between the servers) is already used by tunnel '$owner0' here."
+            bad0=1
+        fi
+    fi
+    while IFS= read -r p0; do
+        p0=$(printf '%s' "$p0" | tr -d '[:space:]')
+        [ -n "$p0" ] || continue
+        if [ "$mode" = direct ] && [ "$p0" = "$tport" ]; then
+            err "The service port and the port between the servers are both $p0; they must differ."
+            bad0=1
+        fi
+        owner0=$(port_owner "$p0" || true)
+        if [ -n "$owner0" ]; then
+            err "Service port $p0 is used by the link of tunnel '$owner0' here."
+            bad0=1
+        fi
+    done < <(printf '%s\n' "$inport" | tr ',' '\n')
+    if [ "$bad0" -eq 1 ]; then
+        err "Nothing was set up. On the Iran server choose Edit a tunnel, then Change ports,"
+        err "and paste the new code here."
         return 1
     fi
 
@@ -1441,7 +1501,8 @@ join_tunnel() {
         [ "$DG_TRANSPORT" = kcp ] && link_proto=udp
         if port_in_use_by_system "$tport" "$link_proto" || port_owner "$tport" >/dev/null; then
             err "Port $tport is already in use on this server, so the Iran server could"
-            err "not connect to it. Create the tunnel again there with another port."
+            err "not connect to it. On the Iran server choose Edit a tunnel, then Change ports,"
+            err "pick a free link port, and paste the new code here."
             return 1
         fi
         taddr="0.0.0.0:$tport"
@@ -1632,7 +1693,274 @@ show_details() {
     hr
 }
 
+# -------------------------------------------------------------- changing ports
+
+# agent_for_tunnel <name> - the saved agent that manages this tunnel's foreign
+# server, if there is one. Only an agent recorded for the tunnel, or one whose
+# address is exactly the tunnel's other server, is ever used.
+agent_for_tunnel() {
+    local name=$1 a
+    init_agents_dir
+    a=$(read_conf "$name" foreign_agent 2>/dev/null || true)
+    if [ -z "$a" ] || [ ! -f "$(agent_conf_of "$a")" ]; then
+        a=$(find_agent_by_target "$(read_conf "$name" peer_ip 2>/dev/null || true)" 2>/dev/null || true)
+    fi
+    if [ -n "$a" ] && [ -f "$(agent_conf_of "$a")" ]; then
+        printf '%s' "$a"
+        return 0
+    fi
+    return 1
+}
+
+# push_tunnel_to_foreign <name> <join|update>
+#
+# Hands the tunnel's current settings to the foreign server's agent: "join" makes
+# the foreign half, "update" changes one that exists. The foreign server checks
+# that both of its ports are usable before it changes anything, and says why not.
+# Returns 0 done, 1 refused (reason shown), 2 no agent is linked for it.
+push_tunnel_to_foreign() {
+    local name=$1 how=$2 alias code out
+    alias=$(agent_for_tunnel "$name") || return 2
+    code=$(get_tunnel_pairing_code "$name") || return 2
+    if [ "$how" = update ]; then
+        info "Asking the foreign server ($alias) to change its half..."
+        if out=$(printf '%s' "$code" | agent_call_alias "$alias" -update -code-file - 2>&1); then
+            printf '%s\n' "$out" | sed 's/^/  /' >&2
+            return 0
+        fi
+    else
+        info "Asking the foreign server ($alias) to set up its half..."
+        if out=$(printf '%s' "$code" | agent_call_alias "$alias" -code-file - 2>&1); then
+            printf '%s\n' "$out" | sed 's/^/  /' >&2
+            return 0
+        fi
+    fi
+    err "The foreign server did not accept it:"
+    printf '%s\n' "$out" | sed 's/^/    /' >&2
+    return 1
+}
+
+# bare_ports <list> - "0.0.0.0:443, 0.0.0.0:8443" becomes "443, 8443"
+bare_ports() {
+    local out="" item
+    while IFS= read -r item; do
+        item=$(printf '%s' "$item" | tr -d '[:space:]')
+        [ -n "$item" ] || continue
+        if [ -n "$out" ]; then out="$out, ${item##*:}"; else out="${item##*:}"; fi
+    done < <(printf '%s\n' "$1" | tr ',' '\n')
+    printf '%s' "$out"
+}
+
+count_ports() { printf '%s' "$1" | awk -F',' '{print NF}'; }
+
+# ask_port_list <prompt> <default> <tunnel> <local|remote> - one or more ports.
+# For ports on this machine, one that is already taken by something else is
+# flagged; ports the tunnel already has are its own and are not.
+ask_port_list() {
+    local prompt=$1 def=$2 name=$3 where=$4 reply item owner clean bad old_ifs
+    while :; do
+        reply=$(ask "$prompt" "$def")
+        if ! valid_ports_list "$reply"; then
+            err "  Each port must be a number from 1 to 65535 (e.g. 443, 8443, 2083)."
+            continue
+        fi
+        clean="" bad=0 old_ifs=$IFS
+        IFS=','
+        for item in $reply; do
+            item=$(printf '%s' "$item" | tr -d '[:space:]')
+            if [ "$where" = local ]; then
+                owner=$(port_owner "$item" || true)
+                if [ -n "$owner" ] && [ "$owner" != "$name" ]; then
+                    err "  Port $item is already used by tunnel '$owner'."
+                    bad=1
+                    break
+                fi
+                case ", $def, " in
+                    *", $item, "*) : ;;
+                    *)
+                        if port_in_use_by_system "$item"; then
+                            warn "  Something is already listening on port $item."
+                            confirm "  Use it anyway?" || { bad=1; break; }
+                        fi
+                        ;;
+                esac
+            fi
+            if [ -n "$clean" ]; then clean="$clean, $item"; else clean="$item"; fi
+        done
+        IFS=$old_ifs
+        [ "$bad" -eq 0 ] || continue
+        printf '%s' "$clean"
+        return 0
+    done
+}
+
+# edit_tunnel_ports <name> [join]
+#
+# Changes the three kinds of port a tunnel has, from the Iran server: the ports
+# users connect to, the service ports on the foreign server they lead to, and the
+# port the two servers use between themselves. The foreign server is changed to
+# match, and it checks the ports first. If it refuses, nothing is changed on
+# either server and the ports can be edited again. "join" is the same for a
+# tunnel the foreign server does not have yet.
+edit_tunnel_ports() {
+    local name=$1 how=${2:-update}
+    local role mode taddr host_part transport alt backup proto
+    local cur_users cur_in cur_link new_users new_in new_link rc=0 n_users n_in
+
+    role=$(read_conf "$name" role)
+    if [ "$role" != edge ]; then
+        info "Ports are changed from the Iran server, which then updates this one."
+        info "Open this menu on the Iran server and choose Edit a tunnel."
+        return 1
+    fi
+
+    mode=$(read_conf "$name" mode)
+    transport=$(read_conf "$name" transport); [ -n "$transport" ] || transport=plain
+    alt=$(read_conf "$name" alt_target)
+    proto=tcp
+    [ "$transport" = kcp ] && proto=udp
+
+    backup=$(mktemp)
+    cp "$(conf_of "$name")" "$backup"
+
+    while :; do
+        cur_users=$(bare_ports "$(read_conf "$name" user_listen)")
+        cur_in=$(read_conf "$name" server_inbound_port | sed -E 's/[[:space:]]+//g; s/,/, /g')
+        taddr=$(read_conf "$name" tunnel_addr)
+        cur_link=${taddr##*:}
+        host_part=${taddr%:*}
+
+        hr
+        say "${B}Change the ports of '$name'${R}"
+        say "${DIM}Press Enter to keep a value. The foreign server is updated to match, and it${R}"
+        say "${DIM}checks that its ports are free before anything is changed.${R}"
+        hr
+        say "  ${B}Users' ports${R}        where your users connect, on this Iran server"
+        say "  ${B}Service ports${R}       where the service listens on the foreign server; each"
+        say "                       user port leads to the service port in the same position"
+        say "  ${B}Link port${R}           the private port the two servers use between themselves"
+        say ""
+
+        new_users=$(ask_port_list "Users' port(s)" "$cur_users" "$name" local)
+        new_in=$(ask_port_list "Service port(s) on the foreign server" "${cur_in:-$cur_users}" "$name" remote)
+        n_users=$(count_ports "$new_users")
+        n_in=$(count_ports "$new_in")
+        if [ "$n_users" != "$n_in" ]; then
+            err "  You gave $n_users user port(s) and $n_in service port(s). Each user port leads to"
+            err "  one service port, in order, so there must be the same number of each."
+            continue
+        fi
+
+        while :; do
+            if [ "$mode" = reverse ]; then
+                new_link=$(ask_port "Link port (opened on this Iran server)" "$cur_link" "$name" link "$proto")
+            else
+                new_link=$(ask_remote_port "Link port (opened on the foreign server)" "$cur_link" link)
+            fi
+            if cdn_involved "$(read_conf "$name" cdn)" "$alt" && ! cdn_port_ok "$new_link"; then
+                explain_cdn_ports "$new_link"
+                continue
+            fi
+            if printf ', %s, ' "$new_users" | grep -q ", $new_link, " && [ "$mode" = reverse ]; then
+                err "  The link port cannot also be one of your users' ports."
+                continue
+            fi
+            if printf ', %s, ' "$new_in" | grep -q ", $new_link, " && [ "$mode" = direct ]; then
+                err "  The link port cannot also be a service port on the foreign server."
+                continue
+            fi
+            break
+        done
+
+        if [ "$new_users" = "$cur_users" ] && [ "$new_in" = "$cur_in" ] && [ "$new_link" = "$cur_link" ] &&
+            [ "$how" = update ]; then
+            rm -f "$backup"
+            say "Nothing changed."
+            return 0
+        fi
+
+        say ""
+        say "  users connect to     $new_users"
+        say "  service ports        $new_in"
+        say "  link port            $new_link"
+        confirm "Apply this?" || { rm -f "$backup"; say "Cancelled. Nothing was changed."; return 1; }
+
+        write_conf "$name" user_listen "$new_users"
+        write_conf "$name" server_inbound_port "$new_in"
+        write_conf "$name" tunnel_addr "$host_part:$new_link"
+        [ -n "$alt" ] && write_conf "$name" alt_target "${alt%:*}:$new_link"
+
+        if ! "$BIN" check -config "$(conf_of "$name")" >/dev/null 2>&1; then
+            "$BIN" check -config "$(conf_of "$name")" >&2
+            err "Those ports were refused here, so nothing has been changed."
+            cp "$backup" "$(conf_of "$name")"
+            confirm "Try other ports?" && continue
+            rm -f "$backup"
+            return 1
+        fi
+
+        push_tunnel_to_foreign "$name" "$how"
+        rc=$?
+        if [ "$rc" -eq 1 ]; then
+            cp "$backup" "$(conf_of "$name")"
+            err "Nothing was changed on either server."
+            if confirm "Choose different ports?"; then
+                continue
+            fi
+            rm -f "$backup"
+            return 1
+        fi
+        break
+    done
+    rm -f "$backup"
+
+    if true; then
+        "$FIREWALL" apply "$name" >/dev/null 2>&1
+        systemctl restart "$(unit_of "$name")"
+        sleep 2
+        if [ "$(systemctl is-active "$(unit_of "$name")")" = active ]; then
+            ok "Ports changed. This server is running on them."
+        else
+            err "This half did not come back up. Recent log:"
+            journalctl -u "$(unit_of "$name")" -n 20 --no-pager
+            return 1
+        fi
+    fi
+
+    if [ "$rc" -eq 2 ]; then
+        say ""
+        warn "No linked foreign server is recorded for this tunnel, so it was not changed there."
+        say "On the foreign server, choose 'Join a tunnel' and paste this code. Because the"
+        say "tunnel already exists there, it offers to change its ports."
+        say ""
+        get_tunnel_pairing_code "$name"
+        say ""
+    fi
+    return 0
+}
+
 edit_tunnel() {
+    local name=$1 role
+    role=$(read_conf "$name" role)
+    hr
+    say "${B}Edit '$name'${R}"
+    hr
+    if [ "$role" = edge ]; then
+        say "  ${B}1${R}) Change ports ${DIM}(users, service and link ports; the foreign server follows)${R}"
+        say "  ${B}2${R}) Change other settings ${DIM}(limits, timing, the other server's IP)${R}"
+    else
+        say "  ${B}1${R}) Change ports ${DIM}(done from the Iran server)${R}"
+        say "  ${B}2${R}) Change other settings ${DIM}(limits, timing, your service address)${R}"
+    fi
+    say "  ${B}0${R}) Back"
+    hr
+    case "$(ask "Choose" "1")" in
+        1) edit_tunnel_ports "$name" ;;
+        2) edit_tunnel_settings "$name" ;;
+        *) return 0 ;;
+    esac
+}
+edit_tunnel_settings() {
     local name=$1 cur new changed=0 backup
     hr
     say "${B}Edit '$name'${R}"
@@ -1723,36 +2051,11 @@ edit_tunnel() {
         changed=1
     fi
 
-    local role uport cur_u
+    local role cur_u
     role=$(read_conf "$name" role)
-    if [ "$role" = edge ]; then
-        cur_u=$(read_conf "$name" user_listen)
-        say "${DIM}Ports users connect to. Several are separated by commas, and each leads to${R}"
-        say "${DIM}the inbound port in the same position.${R}"
-        new=$(ask "Port(s) for users" "$cur_u")
-        if [ "$new" != "$cur_u" ]; then
-            # Each entry is a port or an address and port. The whole list is
-            # kept: only the last port used to be shown and the rest were lost.
-            local item clean="" bad=0 old_ifs=$IFS
-            IFS=','
-            for item in $new; do
-                item=$(printf '%s' "$item" | tr -d '[:space:]')
-                if valid_port "$item"; then
-                    item="0.0.0.0:$item"
-                elif ! { valid_host "${item%:*}" && valid_port "${item##*:}"; }; then
-                    bad=1
-                    break
-                fi
-                [ -n "$clean" ] && clean="$clean, $item" || clean="$item"
-            done
-            IFS=$old_ifs
-            if [ "$bad" -eq 0 ] && [ -n "$clean" ]; then
-                write_conf "$name" user_listen "$clean"; changed=1
-            else
-                err "  Not a valid list of ports; leaving it as it was."
-            fi
-        fi
-    else
+    if [ "$role" != edge ]; then
+        say "${DIM}The service address is where this server sends your users' traffic. The ports${R}"
+        say "${DIM}it leads from are changed on the Iran server (Edit, Change ports).${R}"
         cur_u=$(read_conf "$name" inbound_addr)
         new=$(ask "Your inbound on this server" "$cur_u")
         [ "$new" != "$cur_u" ] && { write_conf "$name" inbound_addr "$new"; changed=1; }

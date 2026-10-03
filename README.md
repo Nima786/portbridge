@@ -204,6 +204,29 @@ expensive thing either server does. Sharing pays it once and then stops paying.
 For large steady transfers it is the other way round, and one connection per user
 is cheaper. On a plain link with no disguise the two are about even.
 
+## Changing a tunnel's ports
+
+Menu option 7 (Edit a tunnel), then **Change ports**, on the Iran server. Three
+kinds of port can be changed, together or one at a time:
+
+- the ports your users connect to (on the Iran server),
+- the service ports they lead to on the foreign server, in the same order, and
+- the private link port the two servers use between themselves.
+
+The foreign server is changed to match. When it is linked by the agent this is
+automatic: the foreign server checks its ports **before changing anything**, and
+if a port is busy, or belongs to another tunnel's link, or the service port equals
+the link port, it refuses with every problem listed. Nothing is changed on either
+server, and you are asked to choose other ports. If the new settings will not run,
+the old ones are put back and started again. When the foreign server is not
+linked, the menu shows a code to paste there with "Join a tunnel", which offers to
+change the existing tunnel's ports (it has to be the same tunnel: the password in
+the code must match).
+
+The same checks run when a tunnel is first set up on the foreign server, whether
+by the agent or by pasting a code. A service port that nothing is answering on yet
+is reported as a note, not an error, since the service may simply not be started.
+
 ## When connections open but nothing gets through
 
 The hardest failure to spot is not a tunnel that is down. It is a route that lets
