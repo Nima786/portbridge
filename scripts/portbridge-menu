@@ -2233,6 +2233,13 @@ enable_agent() {
     say "${DIM}Allows your Iran server(s) to deploy and manage tunnels remotely.${R}"
     hr
 
+    # An agent that is already running holds its own port, which made that port
+    # look taken and sent the setup off to pick a different one every time. It is
+    # stopped first (and started again below), so its own port counts as free.
+    if [ "$(systemctl is-active "$AGENT_UNIT" 2>/dev/null)" = active ]; then
+        systemctl stop "$AGENT_UNIT" >/dev/null 2>&1
+    fi
+
     local cur_listen cur_port def_port
     cur_listen=$(read_file_key "$AGENT_CONF" listen 2>/dev/null || true)
     cur_port=${cur_listen##*:}
@@ -2272,11 +2279,23 @@ enable_agent() {
     chmod 600 "$AGENT_CONF"
 
     systemctl daemon-reload
-    systemctl enable --now "$AGENT_UNIT" >/dev/null 2>&1 || {
+    systemctl enable "$AGENT_UNIT" >/dev/null 2>&1 || {
+        err "Could not enable $AGENT_UNIT. Check systemctl status $AGENT_UNIT."
+        return 1
+    }
+    # Restarted, not just started. "enable --now" leaves an agent that is already
+    # running alone, so it kept listening on its old port while the link string
+    # printed below named the new one, and nothing could connect.
+    systemctl restart "$AGENT_UNIT" >/dev/null 2>&1 || {
         err "Could not start $AGENT_UNIT. Check systemctl status $AGENT_UNIT."
         return 1
     }
-    sleep 1
+    sleep 2
+    if [ "$(systemctl is-active "$AGENT_UNIT" 2>/dev/null)" = active ] && ! port_in_use_by_system "$p"; then
+        err "The agent is running but is not listening on port $p."
+        journalctl -u "$AGENT_UNIT" -n 10 --no-pager
+        return 1
+    fi
     if [ "$(systemctl is-active "$AGENT_UNIT" 2>/dev/null)" = active ]; then
         local my_ip afp
         my_ip=$(public_ip)
@@ -2315,6 +2334,24 @@ show_agent_link() {
     my_ip=$(public_ip)
     st=$(systemctl is-active "$AGENT_UNIT" 2>/dev/null || echo "inactive")
     afp=$(agent_fingerprint)
+
+    # The link string names the port in the settings file. If the agent was
+    # started before that was changed it is still on the old port, and a link
+    # that names the new one can never connect. Say so, and offer the fix.
+    if [ "$st" = active ] && [ -n "$p" ] && ! port_in_use_by_system "$p"; then
+        warn "  The agent is running but is NOT listening on port $p (the port in its settings)."
+        warn "  It was probably started before the port was changed."
+        if confirm "  Restart the agent now so it uses port $p?"; then
+            systemctl restart "$AGENT_UNIT"
+            sleep 2
+            if port_in_use_by_system "$p"; then
+                ok "  Restarted. It is now listening on port $p."
+            else
+                err "  Still not listening on port $p. Recent log:"
+                journalctl -u "$AGENT_UNIT" -n 10 --no-pager
+            fi
+        fi
+    fi
 
     say "  Status:         $st"
     say "  Listen address: ${listen:-0.0.0.0:2083}"
@@ -2551,6 +2588,10 @@ link_foreign_agent() {
     else
         say ""
         warn "Could not verify connection to $url with the provided token."
+        warn "If it says 'connection refused', nothing is listening on that port on the"
+        warn "foreign server. On that server, open the agent menu, choose 'Show the link"
+        warn "string' and let it restart the agent if it offers to. If it says 'timed out',"
+        warn "the port is blocked by that server's firewall or its hosting company's."
         if confirm "Save this configuration anyway?"; then
             local f
             f=$(agent_conf_of "$alias")
