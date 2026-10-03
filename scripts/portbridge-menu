@@ -2234,6 +2234,7 @@ list_foreign_agents() {
     hr
 }
 
+# shellcheck disable=SC2120
 link_foreign_agent() {
     init_agents_dir
     local default_ip=${1-}

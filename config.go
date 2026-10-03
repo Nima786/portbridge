@@ -246,10 +246,10 @@ func defaultConfig() *Config {
 		Transport: TransportPlain,
 		// Off for the same reason, and because sharing connections costs speed
 		// on a lossy route. It is a choice, not an improvement.
-		Mux:             false,
-		MuxLinks:        4,
-		KCPDataShards:   10,
-		KCPParityShards: 3,
+		Mux:              false,
+		MuxLinks:         4,
+		KCPDataShards:    10,
+		KCPParityShards:  3,
 		TLSFragment:      false,
 		TLSFragmentSize:  40,
 		TLSFragmentSleep: 3 * time.Millisecond,
