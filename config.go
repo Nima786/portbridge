@@ -62,6 +62,9 @@ type Config struct {
 	// ServerInboundPort is kept on the edge for multi-port target mapping.
 	ServerInboundPort string
 
+	// ForeignAgent is the alias of the linked foreign agent, kept for management.
+	ForeignAgent string
+
 	// Parsed addresses and mappings for multi-port operation.
 	UserListens   []string
 	InboundAddrs  []string
@@ -378,6 +381,8 @@ func (c *Config) set(key, val string) error {
 		return num(&c.MuxLinks)
 	case "server_inbound_port":
 		c.ServerInboundPort = val
+	case "foreign_agent":
+		c.ForeignAgent = val
 	case "firewall":
 		// Read by the firewall helper, not by the engine. Accepted here so the
 		// engine does not refuse a config that contains it.
