@@ -10,6 +10,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	utls "github.com/refraction-networking/utls"
 )
 
 // Mode decides which side opens the cross-border connection.
@@ -142,12 +144,25 @@ type Config struct {
 
 	secret []byte
 
+	// TLS stealth & evasion settings
+	TLSFragment      bool
+	TLSFragmentSize  int
+	TLSFragmentSleep time.Duration
+	UTLS             bool
+	UTLSProfile      string
+	CleanIPs         []string
+
+	fragmentSet bool
+	utlsSet     bool
+
 	// Disguise settings prepared once at startup and only read afterwards. They
 	// are what makes a repeat connection cheap; see prepareTLS in transport.go
 	// for why building them per connection was costing more than everything else
 	// put together.
-	tlsServer  *tls.Config
-	tlsClients map[string]*tls.Config
+	tlsServer   *tls.Config
+	tlsClients  map[string]*tls.Config
+	utlsClients map[string]*utls.Config
+	utlsCache   utls.ClientSessionCache
 }
 
 // effectiveServerName falls back to the peer address when no name was given, so
@@ -232,6 +247,11 @@ func defaultConfig() *Config {
 		MuxLinks:        4,
 		KCPDataShards:   10,
 		KCPParityShards: 3,
+		TLSFragment:      false,
+		TLSFragmentSize:  40,
+		TLSFragmentSleep: 3 * time.Millisecond,
+		UTLS:             false,
+		UTLSProfile:      "chrome",
 	}
 }
 
@@ -387,6 +407,43 @@ func (c *Config) set(key, val string) error {
 		return num(&c.KCPParityShards)
 	case "drain":
 		return dur(&c.Drain)
+	case "tls_fragment", "fragment":
+		c.fragmentSet = true
+		switch strings.ToLower(val) {
+		case "on", "yes", "true":
+			c.TLSFragment = true
+		case "off", "no", "false":
+			c.TLSFragment = false
+		default:
+			return fmt.Errorf("tls_fragment must be on or off, got %q", val)
+		}
+	case "tls_fragment_size", "fragment_size":
+		c.fragmentSet = true
+		return num(&c.TLSFragmentSize)
+	case "tls_fragment_sleep", "fragment_sleep":
+		c.fragmentSet = true
+		return dur(&c.TLSFragmentSleep)
+	case "utls":
+		c.utlsSet = true
+		switch strings.ToLower(val) {
+		case "on", "yes", "true":
+			c.UTLS = true
+		case "off", "no", "false":
+			c.UTLS = false
+		default:
+			return fmt.Errorf("utls must be on or off, got %q", val)
+		}
+	case "utls_profile":
+		c.utlsSet = true
+		c.UTLSProfile = strings.ToLower(val)
+	case "clean_ips", "clean_ip":
+		parts := strings.Split(val, ",")
+		for _, p := range parts {
+			p = strings.TrimSpace(p)
+			if p != "" {
+				c.CleanIPs = append(c.CleanIPs, p)
+			}
+		}
 	default:
 		return fmt.Errorf("unknown setting %q", key)
 	}
@@ -396,6 +453,24 @@ func (c *Config) set(key, val string) error {
 // Validate catches the mistakes that would otherwise show up as a tunnel that
 // silently does nothing.
 func (c *Config) Validate() error {
+	if c.CDN {
+		if !c.utlsSet {
+			c.UTLS = true
+		}
+		if !c.fragmentSet {
+			c.TLSFragment = true
+		}
+	}
+	if c.TLSFragmentSize <= 0 {
+		c.TLSFragmentSize = 40
+	}
+	if c.TLSFragmentSleep <= 0 {
+		c.TLSFragmentSleep = 3 * time.Millisecond
+	}
+	if c.UTLSProfile == "" {
+		c.UTLSProfile = "chrome"
+	}
+
 	if c.Name == "" {
 		return fmt.Errorf("name is required")
 	}

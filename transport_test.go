@@ -15,6 +15,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	utls "github.com/refraction-networking/utls"
 )
 
 // certPaths gives a tunnel somewhere to keep its generated certificate.
@@ -718,12 +720,17 @@ func TestDisguisedLinkResumesInsteadOfRenegotiating(t *testing.T) {
 				if h2, ok := c.(*h2Conn); ok {
 					under = h2.Conn
 				}
-				tc, ok := under.(*tls.Conn)
-				if !ok {
+				var didResume bool
+				if tc, ok := under.(*tls.Conn); ok {
+					st := tc.ConnectionState()
+					didResume = st.DidResume
+				} else if uc, ok := under.(*utls.UConn); ok {
+					st := uc.ConnectionState()
+					didResume = st.DidResume
+				} else {
 					t.Fatalf("connection %d is not a secured connection: %T", i, under)
 				}
-				st := tc.ConnectionState()
-				if st.DidResume {
+				if didResume {
 					resumed++
 				}
 				_ = c.Close()
@@ -734,5 +741,141 @@ func TestDisguisedLinkResumesInsteadOfRenegotiating(t *testing.T) {
 				t.Fatalf("none of %d repeat connections resumed, so every user pays for a full negotiation", attempts)
 			}
 		})
+	}
+}
+
+func TestFragmentConn(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+
+	done := make(chan []byte, 1)
+	go func() {
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		buf := make([]byte, 100)
+		n, _ := io.ReadAtLeast(conn, buf, 100)
+		done <- buf[:n]
+	}()
+
+	client, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	fc := newFragmentConn(client, 40, 5*time.Millisecond)
+
+	// Simulate a TLS ClientHello write (starts with 0x16 0x03)
+	payload := make([]byte, 100)
+	payload[0] = 0x16
+	payload[1] = 0x03
+	payload[2] = 0x01
+	for i := 3; i < 100; i++ {
+		payload[i] = byte(i)
+	}
+
+	n, err := fc.Write(payload)
+	if err != nil {
+		t.Fatalf("write failed: %v", err)
+	}
+	if n != 100 {
+		t.Fatalf("expected 100 bytes written, got %d", n)
+	}
+
+	select {
+	case received := <-done:
+		if !bytes.Equal(received, payload) {
+			t.Fatalf("data mismatch after fragmentation")
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("timed out waiting for data")
+	}
+}
+
+func TestUTLSHandshakeWithFragmentation(t *testing.T) {
+	certFile, keyFile := certPaths(t)
+	cert, err := ensureCert(certFile, keyFile, "localhost")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+
+	serverTLS := &tls.Config{
+		Certificates: []tls.Certificate{cert},
+		NextProtos:   []string{"http/1.1"},
+	}
+
+	serverDone := make(chan error, 1)
+	go func() {
+		raw, err := ln.Accept()
+		if err != nil {
+			serverDone <- err
+			return
+		}
+		defer raw.Close()
+		ts := tls.Server(raw, serverTLS)
+		if err := ts.Handshake(); err != nil {
+			serverDone <- err
+			return
+		}
+		var b [4]byte
+		_, _ = io.ReadFull(ts, b[:])
+		_, _ = ts.Write([]byte("pong"))
+		serverDone <- nil
+	}()
+
+	raw, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer raw.Close()
+
+	// Wrap with fragmentConn
+	frag := newFragmentConn(raw, 40, 3*time.Millisecond)
+
+	uCfg := &utls.Config{
+		ServerName:         "localhost",
+		InsecureSkipVerify: true,
+	}
+
+	uc := utls.UClient(frag, uCfg, utls.HelloChrome_Auto)
+	if err := uc.BuildHandshakeState(); err == nil {
+		for _, ext := range uc.Extensions {
+			if alpn, ok := ext.(*utls.ALPNExtension); ok {
+				alpn.AlpnProtocols = []string{"http/1.1"}
+			}
+		}
+	}
+
+	if err := uc.Handshake(); err != nil {
+		t.Fatalf("uTLS handshake with fragmentation failed: %v", err)
+	}
+	defer uc.Close()
+
+	if _, err := uc.Write([]byte("ping")); err != nil {
+		t.Fatalf("failed to write ping: %v", err)
+	}
+
+	var reply [4]byte
+	if _, err := io.ReadFull(uc, reply[:]); err != nil {
+		t.Fatalf("failed to read pong: %v", err)
+	}
+	if string(reply[:]) != "pong" {
+		t.Fatalf("expected pong, got %s", string(reply[:]))
+	}
+
+	if err := <-serverDone; err != nil {
+		t.Fatalf("server error: %v", err)
 	}
 }

@@ -13,7 +13,11 @@ import (
 	"math/big"
 	"net"
 	"os"
+	"strings"
+	"sync"
 	"time"
+
+	utls "github.com/refraction-networking/utls"
 )
 
 // Transport decides what the link between the two servers looks like on the wire.
@@ -80,6 +84,71 @@ func alpnFor(t Transport) []string {
 	default:
 		return []string{"h2", "http/1.1"}
 	}
+}
+
+// ---------------------------------------------------------------------------
+// ClientHello Fragmentation
+// ---------------------------------------------------------------------------
+
+// fragmentConn wraps a raw net.Conn and fragments the very first Write()
+// if it contains a TLS ClientHello (0x16 0x03).
+//
+// By splitting the TLS ClientHello record across two TCP segments with a brief
+// micro-pause, DPI middleboxes doing shallow inspection see no SNI in the first
+// packet and raw un-headered data in the second packet, allowing the connection
+// to bypass censorship filters while being fully reassembled by the destination.
+type fragmentConn struct {
+	net.Conn
+	firstWrite   sync.Once
+	fragmentSize int
+	delay        time.Duration
+}
+
+func newFragmentConn(c net.Conn, size int, delay time.Duration) net.Conn {
+	if size <= 0 {
+		size = 40
+	}
+	if delay <= 0 {
+		delay = 3 * time.Millisecond
+	}
+	return &fragmentConn{
+		Conn:         c,
+		fragmentSize: size,
+		delay:        delay,
+	}
+}
+
+func (fc *fragmentConn) Write(b []byte) (int, error) {
+	var writeErr error
+	var totalWritten int
+
+	fc.firstWrite.Do(func() {
+		// Only fragment if this looks like a TLS handshake record (0x16 0x03)
+		// and has enough bytes to split meaningfully.
+		if len(b) > fc.fragmentSize && b[0] == 0x16 && b[1] == 0x03 {
+			split := fc.fragmentSize
+			n1, err := fc.Conn.Write(b[:split])
+			totalWritten += n1
+			if err != nil {
+				writeErr = err
+				return
+			}
+			if fc.delay > 0 {
+				time.Sleep(fc.delay)
+			}
+			n2, err := fc.Conn.Write(b[split:])
+			totalWritten += n2
+			if err != nil {
+				writeErr = err
+				return
+			}
+		}
+	})
+
+	if totalWritten > 0 || writeErr != nil {
+		return totalWritten, writeErr
+	}
+	return fc.Conn.Write(b)
 }
 
 // ---------------------------------------------------------------------------
@@ -204,6 +273,14 @@ func (c *Config) prepareTLS(cert *tls.Certificate) {
 	for _, name := range c.claimedNames() {
 		c.tlsClients[name] = newClientTLS(name, c.Transport, cache)
 	}
+
+	if c.UTLS || (c.CDN && !c.utlsSet) {
+		c.utlsCache = utls.NewLRUClientSessionCache(tlsResumeCache)
+		c.utlsClients = make(map[string]*utls.Config, 2)
+		for _, name := range c.claimedNames() {
+			c.utlsClients[name] = newClientUTLS(name, c.Transport, c.utlsCache)
+		}
+	}
 }
 
 // claimedNames is every hostname this side may present, which is the main one
@@ -240,6 +317,15 @@ func newClientTLS(name string, t Transport, cache tls.ClientSessionCache) *tls.C
 	}
 }
 
+func newClientUTLS(name string, t Transport, cache utls.ClientSessionCache) *utls.Config {
+	return &utls.Config{
+		ServerName:         name,
+		NextProtos:         alpnFor(t),
+		InsecureSkipVerify: true,
+		ClientSessionCache: cache,
+	}
+}
+
 // clientTLS returns the prepared settings for a name, building throwaway ones if
 // this configuration was never prepared. The fallback keeps the function total
 // for callers that build a Config by hand; it simply forgoes resumption.
@@ -248,6 +334,13 @@ func (c *Config) clientTLS(name string) *tls.Config {
 		return cfg
 	}
 	return newClientTLS(name, c.Transport, nil)
+}
+
+func (c *Config) clientUTLS(name string) *utls.Config {
+	if cfg, ok := c.utlsClients[name]; ok {
+		return cfg
+	}
+	return newClientUTLS(name, c.Transport, c.utlsCache)
 }
 
 // serverTLS returns the prepared settings for the accepting side.
@@ -277,7 +370,50 @@ func wrapDial(raw net.Conn, cfg *Config) (net.Conn, error) {
 		return raw, nil
 
 	case TransportTLS, TransportWSS, TransportH2, TransportGRPC:
-		tc := tls.Client(raw, cfg.clientTLS(cfg.effectiveClientName()))
+		connToWrap := raw
+		shouldFrag := cfg.TLSFragment || (cfg.CDN && !cfg.fragmentSet)
+		if shouldFrag {
+			size := cfg.TLSFragmentSize
+			if size <= 0 {
+				size = 40
+			}
+			sleep := cfg.TLSFragmentSleep
+			if sleep <= 0 {
+				sleep = 3 * time.Millisecond
+			}
+			connToWrap = newFragmentConn(raw, size, sleep)
+		}
+
+		shouldUTLS := cfg.UTLS || (cfg.CDN && !cfg.utlsSet)
+		if shouldUTLS {
+			uClient := utls.UClient(connToWrap, cfg.clientUTLS(cfg.effectiveClientName()), utls.HelloChrome_Auto)
+			if err := uClient.BuildHandshakeState(); err == nil {
+				for _, ext := range uClient.Extensions {
+					if alpn, ok := ext.(*utls.ALPNExtension); ok {
+						alpn.AlpnProtocols = alpnFor(cfg.Transport)
+					}
+				}
+			}
+			if err := raw.SetDeadline(time.Now().Add(tlsHandshakeTimeout)); err != nil {
+				return nil, err
+			}
+			if err := uClient.Handshake(); err != nil {
+				_ = raw.Close()
+				return nil, fmt.Errorf("securing the link with uTLS failed: %w", err)
+			}
+			if err := raw.SetDeadline(time.Time{}); err != nil {
+				return nil, err
+			}
+			if cfg.Transport == TransportTLS {
+				return uClient, nil
+			}
+			if cfg.Transport == TransportWSS {
+				return wsDial(uClient, cfg)
+			}
+			return h2Dial(uClient, cfg)
+		}
+
+		tc := tls.Client(connToWrap, cfg.clientTLS(cfg.effectiveClientName()))
 		if err := raw.SetDeadline(time.Now().Add(tlsHandshakeTimeout)); err != nil {
 			return nil, err
 		}
@@ -342,31 +478,54 @@ func wrapAccept(raw net.Conn, cfg *Config, cert *tls.Certificate, guard ...*repl
 
 // Describe is what the startup log says about the disguise, in plain terms.
 func describeTransport(cfg *Config) string {
+	base := ""
 	switch cfg.Transport {
 	case TransportTLS:
-		return fmt.Sprintf("disguised as an HTTPS site (%s)", cfg.effectiveServerName())
+		base = fmt.Sprintf("disguised as an HTTPS site (%s)", cfg.effectiveServerName())
 	case TransportWSS:
 		if cfg.CDN {
-			return fmt.Sprintf("disguised as a websocket over HTTPS (%s%s) and routed through a CDN, so this server's address never appears on it",
+			base = fmt.Sprintf("disguised as a websocket over HTTPS (%s%s) and routed through a CDN, so this server's address never appears on it",
+				cfg.effectiveServerName(), cfg.effectiveWSPath())
+		} else {
+			base = fmt.Sprintf("disguised as a websocket over HTTPS (%s%s)",
 				cfg.effectiveServerName(), cfg.effectiveWSPath())
 		}
-		return fmt.Sprintf("disguised as a websocket over HTTPS (%s%s)",
-			cfg.effectiveServerName(), cfg.effectiveWSPath())
 	case TransportH2:
 		if cfg.CDN {
-			return fmt.Sprintf("disguised as HTTP/2 (%s%s) and routed through a CDN, so this server's address never appears on it",
+			base = fmt.Sprintf("disguised as HTTP/2 (%s%s) and routed through a CDN, so this server's address never appears on it",
 				cfg.effectiveServerName(), cfg.effectiveWSPath())
+		} else {
+			base = fmt.Sprintf("disguised as HTTP/2 (%s)", cfg.effectiveServerName())
 		}
-		return fmt.Sprintf("disguised as HTTP/2 (%s)", cfg.effectiveServerName())
 	case TransportGRPC:
 		if cfg.CDN {
-			return fmt.Sprintf("disguised as gRPC over HTTP/2 (%s) and routed through a CDN, so this server's address never appears on it",
+			base = fmt.Sprintf("disguised as gRPC over HTTP/2 (%s) and routed through a CDN, so this server's address never appears on it",
 				cfg.effectiveServerName())
+		} else {
+			base = fmt.Sprintf("disguised as gRPC over HTTP/2 (%s)", cfg.effectiveServerName())
 		}
-		return fmt.Sprintf("disguised as gRPC over HTTP/2 (%s)", cfg.effectiveServerName())
 	case TransportKCP:
 		return fmt.Sprintf("loss-resistant KCP/UDP transport with FEC (%d/%d shards)", cfg.KCPDataShards, cfg.KCPParityShards)
 	default:
 		return "plain, no disguise"
 	}
+
+	if cfg.Dials() {
+		var stealth []string
+		shouldUTLS := cfg.UTLS || (cfg.CDN && !cfg.utlsSet)
+		shouldFrag := cfg.TLSFragment || (cfg.CDN && !cfg.fragmentSet)
+		if shouldUTLS {
+			stealth = append(stealth, "uTLS Chrome profile")
+		}
+		if shouldFrag {
+			stealth = append(stealth, "ClientHello fragmentation")
+		}
+		if len(cfg.CleanIPs) > 0 {
+			stealth = append(stealth, fmt.Sprintf("%d clean CF IPs", len(cfg.CleanIPs)))
+		}
+		if len(stealth) > 0 {
+			base += fmt.Sprintf(" [%s]", strings.Join(stealth, ", "))
+		}
+	}
+	return base
 }

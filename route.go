@@ -55,14 +55,55 @@ type router struct {
 }
 
 func newRouter(cfg *Config) *router {
-	targets := []route{{addr: cfg.dialTarget(), name: cfg.ServerName}}
-	if alt := cfg.AltTarget; alt != "" && alt != targets[0].addr {
+	var targets []route
+
+	port := "443"
+	if _, p, err := net.SplitHostPort(cfg.TunnelAddr); err == nil && p != "" {
+		port = p
+	}
+
+	// 1. Clean IPs (if configured) take top priority for dialing
+	if len(cfg.CleanIPs) > 0 {
+		for _, ip := range cfg.CleanIPs {
+			addr := ip
+			if _, _, err := net.SplitHostPort(ip); err != nil {
+				addr = net.JoinHostPort(ip, port)
+			}
+			targets = append(targets, route{addr: addr, name: cfg.effectiveServerName()})
+		}
+	}
+
+	// 2. Standard dialTarget
+	std := cfg.dialTarget()
+	alreadyPresent := false
+	for _, t := range targets {
+		if t.addr == std {
+			alreadyPresent = true
+			break
+		}
+	}
+	if !alreadyPresent {
+		targets = append(targets, route{addr: std, name: cfg.ServerName})
+	}
+
+	// 3. Fallback route (if configured)
+	if alt := cfg.AltTarget; alt != "" {
 		name := cfg.AltServerName
 		if name == "" {
 			name = cfg.ServerName
 		}
-		targets = append(targets, route{addr: alt, name: name})
+		alreadyAlt := false
+		for _, t := range targets {
+			if t.addr == alt {
+				alreadyAlt = true
+				break
+			}
+		}
+		if !alreadyAlt {
+			targets = append(targets, route{addr: alt, name: name})
+		}
 	}
+
 	return &router{cfg: cfg, targets: targets, log: newThrottled()}
 }
 

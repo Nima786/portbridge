@@ -462,6 +462,9 @@ ask_disguise() {
     DG_WSPATH=""
     DG_CDN=off
     DG_ALTHOST=""
+    DG_CLEAN_IPS=""
+    DG_UTLS=off
+    DG_FRAGMENT=off
 
     case "$choice" in
         1)
@@ -517,6 +520,13 @@ ask_disguise() {
                 warn "reverse this only works if the domain points at THIS Iran server."
             fi
         fi
+        if [ "$DG_CDN" = on ]; then
+            say ""
+            info "Clean Cloudflare IPs (optional): If Cloudflare default Anycast IPs are"
+            info "blocked or throttled by your ISP, enter one or more verified clean IPs"
+            info "(comma-separated, e.g. 104.16.12.34, 172.67.45.67). Leave blank to resolve via DNS."
+            DG_CLEAN_IPS=$(ask "Clean Cloudflare IPs" "")
+        fi
 
         say ""
         warn "Two things to set on the CDN, or the link will not come up:"
@@ -555,6 +565,11 @@ ask_disguise() {
                 warn "reverse this only works if the domain points at THIS Iran server."
             fi
             say ""
+            info "Clean Cloudflare IPs (optional): If Cloudflare default Anycast IPs are"
+            info "blocked or throttled by your ISP, enter one or more verified clean IPs"
+            info "(comma-separated, e.g. 104.16.12.34, 172.67.45.67). Leave blank to resolve via DNS."
+            DG_CLEAN_IPS=$(ask "Clean Cloudflare IPs" "")
+            say ""
             warn "Three things to set on Cloudflare for gRPC mode:"
             warn "  - Network -> gRPC must be turned ON."
             warn "  - SSL/TLS encryption mode must be Full."
@@ -566,6 +581,13 @@ ask_disguise() {
             info "Any believable name works (e.g. www.google.com, www.bing.com)."
             DG_SERVERNAME=$(ask "Name for it to claim" "www.google.com")
             [ -n "$DG_SERVERNAME" ] || DG_SERVERNAME=www.google.com
+            say ""
+            info "Stealth evasion: Use Chrome TLS fingerprint (uTLS) and ClientHello TCP"
+            info "fragmentation to bypass Iranian SNI DPI on direct connections."
+            if confirm "Enable stealth evasion (uTLS & fragmentation)?"; then
+                DG_UTLS=on
+                DG_FRAGMENT=on
+            fi
         fi
     else
         say ""
@@ -573,6 +595,13 @@ ask_disguise() {
         info "does not need to be a domain you own or one that really exists."
         DG_SERVERNAME=$(ask "Name for it to claim" "www.bing.com")
         [ -n "$DG_SERVERNAME" ] || DG_SERVERNAME=www.bing.com
+        say ""
+        info "Stealth evasion: Use Chrome TLS fingerprint (uTLS) and ClientHello TCP"
+        info "fragmentation to bypass Iranian SNI DPI on direct connections."
+        if confirm "Enable stealth evasion (uTLS & fragmentation)?"; then
+            DG_UTLS=on
+            DG_FRAGMENT=on
+        fi
     fi
 }
 
@@ -644,15 +673,15 @@ explain_sharing() {
     hr
     say "${B}Should all users share a few connections, or get one each?${R}"
     say ""
-    if [ "$transport" = kcp ]; then
-        say "  ${B}1) Share a few connections (Mux)${R} ${DIM}(recommended for KCP)${R}"
-        say "     ${DIM}Everyone rides on $MX_LINKS persistent KCP/UDP carriers. Eliminates${R}"
-        say "     ${DIM}per-connection handshakes (0-RTT), keeps UDP NAT alive, and maximizes${R}"
-        say "     ${DIM}Forward Error Correction (FEC) packet repair across connections.${R}"
+    if [ "$transport" = kcp ] || [ "$transport" = wss ] || [ "$transport" = grpc ]; then
+        say "  ${B}1) Share a few connections (Mux)${R} ${DIM}(recommended for $transport - stealthier & faster)${R}"
+        say "     ${DIM}Everyone rides on $MX_LINKS persistent carrier connections. Eliminates${R}"
+        say "     ${DIM}expensive TLS handshakes, avoids connection bursts to Cloudflare, and${R}"
+        say "     ${DIM}dramatically reduces detection signatures.${R}"
         say ""
         say "  ${B}2) One connection per user${R}"
-        say "     ${DIM}Each user opens their own separate KCP/UDP connection. Uses periodic${R}"
-        say "     ${DIM}keepalive probes to keep NAT alive. Isolated, but higher connection churn.${R}"
+        say "     ${DIM}Each user opens their own separate connection. Isolated, but higher${R}"
+        say "     ${DIM}connection churn and TLS handshake overhead.${R}"
     else
         say "  ${B}1) One connection per user${R} ${DIM}(recommended)${R}"
         say "     ${DIM}How it has always worked. Fastest on a poor route, because one${R}"
@@ -672,12 +701,13 @@ explain_sharing() {
 
 ask_sharing() {
     explain_sharing
-    if [ "${DG_TRANSPORT:-plain}" = kcp ]; then
+    local transport=${DG_TRANSPORT:-plain}
+    if [ "$transport" = kcp ] || [ "$transport" = wss ] || [ "$transport" = grpc ]; then
         case "$(choose "Choose 1 or 2" "1" 1 2)" in
             1)
                 MX_MUX=on
                 say ""
-                info "Four shared KCP carrier links is the standard recommended setting."
+                info "Four shared carrier links is the standard recommended setting for $transport."
                 while :; do
                     MX_LINKS=$(ask "How many shared connections" "4")
                     case "$MX_LINKS" in
@@ -846,6 +876,18 @@ write_tunnel() {
             printf '# The CDN routes by name, so this route has to name the domain,\n'
             printf '# while the direct route above deliberately does not.\n'
             printf 'alt_server_name = %s\n' "$DG_ALTHOST"
+        fi
+
+        if [ -n "${DG_CLEAN_IPS-}" ]; then
+            printf '\n# Clean Cloudflare Anycast IPs for bypassing throttling/blocking\n'
+            printf 'clean_ips = %s\n' "$DG_CLEAN_IPS"
+        fi
+
+        if [ "${DG_UTLS:-off}" = on ]; then
+            printf 'utls = on\n'
+        fi
+        if [ "${DG_FRAGMENT:-off}" = on ]; then
+            printf 'tls_fragment = on\n'
         fi
 
         printf '\n# on = every user session shares a few long-lived connections.\n'
