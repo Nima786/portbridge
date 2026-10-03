@@ -679,7 +679,7 @@ type agentTrust struct {
 	Insecure    bool   // check nothing (asked for explicitly)
 }
 
-func makeAgentHTTPClient(trust agentTrust) *http.Client {
+func makeAgentHTTPClient(trust agentTrust, agentURL string) *http.Client {
 	tc := &tls.Config{MinVersion: tls.VersionTLS12}
 	switch {
 	case trust.Fingerprint != "":
@@ -700,10 +700,41 @@ func makeAgentHTTPClient(trust agentTrust) *http.Client {
 	case trust.Insecure:
 		tc.InsecureSkipVerify = true
 	}
+	// With the chain of trust out of the picture the name sent is free to be
+	// an ordinary one. See agentSNI.
+	if tc.InsecureSkipVerify {
+		tc.ServerName = agentSNI(agentURL)
+	}
 	return &http.Client{
 		Timeout:   20 * time.Second,
 		Transport: &http.Transport{TLSClientConfig: tc},
 	}
+}
+
+// agentDisguiseName is the name sent in the secure handshake when the agent is
+// addressed by a bare IP address.
+//
+// A handshake to an address carries no site name at all, which is itself unusual,
+// and some networks reset exactly those. Measured on a real route out of Iran:
+// the same request to the same agent was reset at once with no name and answered
+// normally with an ordinary one. The agent presents one certificate whatever
+// name it is asked for, and the fingerprint pin is what identifies it, so the
+// name costs nothing.
+const agentDisguiseName = "www.bing.com"
+
+// agentSNI is the name to send for an agent at agentURL: its own name if it has
+// one, since a CDN in front of it routes by that, and an ordinary one if it is
+// reached by IP address.
+func agentSNI(agentURL string) string {
+	u, err := url.Parse(agentURL)
+	if err != nil {
+		return agentDisguiseName
+	}
+	host := u.Hostname()
+	if host == "" || net.ParseIP(host) != nil {
+		return agentDisguiseName
+	}
+	return host
 }
 
 // fetchAgentFingerprint connects to an agent without trusting it and reports the
@@ -719,7 +750,11 @@ func fetchAgentFingerprint(agentURL string) (string, error) {
 		host = net.JoinHostPort(u.Hostname(), "443")
 	}
 	d := &net.Dialer{Timeout: 10 * time.Second}
-	conn, err := tls.DialWithDialer(d, "tcp", host, &tls.Config{InsecureSkipVerify: true, MinVersion: tls.VersionTLS12})
+	conn, err := tls.DialWithDialer(d, "tcp", host, &tls.Config{
+		InsecureSkipVerify: true,
+		MinVersion:         tls.VersionTLS12,
+		ServerName:         agentSNI(agentURL),
+	})
 	if err != nil {
 		return "", fmt.Errorf("connecting to %s: %w", host, err)
 	}
@@ -753,7 +788,7 @@ func agentClientStatus(agentURL, token string, trust agentTrust) error {
 	if token != "" {
 		req.Header.Set("Authorization", "Bearer "+token)
 	}
-	client := makeAgentHTTPClient(trust)
+	client := makeAgentHTTPClient(trust, agentURL)
 	resp, err := client.Do(req)
 	if err != nil {
 		return explainAgentError(fmt.Errorf("connecting to agent at %s: %w", agentURL, err), trust)
@@ -788,7 +823,7 @@ func agentClientDelete(agentURL, token, tunnelName string, trust agentTrust) err
 	if token != "" {
 		req.Header.Set("Authorization", "Bearer "+token)
 	}
-	client := makeAgentHTTPClient(trust)
+	client := makeAgentHTTPClient(trust, agentURL)
 	resp, err := client.Do(req)
 	if err != nil {
 		return explainAgentError(fmt.Errorf("connecting to agent at %s: %w", agentURL, err), trust)
@@ -822,7 +857,7 @@ func agentClientJoin(agentURL, token, code string, trust agentTrust) error {
 	if token != "" {
 		req.Header.Set("Authorization", "Bearer "+token)
 	}
-	client := makeAgentHTTPClient(trust)
+	client := makeAgentHTTPClient(trust, agentURL)
 	resp, err := client.Do(req)
 	if err != nil {
 		return explainAgentError(fmt.Errorf("connecting to agent at %s: %w", agentURL, err), trust)

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"crypto/tls"
 	"encoding/base64"
 	"errors"
 	"net"
@@ -282,5 +283,71 @@ func TestPinnedFingerprintRefusesTheWrongCertificate(t *testing.T) {
 	}
 	if err := agentClientStatus("https://"+addr, "tok", agentTrust{Fingerprint: strings.ToUpper(strings.ReplaceAll(fp, ":", ""))}); err != nil {
 		t.Fatalf("the right fingerprint, written differently, was refused: %v", err)
+	}
+}
+
+// An agent reached by IP address must be asked for by an ordinary name: on a real
+// route out of Iran a handshake with no name was reset at once, while the same
+// one carrying a name was answered. An agent with a real name keeps it, since a
+// CDN in front of it routes by that.
+func TestAgentHandshakeAlwaysCarriesAName(t *testing.T) {
+	cases := map[string]string{
+		"https://79.137.202.176:3333":    agentDisguiseName,
+		"https://[2001:db8::1]:2083":     agentDisguiseName,
+		"https://agent.example.org:2083": "agent.example.org",
+		"https://agent.example.org":      "agent.example.org",
+		"not a url \x7f":                 agentDisguiseName,
+	}
+	for in, want := range cases {
+		if got := agentSNI(in); got != want {
+			t.Errorf("agentSNI(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+// The name is actually sent, both when fetching the fingerprint and when calling
+// the agent.
+func TestAgentClientSendsAName(t *testing.T) {
+	dir := t.TempDir()
+	cert, err := ensureCert(filepath.Join(dir, "c.crt"), filepath.Join(dir, "c.key"), "portbridge-agent")
+	if err != nil {
+		t.Fatal(err)
+	}
+	seen := make(chan string, 4)
+	ln, err := tls.Listen("tcp", "127.0.0.1:0", &tls.Config{
+		Certificates: []tls.Certificate{cert},
+		GetConfigForClient: func(h *tls.ClientHelloInfo) (*tls.Config, error) {
+			seen <- h.ServerName
+			return nil, nil
+		},
+	})
+	if err != nil {
+		t.Skip("cannot listen")
+	}
+	defer ln.Close()
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func() {
+				defer c.Close()
+				_ = c.(*tls.Conn).Handshake()
+			}()
+		}
+	}()
+
+	url := "https://" + ln.Addr().String()
+	if _, err := fetchAgentFingerprint(url); err != nil {
+		t.Fatal(err)
+	}
+	if got := <-seen; got != agentDisguiseName {
+		t.Fatalf("fingerprint fetch sent the name %q", got)
+	}
+
+	_ = agentClientStatus(url, "tok", agentTrust{Fingerprint: certFingerprint(cert)})
+	if got := <-seen; got != agentDisguiseName {
+		t.Fatalf("agent call sent the name %q", got)
 	}
 }
