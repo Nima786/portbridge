@@ -15,6 +15,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	utls "github.com/refraction-networking/utls"
@@ -86,9 +87,65 @@ func alpnFor(t Transport) []string {
 	}
 }
 
+// shapeUTLSHello builds the browser-style hello and makes it consistent with the
+// transport: the protocols it offers are the ones the disguise claims, and the
+// HTTP/2-only settings extension is dropped when HTTP/2 is not offered, since a
+// browser that does not offer h2 does not send it.
+func shapeUTLSHello(u *utls.UConn, t Transport) error {
+	if err := u.BuildHandshakeState(); err != nil {
+		return fmt.Errorf("preparing the browser-style hello failed: %w", err)
+	}
+	alpn := alpnFor(t)
+	offersH2 := false
+	for _, p := range alpn {
+		if p == "h2" {
+			offersH2 = true
+		}
+	}
+	kept := u.Extensions[:0]
+	for _, ext := range u.Extensions {
+		switch e := ext.(type) {
+		case *utls.ALPNExtension:
+			e.AlpnProtocols = alpn
+		case *utls.ApplicationSettingsExtension:
+			if !offersH2 {
+				continue
+			}
+		}
+		kept = append(kept, ext)
+	}
+	u.Extensions = kept
+	if err := u.MarshalClientHello(); err != nil {
+		return fmt.Errorf("preparing the browser-style hello failed: %w", err)
+	}
+	return nil
+}
+
+// checkNegotiated makes sure the far end agreed to the protocol the disguise
+// needs. An HTTP/2 transport that was negotiated down to HTTP/1.1 would fail
+// later with a confusing framing error; this says what actually happened.
+func checkNegotiated(proto string, t Transport) error {
+	switch t {
+	case TransportH2, TransportGRPC:
+		if proto != "h2" {
+			return fmt.Errorf("the far end did not agree to HTTP/2 (it chose %q); "+
+				"an h2 or grpc tunnel needs a server or CDN that allows HTTP/2", proto)
+		}
+	case TransportWSS:
+		if proto == "h2" {
+			return errors.New("the far end chose HTTP/2 for a websocket tunnel, which needs HTTP/1.1")
+		}
+	}
+	return nil
+}
+
 // ---------------------------------------------------------------------------
 // ClientHello Fragmentation
 // ---------------------------------------------------------------------------
+
+// fragmentSkipLog reports, at most occasionally, that fragmentation was asked
+// for and did not happen.
+var fragmentSkipLog = newThrottled()
 
 // fragmentConn wraps a raw net.Conn and fragments the very first Write()
 // if it contains a TLS ClientHello (0x16 0x03).
@@ -100,6 +157,8 @@ func alpnFor(t Transport) []string {
 type fragmentConn struct {
 	net.Conn
 	firstWrite   sync.Once
+	sawFirst     atomic.Bool
+	fragmented   atomic.Bool
 	fragmentSize int
 	delay        time.Duration
 }
@@ -127,6 +186,7 @@ func (fc *fragmentConn) Write(b []byte) (int, error) {
 		// and has enough bytes to split meaningfully.
 		if len(b) > fc.fragmentSize && b[0] == 0x16 && b[1] == 0x03 {
 			split := fc.fragmentSize
+			fc.fragmented.Store(true)
 			n1, err := fc.Conn.Write(b[:split])
 			totalWritten += n1
 			if err != nil {
@@ -147,6 +207,12 @@ func (fc *fragmentConn) Write(b []byte) (int, error) {
 
 	if totalWritten > 0 || writeErr != nil {
 		return totalWritten, writeErr
+	}
+	if !fc.sawFirst.Swap(true) && !fc.fragmented.Load() {
+		// Fragmentation is a setting someone turned on, and sending the hello
+		// whole without a word would look exactly like it working.
+		fragmentSkipLog.printf("ClientHello fragmentation is on but the first write was not a TLS hello " +
+			"large enough to split; it was sent whole")
 	}
 	return fc.Conn.Write(b)
 }
@@ -274,7 +340,9 @@ func (c *Config) prepareTLS(cert *tls.Certificate) {
 		c.tlsClients[name] = newClientTLS(name, c.Transport, cache)
 	}
 
-	if c.UTLS || (c.CDN && !c.utlsSet) {
+	// Also when only a backup route goes through a CDN: that route turns the
+	// browser-style hello on for itself, and should have its settings ready.
+	if c.useUTLS() || (c.hasCDNRoute() && !c.utlsSet) {
 		c.utlsCache = utls.NewLRUClientSessionCache(tlsResumeCache)
 		c.utlsClients = make(map[string]*utls.Config, 2)
 		for _, name := range c.claimedNames() {
@@ -365,14 +433,20 @@ func (c *Config) serverTLS(cert *tls.Certificate) (*tls.Config, error) {
 // wrapDial turns a freshly dialled TCP connection into whatever the transport
 // requires, from the point of view of the side that dialled.
 func wrapDial(raw net.Conn, cfg *Config) (net.Conn, error) {
+	return wrapDialPurpose(raw, cfg, authPurposeTunnel)
+}
+
+// wrapDialPurpose is wrapDial for a caller that knows what the connection is
+// for. The purpose only matters to the websocket disguise, which authenticates
+// inside the upgrade request and so has to say it there.
+func wrapDialPurpose(raw net.Conn, cfg *Config, purpose byte) (net.Conn, error) {
 	switch cfg.Transport {
 	case TransportPlain, TransportKCP:
 		return raw, nil
 
 	case TransportTLS, TransportWSS, TransportH2, TransportGRPC:
 		connToWrap := raw
-		shouldFrag := cfg.TLSFragment || (cfg.CDN && !cfg.fragmentSet)
-		if shouldFrag {
+		if cfg.useFragment() {
 			size := cfg.TLSFragmentSize
 			if size <= 0 {
 				size = 40
@@ -384,15 +458,17 @@ func wrapDial(raw net.Conn, cfg *Config) (net.Conn, error) {
 			connToWrap = newFragmentConn(raw, size, sleep)
 		}
 
-		shouldUTLS := cfg.UTLS || (cfg.CDN && !cfg.utlsSet)
-		if shouldUTLS {
-			uClient := utls.UClient(connToWrap, cfg.clientUTLS(cfg.effectiveClientName()), utls.HelloChrome_Auto)
-			if err := uClient.BuildHandshakeState(); err == nil {
-				for _, ext := range uClient.Extensions {
-					if alpn, ok := ext.(*utls.ALPNExtension); ok {
-						alpn.AlpnProtocols = alpnFor(cfg.Transport)
-					}
-				}
+		if cfg.useUTLS() {
+			// A copy for this connection. Building the hello changes the
+			// settings it is given, and the prepared ones are shared by every
+			// connection made at once; the copy keeps the shared session cache.
+			uClient := utls.UClient(connToWrap, cfg.clientUTLS(cfg.effectiveClientName()).Clone(), cfg.utlsHelloID())
+			// A hello that could not be built must stop the dial. Carrying on
+			// with the library's default would send something other than what
+			// was asked for, without saying so.
+			if err := shapeUTLSHello(uClient, cfg.Transport); err != nil {
+				_ = raw.Close()
+				return nil, err
 			}
 			if err := raw.SetDeadline(time.Now().Add(tlsHandshakeTimeout)); err != nil {
 				return nil, err
@@ -404,11 +480,15 @@ func wrapDial(raw net.Conn, cfg *Config) (net.Conn, error) {
 			if err := raw.SetDeadline(time.Time{}); err != nil {
 				return nil, err
 			}
+			if err := checkNegotiated(uClient.ConnectionState().NegotiatedProtocol, cfg.Transport); err != nil {
+				_ = raw.Close()
+				return nil, err
+			}
 			if cfg.Transport == TransportTLS {
 				return uClient, nil
 			}
 			if cfg.Transport == TransportWSS {
-				return wsDial(uClient, cfg)
+				return wsDialPurpose(uClient, cfg, purpose)
 			}
 			return h2Dial(uClient, cfg)
 		}
@@ -424,11 +504,15 @@ func wrapDial(raw net.Conn, cfg *Config) (net.Conn, error) {
 		if err := raw.SetDeadline(time.Time{}); err != nil {
 			return nil, err
 		}
+		if err := checkNegotiated(tc.ConnectionState().NegotiatedProtocol, cfg.Transport); err != nil {
+			_ = raw.Close()
+			return nil, err
+		}
 		if cfg.Transport == TransportTLS {
 			return tc, nil
 		}
 		if cfg.Transport == TransportWSS {
-			return wsDial(tc, cfg)
+			return wsDialPurpose(tc, cfg, purpose)
 		}
 		return h2Dial(tc, cfg)
 
@@ -512,13 +596,16 @@ func describeTransport(cfg *Config) string {
 
 	if cfg.Dials() {
 		var stealth []string
-		shouldUTLS := cfg.UTLS || (cfg.CDN && !cfg.utlsSet)
-		shouldFrag := cfg.TLSFragment || (cfg.CDN && !cfg.fragmentSet)
-		if shouldUTLS {
-			stealth = append(stealth, "uTLS Chrome profile")
+		backupOnly := !cfg.CDN && cfg.AltServerName != ""
+		suffix := ""
+		if backupOnly {
+			suffix = " on the backup route"
 		}
-		if shouldFrag {
-			stealth = append(stealth, "ClientHello fragmentation")
+		if cfg.useUTLS() || (backupOnly && !cfg.utlsSet) {
+			stealth = append(stealth, "uTLS browser hello"+suffix)
+		}
+		if cfg.useFragment() || (backupOnly && !cfg.fragmentSet) {
+			stealth = append(stealth, "ClientHello fragmentation"+suffix)
 		}
 		if len(cfg.CleanIPs) > 0 {
 			stealth = append(stealth, fmt.Sprintf("%d clean CF IPs", len(cfg.CleanIPs)))

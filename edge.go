@@ -86,6 +86,9 @@ type edge struct {
 	guard *replayGuard
 	cert  *tls.Certificate
 
+	// health is what this side believes about whether data really flows.
+	health *pathHealth
+
 	logAccept   *throttled
 	logCapacity *throttled
 	logSession  *throttled
@@ -129,32 +132,42 @@ func runEdge(ctx context.Context, cfg *Config, st *status) error {
 	// Direct mode: we dial the origin ourselves, so connections can be built on
 	// demand. Reverse mode: we cannot dial anywhere, so we wait to be called.
 	var dial func() (net.Conn, error)
+	var routes *router
 	if cfg.Mode == ModeDirect {
-		routes := newRouter(cfg)
+		routes = newRouter(cfg)
 		st.routes = routes
 		log.Printf("reaching the other server at %s", routes.describe())
 		dial = func() (net.Conn, error) {
-			raw, claim, err := routes.dial(5 * time.Second)
+			raw, idx, err := routes.dialIdx(5 * time.Second)
 			if err != nil {
 				return nil, err
 			}
 			tuneSocket(raw)
 			// Apply the disguise before anything of ours is sent, so the first
-			// thing on the wire is whatever the transport expects. The name comes
-			// from the route, because a fallback route may have to claim a
-			// different one.
-			c, err := wrapDial(raw, cfg.withClaimedName(claim))
+			// thing on the wire is whatever the transport expects. The name and
+			// the CDN defaults come from the route, because a fallback route may
+			// have to claim a different name and is the one that goes through a
+			// CDN.
+			purpose := tunnelPurposeFor(cfg)
+			c, err := wrapDialPurpose(raw, routes.routeConfig(idx), purpose)
 			if err != nil {
 				_ = raw.Close()
+				routes.handshakeFailed(idx, err)
 				return nil, err
 			}
-			if err := sendAuth(c, cfg.secret); err != nil {
+			if err := sendAuthPurpose(c, cfg.secret, purpose); err != nil {
 				_ = c.Close()
+				routes.handshakeFailed(idx, err)
 				return nil, err
 			}
+			routes.handshakeOK(idx)
 			return c, nil
 		}
 	}
+
+	// What the tunnel believes about whether data really flows. See health.go.
+	e.health = newPathHealth(routes != nil && routes.hasFallback())
+	st.health = e.health
 
 	if cfg.Mux {
 		// The edge is always the side that starts sessions, whichever side
@@ -167,6 +180,21 @@ func runEdge(ctx context.Context, cfg *Config, st *status) error {
 		e.pool = newPool(cfg.PoolSize, cfg.SpareTTL, reverseWaitForSpare, dial)
 		st.pool = e.pool
 		go e.pool.maintain(ctx)
+	}
+
+	// The side that dials is the only one with routes to choose between, so it
+	// is the one that checks them. When the route in use changes, whatever was
+	// built over the old one is dropped so it is rebuilt over the new one.
+	if routes != nil && cfg.PathProbe {
+		pr := newProber(cfg, routes, e.health, func() {
+			if e.pool != nil {
+				e.pool.flush()
+			}
+			if e.links != nil {
+				e.links.dropAll(errRouteChanged)
+			}
+		})
+		go pr.run(ctx)
 	}
 
 	ctrl, err := startControlServer(ctx, cfg, e)
@@ -274,6 +302,15 @@ func (e *edge) acceptTunnel(ctx context.Context, ln net.Listener) {
 					go runSpeedtestServer(c)
 					return
 				}
+				// Say by name when the two servers disagree about shared
+				// connections, on both ends, rather than letting it show up as
+				// users who hang while everything reports ready.
+				if err := checkTunnelPurpose(e.cfg, purpose); err != nil {
+					e.logAuth.printf("refused a tunnel connection from %s: %v", c.RemoteAddr(), err)
+					writeReason(c, rejMuxMismatch)
+					_ = c.Close()
+					return
+				}
 				if e.links != nil {
 					// This one connection will carry every session that comes,
 					// so it is kept rather than parked.
@@ -368,8 +405,18 @@ func (e *edge) serve(ctx context.Context, user net.Conn, targetPort uint16) erro
 		return fmt.Errorf("%w: %v", errUserWentAway, err)
 	}
 
+	// When the route is known not to be carrying data, trying six times over
+	// just makes the user wait longer for the same answer: it used to take about
+	// twenty-four seconds to fail, long after any client had given up and tried
+	// again. One try, then let them go. The periodic check finds out when it has
+	// recovered.
+	tries := maxActivateTries
+	if e.health.isBlocked() {
+		tries = 1
+	}
+
 	var lastErr error
-	for attempt := 1; attempt <= maxActivateTries; attempt++ {
+	for attempt := 1; attempt <= tries; attempt++ {
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
@@ -383,11 +430,24 @@ func (e *edge) serve(ctx context.Context, user net.Conn, targetPort uint16) erro
 			continue
 		}
 		if err := activate(tunnel, head, targetPort); err != nil {
+			// A shared link that produced this failure is suspect: it may be
+			// dead without having noticed yet, and picking it again would just
+			// repeat the wait.
+			if s, ok := tunnel.(interface{ suspect() }); ok {
+				s.suspect()
+			}
 			_ = tunnel.Close()
 			lastErr = err
 			atomic.AddInt64(&e.st.retries, 1)
+			e.health.activationFailed(err)
+			// One dead spare is seldom alone. Check the rest now, in parallel,
+			// rather than finding them one at a time at four seconds each.
+			if e.pool != nil && isTimeout(err) && attempt < tries {
+				e.pool.verifyAll(ctx)
+			}
 			continue
 		}
+		e.health.activationOK()
 		if err := relay(user, tunnel); err != nil {
 			// The user has already been served as far as it got, so this is a
 			// report rather than a failure: their download was cut short by the
@@ -448,12 +508,10 @@ func activate(tunnel net.Conn, head []byte, targetPort uint16) error {
 	}
 
 	if ack[0] != msgAck {
-		switch ack[0] {
-		case rejClockSkew, rejReplay:
+		if isRejection(ack[0]) {
 			return describeRejection(ack[0])
-		default:
-			return errBadAck
 		}
+		return errBadAck
 	}
 	return nil
 }
@@ -528,10 +586,13 @@ func (e *edge) selfDelete() {
 
 	// 3. Stop and disable systemd unit
 	unit := fmt.Sprintf("portbridge@%s.service", name)
-	_ = exec.Command("systemctl", "stop", "--no-block", unit).Run()
+	// Disabled first. Stopping is what ends this very process, so anything
+	// queued after it may never run, and a unit left enabled would start again
+	// at the next boot.
 	_ = exec.Command("systemctl", "disable", unit).Run()
 	_ = exec.Command("systemctl", "reset-failed", unit).Run()
 	_ = exec.Command("systemctl", "daemon-reload").Run()
+	_ = exec.Command("systemctl", "stop", "--no-block", unit).Run()
 
 	// 4. Cancel edge context so running loops exit
 	if e.cancel != nil {

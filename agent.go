@@ -3,8 +3,10 @@ package main
 import (
 	"bytes"
 	"crypto/rand"
+	"crypto/sha256"
 	"crypto/subtle"
 	"crypto/tls"
+	"crypto/x509"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
@@ -13,10 +15,12 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
+	"net/url"
 	"os"
-	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -39,7 +43,17 @@ type PairingData struct {
 	Mux         string
 	MuxLinks    string
 	Secret      string
+
+	// Added in version 6: the stealth settings of the dialling side. Without
+	// them a code made for a CDN tunnel produced a foreign side that forgot the
+	// browser hello, the split hello and the clean addresses.
+	UTLS        string
+	TLSFragment string
+	CleanIPs    string
 }
+
+// pairingVersionMax is the newest code this build understands.
+const pairingVersionMax = 6
 
 // decodePairingCode parses a base64 encoded pairing code into structured data.
 func decodePairingCode(code string) (*PairingData, error) {
@@ -82,6 +96,13 @@ func decodePairingCode(code string) (*PairingData, error) {
 		Mux:         kv["mux"],
 		MuxLinks:    kv["mux_links"],
 		Secret:      kv["secret"],
+		UTLS:        kv["utls"],
+		TLSFragment: kv["tls_fragment"],
+		CleanIPs:    kv["clean_ips"],
+	}
+
+	if v, err := strconv.Atoi(p.Version); err == nil && v > pairingVersionMax {
+		return nil, fmt.Errorf("this pairing code was made by a newer PortBridge (code version %d, this one understands up to %d); update this server first", v, pairingVersionMax)
 	}
 
 	if p.Name == "" || p.Mode == "" || p.TunnelPort == "" || p.Secret == "" {
@@ -107,10 +128,23 @@ func decodePairingCode(code string) (*PairingData, error) {
 }
 
 // applyPairingData configures and starts a tunnel on the local server.
+//
+// It is all or nothing. Every check that can be made before touching the machine
+// is made first, and if anything fails after that, what was done is undone, so a
+// refused code never leaves a half-made tunnel behind.
 func applyPairingData(p *PairingData, confDir string) error {
 	if confDir == "" {
-		confDir = "/etc/portbridge/tunnels"
+		confDir = defaultTunnelsDir
 	}
+	if err := validatePairing(p); err != nil {
+		return err
+	}
+
+	agentOpMu.Lock()
+	defer agentOpMu.Unlock()
+
+	host := hostFor(confDir)
+
 	if err := os.MkdirAll(confDir, 0o700); err != nil {
 		return fmt.Errorf("creating tunnels dir: %w", err)
 	}
@@ -119,6 +153,21 @@ func applyPairingData(p *PairingData, confDir string) error {
 	secretFile := filepath.Join(confDir, p.Name+".secret")
 	certFile := filepath.Join(confDir, p.Name+".crt")
 	keyFile := filepath.Join(confDir, p.Name+".key")
+
+	// Never replace a tunnel that is already here: that would swap its secret and
+	// settings under a running service.
+	for _, f := range []string{confFile, secretFile} {
+		if _, err := os.Stat(f); err == nil {
+			return fmt.Errorf("a tunnel named %q already exists on this server; delete it first or use another name", p.Name)
+		}
+	}
+
+	if p.Mode == "direct" {
+		port, _ := portOK(p.TunnelPort)
+		if err := host.PortFree(Transport(p.Transport), port); err != nil {
+			return err
+		}
+	}
 
 	// Format inbound ports (e.g. 100 -> 127.0.0.1:100, 100, 200 -> 127.0.0.1:100, 127.0.0.1:200)
 	inboundParts := strings.Split(p.InboundPort, ",")
@@ -138,7 +187,7 @@ func applyPairingData(p *PairingData, confDir string) error {
 	if p.Mode == "direct" {
 		tunnelAddr = "0.0.0.0:" + p.TunnelPort
 	} else {
-		tunnelAddr = p.RelayIP + ":" + p.TunnelPort
+		tunnelAddr = net.JoinHostPort(p.RelayIP, p.TunnelPort)
 	}
 
 	firewall := "on"
@@ -169,9 +218,20 @@ func applyPairingData(p *PairingData, confDir string) error {
 		fmt.Fprintf(&b, "cdn = %s\n", p.CDN)
 		fmt.Fprintf(&b, "cert_file = %s\n", certFile)
 		fmt.Fprintf(&b, "key_file = %s\n", keyFile)
+		// Only the side that dials uses these, but they are harmless on the
+		// other and keep a code made for a CDN tunnel whole.
+		if p.UTLS != "" {
+			fmt.Fprintf(&b, "utls = %s\n", p.UTLS)
+		}
+		if p.TLSFragment != "" {
+			fmt.Fprintf(&b, "tls_fragment = %s\n", p.TLSFragment)
+		}
+		if p.CleanIPs != "" && p.Mode == "reverse" {
+			fmt.Fprintf(&b, "clean_ips = %s\n", p.CleanIPs)
+		}
 	}
 	if p.AltHost != "" && p.Mode == "reverse" {
-		fmt.Fprintf(&b, "alt_target = %s:%s\n", p.AltHost, p.TunnelPort)
+		fmt.Fprintf(&b, "alt_target = %s\n", net.JoinHostPort(p.AltHost, p.TunnelPort))
 		fmt.Fprintf(&b, "alt_server_name = %s\n", p.AltHost)
 	}
 	fmt.Fprintf(&b, "\nmux = %s\n", p.Mux)
@@ -182,75 +242,139 @@ func applyPairingData(p *PairingData, confDir string) error {
 	fmt.Fprintf(&b, "max_conn = 2000\nmax_pending = 512\nspare_ttl = 10m\npark_timeout = 15m\ndrain = 5s\n")
 	fmt.Fprintf(&b, "\nsecret_file = %s\n", secretFile)
 
-	if err := os.WriteFile(confFile, []byte(b.String()), 0o600); err != nil {
-		return fmt.Errorf("writing config: %w", err)
-	}
-	if err := os.WriteFile(secretFile, []byte(p.Secret), 0o600); err != nil {
-		return fmt.Errorf("writing secret: %w", err)
-	}
-
-	// Validate config syntax with LoadConfig
-	cfg, err := LoadConfig(confFile)
-	if err != nil {
+	// From here on, failure undoes what was written.
+	undo := func() {
 		_ = os.Remove(confFile)
 		_ = os.Remove(secretFile)
+		_ = os.Remove(certFile)
+		_ = os.Remove(keyFile)
+	}
+
+	// The secret first, and never readable by anyone else.
+	if err := writeFileAtomic(secretFile, []byte(p.Secret), 0o600); err != nil {
+		undo()
+		return fmt.Errorf("writing secret: %w", err)
+	}
+	if err := writeFileAtomic(confFile, []byte(b.String()), 0o600); err != nil {
+		undo()
+		return fmt.Errorf("writing config: %w", err)
+	}
+
+	// Everything the service itself will check at start, checked now: a tunnel
+	// that passes here can start, and one that cannot is refused with the reason
+	// instead of being enabled and left to fail in a loop.
+	cfg, err := LoadConfig(confFile)
+	if err != nil {
+		undo()
 		return fmt.Errorf("validating config: %w", err)
+	}
+	if err := cfg.Validate(); err != nil {
+		undo()
+		return fmt.Errorf("validating config: %w", err)
+	}
+	if err := cfg.LoadSecret(); err != nil {
+		undo()
+		return fmt.Errorf("validating secret: %w", err)
 	}
 
 	// In direct mode with TLS, origin is listening, so ensure certificate is prepared
 	if cfg.Transport != TransportPlain && cfg.Transport != TransportKCP && cfg.Mode == ModeDirect {
 		if _, err := ensureCert(certFile, keyFile, cfg.effectiveServerName()); err != nil {
-			log.Printf("[%s] warning: preparing cert: %v", p.Name, err)
+			undo()
+			return fmt.Errorf("preparing the certificate: %w", err)
 		}
 	}
 
-	// Apply firewall rule if helper exists and running as root
-	if _, err := os.Stat("/usr/local/bin/portbridge-firewall"); err == nil && os.Geteuid() == 0 {
-		_ = exec.Command("/usr/local/bin/portbridge-firewall", "apply", p.Name).Run()
+	if err := host.FirewallApply(p.Name); err != nil {
+		log.Printf("[%s] warning: %v", p.Name, err)
 	}
 
-	// Enable and start systemd unit if systemd is active and running as root
-	if _, err := os.Stat("/run/systemd/system"); err == nil && os.Geteuid() == 0 {
-		_ = exec.Command("systemctl", "daemon-reload").Run()
-		if out, err := exec.Command("systemctl", "enable", "--now", "portbridge@"+p.Name).CombinedOutput(); err != nil {
-			return fmt.Errorf("starting systemd service: %s: %w", string(out), err)
+	_ = host.Reload()
+	if err := host.Enable(p.Name); err != nil {
+		if errors.Is(err, errNoSystemd) {
+			// The files are in place; only the starting is left to the owner.
+			log.Printf("[%s] %v", p.Name, err)
+			return nil
 		}
+		_ = host.Disable(p.Name)
+		_ = host.FirewallRemove(p.Name)
+		undo()
+		_ = host.Reload()
+		return err
+	}
+	if err := confirmRunning(host, p.Name); err != nil {
+		_ = host.Disable(p.Name)
+		_ = host.FirewallRemove(p.Name)
+		undo()
+		_ = host.Reload()
+		return err
 	}
 
+	return nil
+}
+
+// writeFileAtomic writes to a temporary file and renames it into place, so a
+// reader never sees half of it.
+func writeFileAtomic(path string, data []byte, perm os.FileMode) error {
+	tmp, err := os.CreateTemp(filepath.Dir(path), ".tmp-*")
+	if err != nil {
+		return err
+	}
+	name := tmp.Name()
+	if err := os.Chmod(name, perm); err != nil {
+		tmp.Close()
+		os.Remove(name)
+		return err
+	}
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		os.Remove(name)
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		os.Remove(name)
+		return err
+	}
+	if err := os.Rename(name, path); err != nil {
+		os.Remove(name)
+		return err
+	}
 	return nil
 }
 
 // deleteTunnel removes a tunnel config, secrets, firewall rules, and stops its service.
 func deleteTunnel(name string, confDir string) error {
 	if confDir == "" {
-		confDir = "/etc/portbridge/tunnels"
+		confDir = defaultTunnelsDir
 	}
-	name = filepath.Base(name)
+	if err := validTunnelName(name); err != nil {
+		return err
+	}
+
+	agentOpMu.Lock()
+	defer agentOpMu.Unlock()
+
+	host := hostFor(confDir)
 	confFile := filepath.Join(confDir, name+".conf")
 	secretFile := filepath.Join(confDir, name+".secret")
 	certFile := filepath.Join(confDir, name+".crt")
 	keyFile := filepath.Join(confDir, name+".key")
-	runJSON := filepath.Join("/run/portbridge", name+".json")
-	runSock := filepath.Join("/run/portbridge", name+".sock")
 
-	if _, err := os.Stat("/run/systemd/system"); err == nil && os.Geteuid() == 0 {
-		_ = exec.Command("systemctl", "disable", "--now", "portbridge@"+name).Run()
+	// Stopped before anything is removed, so the service is not left running on
+	// settings that have gone.
+	if err := host.Disable(name); err != nil {
+		log.Printf("[%s] stopping the service: %v", name, err)
 	}
-
-	if _, err := os.Stat("/usr/local/bin/portbridge-firewall"); err == nil && os.Geteuid() == 0 {
-		_ = exec.Command("/usr/local/bin/portbridge-firewall", "remove", name).Run()
+	if err := host.FirewallRemove(name); err != nil {
+		log.Printf("[%s] removing firewall rules: %v", name, err)
 	}
 
 	_ = os.Remove(confFile)
 	_ = os.Remove(secretFile)
 	_ = os.Remove(certFile)
 	_ = os.Remove(keyFile)
-	_ = os.Remove(runJSON)
-	_ = os.Remove(runSock)
-
-	if _, err := os.Stat("/run/systemd/system"); err == nil && os.Geteuid() == 0 {
-		_ = exec.Command("systemctl", "daemon-reload").Run()
-	}
+	host.RemoveRuntime(name)
+	_ = host.Reload()
 	return nil
 }
 
@@ -314,9 +438,16 @@ func ensureAgentConfigFile(path string) (listen string, token string, certFile s
 
 // parseAgentClientConfigFile parses client config with url and token.
 func parseAgentClientConfigFile(path string) (url string, token string, err error) {
+	url, token, _, err = parseAgentClientProfile(path)
+	return url, token, err
+}
+
+// parseAgentClientProfile is the same with the pinned certificate fingerprint,
+// if the profile has one.
+func parseAgentClientProfile(path string) (url string, token string, fingerprint string, err error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
-		return "", "", err
+		return "", "", "", err
 	}
 	lines := strings.Split(string(data), "\n")
 	for _, l := range lines {
@@ -335,9 +466,11 @@ func parseAgentClientConfigFile(path string) (url string, token string, err erro
 			url = v
 		case "token", "agent_token":
 			token = v
+		case "fingerprint", "agent_fingerprint", "cert_fingerprint":
+			fingerprint = v
 		}
 	}
-	return url, token, nil
+	return url, token, fingerprint, nil
 }
 
 func checkAgentAuth(r *http.Request, token string) bool {
@@ -480,10 +613,9 @@ func runAgentServer(listenAddr, token, certFile, keyFile, confDir string) error 
 	}
 	tlsCert, err := ensureCert(certFile, keyFile, "portbridge-agent")
 	if err != nil {
-		log.Printf("[agent] warning: generating cert failed: %v; running plain HTTP", err)
-		server := &http.Server{Addr: listenAddr, Handler: mux}
-		log.Printf("[agent] PortBridge management agent listening on http://%s", listenAddr)
-		return server.ListenAndServe()
+		// Never fall back to plain HTTP: the token that controls this server
+		// would travel in the clear.
+		return fmt.Errorf("preparing the agent's certificate: %w", err)
 	}
 
 	server := &http.Server{
@@ -493,24 +625,126 @@ func runAgentServer(listenAddr, token, certFile, keyFile, confDir string) error 
 			Certificates: []tls.Certificate{tlsCert},
 			MinVersion:   tls.VersionTLS12,
 		},
+		// Without these a client that connects and says nothing holds a
+		// connection open for ever.
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       30 * time.Second,
+		WriteTimeout:      2 * time.Minute, // starting a service can take a while
+		IdleTimeout:       60 * time.Second,
+		MaxHeaderBytes:    16 * 1024,
 	}
 
-	log.Printf("[agent] PortBridge management agent listening on https://%s", listenAddr)
+	log.Printf("[agent] PortBridge management agent listening on https://%s (certificate fingerprint %s)",
+		listenAddr, certFingerprint(tlsCert))
 	return server.ListenAndServeTLS("", "")
 }
 
-func makeAgentHTTPClient(insecure bool) *http.Client {
+// certFingerprint is the SHA-256 of the leaf certificate, in the form a person
+// can compare by eye: lower-case hex with colons.
+func certFingerprint(c tls.Certificate) string {
+	if len(c.Certificate) == 0 {
+		return ""
+	}
+	return fingerprintOf(c.Certificate[0])
+}
+
+func fingerprintOf(der []byte) string {
+	sum := sha256.Sum256(der)
+	parts := make([]string, len(sum))
+	for i, b := range sum {
+		parts[i] = fmt.Sprintf("%02x", b)
+	}
+	return strings.Join(parts, ":")
+}
+
+// normalizeFingerprint lets a fingerprint be typed with or without colons, in
+// any case.
+func normalizeFingerprint(s string) string {
+	s = strings.ToLower(strings.TrimSpace(s))
+	s = strings.ReplaceAll(s, ":", "")
+	s = strings.ReplaceAll(s, " ", "")
+	return s
+}
+
+// agentTrust says how the client decides whether to believe an agent's
+// certificate.
+//
+// The agent's certificate is self-signed, so the usual check cannot work. The
+// honest options are to pin the certificate it is known to have, or to say
+// plainly that nothing is being checked. Skipping the check by default meant
+// anyone on the path could stand in for the agent and collect the token that
+// controls the server.
+type agentTrust struct {
+	Fingerprint string // pin: the certificate must have exactly this fingerprint
+	Insecure    bool   // check nothing (asked for explicitly)
+}
+
+func makeAgentHTTPClient(trust agentTrust) *http.Client {
+	tc := &tls.Config{MinVersion: tls.VersionTLS12}
+	switch {
+	case trust.Fingerprint != "":
+		want := normalizeFingerprint(trust.Fingerprint)
+		// The certificate is checked by its fingerprint instead of by a
+		// chain of trust, so the chain check is turned off and replaced.
+		tc.InsecureSkipVerify = true
+		tc.VerifyPeerCertificate = func(raw [][]byte, _ [][]*x509.Certificate) error {
+			if len(raw) == 0 {
+				return errors.New("the agent sent no certificate")
+			}
+			if got := normalizeFingerprint(fingerprintOf(raw[0])); got != want {
+				return fmt.Errorf("the agent's certificate does not match the saved fingerprint (it is %s); "+
+					"this could be the wrong server or someone in between", got)
+			}
+			return nil
+		}
+	case trust.Insecure:
+		tc.InsecureSkipVerify = true
+	}
 	return &http.Client{
-		Timeout: 20 * time.Second,
-		Transport: &http.Transport{
-			TLSClientConfig: &tls.Config{
-				InsecureSkipVerify: insecure,
-			},
-		},
+		Timeout:   20 * time.Second,
+		Transport: &http.Transport{TLSClientConfig: tc},
 	}
 }
 
-func agentClientStatus(agentURL, token string, insecure bool) error {
+// fetchAgentFingerprint connects to an agent without trusting it and reports the
+// fingerprint of the certificate it presents, so a person can compare it with
+// the one the agent printed and then pin it. Nothing secret is sent.
+func fetchAgentFingerprint(agentURL string) (string, error) {
+	u, err := url.Parse(agentURL)
+	if err != nil || u.Host == "" {
+		return "", fmt.Errorf("%q is not a valid agent address", agentURL)
+	}
+	host := u.Host
+	if u.Port() == "" {
+		host = net.JoinHostPort(u.Hostname(), "443")
+	}
+	d := &net.Dialer{Timeout: 10 * time.Second}
+	conn, err := tls.DialWithDialer(d, "tcp", host, &tls.Config{InsecureSkipVerify: true, MinVersion: tls.VersionTLS12})
+	if err != nil {
+		return "", fmt.Errorf("connecting to %s: %w", host, err)
+	}
+	defer conn.Close()
+	certs := conn.ConnectionState().PeerCertificates
+	if len(certs) == 0 {
+		return "", errors.New("the agent presented no certificate")
+	}
+	return fingerprintOf(certs[0].Raw), nil
+}
+
+// refuseUnverified turns the certificate error from an agent we could not verify
+// into advice someone can act on.
+func explainAgentError(err error, trust agentTrust) error {
+	if err == nil {
+		return nil
+	}
+	if trust.Fingerprint == "" && !trust.Insecure && strings.Contains(err.Error(), "certificate") {
+		return fmt.Errorf("%w\nThe agent uses a self-signed certificate. Pin it with -fingerprint <value> "+
+			"(see it with -fetch-fingerprint and compare with what the agent printed when it started)", err)
+	}
+	return err
+}
+
+func agentClientStatus(agentURL, token string, trust agentTrust) error {
 	agentURL = strings.TrimRight(agentURL, "/")
 	req, err := http.NewRequest(http.MethodGet, agentURL+"/api/status", nil)
 	if err != nil {
@@ -519,10 +753,10 @@ func agentClientStatus(agentURL, token string, insecure bool) error {
 	if token != "" {
 		req.Header.Set("Authorization", "Bearer "+token)
 	}
-	client := makeAgentHTTPClient(insecure)
+	client := makeAgentHTTPClient(trust)
 	resp, err := client.Do(req)
 	if err != nil {
-		return fmt.Errorf("connecting to agent at %s: %w", agentURL, err)
+		return explainAgentError(fmt.Errorf("connecting to agent at %s: %w", agentURL, err), trust)
 	}
 	defer resp.Body.Close()
 
@@ -543,7 +777,7 @@ func agentClientStatus(agentURL, token string, insecure bool) error {
 	return nil
 }
 
-func agentClientDelete(agentURL, token, tunnelName string, insecure bool) error {
+func agentClientDelete(agentURL, token, tunnelName string, trust agentTrust) error {
 	agentURL = strings.TrimRight(agentURL, "/")
 	payload, _ := json.Marshal(map[string]string{"name": tunnelName})
 	req, err := http.NewRequest(http.MethodPost, agentURL+"/api/tunnel/delete", bytes.NewReader(payload))
@@ -554,10 +788,10 @@ func agentClientDelete(agentURL, token, tunnelName string, insecure bool) error 
 	if token != "" {
 		req.Header.Set("Authorization", "Bearer "+token)
 	}
-	client := makeAgentHTTPClient(insecure)
+	client := makeAgentHTTPClient(trust)
 	resp, err := client.Do(req)
 	if err != nil {
-		return fmt.Errorf("connecting to agent at %s: %w", agentURL, err)
+		return explainAgentError(fmt.Errorf("connecting to agent at %s: %w", agentURL, err), trust)
 	}
 	defer resp.Body.Close()
 
@@ -577,7 +811,7 @@ func agentClientDelete(agentURL, token, tunnelName string, insecure bool) error 
 	return nil
 }
 
-func agentClientJoin(agentURL, token, code string, insecure bool) error {
+func agentClientJoin(agentURL, token, code string, trust agentTrust) error {
 	agentURL = strings.TrimRight(agentURL, "/")
 	payload, _ := json.Marshal(map[string]string{"code": code})
 	req, err := http.NewRequest(http.MethodPost, agentURL+"/api/tunnel/join", bytes.NewReader(payload))
@@ -588,10 +822,10 @@ func agentClientJoin(agentURL, token, code string, insecure bool) error {
 	if token != "" {
 		req.Header.Set("Authorization", "Bearer "+token)
 	}
-	client := makeAgentHTTPClient(insecure)
+	client := makeAgentHTTPClient(trust)
 	resp, err := client.Do(req)
 	if err != nil {
-		return fmt.Errorf("connecting to agent at %s: %w", agentURL, err)
+		return explainAgentError(fmt.Errorf("connecting to agent at %s: %w", agentURL, err), trust)
 	}
 	defer resp.Body.Close()
 
@@ -648,6 +882,7 @@ func cmdAgent(args []string) error {
 	token := fs.String("token", "", "management authentication token")
 	cert := fs.String("cert", "", "TLS certificate path")
 	key := fs.String("key", "", "TLS private key path")
+	showFP := fs.Bool("fingerprint", false, "print the SHA-256 fingerprint of the agent's certificate and exit")
 
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -670,6 +905,19 @@ func cmdAgent(args []string) error {
 		}
 	}
 
+	if *showFP {
+		certPath, keyPath := *cert, *key
+		if certPath == "" || keyPath == "" {
+			certPath, keyPath = "/etc/portbridge/agent.crt", "/etc/portbridge/agent.key"
+		}
+		c, err := ensureCert(certPath, keyPath, "portbridge-agent")
+		if err != nil {
+			return fmt.Errorf("preparing the agent's certificate: %w", err)
+		}
+		fmt.Println(certFingerprint(c))
+		return nil
+	}
+
 	if *token == "" {
 		return errors.New("agent requires -token or token set in config file")
 	}
@@ -684,10 +932,14 @@ func cmdAgent(args []string) error {
 func cmdJoin(args []string) error {
 	fs := flag.NewFlagSet("join", flag.ExitOnError)
 	agentURL := fs.String("agent-url", "", "remote agent URL (e.g. https://foreign-ip:2083)")
-	token := fs.String("token", "", "agent bearer token")
+	token := fs.String("token", "", "agent bearer token (visible in the process list; prefer -token-file or PORTBRIDGE_AGENT_TOKEN)")
+	tokenFile := fs.String("token-file", "", "read the agent bearer token from this file")
+	codeFile := fs.String("code-file", "", "read the pairing code from this file (or - for standard input)")
 	confPath := fs.String("agent-config", "", "path to client agent config file (e.g. /etc/portbridge/agent-client.conf)")
 	agentAlias := fs.String("agent", "", "named agent profile from /etc/portbridge/agents/<alias>.conf")
-	insecure := fs.Bool("insecure", true, "allow self-signed certificates for agent connection")
+	fingerprint := fs.String("fingerprint", "", "SHA-256 fingerprint the agent's certificate must have")
+	insecure := fs.Bool("insecure", false, "do not check the agent's certificate at all (not recommended)")
+	fetchFP := fs.Bool("fetch-fingerprint", false, "print the fingerprint of the agent's certificate and exit")
 	isDelete := fs.Bool("delete", false, "delete remote tunnel instead of joining")
 	isStatus := fs.Bool("status", false, "check status/connectivity to remote agent")
 	isListAgents := fs.Bool("list-agents", false, "list all saved foreign agent profiles")
@@ -700,12 +952,24 @@ func cmdJoin(args []string) error {
 		return listSavedAgents()
 	}
 
+	if *tokenFile != "" {
+		b, err := os.ReadFile(*tokenFile)
+		if err != nil {
+			return fmt.Errorf("reading token file: %w", err)
+		}
+		*token = strings.TrimSpace(string(b))
+	}
+	if *token == "" {
+		*token = strings.TrimSpace(os.Getenv("PORTBRIDGE_AGENT_TOKEN"))
+	}
+
+	profileFP := ""
 	if *agentAlias != "" {
 		namedPath := filepath.Join("/etc/portbridge/agents", *agentAlias+".conf")
 		if _, err := os.Stat(namedPath); err != nil {
 			namedPath = *agentAlias
 		}
-		cURL, cToken, err := parseAgentClientConfigFile(namedPath)
+		cURL, cToken, cFP, err := parseAgentClientProfile(namedPath)
 		if err != nil {
 			return fmt.Errorf("reading agent profile %q: %w", *agentAlias, err)
 		}
@@ -715,6 +979,7 @@ func cmdJoin(args []string) error {
 		if *token == "" {
 			*token = cToken
 		}
+		profileFP = cFP
 	}
 
 	if *confPath == "" && *agentURL == "" {
@@ -735,21 +1000,43 @@ func cmdJoin(args []string) error {
 		}
 	}
 	if *confPath != "" {
-		if cURL, cToken, err := parseAgentClientConfigFile(*confPath); err == nil {
+		if cURL, cToken, cFP, err := parseAgentClientProfile(*confPath); err == nil {
 			if *agentURL == "" {
 				*agentURL = cURL
 			}
 			if *token == "" {
 				*token = cToken
 			}
+			if profileFP == "" {
+				profileFP = cFP
+			}
 		}
+	}
+	if *fingerprint == "" {
+		*fingerprint = profileFP
+	}
+	trust := agentTrust{Fingerprint: *fingerprint, Insecure: *insecure}
+	if trust.Insecure && trust.Fingerprint == "" {
+		fmt.Fprintln(os.Stderr, "warning: the agent's certificate is not being checked; anyone between here and there could read the token")
+	}
+
+	if *fetchFP {
+		if *agentURL == "" {
+			return errors.New("-agent-url, -agent, or agent config required for -fetch-fingerprint")
+		}
+		fp, err := fetchAgentFingerprint(*agentURL)
+		if err != nil {
+			return err
+		}
+		fmt.Println(fp)
+		return nil
 	}
 
 	if *isStatus {
 		if *agentURL == "" {
 			return errors.New("-agent-url, -agent, or agent config required for -status")
 		}
-		return agentClientStatus(*agentURL, *token, *insecure)
+		return agentClientStatus(*agentURL, *token, trust)
 	}
 
 	if *isDelete {
@@ -761,17 +1048,33 @@ func cmdJoin(args []string) error {
 			return errors.New("tunnel name required: portbridge join -agent-url <url> -token <token> -delete <tunnel_name>")
 		}
 		name := remaining[0]
-		return agentClientDelete(*agentURL, *token, name, *insecure)
+		return agentClientDelete(*agentURL, *token, name, trust)
 	}
 
-	remaining := fs.Args()
-	if len(remaining) < 1 {
-		return errors.New("pairing code is required: portbridge join [flags] <code>")
+	var code string
+	switch {
+	case *codeFile == "-":
+		b, err := io.ReadAll(io.LimitReader(os.Stdin, 64*1024))
+		if err != nil {
+			return fmt.Errorf("reading the pairing code: %w", err)
+		}
+		code = strings.TrimSpace(string(b))
+	case *codeFile != "":
+		b, err := os.ReadFile(*codeFile)
+		if err != nil {
+			return fmt.Errorf("reading the pairing code: %w", err)
+		}
+		code = strings.TrimSpace(string(b))
+	default:
+		remaining := fs.Args()
+		if len(remaining) < 1 {
+			return errors.New("pairing code is required: portbridge join [flags] <code>")
+		}
+		code = remaining[0]
 	}
-	code := remaining[0]
 
 	if *agentURL != "" {
-		return agentClientJoin(*agentURL, *token, code, *insecure)
+		return agentClientJoin(*agentURL, *token, code, trust)
 	}
 
 	p, err := decodePairingCode(code)
@@ -779,7 +1082,7 @@ func cmdJoin(args []string) error {
 		return fmt.Errorf("parsing pairing code: %w", err)
 	}
 
-	if err := applyPairingData(p, "/etc/portbridge/tunnels"); err != nil {
+	if err := applyPairingData(p, defaultTunnelsDir); err != nil {
 		return err
 	}
 	fmt.Printf("Successfully joined and activated tunnel %q (role: origin, mode: %s)\n", p.Name, p.Mode)

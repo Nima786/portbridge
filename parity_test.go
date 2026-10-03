@@ -1,0 +1,87 @@
+package main
+
+import (
+	"os"
+	"regexp"
+	"sort"
+	"strings"
+	"testing"
+)
+
+// The menu writes settings files and pairing codes in shell, the engine reads
+// them in Go, and nothing but convention kept the two in agreement. A setting
+// the menu wrote under a name the engine did not know would stop a tunnel from
+// starting; a field the menu put in a code and the engine ignored would be
+// silently lost. These tests read the menu's own text and hold both to account.
+
+func readMenu(t *testing.T) string {
+	t.Helper()
+	b, err := os.ReadFile("scripts/portbridge-menu")
+	if err != nil {
+		t.Skipf("menu not available: %v", err)
+	}
+	return string(b)
+}
+
+// Every setting name the menu writes must be one the engine accepts.
+func TestMenuOnlyWritesSettingsTheEngineKnows(t *testing.T) {
+	menu := readMenu(t)
+
+	keys := map[string]bool{}
+	// printf 'key = %s\n' ... inside the settings writer
+	for _, m := range regexp.MustCompile(`printf '(?:\\n)?([a-z_]+) = `).FindAllStringSubmatch(menu, -1) {
+		keys[m[1]] = true
+	}
+	// write_conf "$name" key value
+	for _, m := range regexp.MustCompile(`write_conf "\$[a-z_]+" ([a-z_]+) `).FindAllStringSubmatch(menu, -1) {
+		keys[m[1]] = true
+	}
+	if len(keys) < 15 {
+		t.Fatalf("only found %d settings in the menu; the pattern no longer matches it", len(keys))
+	}
+
+	// Settings the menu reads or writes for its own purposes, which the engine
+	// is told about through other means or does not need.
+	menuOnly := map[string]bool{"foreign_agent": false}
+
+	for k := range keys {
+		cfg := defaultConfig()
+		err := cfg.set(k, "1")
+		if err != nil && strings.Contains(err.Error(), "unknown setting") {
+			if _, ok := menuOnly[k]; ok {
+				continue
+			}
+			t.Errorf("the menu writes %q, which the engine does not know", k)
+		}
+	}
+}
+
+// The fields of a pairing code: what the menu writes and what the engine reads
+// must be the same list.
+func TestPairingCodeFieldsMatch(t *testing.T) {
+	menu := readMenu(t)
+
+	m := regexp.MustCompile(`printf 'v=6\\n([^']*)'`).FindStringSubmatch(menu)
+	if m == nil {
+		t.Fatalf("could not find the code format in the menu")
+	}
+	var menuKeys []string
+	for _, part := range strings.Split(m[1], `\n`) {
+		if k, _, ok := strings.Cut(part, "="); ok && k != "" {
+			menuKeys = append(menuKeys, k)
+		}
+	}
+	menuKeys = append(menuKeys, "v")
+
+	engineKeys := []string{
+		"v", "name", "mode", "tunnel_port", "relay_ip", "server_ip", "inbound_port", "pool",
+		"transport", "server_name", "ws_path", "cdn", "alt_host", "mux", "mux_links",
+		"utls", "tls_fragment", "clean_ips", "secret",
+	}
+
+	sort.Strings(menuKeys)
+	sort.Strings(engineKeys)
+	if strings.Join(menuKeys, ",") != strings.Join(engineKeys, ",") {
+		t.Fatalf("the menu writes %v\nthe engine reads %v", menuKeys, engineKeys)
+	}
+}

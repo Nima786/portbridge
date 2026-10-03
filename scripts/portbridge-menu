@@ -90,11 +90,15 @@ read_conf() {
 write_conf() {
     local f
     f=$(conf_of "$1")
-    if grep -qE "^[[:space:]]*$2[[:space:]]*=" "$f" 2>/dev/null; then
-        sed -i -E "s|^[[:space:]]*$2[[:space:]]*=.*|$2 = $3|" "$f"
-    else
-        printf '%s = %s\n' "$2" "$3" >>"$f"
-    fi
+    write_file_key "$f" "$2" "$3"
+}
+
+# sed_escape <text> - makes text safe as the replacement part of a sed command
+# that uses | as its delimiter. Backslash, ampersand and the delimiter all mean
+# something there; left alone, a value containing one of them wrote the wrong
+# thing, or ran a different sed command.
+sed_escape() {
+    printf '%s' "$1" | sed -e 's/[\\&|]/\\&/g'
 }
 
 read_file_key() {
@@ -105,10 +109,15 @@ read_file_key() {
 }
 
 write_file_key() {
-    local f=$1 k=$2 v=$3
+    local f=$1 k=$2 v=$3 esc
+    # A value with a line break would write a second setting.
+    case "$v" in
+        *$'\n'* | *$'\r'*) err "Refusing to write a value with a line break into $k."; return 1 ;;
+    esac
     mkdir -p "$(dirname "$f")"
     if [ -f "$f" ] && grep -qE "^[[:space:]]*${k}[[:space:]]*=" "$f" 2>/dev/null; then
-        sed -i -E "s|^[[:space:]]*${k}[[:space:]]*=.*|${k} = $v|" "$f"
+        esc=$(sed_escape "$v")
+        sed -i -E "s|^[[:space:]]*${k}[[:space:]]*=.*|${k} = ${esc}|" "$f"
     else
         printf '%s = %s\n' "$k" "$v" >>"$f"
     fi
@@ -196,6 +205,14 @@ valid_port() {
     esac
 }
 
+# valid_count <n> - a whole number of at least 1
+valid_count() {
+    case "$1" in
+        '' | *[!0-9]*) return 1 ;;
+        *) [ "$1" -ge 1 ] ;;
+    esac
+}
+
 valid_ports_list() {
     local list=$1 item
     [ -n "$list" ] || return 1
@@ -222,12 +239,18 @@ valid_host() {
 
 # port_owner <port> - names the tunnel already using a port, if any
 port_owner() {
-    local want=$1 n a
+    local want=$1 n a item key
     for n in $(tunnel_names); do
         for key in tunnel_addr user_listen; do
             a=$(read_conf "$n" "$key") || continue
             [ -n "$a" ] || continue
-            [ "${a##*:}" = "$want" ] && { printf '%s' "$n"; return 0; }
+            # A setting may list several addresses, "0.0.0.0:443, 0.0.0.0:8443".
+            # Only the last port of the whole string used to be looked at.
+            while IFS= read -r item; do
+                item=$(printf '%s' "$item" | tr -d '[:space:]')
+                [ -n "$item" ] || continue
+                [ "${item##*:}" = "$want" ] && { printf '%s' "$n"; return 0; }
+            done < <(printf '%s\n' "$a" | tr ',' '\n')
         done
     done
     return 1
@@ -247,8 +270,12 @@ warn_if_suspicious_port() {
     return 1
 }
 
+# port_in_use_by_system <port> [udp] - something is already listening on it.
+# The KCP transport is UDP, so its port has to be looked for there.
 port_in_use_by_system() {
-    ss -lntH 2>/dev/null | awk '{print $4}' | sed -E 's/.*:([0-9]+)$/\1/' | grep -qx "$1"
+    local flags=-lntH
+    [ "${2:-tcp}" = "udp" ] && flags=-lnuH
+    ss "$flags" 2>/dev/null | awk '{print $4}' | sed -E 's/.*:([0-9]+)$/\1/' | grep -qx "$1"
 }
 
 # ------------------------------------------------------------------- prompting
@@ -313,7 +340,7 @@ ask_port() {
             err "  Port $p is already used by tunnel '$owner'. Pick another."
             continue
         fi
-        if port_in_use_by_system "$p"; then
+        if port_in_use_by_system "$p" "${5-tcp}"; then
             warn "  Something is already listening on port $p."
             confirm "  Use it anyway?" || continue
         fi
@@ -669,78 +696,64 @@ MX_MUX=off
 MX_LINKS=4
 
 explain_sharing() {
-    local transport=${DG_TRANSPORT:-plain}
+    local transport=${DG_TRANSPORT:-plain} rec_one="" rec_two=""
+    # The two choices are always numbered the same way, so "2" never means
+    # something different from one screen to the next. Only the suggestion moves.
+    if [ "$transport" = kcp ] || [ "$transport" = wss ] || [ "$transport" = grpc ]; then
+        rec_two=" ${DIM}(recommended for $transport)${R}"
+    else
+        rec_one=" ${DIM}(recommended)${R}"
+    fi
     hr
     say "${B}Should all users share a few connections, or get one each?${R}"
     say ""
-    if [ "$transport" = kcp ] || [ "$transport" = wss ] || [ "$transport" = grpc ]; then
-        say "  ${B}1) Share a few connections (Mux)${R} ${DIM}(recommended for $transport - stealthier & faster)${R}"
-        say "     ${DIM}Everyone rides on $MX_LINKS persistent carrier connections. Eliminates${R}"
-        say "     ${DIM}expensive TLS handshakes, avoids connection bursts to Cloudflare, and${R}"
-        say "     ${DIM}dramatically reduces detection signatures.${R}"
-        say ""
-        say "  ${B}2) One connection per user${R}"
-        say "     ${DIM}Each user opens their own separate connection. Isolated, but higher${R}"
-        say "     ${DIM}connection churn and TLS handshake overhead.${R}"
-    else
-        say "  ${B}1) One connection per user${R} ${DIM}(recommended)${R}"
-        say "     ${DIM}How it has always worked. Fastest on a poor route, because one${R}"
-        say "     ${DIM}user's lost packet never holds up anybody else.${R}"
-        say ""
-        say "  ${B}2) Share a few connections${R}"
-        say "     ${DIM}Everyone rides on $MX_LINKS connections that stay open for hours. Far${R}"
-        say "     ${DIM}fewer connections between your servers, so the tunnel is harder to${R}"
-        say "     ${DIM}pick out, and busy times do not show. The cost is real: on a lossy${R}"
-        say "     ${DIM}route a hiccup is felt by everyone on that connection at once.${R}"
-    fi
+    say "  ${B}1) One connection per user${R}$rec_one"
+    say "     ${DIM}Each user opens their own connection. Fastest on a poor route, because${R}"
+    say "     ${DIM}one user's lost packet never holds up anybody else. The cost is many${R}"
+    say "     ${DIM}connection set-ups between your servers, which is easier to notice.${R}"
     say ""
-    say "  ${DIM}If your tunnel works well today, keep option 1. Choose 2 if you think${R}"
-    say "  ${DIM}the number of connections is what is getting your tunnel noticed.${R}"
+    say "  ${B}2) Share a few connections (mux)${R}$rec_two"
+    say "     ${DIM}Everyone rides on $MX_LINKS connections that stay open for hours. Far${R}"
+    say "     ${DIM}fewer connections between your servers, so the tunnel is harder to${R}"
+    say "     ${DIM}pick out and busy times do not show. The cost is real: on a lossy${R}"
+    say "     ${DIM}route a hiccup is felt by everyone on that connection at once.${R}"
+    say ""
+    say "  ${DIM}If your tunnel works well today, keep the recommended choice.${R}"
     hr
+}
+
+# ask_mux_links - how many shared connections, 1 to 16.
+ask_mux_links() {
+    local n
+    while :; do
+        n=$(ask "How many shared connections" "4")
+        if valid_port "$n" && [ "$n" -le 16 ]; then
+            MX_LINKS=$n
+            return 0
+        fi
+        err "  Give a number between 1 and 16."
+    done
 }
 
 ask_sharing() {
     explain_sharing
-    local transport=${DG_TRANSPORT:-plain}
+    local transport=${DG_TRANSPORT:-plain} def=1
     if [ "$transport" = kcp ] || [ "$transport" = wss ] || [ "$transport" = grpc ]; then
-        case "$(choose "Choose 1 or 2" "1" 1 2)" in
-            1)
-                MX_MUX=on
-                say ""
-                info "Four shared carrier links is the standard recommended setting for $transport."
-                while :; do
-                    MX_LINKS=$(ask "How many shared connections" "4")
-                    case "$MX_LINKS" in
-                        '' | *[!0-9]*) err "  Give a number between 1 and 16." ;;
-                        *) [ "$MX_LINKS" -ge 1 ] && [ "$MX_LINKS" -le 16 ] && break
-                           err "  Give a number between 1 and 16." ;;
-                    esac
-                done
-                ;;
-            2)
-                MX_MUX=off
-                MX_LINKS=4
-                ;;
-        esac
-    else
-        case "$(choose "Choose 1 or 2" "1" 1 2)" in
-            1) MX_MUX=off; MX_LINKS=4 ;;
-            2)
-                MX_MUX=on
-                say ""
-                info "More connections spread the risk of a hiccup; fewer hide the tunnel"
-                info "better. Four is a sensible middle."
-                while :; do
-                    MX_LINKS=$(ask "How many shared connections" "4")
-                    case "$MX_LINKS" in
-                        '' | *[!0-9]*) err "  Give a number between 1 and 16." ;;
-                        *) [ "$MX_LINKS" -ge 1 ] && [ "$MX_LINKS" -le 16 ] && break
-                           err "  Give a number between 1 and 16." ;;
-                    esac
-                done
-                ;;
-        esac
+        def=2
     fi
+    case "$(choose "Choose 1 or 2" "$def" 1 2)" in
+        1)
+            MX_MUX=off
+            MX_LINKS=4
+            ;;
+        2)
+            MX_MUX=on
+            say ""
+            info "More connections spread the risk of a hiccup; fewer hide the tunnel"
+            info "better. Four is a sensible middle."
+            ask_mux_links
+            ;;
+    esac
 }
 
 # describe_sharing <mux> <links> - one short phrase for summaries.
@@ -758,10 +771,13 @@ describe_sharing() {
 make_pairing_code() {
     local name=$1 mode=$2 tport=$3 relay_ip=$4 server_ip=$5 inbound_port=$6 pool=$7 secret=$8
     local transport=$9 servername=${10} wspath=${11} cdn=${12} mux=${13} muxlinks=${14}
-    local althost=${15-}
-    printf 'v=5\nname=%s\nmode=%s\ntunnel_port=%s\nrelay_ip=%s\nserver_ip=%s\ninbound_port=%s\npool=%s\ntransport=%s\nserver_name=%s\nws_path=%s\ncdn=%s\nalt_host=%s\nmux=%s\nmux_links=%s\nsecret=%s\n' \
+    local althost=${15-} utls=${16-} fragment=${17-} cleanips=${18-}
+    # Version 6 adds the browser hello, the split hello and the clean addresses,
+    # which a CDN tunnel needs on the foreign side as well.
+    printf 'v=6\nname=%s\nmode=%s\ntunnel_port=%s\nrelay_ip=%s\nserver_ip=%s\ninbound_port=%s\npool=%s\ntransport=%s\nserver_name=%s\nws_path=%s\ncdn=%s\nalt_host=%s\nmux=%s\nmux_links=%s\nutls=%s\ntls_fragment=%s\nclean_ips=%s\nsecret=%s\n' \
         "$name" "$mode" "$tport" "$relay_ip" "$server_ip" "$inbound_port" "$pool" \
-        "$transport" "$servername" "$wspath" "$cdn" "$althost" "${mux:-off}" "${muxlinks:-4}" "$secret" |
+        "$transport" "$servername" "$wspath" "$cdn" "$althost" "${mux:-off}" "${muxlinks:-4}" \
+        "$utls" "$fragment" "$cleanips" "$secret" |
         base64 | tr -d '\n'
 }
 
@@ -789,9 +805,16 @@ get_tunnel_pairing_code() {
     muxlinks=$(read_conf "$name" mux_links); [ -n "$muxlinks" ] || muxlinks=4
     alt=$(read_conf "$name" alt_target)
     althost=${alt%:*}
+    local utls fragment cleanips
+    # Left empty when the tunnel never set them, so the other side keeps its own
+    # default (on for a CDN) instead of being told "off".
+    utls=$(read_conf "$name" utls)
+    fragment=$(read_conf "$name" tls_fragment)
+    cleanips=$(read_conf "$name" clean_ips | tr -d ' ')
 
     make_pairing_code "$name" "$mode" "$tport" "$relay_ip" "$server_ip" "$inbound_port" \
-        "$pool" "$secret" "$transport" "$servername" "$wspath" "$cdn" "$mux" "$muxlinks" "$althost"
+        "$pool" "$secret" "$transport" "$servername" "$wspath" "$cdn" "$mux" "$muxlinks" "$althost" \
+        "$utls" "$fragment" "$cleanips"
 }
 
 show_pairing_code() {
@@ -878,7 +901,9 @@ write_tunnel() {
             printf 'alt_server_name = %s\n' "$DG_ALTHOST"
         fi
 
-        if [ -n "${DG_CLEAN_IPS-}" ]; then
+        # Only the side that dials uses these.
+        if [ -n "${DG_CLEAN_IPS-}" ] &&
+            { [ "$mode:$role" = "direct:edge" ] || [ "$mode:$role" = "reverse:origin" ]; }; then
             printf '\n# Clean Cloudflare Anycast IPs for bypassing throttling/blocking\n'
             printf 'clean_ips = %s\n' "$DG_CLEAN_IPS"
         fi
@@ -1092,7 +1117,7 @@ create_tunnel() {
                     ok "Using newly linked server: $target_agent ($peer)"
                 fi
             fi
-        elif [ "$sel" -ge 1 ] && [ "$sel" -le "${#names[@]}" ] 2>/dev/null; then
+        elif valid_count "$sel" && [ "$sel" -le "${#names[@]}" ]; then
             target_agent="${names[$((sel - 1))]}"
             peer=$(read_file_key "$(agent_conf_of "$target_agent")" server_ip)
             agent_url=$(read_file_key "$(agent_conf_of "$target_agent")" url)
@@ -1155,6 +1180,13 @@ create_tunnel() {
     info "The port(s) your users put in their configs, next to this Iran server's IP."
     info "Keeping it the same as the inbound port(s) is simplest, so that is suggested."
     uport=$(ask_user_ports "Port(s) for your users" "$inport")
+    # Each port users connect to leads to one inbound port, in the same order, so
+    # the two lists must be the same length.
+    while [ "$(printf '%s' "$uport" | awk -F',' '{print NF}')" != "$(printf '%s' "$inport" | awk -F',' '{print NF}')" ]; do
+        err "  You gave a different number of user ports than inbound ports. Each user port"
+        err "  leads to one inbound port, in order, so give the same number of each."
+        uport=$(ask_user_ports "Port(s) for your users" "$inport")
+    done
     ulisten="$uport"
 
     ask_disguise "$mode"
@@ -1170,7 +1202,9 @@ create_tunnel() {
     while :; do
         if [ "$mode" = reverse ]; then
             # Reverse: it is opened here on the Iran server, so check it here.
-            tport=$(ask_port "Port between the two servers" "$DEFAULT_TUNNEL_PORT" "" link)
+            local link_proto=tcp
+            [ "$DG_TRANSPORT" = kcp ] && link_proto=udp
+            tport=$(ask_port "Port between the two servers" "$DEFAULT_TUNNEL_PORT" "" link "$link_proto")
             if printf ',%s,' "$uport" | tr -d ' ' | grep -q ",$tport,"; then
                 err "  It cannot be the same as your users' port."
                 continue
@@ -1253,7 +1287,7 @@ create_tunnel() {
         info "Deploying tunnel '$name' on Foreign server '$target_agent' ($agent_url)..."
         local code
         code=$(get_tunnel_pairing_code "$name")
-        if "$BIN" join -agent-url "$agent_url" -token "$agent_token" "$code"; then
+        if run_agent_join "$target_agent" "$agent_url" "$agent_token" "$code"; then
             say ""
             ok "============================================================"
             ok "SUCCESS: Tunnel '$name' deployed automatically to '$target_agent'!"
@@ -1301,11 +1335,18 @@ join_tunnel() {
         err "Update the Iran server, then create the tunnel there again for a new code."
         return 1
     fi
+    if [ "$v" != 5 ] && [ "$v" != 6 ]; then
+        err "That code was made by a newer PortBridge than this one, or is not a code."
+        err "Update this server, then try again."
+        return 1
+    fi
     name=$(get name); mode=$(get mode); tport=$(get tunnel_port)
     relay_ip=$(get relay_ip); server_ip=$(get server_ip)
     inport=$(get inbound_port); pool=$(get pool); secret=$(get secret)
 
-    # The disguise comes from the code, so both ends always match.
+    # The disguise comes from the code, so both ends always match. Everything is
+    # set every time, so nothing is left over from an earlier tunnel made in the
+    # same session.
     DG_TRANSPORT=$(get transport); [ -n "$DG_TRANSPORT" ] || DG_TRANSPORT=plain
     DG_SERVERNAME=$(get server_name)
     DG_WSPATH=$(get ws_path)
@@ -1313,17 +1354,44 @@ join_tunnel() {
     # Carried so this side knows the link may arrive from a CDN and must leave
     # its port open, even though it is the Iran server that does the dialling.
     DG_ALTHOST=$(get alt_host)
+    DG_UTLS=$(get utls)
+    DG_FRAGMENT=$(get tls_fragment)
+    DG_CLEAN_IPS=$(get clean_ips)
 
     # So does whether connections are shared: it must match on both ends or
     # neither side would understand the other.
     MX_MUX=$(get mux); [ -n "$MX_MUX" ] || MX_MUX=off
     MX_LINKS=$(get mux_links); [ -n "$MX_LINKS" ] || MX_LINKS=4
 
-    if [ "$v" != 5 ] || [ -z "$name" ] || [ -z "$mode" ] || [ -z "$secret" ] ||
-        ! valid_port "${tport:-x}" || ! valid_ports_list "${inport:-x}" || [ -z "$relay_ip" ]; then
+    # Everything in the code ends up in a settings file, so it is checked for what
+    # it is allowed to be before anything is written. A code pasted from somewhere
+    # untrustworthy must not be able to name a path or add a setting.
+    if ! valid_name "$name" || [ -z "$secret" ] || [ "${#secret}" -lt 16 ] ||
+        ! valid_port "${tport:-x}" || ! valid_ports_list "${inport:-x}" || ! valid_host "$relay_ip"; then
         err "That is not a valid PortBridge code."
         return 1
     fi
+    case "$mode" in direct | reverse) ;; *) err "That code has an unknown mode."; return 1 ;; esac
+    case "$DG_TRANSPORT" in plain | tls | wss | h2 | grpc | kcp) ;; *) err "That code has an unknown link type."; return 1 ;; esac
+    case "$DG_CDN" in on | off) ;; *) err "That code has a bad CDN setting."; return 1 ;; esac
+    case "$MX_MUX" in on | off) ;; *) err "That code has a bad sharing setting."; return 1 ;; esac
+    case "$DG_UTLS" in '' | on | off) ;; *) err "That code has a bad setting."; return 1 ;; esac
+    case "$DG_FRAGMENT" in '' | on | off) ;; *) err "That code has a bad setting."; return 1 ;; esac
+    if ! valid_port "$MX_LINKS" || [ "$MX_LINKS" -gt 16 ]; then
+        err "That code has a bad number of shared connections."
+        return 1
+    fi
+    if [ -n "$DG_SERVERNAME" ] && ! valid_host "$DG_SERVERNAME"; then err "That code has a bad server name."; return 1; fi
+    if [ -n "$DG_ALTHOST" ] && ! valid_host "$DG_ALTHOST"; then err "That code has a bad backup host."; return 1; fi
+    if [ -n "$server_ip" ] && ! valid_host "$server_ip"; then err "That code has a bad server address."; return 1; fi
+    if [ -n "$DG_WSPATH" ]; then
+        case "$DG_WSPATH" in
+            /*[!a-zA-Z0-9/_.~%-]* | [!/]*) err "That code has a bad path."; return 1 ;;
+        esac
+    fi
+    case "$DG_CLEAN_IPS" in
+        *[!]0-9a-fA-F.:,[]*) err "That code has a bad address list."; return 1 ;;
+    esac
     valid_port "${pool:-x}" || pool=25
 
     # Pasting the code back on the Iran server is an easy slip; catch it.
@@ -1369,7 +1437,9 @@ join_tunnel() {
         confirm "Carry on anyway?" || { say "Cancelled. Nothing was changed."; return 1; }
     fi
     if [ "$mode" = direct ]; then
-        if port_in_use_by_system "$tport" || port_owner "$tport" >/dev/null; then
+        local link_proto=tcp
+        [ "$DG_TRANSPORT" = kcp ] && link_proto=udp
+        if port_in_use_by_system "$tport" "$link_proto" || port_owner "$tport" >/dev/null; then
             err "Port $tport is already in use on this server, so the Iran server could"
             err "not connect to it. Create the tunnel again there with another port."
             return 1
@@ -1456,6 +1526,7 @@ status_line() {
         tls:*) look=website ;;
         h2:*) look=http2 ;;
         grpc:*) look=grpc ;;
+        kcp:*) look=kcp-udp ;;
         wss:on) look=cdn ;;
         wss:*)
             if [ -n "$(read_conf "$name" alt_target)" ]; then
@@ -1467,8 +1538,16 @@ status_line() {
         *) look=plain ;;
     esac
 
-    printf '  %-14s %-8s %-12s %s%-8s%s %-10s users:%-5s %s:%s\n' \
-        "$name" "$mode" "$job" "$colour" "$state" "$R" "$look" "$active_s" "$label" "$parked"
+    # Said plainly when the tunnel has found that nothing gets through, so a row
+    # that shows connections "ready" is not read as a tunnel that works.
+    local pstate warn_tag=""
+    pstate=$(json_field "$RUN_DIR/$name.json" path_state 2>/dev/null)
+    case "$pstate" in
+        blocked) warn_tag="  ${RED}NO DATA GETS THROUGH${R}" ;;
+        degraded) warn_tag="  ${YELLOW}unhealthy${R}" ;;
+    esac
+    printf '  %-14s %-8s %-12s %s%-8s%s %-10s users:%-5s %s:%s%s\n' \
+        "$name" "$mode" "$job" "$colour" "$state" "$R" "$look" "$active_s" "$label" "$parked" "$warn_tag"
 }
 
 list_tunnels() {
@@ -1572,7 +1651,13 @@ edit_tunnel() {
         say "${DIM}many is safe on its own; the other server does not have to match.${R}"
         cur=$(read_conf "$name" mux_links); [ -n "$cur" ] || cur=4
         new=$(ask "Shared connections between the servers" "$cur")
-        [ "$new" != "$cur" ] && { write_conf "$name" mux_links "$new"; changed=1; }
+        if [ "$new" != "$cur" ]; then
+            if valid_count "$new" && [ "$new" -le 16 ]; then
+                write_conf "$name" mux_links "$new"; changed=1
+            else
+                err "  Give a number from 1 to 16; leaving it as it was."
+            fi
+        fi
     else
         # How many are ready is agreed by both servers, and whichever asks for
         # fewer decides. Saying so matters: changing it on one server only looks
@@ -1597,7 +1682,13 @@ edit_tunnel() {
         info "the ones beyond it wait while fresh connections are opened."
         cur=$(read_conf "$name" pool_size)
         new=$(ask "Connections to keep ready" "$cur")
-        [ "$new" != "$cur" ] && { write_conf "$name" pool_size "$new"; changed=1; }
+        if [ "$new" != "$cur" ]; then
+            if valid_count "$new"; then
+                write_conf "$name" pool_size "$new"; changed=1
+            else
+                err "  Give a whole number; leaving it as it was."
+            fi
+        fi
 
         cur=$(read_conf "$name" spare_ttl)
         new=$(ask "How long a spare lives before being replaced" "$cur")
@@ -1606,7 +1697,13 @@ edit_tunnel() {
 
     cur=$(read_conf "$name" max_conn)
     new=$(ask "Maximum users at once" "$cur")
-    [ "$new" != "$cur" ] && { write_conf "$name" max_conn "$new"; changed=1; }
+    if [ "$new" != "$cur" ]; then
+        if valid_count "$new"; then
+            write_conf "$name" max_conn "$new"; changed=1
+        else
+            err "  Give a whole number; leaving it as it was."
+        fi
+    fi
 
     cur=$(read_conf "$name" drain)
     new=$(ask "How long to let sessions finish when restarting" "$cur")
@@ -1630,12 +1727,29 @@ edit_tunnel() {
     role=$(read_conf "$name" role)
     if [ "$role" = edge ]; then
         cur_u=$(read_conf "$name" user_listen)
-        new=$(ask "Port for users" "${cur_u##*:}")
-        if [ "$new" != "${cur_u##*:}" ]; then
-            if valid_port "$new"; then
-                write_conf "$name" user_listen "0.0.0.0:$new"; changed=1
+        say "${DIM}Ports users connect to. Several are separated by commas, and each leads to${R}"
+        say "${DIM}the inbound port in the same position.${R}"
+        new=$(ask "Port(s) for users" "$cur_u")
+        if [ "$new" != "$cur_u" ]; then
+            # Each entry is a port or an address and port. The whole list is
+            # kept: only the last port used to be shown and the rest were lost.
+            local item clean="" bad=0 old_ifs=$IFS
+            IFS=','
+            for item in $new; do
+                item=$(printf '%s' "$item" | tr -d '[:space:]')
+                if valid_port "$item"; then
+                    item="0.0.0.0:$item"
+                elif ! { valid_host "${item%:*}" && valid_port "${item##*:}"; }; then
+                    bad=1
+                    break
+                fi
+                [ -n "$clean" ] && clean="$clean, $item" || clean="$item"
+            done
+            IFS=$old_ifs
+            if [ "$bad" -eq 0 ] && [ -n "$clean" ]; then
+                write_conf "$name" user_listen "$clean"; changed=1
             else
-                err "  Not a valid port; leaving it as it was."
+                err "  Not a valid list of ports; leaving it as it was."
             fi
         fi
     else
@@ -1698,27 +1812,16 @@ delete_tunnel() {
 
     if [ "$deleted_remote" = no ] && [ "$role" = edge ]; then
         init_agents_dir
-        local target_agent agent_url="" agent_token=""
+        local target_agent
         target_agent=$(read_conf "$name" foreign_agent 2>/dev/null || true)
-        if [ -n "$target_agent" ] && [ -f "$(agent_conf_of "$target_agent")" ]; then
-            agent_url=$(read_file_key "$(agent_conf_of "$target_agent")" url)
-            agent_token=$(read_file_key "$(agent_conf_of "$target_agent")" token)
-        else
-            local peer_ip
-            peer_ip=$(read_conf "$name" peer_ip 2>/dev/null || true)
-            local matched
-            matched=$(find_agent_by_target "$peer_ip" 2>/dev/null || true)
-            if [ -n "$matched" ]; then
-                agent_url=$(read_file_key "$(agent_conf_of "$matched")" url)
-                agent_token=$(read_file_key "$(agent_conf_of "$matched")" token)
-            else
-                agent_url=$(read_file_key "$AGENT_CLIENT_CONF" url 2>/dev/null || true)
-                agent_token=$(read_file_key "$AGENT_CLIENT_CONF" token 2>/dev/null || true)
-            fi
+        if [ -z "$target_agent" ] || [ ! -f "$(agent_conf_of "$target_agent")" ]; then
+            # Only an agent whose address is exactly this tunnel's other server
+            # is used. Falling back to "the last agent linked" could delete a
+            # tunnel of the same name on a different server.
+            target_agent=$(find_agent_by_target "$(read_conf "$name" peer_ip 2>/dev/null || true)" 2>/dev/null || true)
         fi
-
-        if [ -n "$agent_url" ] && [ -n "$agent_token" ]; then
-            if "$BIN" join -agent-url "$agent_url" -token "$agent_token" -delete "$name" >/dev/null 2>&1; then
+        if [ -n "$target_agent" ] && [ -f "$(agent_conf_of "$target_agent")" ]; then
+            if agent_call_alias "$target_agent" -delete "$name" >/dev/null 2>&1; then
                 deleted_remote=yes
             fi
         fi
@@ -1785,27 +1888,43 @@ test_tunnel() {
         note "Start it from the menu, or look at the log for why it stopped."
     fi
 
+    # Settings may list several addresses, so each is checked in turn.
+    local item
     if [ "$role" = edge ]; then
         ulisten=$(read_conf "$name" user_listen)
-        if port_in_use_by_system "${ulisten##*:}"; then
-            result "listening for users" good "yes, port ${ulisten##*:}"
-        else
-            result "listening for users" bad "no"
-        fi
+        while IFS= read -r item; do
+            item=$(printf '%s' "$item" | tr -d '[:space:]')
+            [ -n "$item" ] || continue
+            if port_in_use_by_system "${item##*:}"; then
+                result "listening for users" good "yes, port ${item##*:}"
+            else
+                result "listening for users" bad "no, port ${item##*:}"
+            fi
+        done < <(printf '%s\n' "$ulisten" | tr ',' '\n')
     else
         local inbound
         inbound=$(read_conf "$name" inbound_addr)
-        if timeout 5 bash -c "echo > /dev/tcp/${inbound%:*}/${inbound##*:}" 2>/dev/null; then
-            result "local service reachable" good "yes, $inbound"
-        else
-            result "local service reachable" bad "no, cannot reach $inbound"
-            note "Is the service actually running on this server?"
-        fi
+        while IFS= read -r item; do
+            item=$(printf '%s' "$item" | tr -d '[:space:]')
+            [ -n "$item" ] || continue
+            if timeout 5 bash -c "echo > /dev/tcp/${item%:*}/${item##*:}" 2>/dev/null; then
+                result "local service reachable" good "yes, $item"
+            else
+                result "local service reachable" bad "no, cannot reach $item"
+                note "Is the service actually running on this server?"
+            fi
+        done < <(printf '%s\n' "$inbound" | tr ',' '\n')
     fi
 
     taddr=$(read_conf "$name" tunnel_addr)
+    local link_proto=tcp
+    [ "$(read_conf "$name" transport)" = kcp ] && link_proto=udp
     if [ "$mode:$role" = "direct:edge" ] || [ "$mode:$role" = "reverse:origin" ]; then
-        if timeout 8 bash -c "echo > /dev/tcp/${taddr%:*}/${taddr##*:}" 2>/dev/null; then
+        if [ "$link_proto" = udp ]; then
+            # A UDP port cannot be probed by connecting to it; whether the two
+            # servers are linked, below, is the real answer.
+            result "other server reachable" note "UDP, cannot be probed; see whether the servers are linked below"
+        elif timeout 8 bash -c "echo > /dev/tcp/${taddr%:*}/${taddr##*:}" 2>/dev/null; then
             result "other server reachable" good "yes, $taddr"
         else
             result "other server reachable" bad "no, cannot reach $taddr"
@@ -1813,7 +1932,7 @@ test_tunnel() {
             note "allowing this server's address."
         fi
     else
-        if port_in_use_by_system "${taddr##*:}"; then
+        if port_in_use_by_system "${taddr##*:}" "$link_proto"; then
             result "waiting on tunnel port" good "yes, port ${taddr##*:}"
         else
             result "waiting on tunnel port" bad "no"
@@ -1837,6 +1956,27 @@ test_tunnel() {
         note "Make sure the tunnel is set up on both servers, that the code was"
         note "pasted on the foreign server, and that both clocks are correct."
     fi
+
+    # Whether data really flows, as measured by the tunnel itself. Connections
+    # being ready proves nothing: a route that lets a few packets through and
+    # then cuts the connection leaves every one of them looking fine.
+    local pstate pnote
+    pstate=$(json_field "$f" path_state 2>/dev/null)
+    pnote=$(sed -nE 's/^[[:space:]]*"path_note"[[:space:]]*:[[:space:]]*"(.*)",?[[:space:]]*$/\1/p' "$f" 2>/dev/null | head -1)
+    case "$pstate" in
+        ok) result "data flows" good "yes, checked by the tunnel" ;;
+        blocked)
+            result "data flows" bad "no, connections open but nothing gets through"
+            note "${pnote:-The route between the servers is cutting connections.}"
+            note "This is usually the route being filtered, not a fault in PortBridge."
+            note "Use a backup route through a CDN, or another address or server."
+            ;;
+        degraded)
+            result "data flows" bad "doubtful"
+            note "${pnote:-Something is wrong on the route between the servers.}"
+            ;;
+        *) result "data flows" note "not measured yet" ;;
+    esac
 
     local transport cdn
     transport=$(read_conf "$name" transport); [ -n "$transport" ] || transport=plain
@@ -1991,6 +2131,9 @@ init_agents_dir() {
                 write_file_key "$AGENTS_DIR/${def_alias}.conf" url "$u"
                 write_file_key "$AGENTS_DIR/${def_alias}.conf" token "$t"
                 write_file_key "$AGENTS_DIR/${def_alias}.conf" server_ip "$def_ip"
+                local old_fp
+                old_fp=$(read_file_key "$AGENT_CLIENT_CONF" fingerprint)
+                [ -n "$old_fp" ] && write_file_key "$AGENTS_DIR/${def_alias}.conf" fingerprint "$old_fp"
                 chmod 600 "$AGENTS_DIR/${def_alias}.conf"
             fi
         fi
@@ -2017,12 +2160,59 @@ find_agent_by_target() {
         local ip u
         ip=$(read_file_key "$f" server_ip)
         u=$(read_file_key "$f" url)
-        if [ "$ip" = "$target" ] || [[ "$u" =~ $target ]]; then
+        # The address has to be the whole host of the saved link. It used to be
+        # matched as a pattern anywhere in the link, so 1.2.3.4 also matched
+        # 11.2.3.45, and a tunnel could be deleted from the wrong server.
+        local host=${u#*://}
+        host=${host%%/*}
+        host=${host%:*}
+        if [ -n "$target" ] && { [ "$ip" = "$target" ] || [ "$host" = "$target" ]; }; then
             basename "$f" .conf
             return 0
         fi
     done
     return 1
+}
+
+# agent_call <url> <token> <fingerprint> <arguments to "portbridge join"...>
+#
+# Runs the agent client with the token handed over in a private file rather than
+# on the command line, where every user on the machine can read it.
+agent_call() {
+    local url=$1 tok=$2 fp=$3 tf rc
+    shift 3
+    tf=$(mktemp) || return 1
+    chmod 600 "$tf"
+    printf '%s' "$tok" >"$tf"
+    local args=(join -agent-url "$url" -token-file "$tf")
+    [ -n "$fp" ] && args+=(-fingerprint "$fp")
+    "$BIN" "${args[@]}" "$@"
+    rc=$?
+    rm -f "$tf"
+    return $rc
+}
+
+# agent_call_alias <alias> <arguments...> - the same, using a saved profile.
+agent_call_alias() {
+    local f
+    f=$(agent_conf_of "$1")
+    shift
+    agent_call "$(read_file_key "$f" url)" "$(read_file_key "$f" token)" "$(read_file_key "$f" fingerprint)" "$@"
+}
+
+# run_agent_join <alias> <url> <token> <code> - hands a pairing code to the agent
+# on the foreign server. The code holds the tunnel's password, so it goes in on
+# standard input.
+run_agent_join() {
+    local alias=$1 url=$2 tok=$3 code=$4 fp=""
+    [ -n "$alias" ] && [ -f "$(agent_conf_of "$alias")" ] && fp=$(read_file_key "$(agent_conf_of "$alias")" fingerprint)
+    printf '%s' "$code" | agent_call "$url" "$tok" "$fp" -code-file -
+}
+
+# agent_fingerprint - the fingerprint of this server's agent certificate, which
+# the Iran server pins so it knows it is talking to the real agent.
+agent_fingerprint() {
+    "$BIN" agent -config "$AGENT_CONF" -fingerprint 2>/dev/null | tail -1
 }
 
 find_free_agent_port() {
@@ -2088,13 +2278,14 @@ enable_agent() {
     }
     sleep 1
     if [ "$(systemctl is-active "$AGENT_UNIT" 2>/dev/null)" = active ]; then
-        local my_ip
+        local my_ip afp
         my_ip=$(public_ip)
+        afp=$(agent_fingerprint)
         say ""
         ok "Foreign Management Agent is now ACTIVE and running on port $p!"
         hr
         say "  ${B}Copy this Link String to your Iran server:${R}"
-        say "  ${GREEN}pb-agent://${tok}@${my_ip}:${p}${R}"
+        say "  ${GREEN}pb-agent://${tok}@${my_ip}:${p}${afp:+?fp=$afp}${R}"
         say ""
         say "  ${DIM}On your Iran server, open 'portbridge' -> Option 11 -> Option 2 (Link a new Foreign server)${R}"
         say "  ${DIM}and paste the link string above.${R}"
@@ -2117,20 +2308,22 @@ show_agent_link() {
         return 1
     fi
 
-    local tok listen p my_ip st
+    local tok listen p my_ip st afp
     tok=$(read_file_key "$AGENT_CONF" token)
     listen=$(read_file_key "$AGENT_CONF" listen)
     p=${listen##*:}
     my_ip=$(public_ip)
     st=$(systemctl is-active "$AGENT_UNIT" 2>/dev/null || echo "inactive")
+    afp=$(agent_fingerprint)
 
     say "  Status:         $st"
     say "  Listen address: ${listen:-0.0.0.0:2083}"
     say "  Agent Token:    $tok"
     say "  Server IP:      $my_ip"
+    say "  Certificate:    ${afp:-unknown}"
     say ""
     say "  ${B}Iran Link String:${R}"
-    say "  ${GREEN}pb-agent://${tok}@${my_ip}:${p}${R}"
+    say "  ${GREEN}pb-agent://${tok}@${my_ip}:${p}${afp:+?fp=$afp}${R}"
     say ""
     say "  ${DIM}Copy the link string above and paste it in Option 11 -> Option 2 on your Iran server.${R}"
     hr
@@ -2211,15 +2404,12 @@ list_foreign_agents() {
     printf "  %-15s %-25s %-12s %s\n" "---------------" "-------------------------" "------------" "--------------"
     local name
     for name in $(agent_names); do
-        local f u tok ip p out st="ONLINE" tun="?"
+        local f u out st="ONLINE" tun="?"
         f=$(agent_conf_of "$name")
         u=$(read_file_key "$f" url)
-        tok=$(read_file_key "$f" token)
-        ip=$(read_file_key "$f" server_ip)
-        p=$(read_file_key "$f" port)
 
         local hostport="${u#*://}"
-        out=$("$BIN" join -agent-url "$u" -token "$tok" -status 2>&1 || true)
+        out=$(agent_call_alias "$name" -status 2>&1 || true)
         if echo "$out" | grep -qi "status: OK"; then
             st="${GREEN}ONLINE${R}"
             local tun_info
@@ -2251,11 +2441,12 @@ link_foreign_agent() {
     input=$(ask "Agent Link String or Foreign Server IP" "$default_ip")
     [ -n "$input" ] || { err "Nothing entered."; return 1; }
 
-    local target_host="" target_port="" tok=""
-    if [[ "$input" =~ ^pb-agent://([^@]+)@([^/:]+)(:([0-9]+))? ]]; then
+    local target_host="" target_port="" tok="" fp=""
+    if [[ "$input" =~ ^pb-agent://([^@]+)@([^/:?]+)(:([0-9]+))?(\?fp=([0-9a-fA-F:]+))? ]]; then
         tok="${BASH_REMATCH[1]}"
         target_host="${BASH_REMATCH[2]}"
         target_port="${BASH_REMATCH[4]}"
+        fp="${BASH_REMATCH[6]}"
     elif [[ "$input" =~ ^https?://([^/:]+)(:([0-9]+))? ]]; then
         target_host="${BASH_REMATCH[1]}"
         target_port="${BASH_REMATCH[3]}"
@@ -2309,20 +2500,44 @@ link_foreign_agent() {
 
     local url="https://${target_host}:${target_port}"
 
+    # The agent's certificate is self-signed, so it is recognised by its
+    # fingerprint. A link string carries it. Without one, it is read from the
+    # server and the person checks it against what the server itself shows,
+    # which is the one step that proves this really is their server.
+    if [ -z "$fp" ]; then
+        say ""
+        info "Reading the agent's certificate fingerprint..."
+        fp=$("$BIN" join -agent-url "$url" -fetch-fingerprint 2>/dev/null || true)
+        if [ -z "$fp" ]; then
+            err "Could not reach the agent at $url, so there is nothing to compare."
+            warn "Check the address and port, and that the agent is running there."
+            return 1
+        fi
+        say ""
+        say "  The agent at $url presents this certificate:"
+        say "  ${B}$fp${R}"
+        say ""
+        say "  On the foreign server, choose the agent option 'Show the link string'."
+        say "  It shows the same fingerprint. If they differ, do not continue."
+        confirm "Is it the same?" || { err "Not linked."; return 1; }
+    fi
+
     say ""
     info "Testing connection to $url (alias: $alias)..."
-    if "$BIN" join -agent-url "$url" -token "$tok" -status; then
+    if agent_call "$url" "$tok" "$fp" -status; then
         local f
         f=$(agent_conf_of "$alias")
         write_file_key "$f" alias "$alias"
         write_file_key "$f" url "$url"
         write_file_key "$f" token "$tok"
+        write_file_key "$f" fingerprint "$fp"
         write_file_key "$f" server_ip "$target_host"
         write_file_key "$f" port "$target_port"
         chmod 600 "$f"
 
         write_file_key "$AGENT_CLIENT_CONF" url "$url"
         write_file_key "$AGENT_CLIENT_CONF" token "$tok"
+        write_file_key "$AGENT_CLIENT_CONF" fingerprint "$fp"
         chmod 600 "$AGENT_CLIENT_CONF"
 
         LAST_LINKED_AGENT="$alias"
@@ -2342,12 +2557,14 @@ link_foreign_agent() {
             write_file_key "$f" alias "$alias"
             write_file_key "$f" url "$url"
             write_file_key "$f" token "$tok"
+            write_file_key "$f" fingerprint "$fp"
             write_file_key "$f" server_ip "$target_host"
             write_file_key "$f" port "$target_port"
             chmod 600 "$f"
 
             write_file_key "$AGENT_CLIENT_CONF" url "$url"
             write_file_key "$AGENT_CLIENT_CONF" token "$tok"
+            write_file_key "$AGENT_CLIENT_CONF" fingerprint "$fp"
             chmod 600 "$AGENT_CLIENT_CONF"
             LAST_LINKED_AGENT="$alias"
             ok "Saved."
@@ -2373,12 +2590,10 @@ test_foreign_agent() {
     if [ "$count" -eq 1 ]; then
         local name
         name=$(agent_names)
-        local f u tok
-        f=$(agent_conf_of "$name")
-        u=$(read_file_key "$f" url)
-        tok=$(read_file_key "$f" token)
+        local u
+        u=$(read_file_key "$(agent_conf_of "$name")" url)
         info "Testing connection to '$name' ($u)..."
-        "$BIN" join -agent-url "$u" -token "$tok" -status
+        agent_call_alias "$name" -status
         return $?
     fi
 
@@ -2400,24 +2615,20 @@ test_foreign_agent() {
         return 0
     elif [ "$choice" = "a" ] || [ "$choice" = "A" ]; then
         for name in "${names[@]}"; do
-            local f u tok
-            f=$(agent_conf_of "$name")
-            u=$(read_file_key "$f" url)
-            tok=$(read_file_key "$f" token)
+            local u
+            u=$(read_file_key "$(agent_conf_of "$name")" url)
             say ""
             info "--> Testing '$name' ($u)..."
-            "$BIN" join -agent-url "$u" -token "$tok" -status || true
+            agent_call_alias "$name" -status || true
         done
         return 0
-    elif [ "$choice" -ge 1 ] && [ "$choice" -le "${#names[@]}" ] 2>/dev/null; then
+    elif valid_count "$choice" && [ "$choice" -le "${#names[@]}" ]; then
         local sel_name="${names[$((choice - 1))]}"
-        local f u tok
-        f=$(agent_conf_of "$sel_name")
-        u=$(read_file_key "$f" url)
-        tok=$(read_file_key "$f" token)
+        local u
+        u=$(read_file_key "$(agent_conf_of "$sel_name")" url)
         say ""
         info "--> Testing '$sel_name' ($u)..."
-        "$BIN" join -agent-url "$u" -token "$tok" -status
+        agent_call_alias "$sel_name" -status
         return $?
     else
         err "Invalid choice."
@@ -2459,7 +2670,7 @@ unlink_foreign_agent() {
         rm -f "$AGENT_CLIENT_CONF"
         ok "All foreign servers unlinked."
         return 0
-    elif [ "$choice" -ge 1 ] && [ "$choice" -le "${#names[@]}" ] 2>/dev/null; then
+    elif valid_count "$choice" && [ "$choice" -le "${#names[@]}" ]; then
         local sel_name="${names[$((choice - 1))]}"
         confirm "Unlink foreign server '$sel_name'?" || return 0
         rm -f "$(agent_conf_of "$sel_name")"
@@ -2470,11 +2681,13 @@ unlink_foreign_agent() {
         if [ "$rem_count" -gt 0 ]; then
             local next_name
             next_name=$(agent_names | head -n 1)
-            local next_u next_tok
+            local next_u next_tok next_fp
             next_u=$(read_file_key "$(agent_conf_of "$next_name")" url)
             next_tok=$(read_file_key "$(agent_conf_of "$next_name")" token)
+            next_fp=$(read_file_key "$(agent_conf_of "$next_name")" fingerprint)
             write_file_key "$AGENT_CLIENT_CONF" url "$next_u"
             write_file_key "$AGENT_CLIENT_CONF" token "$next_tok"
+            write_file_key "$AGENT_CLIENT_CONF" fingerprint "$next_fp"
             chmod 600 "$AGENT_CLIENT_CONF"
         else
             rm -f "$AGENT_CLIENT_CONF"
@@ -2593,7 +2806,16 @@ main_menu() {
 
 # set_firewall <name> <on|off> - records the choice and applies it at once
 set_firewall() {
-    write_conf "$1" firewall "$2"
+    # A tunnel that can arrive from a CDN cannot have its port locked to one
+    # address: the connection comes from the CDN, not from the other server, so
+    # the lock would cut off the very route meant to keep it alive.
+    if [ "$2" = on ] && cdn_involved "$(read_conf "$1" cdn)" "$(read_conf "$1" alt_target)"; then
+        warn "'$1' can be reached through a CDN, whose addresses are not the other"
+        warn "server's. Locking its port to one address would cut that route off, so"
+        warn "the firewall stays off for it."
+        return 1
+    fi
+    write_conf "$1" firewall "$2" || return 1
     "$FIREWALL" apply "$1"
 }
 

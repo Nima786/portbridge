@@ -203,13 +203,20 @@ func cmdTeardown(args []string) {
 	}
 
 	if cfg.Role == RoleOrigin {
+		told := true
 		if err := teardownFromOrigin(cfg); err != nil {
 			fmt.Fprintf(os.Stderr, "teardown warning: %v\n", err)
+			told = false
 		} else {
 			fmt.Printf("[%s] remote teardown succeeded.\n", cfg.Name)
 		}
 		o := &origin{cfg: cfg}
 		o.selfDelete()
+		if !told {
+			// This side is removed, but the other side was not told. The exit
+			// status says so, so a caller does not report it as fully done.
+			os.Exit(3)
+		}
 		return
 	}
 
@@ -236,10 +243,16 @@ func teardownFromOrigin(cfg *Config) error {
 				if strings.HasPrefix(res, "err: ") {
 					return errors.New(strings.TrimPrefix(res, "err: "))
 				}
+				return fmt.Errorf("unexpected reply from the running tunnel: %q", res)
 			}
+			return fmt.Errorf("no reply from the running tunnel: %w", err)
 		}
+		return errors.New("could not talk to the running tunnel")
 	}
-	return nil
+	// Reporting success here used to tell someone the other server had been
+	// cleaned up when nothing had been sent to it at all.
+	return errors.New("the tunnel is not running on this server, so the other server could not be told; " +
+		"it still has its side and must be removed there")
 }
 
 func teardownFromEdge(cfg *Config) error {

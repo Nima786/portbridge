@@ -19,7 +19,12 @@ import (
 func runSpeedtestServer(c net.Conn) {
 	defer c.Close()
 	_ = c.SetDeadline(time.Now().Add(60 * time.Second))
-	log.Printf("[speedtest-server] handling connection from %s", c.RemoteAddr())
+
+	// A person running a speed test starts with the latency phase and is worth
+	// one line in the log. The routine path check that tunnels run on themselves
+	// every few seconds starts with the download phase and is not: logging it
+	// would put a line in the journal every quarter of a minute, for ever.
+	announced := false
 
 	buf := make([]byte, 32*1024)
 	_, _ = rand.Read(buf[:256])
@@ -30,30 +35,28 @@ func runSpeedtestServer(c net.Conn) {
 	for {
 		var phase [1]byte
 		if _, err := io.ReadFull(c, phase[:]); err != nil {
-			log.Printf("[speedtest-server] read phase err from %s: %v", c.RemoteAddr(), err)
 			return
 		}
-		log.Printf("[speedtest-server] phase 0x%02x from %s", phase[0], c.RemoteAddr())
 
 		switch phase[0] {
 		case 0x01: // Latency / Ping phase
+			if !announced {
+				announced = true
+				log.Printf("[speedtest-server] speed test from %s", c.RemoteAddr())
+			}
 			const numSamples = 1
 			for i := 0; i < numSamples; i++ {
 				var ts [8]byte
 				_ = c.SetReadDeadline(time.Now().Add(10 * time.Second))
 				if _, err := io.ReadFull(c, ts[:]); err != nil {
-					log.Printf("[speedtest-server] ping sample %d read err: %v", i, err)
 					return
 				}
 				_ = c.SetWriteDeadline(time.Now().Add(10 * time.Second))
 				if _, err := c.Write(ts[:]); err != nil {
-					log.Printf("[speedtest-server] ping sample %d write err: %v", i, err)
 					return
 				}
-				log.Printf("[speedtest-server] ping sample %d echoed successfully", i)
 			}
 			_ = c.SetDeadline(time.Now().Add(60 * time.Second))
-			log.Printf("[speedtest-server] ping phase completed")
 
 		case 0x02: // Download phase: Server pumps data to Client
 			_ = c.SetDeadline(time.Now().Add(60 * time.Second))

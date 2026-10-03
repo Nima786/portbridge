@@ -41,6 +41,12 @@ var errWSUpgrade = errors.New("the other end did not complete the websocket upgr
 // wsDial performs the client half of the upgrade over an already-secured
 // connection, then returns a stream that frames everything as websocket data.
 func wsDial(c net.Conn, cfg *Config) (net.Conn, error) {
+	return wsDialPurpose(c, cfg, authPurposeTunnel)
+}
+
+// wsDialPurpose is wsDial with the purpose to announce in the early
+// authentication carried by the upgrade request.
+func wsDialPurpose(c net.Conn, cfg *Config, purpose byte) (net.Conn, error) {
 	var nonce [16]byte
 	if _, err := rand.Read(nonce[:]); err != nil {
 		return nil, err
@@ -53,7 +59,7 @@ func wsDial(c net.Conn, cfg *Config) (net.Conn, error) {
 	// Build v2 early-data auth frame for 0-RTT handshake
 	var earlyDataProto string
 	if len(cfg.secret) >= 16 {
-		if frame, err := buildAuthFrameV2(cfg.secret, authPurposeTunnel); err == nil {
+		if frame, err := buildAuthFrameV2(cfg.secret, purpose); err == nil {
 			earlyDataProto = "portbridge.v2." + base64.RawURLEncoding.EncodeToString(frame)
 		}
 	}
@@ -103,7 +109,7 @@ func wsDial(c net.Conn, cfg *Config) (net.Conn, error) {
 
 	earlyAuthed := resp.Header.Get("Sec-WebSocket-Protocol") == "portbridge.v2"
 	// br may hold bytes already read past the response, so it must be kept.
-	return &wsConn{Conn: c, br: br, mask: true, earlyAuthed: earlyAuthed}, nil
+	return &wsConn{Conn: c, br: br, mask: true, earlyAuthed: earlyAuthed, earlyPurposeB: purpose}, nil
 }
 
 // wsAccept performs the server half. Anything that is not a correct upgrade for
@@ -129,6 +135,7 @@ func wsAccept(c net.Conn, cfg *Config, guard ...*replayGuard) (net.Conn, error) 
 	}
 
 	earlyAuthed := false
+	earlyPurpose := authPurposeTunnel
 	protoHeader := req.Header.Get("Sec-WebSocket-Protocol")
 	if strings.HasPrefix(protoHeader, "portbridge.v2.") {
 		token := strings.TrimPrefix(protoHeader, "portbridge.v2.")
@@ -138,9 +145,13 @@ func wsAccept(c net.Conn, cfg *Config, guard ...*replayGuard) (net.Conn, error) 
 			if len(guard) > 0 && guard[0] != nil {
 				g = guard[0]
 			}
-			_, err = verifyAuthFrameBytes(frame, cfg.secret, g)
+			var purpose byte
+			purpose, err = verifyAuthFrameBytes(frame, cfg.secret, g)
 			if err == nil {
 				earlyAuthed = true
+				// Keep what the dialler said it wants. Dropping it meant a
+				// speed test over this disguise was taken for a tunnel.
+				earlyPurpose = purpose
 			} else {
 				writeDecoyResponse(c)
 				return nil, fmt.Errorf("%w: early auth failed: %v", errWSUpgrade, err)
@@ -163,7 +174,7 @@ func wsAccept(c net.Conn, cfg *Config, guard ...*replayGuard) (net.Conn, error) 
 	if err := c.SetDeadline(time.Time{}); err != nil {
 		return nil, err
 	}
-	return &wsConn{Conn: c, br: br, mask: false, earlyAuthed: earlyAuthed}, nil
+	return &wsConn{Conn: c, br: br, mask: false, earlyAuthed: earlyAuthed, earlyPurposeB: earlyPurpose}, nil
 }
 
 // writeDecoyResponse answers anything unexpected the way a small web server
@@ -196,6 +207,10 @@ type wsConn struct {
 	mask        bool // whichever side dialled must mask its frames
 	earlyAuthed bool
 
+	// earlyPurposeB is the purpose carried by the early authentication: what the
+	// dialler asked for, or on the accepting side what it was verified to ask for.
+	earlyPurposeB byte
+
 	readBuf []byte // payload left over from the last frame
 	closed  bool
 
@@ -204,6 +219,10 @@ type wsConn struct {
 
 func (w *wsConn) isEarlyAuthed() bool {
 	return w.earlyAuthed
+}
+
+func (w *wsConn) earlyPurpose() byte {
+	return w.earlyPurposeB
 }
 
 func (w *wsConn) Read(p []byte) (int, error) {

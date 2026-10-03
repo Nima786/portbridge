@@ -37,3 +37,7 @@ func socketAlive(c net.Conn) bool {
 	}
 	return true
 }
+
+// pendingByte is only meaningful on Linux, where socketAlive can see that a
+// byte is waiting. Elsewhere nothing is ever reported waiting.
+func pendingByte(net.Conn) (byte, bool) { return 0, false }

@@ -79,8 +79,33 @@ func socketAlive(c net.Conn) bool {
 			alive = true // nothing pending, socket healthy
 		case err != nil || n == 0:
 			alive = false // reset, or a clean close from the far side
+		case n > 0:
+			// Something arrived on a connection that is only waiting. The far
+			// side has nothing to say to a parked connection unprompted, so a
+			// byte here is a refusal (wrong password, clocks apart, the two
+			// ends disagreeing about shared connections) that was sent just
+			// before it hung up. Treating that as alive left refused
+			// connections filling the pool as if they were ready.
+			alive = false
 		}
 		return true // always done: never block waiting for readability
 	})
 	return alive
+}
+
+// pendingByte reads the one byte waiting on a connection that socketAlive found
+// dead, if there is one, so the reason the far side gave can be reported.
+func pendingByte(c net.Conn) (byte, bool) {
+	tc, ok := c.(*net.TCPConn)
+	if !ok {
+		return 0, false
+	}
+	_ = tc.SetReadDeadline(time.Now().Add(50 * time.Millisecond))
+	defer func() { _ = tc.SetReadDeadline(time.Time{}) }()
+	var b [1]byte
+	n, err := tc.Read(b[:])
+	if n == 1 && (err == nil) {
+		return b[0], true
+	}
+	return 0, false
 }

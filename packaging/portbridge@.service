@@ -5,6 +5,11 @@ Documentation=https://github.com/Nima786/portbridge
 After=network-online.target
 Wants=network-online.target
 
+# A tunnel whose settings are gone is not started. Without this, enabling the
+# template for a name that has no settings file (or whose settings were removed)
+# produces a service that fails and restarts for ever.
+ConditionPathExists=/etc/portbridge/tunnels/%i.conf
+
 [Service]
 Type=simple
 User=root

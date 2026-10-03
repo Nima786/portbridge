@@ -17,6 +17,7 @@ type status struct {
 	pool    *pool
 	links   *carrierSet
 	routes  *router
+	health  *pathHealth
 
 	activeSessions   int64
 	failedSessions   int64
@@ -58,7 +59,18 @@ type statusFile struct {
 	RouteInUse    string `json:"route_in_use,omitempty"`
 	OnMainRoute   bool   `json:"on_main_route,omitempty"`
 	OnBackupRoute bool   `json:"on_backup_route,omitempty"`
-	UpdatedAt     string `json:"updated_at"`
+
+	// PathState is whether data really flows over the route to the other server:
+	// ok, degraded, blocked, or unknown while nothing has been measured. It is
+	// what "ready" never was: a count of parked connections says they exist, not
+	// that anything gets through them.
+	PathState string `json:"path_state,omitempty"`
+	PathNote  string `json:"path_note,omitempty"`
+	// PathLastOKSeconds is how long ago data last provably flowed, or absent if
+	// it never has since start.
+	PathLastOKSeconds *int64 `json:"path_last_ok_seconds,omitempty"`
+
+	UpdatedAt string `json:"updated_at"`
 }
 
 func newStatus(cfg *Config) *status {
@@ -105,6 +117,16 @@ func (s *status) writeOnce() {
 		onMain, onBackup = preferred, !preferred
 	}
 
+	var pathState, pathNote string
+	var pathLastOK *int64
+	if s.health != nil {
+		var ago int64
+		pathState, pathNote, ago = s.health.snapshot()
+		if ago >= 0 {
+			pathLastOK = &ago
+		}
+	}
+
 	var links, linkSessions, linkTarget int
 	if s.links != nil {
 		links, linkSessions = s.links.stats()
@@ -139,7 +161,12 @@ func (s *status) writeOnce() {
 		RouteInUse:       routeInUse,
 		OnMainRoute:      onMain,
 		OnBackupRoute:    onBackup,
-		UpdatedAt:        time.Now().UTC().Format(time.RFC3339),
+
+		PathState:         pathState,
+		PathNote:          pathNote,
+		PathLastOKSeconds: pathLastOK,
+
+		UpdatedAt: time.Now().UTC().Format(time.RFC3339),
 	}
 
 	b, err := json.MarshalIndent(sf, "", "  ")

@@ -19,6 +19,14 @@ const (
 	refillBackoffM   = 30 * time.Second
 	parkPingInterval = 15 * time.Second
 	parkPingTimeout  = 3 * time.Second
+
+	// How often the liveness loop looks for spares that are due a check. The
+	// interval above is per spare; this is only how finely it is scheduled.
+	livenessTick = time.Second
+
+	// How long a check of every spare waits for the replies. Short, because it
+	// runs while a user is waiting and the usual answer is tens of milliseconds.
+	verifyTimeout = 1500 * time.Millisecond
 )
 
 type parked struct {
@@ -47,8 +55,8 @@ type pool struct {
 	// dial is nil in reverse mode.
 	dial func() (net.Conn, error)
 
-	// waitForOffer is how long a user waits for the origin to supply a
-	// connection in reverse mode before giving up.
+	// waitForOffer is how long a user waits in reverse mode for the origin to
+	// supply a connection before giving up.
 	waitForOffer time.Duration
 
 	log *throttled
@@ -60,6 +68,14 @@ type pool struct {
 	statParked    int64
 	statOffered   int64
 	statDiscarded int64
+
+	// fastDeaths counts spares that died very soon after being built, since the
+	// refill loop last looked.
+	fastDeaths int32
+
+	// verifying is set while a check of every spare is under way, so a burst of
+	// failing users starts one check between them rather than one each.
+	verifying int32
 }
 
 func newPool(maxSize int, maxAge, waitForOffer time.Duration, dial func() (net.Conn, error)) *pool {
@@ -121,8 +137,7 @@ func (p *pool) takeParked() net.Conn {
 		p.mu.Unlock()
 
 		if time.Since(it.at) >= p.maxAge || !socketAlive(it.conn) {
-			atomic.AddInt64(&p.statDiscarded, 1)
-			_ = it.conn.Close()
+			p.discard(it)
 			continue
 		}
 		return it.conn
@@ -203,12 +218,16 @@ func (p *pool) dropWaiter(ch chan net.Conn) {
 func (p *pool) maintain(ctx context.Context) {
 	backoff := time.Duration(0)
 
+	// Liveness checks run on their own clock. They used to share this loop with
+	// refilling, so a handful of dead connections, each taking seconds to give up
+	// on, held the loop up and starved the refills behind them.
+	go p.liveness(ctx)
+
 	for {
 		if ctx.Err() != nil {
 			return
 		}
 		p.evict()
-		p.probeKeepalives(ctx)
 
 		var failures int32
 		if p.dial != nil {
@@ -244,6 +263,21 @@ func (p *pool) maintain(ctx context.Context) {
 					}()
 				}
 				wg.Wait()
+			}
+		}
+
+		// A connection that was accepted, authenticated and then dropped within
+		// seconds is a failure even though dialling it went fine. Without
+		// counting these, a wrong password or a version the other end refuses
+		// looked like success to the refill loop, which then rebuilt the whole
+		// pool several times a second for as long as it ran.
+		if p.dial != nil {
+			if fast := atomic.SwapInt32(&p.fastDeaths, 0); fast > 0 {
+				failures += fast
+				if _, ok := p.lastErr.Load().(string); !ok {
+					p.lastErr.Store("the other server accepts connections and then drops them at once " +
+						"(wrong secret, clocks apart, shared connections set differently, or an older version)")
+				}
 			}
 		}
 
@@ -291,16 +325,20 @@ func (p *pool) offerLocal(c net.Conn) bool {
 	return true
 }
 
+// fastDeathAge is how young a spare has to be when it dies to count as having
+// been refused rather than having simply worn out or lost its path.
+const fastDeathAge = 20 * time.Second
+
 func (p *pool) evict() {
 	p.mu.Lock()
 	original := p.items
 	kept := original[:0]
-	var dead []net.Conn
+	var dead []parked
 	for _, it := range original {
 		if time.Since(it.at) < p.maxAge && socketAlive(it.conn) {
 			kept = append(kept, it)
 		} else {
-			dead = append(dead, it.conn)
+			dead = append(dead, it)
 		}
 	}
 	for i := len(kept); i < len(original); i++ {
@@ -310,82 +348,160 @@ func (p *pool) evict() {
 	atomic.StoreInt64(&p.statParked, int64(len(p.items)))
 	p.mu.Unlock()
 
-	for _, c := range dead {
-		atomic.AddInt64(&p.statDiscarded, 1)
-		_ = c.Close()
+	for _, it := range dead {
+		p.discard(it)
 	}
 }
 
-func (p *pool) probeKeepalives(ctx context.Context) {
-	// Pick at most 2 items that need keepalive per cycle to avoid blocking users
-	const maxProbesPerCycle = 2
-	var candidates []parked
-
-	p.mu.Lock()
-	now := time.Now()
-	for i := 0; i < len(p.items); i++ {
-		it := p.items[i]
-		if needsKeepalive(it.conn) && now.Sub(it.lastPing) >= parkPingInterval {
-			candidates = append(candidates, it)
-			p.items = append(p.items[:i], p.items[i+1:]...)
-			i--
-			if len(candidates) >= maxProbesPerCycle {
-				break
-			}
+// discard closes a spare that is no good, and if it died young works out why.
+func (p *pool) discard(it parked) {
+	atomic.AddInt64(&p.statDiscarded, 1)
+	if time.Since(it.at) < fastDeathAge {
+		atomic.AddInt32(&p.fastDeaths, 1)
+		// The far side may have said why just before it hung up.
+		if b, ok := pendingByte(it.conn); ok && isRejection(b) {
+			reason := describeRejection(b)
+			p.lastErr.Store(reason.Error())
+			p.log.printf("the other server refused a connection: %v", reason)
 		}
 	}
+	_ = it.conn.Close()
+}
+
+// flush closes every parked spare. Used when the route changes: spares built
+// over the old route are worth nothing on the new one.
+func (p *pool) flush() {
+	p.mu.Lock()
+	items := p.items
+	p.items = nil
+	atomic.StoreInt64(&p.statParked, 0)
+	p.mu.Unlock()
+	for _, it := range items {
+		_ = it.conn.Close()
+	}
+}
+
+// liveness proves, on a schedule, that parked connections still work.
+//
+// Every transport is checked, plain TCP included. That was the gap: a plain
+// connection was assumed healthy until something tried to use it, so a route
+// that had quietly stopped carrying data left the pool full of connections that
+// looked ready and were not, and the first users to arrive paid for finding out.
+// The check is one byte each way, every fifteen seconds per connection, which
+// also keeps anything tracking idle connections along the route from forgetting
+// them.
+func (p *pool) liveness(ctx context.Context) {
+	t := time.NewTicker(livenessTick)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			p.checkSpares(ctx, parkPingInterval, parkPingTimeout, false)
+		}
+	}
+}
+
+// checkSpares pings the spares that have not been proven alive for at least
+// older, in parallel, and keeps the ones that answer. With all set it ignores
+// the pacing and checks everything at once.
+//
+// A spare being checked is out of the pool, so no user can pick it up halfway
+// through; the number out at once is capped so a quiet pool is never emptied by
+// its own checking.
+func (p *pool) checkSpares(ctx context.Context, older, timeout time.Duration, all bool) {
+	now := time.Now()
+
+	p.mu.Lock()
+	limit := len(p.items)/4 + 1
+	if all {
+		limit = len(p.items)
+	}
+	var due []parked
+	kept := p.items[:0]
+	for _, it := range p.items {
+		if len(due) < limit && now.Sub(it.lastPing) >= older {
+			due = append(due, it)
+		} else {
+			kept = append(kept, it)
+		}
+	}
+	for i := len(kept); i < len(p.items); i++ {
+		p.items[i] = parked{}
+	}
+	p.items = kept
 	atomic.StoreInt64(&p.statParked, int64(len(p.items)))
 	p.mu.Unlock()
 
-	if len(candidates) == 0 {
+	if len(due) == 0 {
 		return
 	}
 
-	for _, it := range candidates {
-		if ctx.Err() != nil {
-			_ = it.conn.Close()
-			continue
-		}
-
-		err := probeParked(it.conn)
-		if err != nil {
-			atomic.AddInt64(&p.statDiscarded, 1)
-			_ = it.conn.Close()
-			continue
-		}
-
-		it.lastPing = time.Now()
-
-		p.mu.Lock()
-		handed := false
-		for len(p.waiters) > 0 {
-			ch := p.waiters[0]
-			p.waiters = p.waiters[1:]
-			select {
-			case ch <- it.conn:
-				handed = true
-				break
-			default:
-			}
-			if handed {
-				break
-			}
-		}
-		if !handed {
-			if len(p.items) < p.maxSize && time.Since(it.at) < p.maxAge && socketAlive(it.conn) {
-				p.items = append(p.items, it)
-				atomic.StoreInt64(&p.statParked, int64(len(p.items)))
-			} else {
+	var wg sync.WaitGroup
+	for _, it := range due {
+		wg.Add(1)
+		go func(it parked) {
+			defer wg.Done()
+			if ctx.Err() != nil {
 				_ = it.conn.Close()
-				atomic.AddInt64(&p.statDiscarded, 1)
+				return
 			}
-		}
-		p.mu.Unlock()
+			if err := probeParkedWithin(it.conn, timeout); err != nil {
+				p.discard(it)
+				return
+			}
+			it.lastPing = time.Now()
+			p.putBack(it)
+		}(it)
 	}
+	wg.Wait()
+}
+
+// putBack returns a checked spare to the pool, or straight to a user who is
+// waiting for one.
+func (p *pool) putBack(it parked) {
+	p.mu.Lock()
+	for len(p.waiters) > 0 {
+		ch := p.waiters[0]
+		p.waiters = p.waiters[1:]
+		select {
+		case ch <- it.conn:
+			p.mu.Unlock()
+			return
+		default:
+		}
+	}
+	if len(p.items) < p.maxSize && time.Since(it.at) < p.maxAge && socketAlive(it.conn) {
+		p.items = append(p.items, it)
+		atomic.StoreInt64(&p.statParked, int64(len(p.items)))
+		p.mu.Unlock()
+		return
+	}
+	p.mu.Unlock()
+	atomic.AddInt64(&p.statDiscarded, 1)
+	_ = it.conn.Close()
+}
+
+// verifyAll checks every spare right now. Called when a user's activation timed
+// out: one dead spare is usually not alone, and finding the rest in a second
+// beats letting each following attempt discover them one at a time, four seconds
+// apiece.
+func (p *pool) verifyAll(ctx context.Context) {
+	if !atomic.CompareAndSwapInt32(&p.verifying, 0, 1) {
+		return
+	}
+	defer atomic.StoreInt32(&p.verifying, 0)
+	p.checkSpares(ctx, 0, verifyTimeout, true)
 }
 
 func probeParked(c net.Conn) error {
-	if err := c.SetWriteDeadline(time.Now().Add(parkPingTimeout)); err != nil {
+	return probeParkedWithin(c, parkPingTimeout)
+}
+
+// probeParkedWithin sends one byte and expects one back.
+func probeParkedWithin(c net.Conn, timeout time.Duration) error {
+	if err := c.SetWriteDeadline(time.Now().Add(timeout)); err != nil {
 		return err
 	}
 	if _, err := c.Write([]byte{msgParkPing}); err != nil {
@@ -394,7 +510,7 @@ func probeParked(c net.Conn) error {
 	if err := c.SetWriteDeadline(time.Time{}); err != nil {
 		return err
 	}
-	if err := c.SetReadDeadline(time.Now().Add(parkPingTimeout)); err != nil {
+	if err := c.SetReadDeadline(time.Now().Add(timeout)); err != nil {
 		return err
 	}
 	var pong [1]byte
@@ -405,6 +521,9 @@ func probeParked(c net.Conn) error {
 		return err
 	}
 	if pong[0] != msgParkPong {
+		if isRejection(pong[0]) {
+			return describeRejection(pong[0])
+		}
 		return errBadAck
 	}
 	return nil

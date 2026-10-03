@@ -209,18 +209,23 @@ func TestAgentServerAPI(t *testing.T) {
 
 	// 5. Test agent client helper functions directly against the running agent
 	agentURL := "https://" + listenAddr
-	if err := agentClientStatus(agentURL, token, true); err != nil {
+	fp, err := fetchAgentFingerprint(agentURL)
+	if err != nil {
+		t.Fatalf("fetching the fingerprint: %v", err)
+	}
+	pinned := agentTrust{Fingerprint: fp}
+	if err := agentClientStatus(agentURL, token, pinned); err != nil {
 		t.Errorf("agentClientStatus failed: %v", err)
 	}
 
-	if err := agentClientJoin(agentURL, token, pairingCode, true); err != nil {
+	if err := agentClientJoin(agentURL, token, pairingCode, pinned); err != nil {
 		t.Errorf("agentClientJoin failed: %v", err)
 	}
 	if _, err := os.Stat(filepath.Join(tmpDir, "agttest.conf")); err != nil {
 		t.Errorf("agttest.conf not found after agentClientJoin: %v", err)
 	}
 
-	if err := agentClientDelete(agentURL, token, "agttest", true); err != nil {
+	if err := agentClientDelete(agentURL, token, "agttest", pinned); err != nil {
 		t.Errorf("agentClientDelete failed: %v", err)
 	}
 	if _, err := os.Stat(filepath.Join(tmpDir, "agttest.conf")); !os.IsNotExist(err) {

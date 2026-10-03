@@ -24,19 +24,52 @@ jobs:
 
       - name: Work out the version
         id: v
+        env:
+          # Passed through the environment, never pasted into the script, so a
+          # tag name cannot run as a command.
+          EVENT: ${{ github.event_name }}
+          INPUT_TAG: ${{ github.event.inputs.tag }}
         run: |
-          if [ "${{ github.event_name }}" = workflow_dispatch ]; then
-            tag='${{ github.event.inputs.tag }}'
+          if [ "$EVENT" = workflow_dispatch ]; then
+            tag="$INPUT_TAG"
           else
             tag="${GITHUB_REF#refs/tags/}"
           fi
+          case "$tag" in
+            v[0-9]*.[0-9]*.[0-9]*) ;;
+            *) echo "not a release tag: $tag"; exit 1 ;;
+          esac
+          case "$tag" in
+            *[!a-zA-Z0-9.+-]*) echo "not a release tag: $tag"; exit 1 ;;
+          esac
           echo "tag=$tag" >>"$GITHUB_OUTPUT"
           echo "bare=${tag#v}" >>"$GITHUB_OUTPUT"
+
+      # The same checks as every push, so a release can never be cut from
+      # something CI would have refused.
+      - name: Formatting
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "These files need gofmt:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: Check the scripts
+        run: |
+          bash -n install.sh
+          bash -n scripts/portbridge-menu
+          bash -n scripts/portbridge-firewall
+          bash -n scripts/portbridge-tune
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq shellcheck
+          shellcheck -s bash -S warning install.sh scripts/portbridge-menu scripts/portbridge-firewall scripts/portbridge-tune
 
       - name: Test before releasing
         run: |
           go vet ./...
-          go test -count=1 -timeout 15m ./...
+          go test -race -count=1 -timeout 15m ./...
 
       - name: Build the archives
         env:

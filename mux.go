@@ -25,13 +25,15 @@ import (
 //	With multiplexing the two servers hold a handful of connections that stay up
 //	for hours, which is what an ordinary long-lived web application looks like.
 //
-// Why it is not the default
+// Why it is a choice
 //
 //	Everything shares one TCP connection, so a lost packet stalls every session
 //	riding on it until it is resent, not just the one that lost data. On a lossy
 //	intercontinental route that is a real cost, and it is the reason this is
-//	offered as a choice rather than switched on for everyone. Several links
-//	rather than one limit the damage, but they do not remove it.
+//	offered as a choice. The engine itself defaults to off; the menu suggests it
+//	for the disguises where opening a fresh connection per user is the expensive
+//	part (websocket, gRPC, KCP). Several links rather than one limit the damage,
+//	but they do not remove it.
 //
 // What this layer does not change
 //
@@ -106,8 +108,16 @@ const (
 	// silently died, which on these routes happens often. Pinging proves it
 	// works and keeps anything tracking connections along the way from
 	// forgetting it.
-	muxPingEvery = 25 * time.Second
-	muxPingGrace = 90 * time.Second
+	//
+	// Kept short on purpose: a link that has silently died is otherwise still
+	// counted as "up" while users land on it and wait.
+	muxPingEvery = 15 * time.Second
+	muxPingGrace = 50 * time.Second
+
+	// How long a link is avoided after a session on it failed to start, and how
+	// long it is given to answer a check before being dropped.
+	muxSuspectFor = 30 * time.Second
+	muxCheckWait  = 6 * time.Second
 
 	// How long the origin waits, after the edge opens a stream, for the session
 	// handshake that should follow immediately.
@@ -139,6 +149,10 @@ var (
 	errMuxOverflow = errors.New("the other end sent more than the agreed amount of data")
 	errMuxBacklog  = errors.New("the multiplexed link stopped accepting anything")
 	errStreamGone  = errors.New("the session was ended by the other end")
+
+	// errRouteChanged is why links are closed when the path to the other server
+	// is switched to a different route.
+	errRouteChanged = errors.New("the route to the other server changed")
 )
 
 // ---------------------------------------------------------------------------
@@ -156,6 +170,7 @@ type deadline struct {
 	mu     sync.Mutex
 	timer  *time.Timer
 	expire chan struct{}
+	gen    uint64 // bumped whenever a timer is replaced or cancelled
 }
 
 func newDeadline() *deadline {
@@ -170,6 +185,8 @@ func (d *deadline) set(t time.Time) {
 		d.timer.Stop()
 		d.timer = nil
 	}
+	// Any timer already running but not yet through the lock is now stale.
+	d.gen++
 
 	expired := false
 	select {
@@ -192,13 +209,32 @@ func (d *deadline) set(t time.Time) {
 			d.expire = make(chan struct{})
 		}
 		ch := d.expire
-		d.timer = time.AfterFunc(wait, func() { close(ch) })
+		d.gen++
+		gen := d.gen
+		d.timer = time.AfterFunc(wait, func() { d.fire(ch, gen) })
 		return
 	}
 
 	// Already in the past: wake anything waiting straight away.
 	if !expired {
 		close(d.expire)
+	}
+}
+
+// fire closes ch, unless it has been closed already. The timer runs on its own
+// goroutine, so it can race with set: both may decide the same channel needs
+// closing, and closing twice panics. Checking under the lock settles it.
+func (d *deadline) fire(ch chan struct{}, gen uint64) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if ch != d.expire || gen != d.gen {
+		// A newer deadline has taken over; this timer's moment has passed.
+		return
+	}
+	select {
+	case <-ch:
+	default:
+		close(ch)
 	}
 }
 
@@ -246,6 +282,7 @@ type muxStream struct {
 	finished   bool // the far side has finished sending
 	rwin       int  // how much the far side may have in flight to us
 	rtaken     int  // how much of the link's grow budget this session holds
+	rreleased  bool // the session is over and its budget has been handed back
 	rready     chan struct{}
 
 	// Sending.
@@ -307,6 +344,10 @@ func (s *muxStream) releaseGrow() {
 	s.rmu.Lock()
 	taken := s.rtaken
 	s.rtaken = 0
+	// From here on nothing may take more: a reader draining the last buffered
+	// bytes of a finished session used to take budget that was never returned,
+	// and a long-lived link slowly ran out of room to grow.
+	s.rreleased = true
 	s.rmu.Unlock()
 	s.c.returnGrow(taken)
 }
@@ -409,7 +450,7 @@ func (s *muxStream) Read(p []byte) (int, error) {
 			// The reader has taken everything there was, so the far side is
 			// being held back by the window rather than by us. Widen it, if the
 			// link can spare the memory, and pass the extra on as credit.
-			if drained && s.rwin < muxWindowMax {
+			if drained && !s.rreleased && s.rwin < muxWindowMax {
 				want := s.rwin
 				if want > muxWindowMax-s.rwin {
 					want = muxWindowMax - s.rwin
@@ -705,6 +746,68 @@ type carrier struct {
 	// grow while this lasts, so the memory one link can tie up has a ceiling
 	// however many sessions ask for speed at once.
 	growLeft int64
+
+	// born is when the link came up. A link that dies within moments of coming
+	// up says something is wrong with the route or the settings, and is treated
+	// differently from one that ran for hours.
+	born time.Time
+
+	// suspectUntil (unix nano, atomic) is set when a session on this link failed
+	// to start. Until it passes, other links are preferred, and a check is sent
+	// to find out whether this one is still alive.
+	suspectUntil int64
+	checking     int32
+
+	// onDone is told once, when the link finishes, how long it lived and why.
+	onDone func(age time.Duration, err error)
+}
+
+// markSuspect notes that a session on this link failed to start, steers new
+// sessions elsewhere for a while, and asks the other end to answer a ping. If no
+// answer comes the link is dropped instead of left to fail users one by one.
+func (c *carrier) markSuspect() {
+	atomic.StoreInt64(&c.suspectUntil, time.Now().Add(muxSuspectFor).UnixNano())
+	if !atomic.CompareAndSwapInt32(&c.checking, 0, 1) {
+		return
+	}
+	go func() {
+		defer atomic.StoreInt32(&c.checking, 0)
+		before := atomic.LoadInt64(&c.lastHeard)
+		c.sendControl(muxFrame{typ: muxPing})
+		t := time.NewTimer(muxCheckWait)
+		defer t.Stop()
+		select {
+		case <-c.done:
+		case <-t.C:
+			if atomic.LoadInt64(&c.lastHeard) == before {
+				c.fail(fmt.Errorf("the other server did not answer a check within %s", muxCheckWait))
+			}
+		}
+	}()
+}
+
+func (c *carrier) isSuspect() bool {
+	return time.Now().UnixNano() < atomic.LoadInt64(&c.suspectUntil)
+}
+
+// suspect is called by the edge when a session on this stream failed to start.
+func (s *muxStream) suspect() { s.c.markSuspect() }
+
+// checkFirstFrame looks at the very first byte the other end sent on a shared
+// link. Anything that is not a shared-link frame means the two ends disagree
+// about settings, and the useful thing is to say so by name.
+func checkFirstFrame(typ byte) error {
+	switch {
+	case typ >= muxOpen && typ <= muxTeardownAck:
+		return nil
+	case isRejection(typ):
+		return describeRejection(typ)
+	case typ == msgActivate || typ == msgActivatePort || typ == msgParkPing:
+		return errMuxOnlyHere
+	default:
+		return fmt.Errorf("the other server sent something that is not shared-connection data (0x%02x); "+
+			"check that both servers have the same settings", typ)
+	}
 }
 
 // takeGrow hands out up to n bytes of this link's grow budget, returning how much
@@ -745,6 +848,7 @@ func newCarrier(conn net.Conn) *carrier {
 		incoming: make(chan *muxStream, 64),
 		done:     make(chan struct{}),
 		growLeft: muxGrowBudget,
+		born:     time.Now(),
 	}
 	atomic.StoreInt64(&c.lastHeard, time.Now().UnixNano())
 	return c
@@ -870,6 +974,9 @@ func (c *carrier) fail(err error) {
 	c.doneOnce.Do(func() {
 		close(c.done)
 		_ = c.conn.Close()
+		if c.onDone != nil {
+			c.onDone(time.Since(c.born), err)
+		}
 	})
 
 	c.mu.Lock()
@@ -930,8 +1037,26 @@ func (c *carrier) readLoop() {
 	// acted on immediately.
 	body := make([]byte, muxMaxPayload)
 
+	first := true
 	for {
-		if _, err := io.ReadFull(c.conn, hdr); err != nil {
+		got := 0
+		if first {
+			// The first byte is looked at on its own. A refusal from the other
+			// end is a single byte followed by a close, which would never fill
+			// a whole header, and its reason would be lost behind a bare
+			// end-of-file.
+			first = false
+			if _, err := io.ReadFull(c.conn, hdr[:1]); err != nil {
+				c.fail(err)
+				return
+			}
+			if err := checkFirstFrame(hdr[0]); err != nil {
+				c.fail(err)
+				return
+			}
+			got = 1
+		}
+		if _, err := io.ReadFull(c.conn, hdr[got:]); err != nil {
 			c.fail(err)
 			return
 		}
@@ -1117,6 +1242,9 @@ type carrierSet struct {
 	added   chan struct{}
 	log     *throttled
 	lastErr atomic.Value
+
+	// youngStreak counts links in a row that died soon after coming up.
+	youngStreak int32
 }
 
 func (cs *carrierSet) SetOnTeardown(fn func()) {
@@ -1185,6 +1313,7 @@ func (cs *carrierSet) add(conn net.Conn) bool {
 		return false
 	}
 	c.onTeardown = cs.onTeardown
+	c.onDone = cs.noteDeath
 	cs.items = append(cs.items, c)
 	cs.mu.Unlock()
 
@@ -1237,15 +1366,62 @@ func (cs *carrierSet) best() *carrier {
 	}
 	cs.items = kept
 
-	var pick *carrier
-	fewest := -1
+	// Links that recently failed to start a session are passed over while any
+	// other link is up. If every link is suspect one is used anyway: a doubtful
+	// link is still better than telling the user nothing is available.
+	var pick, pickSuspect *carrier
+	fewest, fewestSuspect := -1, -1
 	for _, c := range cs.items {
 		n := c.streamCount()
+		if c.isSuspect() {
+			if fewestSuspect < 0 || n < fewestSuspect {
+				pickSuspect, fewestSuspect = c, n
+			}
+			continue
+		}
 		if fewest < 0 || n < fewest {
 			pick, fewest = c, n
 		}
 	}
+	if pick == nil {
+		return pickSuspect
+	}
 	return pick
+}
+
+// dropAll closes every link, for when the route underneath them has changed.
+// They are rebuilt on the new route by the normal upkeep.
+func (cs *carrierSet) dropAll(reason error) {
+	cs.mu.Lock()
+	items := make([]*carrier, len(cs.items))
+	copy(items, cs.items)
+	cs.mu.Unlock()
+	for _, c := range items {
+		c.fail(reason)
+	}
+}
+
+// youngLimit is how long a link must live to count as having worked.
+const youngLimit = 20 * time.Second
+
+// noteDeath is called when a link finishes. A run of links that die almost at
+// once is reported by name when the cause is a settings mismatch, and slows the
+// rebuilding so a broken pair does not hammer the route.
+func (cs *carrierSet) noteDeath(age time.Duration, err error) {
+	if errors.Is(err, errRouteChanged) || errors.Is(err, errMuxClosed) {
+		return
+	}
+	if age >= youngLimit {
+		atomic.StoreInt32(&cs.youngStreak, 0)
+		return
+	}
+	atomic.AddInt32(&cs.youngStreak, 1)
+	switch {
+	case errors.Is(err, errMuxMismatch), errors.Is(err, errMuxOnlyHere), errors.Is(err, errMuxOnlyThere):
+		cs.log.printf("shared connections do not match between the two servers: %v", err)
+	default:
+		cs.log.printf("a link to the other server closed after %s: %v", age.Round(time.Second), err)
+	}
 }
 
 // open starts one session across the border. Unlike a spare connection this
@@ -1327,6 +1503,17 @@ func (cs *carrierSet) maintain(done <-chan struct{}) {
 				if cs.build(missing) {
 					backoff = 0
 					wait = 200 * time.Millisecond
+					// Links that keep dying straight after coming up mean
+					// rebuilding faster will not help; slow down instead.
+					if streak := atomic.LoadInt32(&cs.youngStreak); streak > 0 {
+						wait = refillBackoff0
+						for i := int32(1); i < streak && wait < refillBackoffM; i++ {
+							wait *= 2
+						}
+						if wait > refillBackoffM {
+							wait = refillBackoffM
+						}
+					}
 				} else {
 					if backoff == 0 {
 						backoff = refillBackoff0

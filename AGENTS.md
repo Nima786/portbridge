@@ -22,3 +22,11 @@ Before pushing ANY commit to `origin/main` or any remote branch, you MUST verify
    - Run `go vet ./...`
    - Run `go test -race ./...` (or run full suite on the build server `45.74.158.41`).
    - All tests must pass.
+
+## Never Run the Tests as Root on a Real Server
+The tests must be run as an ordinary user. The agent code starts services and
+changes firewall rules, and although it only does that for the real settings
+directory (`/etc/portbridge/tunnels`), running as root on a machine that has real
+tunnels is never worth the risk. Use an unprivileged account, or a throwaway
+container. Any new test that needs the machine (services, firewall, ports below
+1024) must go through the replaceable host in `agentops.go` instead.

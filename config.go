@@ -141,6 +141,11 @@ type Config struct {
 	// packet stalls every session on it.
 	MuxLinks int
 
+	// PathProbe turns on the periodic transfer that proves data really flows over
+	// the route, and which moves traffic to a backup route when it does not. On
+	// by default; see health.go for why a count of ready connections is not proof.
+	PathProbe bool
+
 	// KCP Forward Error Correction shards
 	KCPDataShards   int
 	KCPParityShards int
@@ -219,6 +224,62 @@ func (c *Config) withClaimedName(name string) *Config {
 	return &alt
 }
 
+// withRoute returns this configuration as it should be used for one particular
+// route: the hostname that route claims, and whether it goes through a CDN.
+//
+// Whether a connection goes through a CDN decides the defaults for the browser
+// fingerprint and the split hello, so it has to follow the route and not the
+// tunnel. A tunnel that goes straight to the server but keeps a CDN route in
+// reserve used to send a plain Go fingerprint down that reserve route, which is
+// exactly where a browser fingerprint matters most.
+//
+// The copy shares the prepared handshake settings with the original, so nothing
+// about resumption changes.
+func (c *Config) withRoute(name string, cdn bool) *Config {
+	if (name == "" || name == c.ServerName) && cdn == c.CDN {
+		return c
+	}
+	alt := *c
+	if name != "" {
+		alt.ServerName = name
+	}
+	alt.CDN = cdn
+	return &alt
+}
+
+// useUTLS says whether the browser fingerprint applies to a connection made with
+// this configuration: when asked for, or by default for a CDN unless the choice
+// was made explicitly.
+func (c *Config) useUTLS() bool { return c.UTLS || (c.CDN && !c.utlsSet) }
+
+// useFragment is the same question for splitting the first packet.
+func (c *Config) useFragment() bool { return c.TLSFragment || (c.CDN && !c.fragmentSet) }
+
+// hasCDNRoute says whether any route of this tunnel goes through a CDN, which is
+// true when the tunnel itself is one, or when it keeps a CDN route in reserve
+// under its own name.
+func (c *Config) hasCDNRoute() bool { return c.CDN || c.AltServerName != "" }
+
+// checkCleanIP validates one entry of the clean address list: an address, with
+// or without a port, and never a hostname (a name would have to be resolved, and
+// the point of these is to not depend on that).
+func checkCleanIP(entry string) error {
+	host := entry
+	if h, p, err := net.SplitHostPort(entry); err == nil {
+		host = h
+		if n, err := strconv.Atoi(p); err != nil || n < 1 || n > 65535 {
+			return fmt.Errorf("%q has a bad port", entry)
+		}
+	}
+	if len(host) > 1 && host[0] == '[' && host[len(host)-1] == ']' {
+		host = host[1 : len(host)-1]
+	}
+	if net.ParseIP(host) == nil {
+		return fmt.Errorf("%q is not an IP address", entry)
+	}
+	return nil
+}
+
 func (c *Config) effectiveWSPath() string {
 	if c.WSPath != "" {
 		return c.WSPath
@@ -248,6 +309,7 @@ func defaultConfig() *Config {
 		// on a lossy route. It is a choice, not an improvement.
 		Mux:              false,
 		MuxLinks:         4,
+		PathProbe:        true,
 		KCPDataShards:    10,
 		KCPParityShards:  3,
 		TLSFragment:      false,
@@ -379,6 +441,15 @@ func (c *Config) set(key, val string) error {
 		}
 	case "mux_links":
 		return num(&c.MuxLinks)
+	case "path_probe":
+		switch strings.ToLower(val) {
+		case "on", "yes", "true":
+			c.PathProbe = true
+		case "off", "no", "false":
+			c.PathProbe = false
+		default:
+			return fmt.Errorf("path_probe must be on or off, got %q", val)
+		}
 	case "server_inbound_port":
 		c.ServerInboundPort = val
 	case "foreign_agent":
@@ -423,10 +494,12 @@ func (c *Config) set(key, val string) error {
 			return fmt.Errorf("tls_fragment must be on or off, got %q", val)
 		}
 	case "tls_fragment_size", "fragment_size":
-		c.fragmentSet = true
+		// Tuning how the hello is split says nothing about whether to split it,
+		// so it must not count as an explicit choice. It used to, which meant
+		// that setting a size on a CDN tunnel quietly switched the default
+		// fragmentation off.
 		return num(&c.TLSFragmentSize)
 	case "tls_fragment_sleep", "fragment_sleep":
-		c.fragmentSet = true
 		return dur(&c.TLSFragmentSleep)
 	case "utls":
 		c.utlsSet = true
@@ -439,13 +512,32 @@ func (c *Config) set(key, val string) error {
 			return fmt.Errorf("utls must be on or off, got %q", val)
 		}
 	case "utls_profile":
-		c.utlsSet = true
-		c.UTLSProfile = strings.ToLower(val)
+		// Choosing a profile is not choosing whether to use one; see above.
+		profile := strings.ToLower(strings.TrimSpace(val))
+		if _, ok := utlsProfileIDs[profile]; !ok {
+			return fmt.Errorf("utls_profile %q is not one I know: use %s", val, utlsProfileNames())
+		}
+		c.UTLSProfile = profile
 	case "clean_ips", "clean_ip":
 		parts := strings.Split(val, ",")
 		for _, p := range parts {
 			p = strings.TrimSpace(p)
-			if p != "" {
+			if p == "" {
+				continue
+			}
+			// Checked here so a typo is refused at start rather than becoming a
+			// route that silently never connects.
+			if err := checkCleanIP(p); err != nil {
+				return fmt.Errorf("clean_ips: %w", err)
+			}
+			dup := false
+			for _, have := range c.CleanIPs {
+				if have == p {
+					dup = true
+					break
+				}
+			}
+			if !dup {
 				c.CleanIPs = append(c.CleanIPs, p)
 			}
 		}
@@ -538,11 +630,20 @@ func (c *Config) Validate() error {
 			}
 		}
 
+		if len(sinPorts) > 0 && len(sinPorts) != len(listens) {
+			return fmt.Errorf("server_inbound_port lists %d ports but user_listen has %d; "+
+				"give one for each, in the same order", len(sinPorts), len(listens))
+		}
+		seenPorts := make(map[string]bool, len(listens))
 		for i, u := range listens {
 			if u == c.TunnelAddr {
 				return fmt.Errorf("user_listen and tunnel_addr cannot be the same address")
 			}
 			_, pStr, _ := net.SplitHostPort(u)
+			if seenPorts[pStr] {
+				return fmt.Errorf("user_listen lists port %s twice", pStr)
+			}
+			seenPorts[pStr] = true
 			pNum, _ := strconv.Atoi(pStr)
 			tp := uint16(pNum)
 			if i < len(sinPorts) {
@@ -569,6 +670,9 @@ func (c *Config) Validate() error {
 		for _, in := range inbounds {
 			_, pStr, _ := net.SplitHostPort(in)
 			pNum, _ := strconv.Atoi(pStr)
+			if _, dup := c.portToInbound[uint16(pNum)]; dup {
+				return fmt.Errorf("inbound_addr lists port %d twice", pNum)
+			}
 			c.portToInbound[uint16(pNum)] = in
 		}
 		if len(inbounds) > 0 {
@@ -768,6 +872,12 @@ func (c *Config) InboundFor(port uint16) string {
 		if addr, ok := c.portToInbound[port]; ok {
 			return addr
 		}
+	}
+	if len(c.InboundAddrs) > 1 && port > 0 {
+		// Several services are published and the edge asked for a port that is
+		// none of them. Sending the user to the first one instead would hand
+		// them the wrong service without a word, so it is refused.
+		return ""
 	}
 	if len(c.InboundAddrs) > 0 {
 		return c.InboundAddrs[0]

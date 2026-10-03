@@ -8,6 +8,7 @@ import (
 	"net"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/xtaci/kcp-go/v5"
 )
@@ -38,6 +39,7 @@ type kcpConn struct {
 	closed      atomic.Bool
 	writeClosed atomic.Bool
 	remoteEOF   atomic.Bool
+	wrote       atomic.Bool // something has been written since the connection opened
 
 	rmu     sync.Mutex
 	readBuf []byte
@@ -78,6 +80,7 @@ func (c *kcpConn) Write(b []byte) (int, error) {
 	}
 	c.wmu.Lock()
 	defer c.wmu.Unlock()
+	c.wrote.Store(true)
 
 	total := len(b)
 	for len(b) > 0 {
@@ -157,8 +160,18 @@ func (c *kcpConn) Read(p []byte) (int, error) {
 	}
 }
 
+// kcpLinger is how long Close waits after data was written, so the last packets
+// get on the wire. Closing a KCP session discards whatever it has not yet sent,
+// which ended the tail of a reply early when a session finished right after its
+// final write. The session's send queue is not visible from outside the library,
+// so this is a short fixed wait, and only when something was actually written.
+const kcpLinger = 250 * time.Millisecond
+
 func (c *kcpConn) Close() error {
 	if c.closed.CompareAndSwap(false, true) {
+		if c.wrote.Load() {
+			time.Sleep(kcpLinger)
+		}
 		return c.UDPSession.Close()
 	}
 	return nil

@@ -168,11 +168,19 @@ else.
 ## One connection per user, or a few shared
 
 The other question the menu asks when you create a tunnel. It is a real trade,
-not an upgrade, so it defaults to the way things have always worked.
+not an upgrade. The menu suggests one connection per user for a plain link or a
+website disguise, and shared connections for the websocket, gRPC and KCP options,
+where opening a fresh disguised connection for every user is the costly part.
+Option 1 is always "one connection per user" and option 2 is always "shared".
 
-**One connection per user** is the default. Every user session gets its own
-connection across the border. On a poor route this is the faster choice, because
-one user's lost packet never holds anybody else up.
+Both servers must agree. The menu makes sure of that by putting the choice in the
+code, and if someone edits a settings file by hand and they disagree, both
+servers now say so in the log, by name, within moments, instead of leaving users
+to wait.
+
+**One connection per user** gives every user session its own connection across
+the border. On a poor route this is the faster choice, because one user's lost
+packet never holds anybody else up.
 
 **Shared connections** put everyone on a handful of connections that stay open
 for hours. Two things get better: the number of connections between your two
@@ -185,8 +193,8 @@ by several people at once rather than one.
 Four shared connections is the default when you turn it on, which limits how
 much of your traffic a single stall can affect.
 
-Keep the default unless you have reason to think the sheer number of connections
-is what is getting your tunnel noticed.
+Keep the suggestion unless you have reason to think the sheer number of
+connections is what is getting your tunnel noticed.
 
 One measured exception is worth knowing. If you are using a disguise **and** your
 users make many short-lived connections, shared connections do about a quarter of
@@ -195,6 +203,44 @@ to set the disguise up again for the next one, and that setup is the most
 expensive thing either server does. Sharing pays it once and then stops paying.
 For large steady transfers it is the other way round, and one connection per user
 is cheaper. On a plain link with no disguise the two are about even.
+
+## When connections open but nothing gets through
+
+The hardest failure to spot is not a tunnel that is down. It is a route that lets
+a connection open, carries its first few packets, and then quietly stops. Every
+connection looks healthy. The menu used to show "ready" and users waited for
+replies that never came. Measured on a real route, every connection was cut after
+about six packets, in both directions, whatever the port or protocol. Nothing in
+either server is wrong when that happens, and no setting on either server can fix
+it. What fixes it is reaching the other server by a different route.
+
+So the tunnel no longer takes "ready connections" as proof. Three things now
+happen:
+
+- **It measures.** The side that dials moves a small test transfer, larger than
+  the few packets such a route lets through, over the same route real users
+  take. It is skipped while real users are getting through, so a busy tunnel
+  spends nothing on it. The result is in the status: `data flows`, or a plain
+  statement that connections open but nothing gets through.
+- **It moves.** With a backup route configured (menu option 4, the website with a
+  CDN in reserve), two failed tests in a row set the route aside and traffic goes
+  to the backup. The preferred route is tried again regularly and used again only
+  after a test over it succeeds.
+- **It says so.** Without a backup it still reports the problem honestly, once,
+  in the log, and in the menu's check: this is the route being filtered, and the
+  options are another address or server, or a CDN.
+
+Turn the test off with `path_probe = off` in a tunnel's settings if you ever need
+to. The idle cost is a few tens of megabytes a day at most.
+
+Spare connections are checked the same way for every link type, including plain,
+so a spare that has died silently is dropped before a user lands on it.
+
+For a tunnel through a CDN, the browser-style handshake, the split first packet
+and the list of clean addresses now follow the route, not the tunnel: a backup
+route through a CDN gets them even when the main route goes straight to the
+server. The pairing code carries them too, so the foreign server does not forget
+them.
 
 ## Many users at once
 
@@ -347,7 +393,7 @@ PortBridge includes a lightweight, secure management daemon (`portbridge-agent.s
 - **Automatic Remote Teardown**: When you delete a tunnel on your Iran server, PortBridge automatically wipes the corresponding tunnel config, secrets, certificates, and firewall rules on the specific foreign server via the tunnel socket or the agent API.
 
 Setup takes under 30 seconds:
-1. On your **Foreign server**: Choose **11) Management Agent** -> **5) Enable & start Agent daemon**. Choose any port you like (e.g. `2083`, `2087`, etc.). It prints your Link String (e.g. `pb-agent://<token>@<ip>:<port>`).
+1. On your **Foreign server**: Choose **11) Management Agent** -> **5) Enable & start Agent daemon**. Choose any port you like (e.g. `2083`, `2087`, etc.). It prints your Link String (e.g. `pb-agent://<token>@<ip>:<port>?fp=<fingerprint>`). The fingerprint identifies the agent's certificate: the Iran server pins it, so nobody between the two servers can stand in for the agent and collect its token. If you type the address and token by hand instead, the Iran server shows the fingerprint it sees and asks you to compare it with the one on the foreign server.
 2. On your **Iran server**: Choose **11) Management Agent** -> **2) Link a new Foreign server**, paste that string (or enter host, port, token), and give it an alias (e.g. `germany`). Repeat for any additional foreign servers!
 3. Every tunnel you create or delete from then on is automated end-to-end!
 

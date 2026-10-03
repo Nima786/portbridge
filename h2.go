@@ -302,13 +302,102 @@ type h2Conn struct {
 
 	// msgRemaining tracks bytes remaining in the currently deframed gRPC message payload.
 	msgRemaining int
+
+	// Replies the reader owes the other end (window updates, ping and settings
+	// acknowledgements). The reader must never write them itself: writing takes
+	// writeMu, and a writer holding it can be stuck behind a full socket while
+	// the other end is stuck the same way, each waiting for the other to read.
+	// With the reader blocked on that write, neither ever would. So the reader
+	// only records what is owed, and a separate goroutine sends it.
+	ctlMu     sync.Mutex
+	ctlWindow uint32
+	ctlFrames []h2Reply
+	ctlWake   chan struct{}
+	ctlOnce   sync.Once
+	done      chan struct{}
+	doneOnce  sync.Once
 }
+
+// h2Reply is one acknowledgement waiting to be sent.
+type h2Reply struct {
+	typ     byte
+	flags   byte
+	payload []byte
+}
+
+// h2MaxPendingReplies bounds the backlog of acknowledgements; a peer that floods
+// pings cannot make this grow without limit.
+const h2MaxPendingReplies = 64
 
 func newH2Conn(c net.Conn, streamID uint32, isGRPC bool) *h2Conn {
 	return &h2Conn{
 		Conn:     c,
 		streamID: streamID,
 		isGRPC:   isGRPC,
+		ctlWake:  make(chan struct{}, 1),
+		done:     make(chan struct{}),
+	}
+}
+
+// owe records a reply (or window credit) to be sent soon, without ever blocking
+// on the socket.
+func (h *h2Conn) owe(window uint32, reply *h2Reply) {
+	h.ctlMu.Lock()
+	if window > 0 {
+		if sum := uint64(h.ctlWindow) + uint64(window); sum > 0x7fffffff {
+			h.ctlWindow = 0x7fffffff
+		} else {
+			h.ctlWindow = uint32(sum)
+		}
+	}
+	if reply != nil && len(h.ctlFrames) < h2MaxPendingReplies {
+		h.ctlFrames = append(h.ctlFrames, *reply)
+	}
+	h.ctlMu.Unlock()
+
+	h.ctlOnce.Do(func() { go h.sendOwed() })
+	select {
+	case h.ctlWake <- struct{}{}:
+	default:
+	}
+}
+
+// sendOwed writes what the reader owes, on its own goroutine.
+func (h *h2Conn) sendOwed() {
+	for {
+		select {
+		case <-h.ctlWake:
+		case <-h.done:
+			return
+		}
+
+		h.ctlMu.Lock()
+		window := h.ctlWindow
+		h.ctlWindow = 0
+		frames := h.ctlFrames
+		h.ctlFrames = nil
+		h.ctlMu.Unlock()
+
+		h.writeMu.Lock()
+		var err error
+		for _, f := range frames {
+			if err = writeH2Frame(h.Conn, f.typ, f.flags, 0, f.payload); err != nil {
+				break
+			}
+		}
+		if err == nil && window > 0 {
+			var winBuf [4]byte
+			binary.BigEndian.PutUint32(winBuf[:], window)
+			// The connection as a whole, and this stream.
+			if err = writeH2Frame(h.Conn, h2FrameWindowUpdate, 0, 0, winBuf[:]); err == nil {
+				err = writeH2Frame(h.Conn, h2FrameWindowUpdate, 0, h.streamID, winBuf[:])
+			}
+		}
+		h.writeMu.Unlock()
+		if err != nil {
+			// The connection is broken; the reader will find out on its own.
+			return
+		}
 	}
 }
 
@@ -320,6 +409,7 @@ func (h *h2Conn) CloseWrite() error {
 
 func (h *h2Conn) Close() error {
 	time.Sleep(100 * time.Millisecond)
+	h.doneOnce.Do(func() { close(h.done) })
 	return h.Conn.Close()
 }
 
@@ -414,12 +504,7 @@ func (h *h2Conn) Read(p []byte) (int, error) {
 				}
 				if len(payload) > 0 {
 					// Replenish flow control window so throughput remains unconstrained
-					var winBuf [4]byte
-					binary.BigEndian.PutUint32(winBuf[:], uint32(len(payload)))
-					h.writeMu.Lock()
-					_ = writeH2Frame(h.Conn, h2FrameWindowUpdate, 0, 0, winBuf[:])
-					_ = writeH2Frame(h.Conn, h2FrameWindowUpdate, 0, h.streamID, winBuf[:])
-					h.writeMu.Unlock()
+					h.owe(uint32(len(payload)), nil)
 
 					h.readBuf = append(h.readBuf, payload...)
 				}
@@ -427,16 +512,14 @@ func (h *h2Conn) Read(p []byte) (int, error) {
 
 		case h2FramePing:
 			if flags&h2FlagAck == 0 {
-				h.writeMu.Lock()
-				_ = writeH2Frame(h.Conn, h2FramePing, h2FlagAck, 0, payload)
-				h.writeMu.Unlock()
+				// The payload buffer may be reused by the next read, so the
+				// reply keeps its own copy.
+				h.owe(0, &h2Reply{typ: h2FramePing, flags: h2FlagAck, payload: append([]byte(nil), payload...)})
 			}
 
 		case h2FrameSettings:
 			if flags&h2FlagAck == 0 {
-				h.writeMu.Lock()
-				_ = writeH2Frame(h.Conn, h2FrameSettings, h2FlagAck, 0, nil)
-				h.writeMu.Unlock()
+				h.owe(0, &h2Reply{typ: h2FrameSettings, flags: h2FlagAck})
 			}
 
 		case h2FrameRSTStream, h2FrameGoAway:

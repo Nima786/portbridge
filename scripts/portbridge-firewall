@@ -14,10 +14,16 @@
 # Run from the tunnel's systemd unit on every start, so rules are restored after
 # a reboot without a separate service to manage. Every rule is added only if it
 # is missing, so repeated runs are harmless.
+#
+# Every rule carries a comment naming its tunnel ("portbridge:<name>"). That is
+# how it finds its own rules again: a rule that someone else put on the same port
+# number, a web server's for instance, is never touched. Rules made by versions
+# that did not tag them are recognised by their exact shape and cleaned up only
+# on the side that accepts, where the port is this tunnel's own.
 
 set -uo pipefail
 
-CONF_DIR=/etc/portbridge/tunnels
+CONF_DIR=${PORTBRIDGE_CONF_DIR:-/etc/portbridge/tunnels}
 
 die() {
     echo "portbridge-firewall: $*" >&2
@@ -42,11 +48,22 @@ read_conf() {
 }
 
 # Works out whether this side accepts the tunnel connection, and on which port.
-# Sets: LISTENS, TPORT, PEER
+# Sets: LISTENS, TPORT, PEER, TRANSPORT, ENABLED, PROTO
+# Returns non-zero, after saying why, when the settings cannot be used; one
+# unreadable tunnel must not stop the others from being handled.
 load() {
     local name=$1
     local conf="$CONF_DIR/$name.conf"
-    [ -f "$conf" ] || die "no such tunnel: $name"
+    case "$name" in
+        '' | *[!a-zA-Z0-9_-]*)
+            echo "portbridge-firewall: not a valid tunnel name: $name" >&2
+            return 1
+            ;;
+    esac
+    if [ ! -f "$conf" ]; then
+        echo "portbridge-firewall: no such tunnel: $name" >&2
+        return 1
+    fi
 
     local mode role tunnel_addr
     mode=$(read_conf "$conf" mode)
@@ -65,81 +82,69 @@ load() {
     case "$mode:$role" in
         direct:origin | reverse:edge) LISTENS=yes ;;
         direct:edge | reverse:origin) LISTENS=no ;;
-        *) die "tunnel $name has an unexpected mode/role combination: $mode/$role" ;;
+        *)
+            echo "portbridge-firewall: tunnel $name has an unexpected mode/role combination: $mode/$role" >&2
+            return 1
+            ;;
     esac
 
     case "$TPORT" in
-        '' | *[!0-9]*) die "tunnel $name has an unreadable tunnel port: '$tunnel_addr'" ;;
+        '' | *[!0-9]*)
+            echo "portbridge-firewall: tunnel $name has an unreadable tunnel port: '$tunnel_addr'" >&2
+            return 1
+            ;;
     esac
+
+    PROTO=tcp
+    [ "$TRANSPORT" = kcp ] && PROTO=udp
+    return 0
 }
 
 have() { command -v "$1" >/dev/null 2>&1; }
 
-# Adds a rule only when an identical one is not already present.
-ensure4() {
-    have iptables || return 0
-    iptables -C "$@" 2>/dev/null || iptables -A "$@"
-}
-drop4() {
-    have iptables || return 0
-    while iptables -C "$@" 2>/dev/null; do
-        iptables -D "$@" || break
-    done
-}
+tag() { printf 'portbridge:%s' "$1"; }
 
-cmd_apply() {
-    load "$1"
-
-    if [ "$LISTENS" != yes ]; then
-        # Switching a tunnel between direct and reverse swaps which side accepts.
-        # If this side used to accept, its rules are now meaningless and would
-        # keep a port shut that nothing is listening on, so clear them.
-        purge_port iptables "$TPORT"
-        purge_port ip6tables "$TPORT"
-        echo "tunnel $1 dials out, so no firewall rule is needed on this server"
-        return 0
-    fi
-    if [ "$ENABLED" = off ]; then
-        # Turned off by the user: make sure nothing is left behind from when it
-        # was on, so "off" really means the port is open.
-        cmd_remove "$1" >/dev/null
-        echo "firewall is turned off for tunnel $1, so port $TPORT is open to everyone"
-        return 0
-    fi
-    if [ -z "$PEER" ]; then
-        echo "tunnel $1 has no peer address recorded, so port $TPORT is left open" >&2
-        return 0
-    fi
-
-    # Start clean, so a changed peer address never leaves the old one allowed.
-    purge_port iptables "$TPORT"
-    purge_port ip6tables "$TPORT"
-
-    local proto=tcp
-    if [ "$TRANSPORT" = "kcp" ]; then
-        proto=udp
-    fi
-
-    # Order matters: the allow rules must sit above the catch-all drop.
-    ensure4 INPUT -p "$proto" --dport "$TPORT" -s "$PEER" -j ACCEPT
-    ensure4 INPUT -p "$proto" --dport "$TPORT" -s 127.0.0.1 -j ACCEPT
-    ensure4 INPUT -p "$proto" --dport "$TPORT" -j DROP
-
-    # The port is bound on IPv6 too. The peer is recorded as IPv4, so close v6
-    # rather than leaving an unguarded way in.
-    if have ip6tables && [[ "$PEER" != *:* ]]; then
-        ip6tables -C INPUT -p "$proto" --dport "$TPORT" -j DROP 2>/dev/null ||
-            ip6tables -A INPUT -p "$proto" --dport "$TPORT" -j DROP
-    fi
-
-    echo "tunnel port $TPORT ($proto) is restricted to $PEER"
+# rule_spec <name> <target> [source] - fills RULE with a rule for the loaded
+# tunnel, after the chain name. The same words serve for checking, adding and
+# deleting.
+rule_spec() {
+    local name=$1 target=$2 src=${3-}
+    RULE=()
+    [ -n "$src" ] && RULE+=(-s "$src")
+    RULE+=(-p "$PROTO" --dport "$TPORT" -m comment --comment "$(tag "$name")" -j "$target")
 }
 
-# Removes every allow and drop rule for a port, whatever source address it
-# names. Matching on the port rather than on the recorded peer matters: if the
-# peer address was changed, the rule for the old address must go too, or it
-# would stay open to a server that is no longer part of the tunnel.
-purge_port() {
+# add_rule <tool> <name> <target> [source]
+#
+# Inserted at the top of the chain, not appended. Appending put the rule below
+# whatever the machine already had, and a broad REJECT or an accept-everything
+# further up made the lock either useless or impossible to get through. Rules
+# are added so that, in the end, the allowed sources sit above the drop.
+add_rule() {
+    local tool=$1 name=$2 target=$3 src=${4-}
+    have "$tool" || return 0
+    rule_spec "$name" "$target" "$src"
+    "$tool" -C INPUT "${RULE[@]}" 2>/dev/null || "$tool" -I INPUT 1 "${RULE[@]}"
+}
+
+# purge_own <tool> <name> - removes every rule this tunnel added, whatever port
+# or address it names, so a changed port or peer never leaves an old one behind.
+purge_own() {
+    local tool=$1 name=$2 rule
+    have "$tool" || return 0
+    "$tool" -S INPUT 2>/dev/null |
+        grep -E -- "^-A INPUT .*--comment \"?$(tag "$name")\"?( |$)" |
+        while read -r rule; do
+            # shellcheck disable=SC2086 # the rule must be split back into words
+            "$tool" ${rule/-A/-D} 2>/dev/null || true
+        done
+}
+
+# purge_legacy <tool> <port> - removes rules of the shape older versions made,
+# which carried no tag. Only ever used on the side that accepts, where the port
+# belongs to this tunnel; on the side that dials the same number may be somebody
+# else's service.
+purge_legacy() {
     local tool=$1 port=$2 rule
     have "$tool" || return 0
     "$tool" -S INPUT 2>/dev/null |
@@ -150,13 +155,66 @@ purge_port() {
         done
 }
 
+purge_everything() {
+    local name=$1
+    purge_own iptables "$name"
+    purge_own ip6tables "$name"
+    if [ "$LISTENS" = yes ]; then
+        purge_legacy iptables "$TPORT"
+        purge_legacy ip6tables "$TPORT"
+    fi
+}
+
+cmd_apply() {
+    local name=$1
+    load "$name" || exit 1
+
+    if [ "$LISTENS" != yes ]; then
+        # Switching a tunnel between direct and reverse swaps which side accepts.
+        # If this side used to accept, its rules are now meaningless and would
+        # keep a port shut that nothing is listening on, so clear this tunnel's
+        # own.
+        purge_everything "$name"
+        echo "tunnel $name dials out, so no firewall rule is needed on this server"
+        return 0
+    fi
+    if [ "$ENABLED" = off ]; then
+        # Turned off by the user: make sure nothing is left behind from when it
+        # was on, so "off" really means the port is open.
+        purge_everything "$name"
+        echo "firewall is turned off for tunnel $name, so port $TPORT is open to everyone"
+        return 0
+    fi
+    if [ -z "$PEER" ]; then
+        echo "tunnel $name has no peer address recorded, so port $TPORT is left open" >&2
+        return 0
+    fi
+
+    # Start clean, so a changed peer address never leaves the old one allowed.
+    purge_everything "$name"
+
+    # Added bottom to top, each at the top of the chain: the drop first, then the
+    # addresses allowed through, which end up above it.
+    add_rule iptables "$name" DROP
+    add_rule iptables "$name" ACCEPT 127.0.0.1
+    add_rule iptables "$name" ACCEPT "$PEER"
+
+    # The port is bound on IPv6 too. The peer is recorded as IPv4, so close v6
+    # rather than leaving an unguarded way in.
+    if have ip6tables && [[ "$PEER" != *:* ]]; then
+        add_rule ip6tables "$name" DROP
+    fi
+
+    echo "tunnel port $TPORT ($PROTO) is restricted to $PEER"
+}
+
 cmd_remove() {
-    load "$1"
+    local name=$1
+    load "$name" || exit 1
     # Purge whether or not this side accepts now: the mode may have been changed
     # since the rules were added, and leaving them behind shuts a port for good.
-    purge_port iptables "$TPORT"
-    purge_port ip6tables "$TPORT"
-    echo "firewall rules for tunnel port $TPORT removed"
+    purge_everything "$name"
+    echo "firewall rules for tunnel $name removed"
 }
 
 cmd_status() {
@@ -165,13 +223,19 @@ cmd_status() {
     for f in "$CONF_DIR"/*.conf; do
         [ -e "$f" ] || continue
         name=$(basename "$f" .conf)
-        load "$name"
+        # A tunnel whose settings cannot be read is listed as such, not allowed
+        # to end the listing.
+        if ! load "$name" 2>/dev/null; then
+            printf '%-16s %-8s %-7s %-10s %s\n' "$name" "?" "?" "unreadable" "check its settings file"
+            continue
+        fi
         if [ "$LISTENS" != yes ]; then
             printf '%-16s %-8s %-7s %-10s %s\n' "$name" "$TPORT" "-" "not needed" "this side dials out"
             continue
         fi
         local state="open"
-        if have iptables && iptables -C INPUT -p tcp --dport "$TPORT" -j DROP 2>/dev/null; then
+        rule_spec "$name" DROP
+        if have iptables && iptables -C INPUT "${RULE[@]}" 2>/dev/null; then
             state="locked"
         fi
         printf '%-16s %-8s %-7s %-10s %s\n' "$name" "$TPORT" "$ENABLED" "$state" \
@@ -180,13 +244,14 @@ cmd_status() {
 }
 
 cmd_show() {
-    load "$1"
+    local name=$1
+    load "$name" || exit 1
     if [ "$LISTENS" != yes ]; then
         echo "this side dials out; no rules expected"
         return 0
     fi
     echo "rules for port $TPORT:"
-    have iptables && iptables -S INPUT | grep -- "--dport $TPORT" || echo "  (none)"
+    have iptables && { iptables -S INPUT | grep -- "--dport $TPORT" || echo "  (none)"; }
     if have ip6tables; then
         echo "IPv6:"
         ip6tables -S INPUT | grep -- "--dport $TPORT" || echo "  (none)"

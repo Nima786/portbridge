@@ -35,7 +35,22 @@ const (
 	protoVersion  = 1
 	protoVersion2 = 2
 
-	authPurposeTunnel    byte = 0x00
+	// authPurposeTunnel is what every build up to 0.4.5 sends for a tunnel
+	// connection, and it still means "a tunnel connection, no claim made about
+	// how it will be used". An acceptor must keep taking it as before.
+	authPurposeTunnel byte = 0x00
+
+	// These two say how the dialling side intends to use the connection: parked
+	// one-per-user (pooled), or as one of a few long-lived shared links (mux).
+	//
+	// They exist so that a disagreement between the two servers is caught at the
+	// handshake, by name, instead of surfacing later as users hanging for twenty
+	// seconds while both ends report everything ready. Older acceptors treat any
+	// purpose other than speedtest as a plain tunnel connection, so sending these
+	// to an older build is harmless.
+	authPurposeTunnelPooled byte = 0x01
+	authPurposeTunnelMux    byte = 0x02
+
 	authPurposeSpeedtest byte = 0x05
 
 	authTimeLen  = 8
@@ -60,6 +75,10 @@ const (
 	rejClockSkew = 0x11
 	rejReplay    = 0x12
 
+	// rejMuxMismatch says the two servers disagree about shared connections.
+	// Sent only after the MAC has verified, like the others.
+	rejMuxMismatch = 0x13
+
 	authReadTimeout  = 10 * time.Second
 	authWriteTimeout = 10 * time.Second
 
@@ -69,11 +88,20 @@ const (
 )
 
 var (
-	errAuthMAC           = errors.New("wrong or missing secret")
-	errAuthVersion       = errors.New("peer speaks a different protocol version")
-	errAuthSkew          = errors.New("the two servers' clocks differ by more than two minutes; check time sync")
-	errAuthReplay        = errors.New("auth frame replayed")
-	errRejected          = errors.New("peer rejected our credentials")
+	errAuthMAC     = errors.New("wrong or missing secret")
+	errAuthVersion = errors.New("peer speaks a different protocol version")
+	errAuthSkew    = errors.New("the two servers' clocks differ by more than two minutes; check time sync")
+	errAuthReplay  = errors.New("auth frame replayed")
+	errRejected    = errors.New("peer rejected our credentials")
+
+	// The mismatch errors say which side has sharing turned on, because that is
+	// the thing someone has to go and change.
+	errMuxMismatch = errors.New("the two servers disagree about shared connections (mux): " +
+		"one has it on and the other off; set it the same on both")
+	errMuxOnlyThere = errors.New("the other server uses shared connections (mux) but this one does not; " +
+		"set it the same on both")
+	errMuxOnlyHere = errors.New("this server uses shared connections (mux) but the other one does not; " +
+		"set it the same on both")
 	errTeardownRequested = errors.New("remote teardown requested")
 	errSpeedtestFinished = errors.New("speedtest completed")
 )
@@ -290,14 +318,55 @@ func verifyAuthFrame(frame, secret []byte, guard *replayGuard) error {
 	return err
 }
 
-// sendAuth is used by whichever side dials.
+// sendAuth is used by whichever side dials, for a connection that makes no claim
+// about how it will be used (teardown requests, and anything from an older
+// caller).
 func sendAuth(c net.Conn, secret []byte) error {
 	return sendAuthPurpose(c, secret, authPurposeTunnel)
 }
 
+// tunnelPurposeFor is the purpose a dialling side announces for a tunnel
+// connection: pooled or shared, according to its own settings.
+func tunnelPurposeFor(cfg *Config) byte {
+	if cfg.Mux {
+		return authPurposeTunnelMux
+	}
+	return authPurposeTunnelPooled
+}
+
+// isTunnelPurpose reports whether a purpose means "a tunnel connection" in any of
+// its spellings, as opposed to a speed test.
+func isTunnelPurpose(p byte) bool {
+	return p == authPurposeTunnel || p == authPurposeTunnelPooled || p == authPurposeTunnelMux
+}
+
+// checkTunnelPurpose compares what the dialling side said it will do with what
+// this side is set up to do. The legacy purpose makes no claim, so it always
+// passes: that is what keeps a mixed-version pair working as it did.
+func checkTunnelPurpose(cfg *Config, purpose byte) error {
+	switch purpose {
+	case authPurposeTunnelMux:
+		if !cfg.Mux {
+			return errMuxOnlyThere
+		}
+	case authPurposeTunnelPooled:
+		if cfg.Mux {
+			return errMuxOnlyHere
+		}
+	}
+	return nil
+}
+
 // sendAuthPurpose sends an auth frame with a specific purpose (tunnel or speedtest).
 func sendAuthPurpose(c net.Conn, secret []byte, purpose byte) error {
-	if ea, ok := c.(interface{ isEarlyAuthed() bool }); ok && ea.isEarlyAuthed() && purpose == authPurposeTunnel {
+	// A connection that was already authenticated during the websocket upgrade
+	// has told the far side its purpose there. Only skip sending again when that
+	// purpose is the one being asked for now; otherwise the far side would read a
+	// second frame as if it were tunnel data.
+	if ea, ok := c.(interface {
+		isEarlyAuthed() bool
+		earlyPurpose() byte
+	}); ok && ea.isEarlyAuthed() && ea.earlyPurpose() == purpose {
 		return nil
 	}
 	frame, err := buildAuthFrameV2(secret, purpose)
@@ -321,8 +390,14 @@ func recvAuth(c net.Conn, secret []byte, guard *replayGuard) error {
 
 // recvAuthPurpose reads the auth frame from c and returns the authenticated purpose.
 func recvAuthPurpose(c net.Conn, secret []byte, guard *replayGuard) (byte, error) {
-	if ea, ok := c.(interface{ isEarlyAuthed() bool }); ok && ea.isEarlyAuthed() {
-		return authPurposeTunnel, nil
+	if ea, ok := c.(interface {
+		isEarlyAuthed() bool
+		earlyPurpose() byte
+	}); ok && ea.isEarlyAuthed() {
+		// Already verified during the upgrade, including its purpose. Returning
+		// a fixed "tunnel" here used to discard that, which quietly broke every
+		// speed test over the websocket disguise.
+		return ea.earlyPurpose(), nil
 	}
 
 	if err := c.SetReadDeadline(time.Now().Add(authReadTimeout)); err != nil {
@@ -434,7 +509,15 @@ func describeRejection(b byte) error {
 		return errAuthSkew
 	case rejReplay:
 		return errAuthReplay
+	case rejMuxMismatch:
+		return errMuxMismatch
 	default:
 		return errRejected
 	}
+}
+
+// isRejection reports whether b is one of the one-byte reasons a far side sends
+// just before closing.
+func isRejection(b byte) bool {
+	return b == rejClockSkew || b == rejReplay || b == rejMuxMismatch
 }
