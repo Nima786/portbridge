@@ -492,11 +492,23 @@ ask_disguise() {
     DG_CLEAN_IPS=""
     DG_UTLS=off
     DG_FRAGMENT=off
+    DG_HTTPHEADER=off
+    DG_HTTPHOST=""
 
     case "$choice" in
         1)
             DG_TRANSPORT=plain
             warn "Chosen: plain. Nothing is hidden."
+            say ""
+            info "The plain link opens with random-looking bytes, which some networks refuse."
+            info "It can instead open like ordinary web traffic: a short fake web request and"
+            info "reply naming a site of your choice, then the tunnel as before. It is not"
+            info "encryption, and both servers get the same setting from the code."
+            if confirm "Make it open like web traffic?"; then
+                DG_HTTPHEADER=on
+                DG_HTTPHOST=$(ask_http_host)
+                ok "Chosen: plain, opening like web traffic to $DG_HTTPHOST."
+            fi
             return 0
             ;;
         2) DG_TRANSPORT=tls ;;
@@ -633,6 +645,29 @@ ask_disguise() {
 }
 
 # describe_disguise <transport> <cdn> [althost] - one short phrase for summaries.
+# valid_hostname <name> - letters, digits, dots and dashes
+valid_hostname() {
+    case "$1" in
+        '' | .* | -* | *. | *-) return 1 ;;
+        *[!a-zA-Z0-9.-]*) return 1 ;;
+        *) [ "${#1}" -le 253 ] ;;
+    esac
+}
+
+# ask_http_host - the site name the web header claims; any believable name works
+# and it does not have to be one you own.
+ask_http_host() {
+    local h
+    while :; do
+        h=$(ask "Site name for the web header" "www.bing.com")
+        if valid_hostname "$h"; then
+            printf '%s' "$h"
+            return 0
+        fi
+        err "  Use a name like www.example.com (letters, digits, dots and dashes)."
+    done
+}
+
 describe_disguise() {
     case "$1:$2" in
         tls:*) printf 'looks like a normal website' ;;
@@ -649,8 +684,24 @@ describe_disguise() {
                 printf 'looks like a website, websocket'
             fi
             ;;
-        *) printf 'plain, not hidden' ;;
+        *)
+            if [ -n "${4-}" ]; then
+                printf 'plain, opening like web traffic to %s (not encrypted)' "$4"
+            else
+                printf 'plain, not hidden'
+            fi
+            ;;
     esac
+}
+
+# http_header_host <name> - the name a plain tunnel's web header claims, or nothing
+# if the header is off.
+http_header_host() {
+    if [ "$(read_conf "$1" http_header)" = on ]; then
+        local h
+        h=$(read_conf "$1" http_host)
+        printf '%s' "${h:-www.bing.com}"
+    fi
 }
 
 # cdn_involved <cdn> <althost> - can the link arrive from a CDN rather than
@@ -772,15 +823,25 @@ make_pairing_code() {
     local name=$1 mode=$2 tport=$3 relay_ip=$4 server_ip=$5 inbound_port=$6 pool=$7 secret=$8
     local transport=$9 servername=${10} wspath=${11} cdn=${12} mux=${13} muxlinks=${14}
     local althost=${15-} utls=${16-} fragment=${17-} cleanips=${18-}
+    local httpheader=${19-} httphost=${20-}
     # Version 6 adds the browser hello, the split hello and the clean addresses,
-    # which a CDN tunnel needs on the foreign side as well.
+    # which a CDN tunnel needs on the foreign side as well. Version 7 adds the web
+    # header of a plain link. A code says 7 only when it uses it, so a server that
+    # knows up to 6 keeps working with every tunnel that does not.
+    if [ "$httpheader" = on ]; then
+        printf 'v=7\nname=%s\nmode=%s\ntunnel_port=%s\nrelay_ip=%s\nserver_ip=%s\ninbound_port=%s\npool=%s\ntransport=%s\nserver_name=%s\nws_path=%s\ncdn=%s\nalt_host=%s\nmux=%s\nmux_links=%s\nutls=%s\ntls_fragment=%s\nclean_ips=%s\nhttp_header=%s\nhttp_host=%s\nsecret=%s\n' \
+            "$name" "$mode" "$tport" "$relay_ip" "$server_ip" "$inbound_port" "$pool" \
+            "$transport" "$servername" "$wspath" "$cdn" "$althost" "${mux:-off}" "${muxlinks:-4}" \
+            "$utls" "$fragment" "$cleanips" "on" "${httphost:-www.bing.com}" "$secret" |
+            base64 | tr -d '\n'
+        return 0
+    fi
     printf 'v=6\nname=%s\nmode=%s\ntunnel_port=%s\nrelay_ip=%s\nserver_ip=%s\ninbound_port=%s\npool=%s\ntransport=%s\nserver_name=%s\nws_path=%s\ncdn=%s\nalt_host=%s\nmux=%s\nmux_links=%s\nutls=%s\ntls_fragment=%s\nclean_ips=%s\nsecret=%s\n' \
         "$name" "$mode" "$tport" "$relay_ip" "$server_ip" "$inbound_port" "$pool" \
         "$transport" "$servername" "$wspath" "$cdn" "$althost" "${mux:-off}" "${muxlinks:-4}" \
         "$utls" "$fragment" "$cleanips" "$secret" |
         base64 | tr -d '\n'
 }
-
 get_tunnel_pairing_code() {
     local name=$1 role mode tport secret relay_ip server_ip inbound_port pool
     role=$(read_conf "$name" role)
@@ -814,7 +875,7 @@ get_tunnel_pairing_code() {
 
     make_pairing_code "$name" "$mode" "$tport" "$relay_ip" "$server_ip" "$inbound_port" \
         "$pool" "$secret" "$transport" "$servername" "$wspath" "$cdn" "$mux" "$muxlinks" "$althost" \
-        "$utls" "$fragment" "$cleanips"
+        "$utls" "$fragment" "$cleanips" "$(read_conf "$name" http_header)" "$(read_conf "$name" http_host)"
 }
 
 show_pairing_code() {
@@ -883,6 +944,11 @@ write_tunnel() {
         [ -n "$localip" ] && printf 'local_ip = %s\n' "$localip"
         printf '\n# What the link looks like to anyone watching it. See the menu.\n'
         printf 'transport = %s\n' "${DG_TRANSPORT:-plain}"
+        if [ "${DG_TRANSPORT:-plain}" = plain ] && [ "${DG_HTTPHEADER:-off}" = on ]; then
+            printf '# Opens with a fake web request and reply; both servers must have it.\n'
+            printf 'http_header = on\n'
+            printf 'http_host = %s\n' "${DG_HTTPHOST:-www.bing.com}"
+        fi
         if [ "${DG_TRANSPORT:-plain}" != plain ] && [ "${DG_TRANSPORT:-plain}" != kcp ]; then
             [ -n "${DG_SERVERNAME-}" ] && printf 'server_name = %s\n' "$DG_SERVERNAME"
             [ -n "${DG_WSPATH-}" ] && printf 'ws_path = %s\n' "$DG_WSPATH"
@@ -1264,7 +1330,7 @@ create_tunnel() {
             say "  firewall           port $tport here open to $peer only"
         fi
     fi
-    say "  link appearance    $(describe_disguise "$DG_TRANSPORT" "$DG_CDN" "$DG_ALTHOST")"
+    say "  link appearance    $(describe_disguise "$DG_TRANSPORT" "$DG_CDN" "$DG_ALTHOST" "${DG_HTTPHOST-}")"
     [ -n "$DG_SERVERNAME" ] && say "  claims to be       $DG_SERVERNAME$DG_WSPATH"
     if [ -n "$DG_ALTHOST" ]; then
         say "  if that is blocked it moves to $DG_ALTHOST:$tport through the CDN,"
@@ -1348,7 +1414,7 @@ join_tunnel() {
         err "Update the Iran server, then create the tunnel there again for a new code."
         return 1
     fi
-    if [ "$v" != 5 ] && [ "$v" != 6 ]; then
+    if [ "$v" != 5 ] && [ "$v" != 6 ] && [ "$v" != 7 ]; then
         err "That code was made by a newer PortBridge than this one, or is not a code."
         err "Update this server, then try again."
         return 1
@@ -1370,6 +1436,8 @@ join_tunnel() {
     DG_UTLS=$(get utls)
     DG_FRAGMENT=$(get tls_fragment)
     DG_CLEAN_IPS=$(get clean_ips)
+    DG_HTTPHEADER=$(get http_header); [ -n "$DG_HTTPHEADER" ] || DG_HTTPHEADER=off
+    DG_HTTPHOST=$(get http_host)
 
     # So does whether connections are shared: it must match on both ends or
     # neither side would understand the other.
@@ -1388,6 +1456,9 @@ join_tunnel() {
     case "$DG_TRANSPORT" in plain | tls | wss | h2 | grpc | kcp) ;; *) err "That code has an unknown link type."; return 1 ;; esac
     case "$DG_CDN" in on | off) ;; *) err "That code has a bad CDN setting."; return 1 ;; esac
     case "$MX_MUX" in on | off) ;; *) err "That code has a bad sharing setting."; return 1 ;; esac
+    case "$DG_HTTPHEADER" in on | off) ;; *) err "That code has a bad web header setting."; return 1 ;; esac
+    if [ -n "$DG_HTTPHOST" ] && ! valid_hostname "$DG_HTTPHOST"; then err "That code has a bad web header name."; return 1; fi
+    if [ "$DG_HTTPHEADER" = on ] && [ "$DG_TRANSPORT" != plain ]; then err "That code puts a web header on a link that is not plain."; return 1; fi
     case "$DG_UTLS" in '' | on | off) ;; *) err "That code has a bad setting."; return 1 ;; esac
     case "$DG_FRAGMENT" in '' | on | off) ;; *) err "That code has a bad setting."; return 1 ;; esac
     if ! valid_port "$MX_LINKS" || [ "$MX_LINKS" -gt 16 ]; then
@@ -1482,7 +1553,7 @@ join_tunnel() {
         say "  connection         reverse: this server connects out to $relay_ip:$tport"
         say "                     so this server needs no open port for it"
     fi
-    say "  link appearance    $(describe_disguise "$DG_TRANSPORT" "$DG_CDN" "$DG_ALTHOST")"
+    say "  link appearance    $(describe_disguise "$DG_TRANSPORT" "$DG_CDN" "$DG_ALTHOST" "${DG_HTTPHOST-}")"
     [ -n "$DG_SERVERNAME" ] && say "  claims to be       $DG_SERVERNAME$DG_WSPATH"
     say "  connections        $(describe_sharing "$MX_MUX" "$MX_LINKS")"
     hr
@@ -2286,7 +2357,7 @@ test_tunnel() {
     cdn=$(read_conf "$name" cdn); [ -n "$cdn" ] || cdn=off
     local alt
     alt=$(read_conf "$name" alt_target)
-    result "link appearance" note "$(describe_disguise "$transport" "$cdn" "$alt")"
+    result "link appearance" note "$(describe_disguise "$transport" "$cdn" "$alt" "$(http_header_host "$name")")"
     result "connections" note "$(describe_sharing "$mux" "$(read_conf "$name" mux_links)")"
 
     # A tunnel made before this check existed, or edited by hand, can end up on a

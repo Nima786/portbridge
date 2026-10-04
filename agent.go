@@ -50,10 +50,15 @@ type PairingData struct {
 	UTLS        string
 	TLSFragment string
 	CleanIPs    string
+
+	// Added in version 7, and only sent when used: a plain link that opens with a
+	// web header, and the name that header claims. See httpheader.go.
+	HTTPHeader string
+	HTTPHost   string
 }
 
 // pairingVersionMax is the newest code this build understands.
-const pairingVersionMax = 6
+const pairingVersionMax = 7
 
 // decodePairingCode parses a base64 encoded pairing code into structured data.
 func decodePairingCode(code string) (*PairingData, error) {
@@ -99,6 +104,8 @@ func decodePairingCode(code string) (*PairingData, error) {
 		UTLS:        kv["utls"],
 		TLSFragment: kv["tls_fragment"],
 		CleanIPs:    kv["clean_ips"],
+		HTTPHeader:  kv["http_header"],
+		HTTPHost:    kv["http_host"],
 	}
 
 	if v, err := strconv.Atoi(p.Version); err == nil && v > pairingVersionMax {
@@ -178,78 +185,7 @@ func applyPairingWarn(p *PairingData, confDir string, warns *[]string) error {
 		*warns = append(*warns, notes...)
 	}
 
-	// Format inbound ports (e.g. 100 -> 127.0.0.1:100, 100, 200 -> 127.0.0.1:100, 127.0.0.1:200)
-	inboundParts := strings.Split(p.InboundPort, ",")
-	var inbounds []string
-	for _, ip := range inboundParts {
-		ip = strings.TrimSpace(ip)
-		if ip != "" {
-			inbounds = append(inbounds, "127.0.0.1:"+ip)
-		}
-	}
-	inboundAddr := strings.Join(inbounds, ", ")
-	if inboundAddr == "" {
-		inboundAddr = "127.0.0.1:100"
-	}
-
-	var tunnelAddr string
-	if p.Mode == "direct" {
-		tunnelAddr = "0.0.0.0:" + p.TunnelPort
-	} else {
-		tunnelAddr = net.JoinHostPort(p.RelayIP, p.TunnelPort)
-	}
-
-	firewall := "on"
-	if p.CDN == "on" || p.AltHost != "" || p.Mode == "reverse" {
-		firewall = "off"
-	}
-
-	var b strings.Builder
-	fmt.Fprintf(&b, "# PortBridge tunnel %q, deployed by management agent\n", p.Name)
-	fmt.Fprintf(&b, "name = %s\n", p.Name)
-	fmt.Fprintf(&b, "mode = %s\n", p.Mode)
-	fmt.Fprintf(&b, "role = origin\n")
-	fmt.Fprintf(&b, "tunnel_addr = %s\n", tunnelAddr)
-	fmt.Fprintf(&b, "inbound_addr = %s\n", inboundAddr)
-	fmt.Fprintf(&b, "peer_ip = %s\n", p.RelayIP)
-	fmt.Fprintf(&b, "firewall = %s\n", firewall)
-	if p.ServerIP != "" {
-		fmt.Fprintf(&b, "local_ip = %s\n", p.ServerIP)
-	}
-	fmt.Fprintf(&b, "\ntransport = %s\n", p.Transport)
-	if p.Transport != "plain" && p.Transport != "kcp" {
-		if p.ServerName != "" {
-			fmt.Fprintf(&b, "server_name = %s\n", p.ServerName)
-		}
-		if p.WSPath != "" {
-			fmt.Fprintf(&b, "ws_path = %s\n", p.WSPath)
-		}
-		fmt.Fprintf(&b, "cdn = %s\n", p.CDN)
-		fmt.Fprintf(&b, "cert_file = %s\n", certFile)
-		fmt.Fprintf(&b, "key_file = %s\n", keyFile)
-		// Only the side that dials uses these, but they are harmless on the
-		// other and keep a code made for a CDN tunnel whole.
-		if p.UTLS != "" {
-			fmt.Fprintf(&b, "utls = %s\n", p.UTLS)
-		}
-		if p.TLSFragment != "" {
-			fmt.Fprintf(&b, "tls_fragment = %s\n", p.TLSFragment)
-		}
-		if p.CleanIPs != "" && p.Mode == "reverse" {
-			fmt.Fprintf(&b, "clean_ips = %s\n", p.CleanIPs)
-		}
-	}
-	if p.AltHost != "" && p.Mode == "reverse" {
-		fmt.Fprintf(&b, "alt_target = %s\n", net.JoinHostPort(p.AltHost, p.TunnelPort))
-		fmt.Fprintf(&b, "alt_server_name = %s\n", p.AltHost)
-	}
-	fmt.Fprintf(&b, "\nmux = %s\n", p.Mux)
-	if p.Mux == "on" {
-		fmt.Fprintf(&b, "mux_links = %s\n", p.MuxLinks)
-	}
-	fmt.Fprintf(&b, "\npool_size = %s\n", p.Pool)
-	fmt.Fprintf(&b, "max_conn = 2000\nmax_pending = 512\nspare_ttl = 10m\npark_timeout = 15m\ndrain = 5s\n")
-	fmt.Fprintf(&b, "\nsecret_file = %s\n", secretFile)
+	confText := buildOriginConf(p, secretFile, certFile, keyFile)
 
 	// From here on, failure undoes what was written.
 	undo := func() {
@@ -264,7 +200,7 @@ func applyPairingWarn(p *PairingData, confDir string, warns *[]string) error {
 		undo()
 		return fmt.Errorf("writing secret: %w", err)
 	}
-	if err := writeFileAtomic(confFile, []byte(b.String()), 0o600); err != nil {
+	if err := writeFileAtomic(confFile, []byte(confText), 0o600); err != nil {
 		undo()
 		return fmt.Errorf("writing config: %w", err)
 	}

@@ -141,6 +141,12 @@ type Config struct {
 	// packet stalls every session on it.
 	MuxLinks int
 
+	// HTTPHeader makes a plain link open with a believable web request and
+	// answer, naming HTTPHost, so it does not begin with unrecognisable bytes.
+	// Plain transport only; both ends must agree. See httpheader.go.
+	HTTPHeader bool
+	HTTPHost   string
+
 	// PathProbe turns on the periodic transfer that proves data really flows over
 	// the route, and which moves traffic to a backup route when it does not. On
 	// by default; see health.go for why a count of ready connections is not proof.
@@ -430,6 +436,17 @@ func (c *Config) set(key, val string) error {
 		c.AltTarget = val
 	case "alt_server_name":
 		c.AltServerName = val
+	case "http_header":
+		switch strings.ToLower(val) {
+		case "on", "yes", "true":
+			c.HTTPHeader = true
+		case "off", "no", "false":
+			c.HTTPHeader = false
+		default:
+			return fmt.Errorf("http_header must be on or off, got %q", val)
+		}
+	case "http_host":
+		c.HTTPHost = strings.TrimSpace(val)
 	case "mux":
 		switch strings.ToLower(val) {
 		case "on", "yes", "true":
@@ -557,6 +574,17 @@ func (c *Config) Validate() error {
 		if !c.fragmentSet {
 			c.TLSFragment = true
 		}
+	}
+	if c.HTTPHeader {
+		if c.Transport != TransportPlain {
+			return fmt.Errorf("http_header only applies to the plain link; the %s link already opens like a website", c.Transport)
+		}
+		if c.HTTPHost == "" {
+			c.HTTPHost = defaultHTTPHost
+		}
+	}
+	if c.HTTPHost != "" && !hostnameRe.MatchString(c.HTTPHost) {
+		return fmt.Errorf("http_host %q is not a hostname (letters, digits, dots and dashes)", c.HTTPHost)
 	}
 	if c.TLSFragmentSize <= 0 {
 		c.TLSFragmentSize = 40

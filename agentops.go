@@ -312,6 +312,7 @@ func validatePairing(p *PairingData) error {
 	}
 	for _, f := range []struct{ name, val string }{
 		{"cdn", p.CDN}, {"mux", p.Mux}, {"utls", p.UTLS}, {"tls_fragment", p.TLSFragment},
+		{"http_header", p.HTTPHeader},
 	} {
 		if f.val != "" && f.val != "on" && f.val != "off" {
 			return fmt.Errorf("%s must be on or off, got %q", f.name, f.val)
@@ -319,6 +320,12 @@ func validatePairing(p *PairingData) error {
 	}
 	if n, err := strconv.Atoi(p.MuxLinks); err != nil || n < 1 || n > 64 {
 		return fmt.Errorf("mux links %q is not a sensible number", p.MuxLinks)
+	}
+	if p.HTTPHeader == "on" && p.Transport != "plain" {
+		return errors.New("the web header only applies to a plain link")
+	}
+	if p.HTTPHost != "" && !hostnameRe.MatchString(p.HTTPHost) {
+		return fmt.Errorf("web header name %q is not a hostname", p.HTTPHost)
 	}
 	if p.ServerName != "" && !hostnameRe.MatchString(p.ServerName) {
 		return fmt.Errorf("server name %q is not a hostname", p.ServerName)

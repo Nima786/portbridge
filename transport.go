@@ -442,6 +442,12 @@ func wrapDial(raw net.Conn, cfg *Config) (net.Conn, error) {
 func wrapDialPurpose(raw net.Conn, cfg *Config, purpose byte) (net.Conn, error) {
 	switch cfg.Transport {
 	case TransportPlain, TransportKCP:
+		if cfg.Transport == TransportPlain && cfg.HTTPHeader {
+			if err := httpHeaderDial(raw, cfg.HTTPHost); err != nil {
+				_ = raw.Close()
+				return nil, err
+			}
+		}
 		return raw, nil
 
 	case TransportTLS, TransportWSS, TransportH2, TransportGRPC:
@@ -525,6 +531,12 @@ func wrapDialPurpose(raw net.Conn, cfg *Config, purpose byte) (net.Conn, error) 
 func wrapAccept(raw net.Conn, cfg *Config, cert *tls.Certificate, guard ...*replayGuard) (net.Conn, error) {
 	switch cfg.Transport {
 	case TransportPlain, TransportKCP:
+		if cfg.Transport == TransportPlain && cfg.HTTPHeader {
+			if err := httpHeaderAccept(raw); err != nil {
+				_ = raw.Close()
+				return nil, err
+			}
+		}
 		return raw, nil
 
 	case TransportTLS, TransportWSS, TransportH2, TransportGRPC:
@@ -591,6 +603,13 @@ func describeTransport(cfg *Config) string {
 	case TransportKCP:
 		return fmt.Sprintf("loss-resistant KCP/UDP transport with FEC (%d/%d shards)", cfg.KCPDataShards, cfg.KCPParityShards)
 	default:
+		if cfg.HTTPHeader {
+			host := cfg.HTTPHost
+			if host == "" {
+				host = defaultHTTPHost
+			}
+			return fmt.Sprintf("plain, opening like web traffic to %s (not encrypted)", host)
+		}
 		return "plain, no disguise"
 	}
 

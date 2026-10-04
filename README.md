@@ -204,6 +204,29 @@ expensive thing either server does. Sharing pays it once and then stops paying.
 For large steady transfers it is the other way round, and one connection per user
 is cheaper. On a plain link with no disguise the two are about even.
 
+## Making a plain link open like web traffic
+
+The plain option starts with random-looking bytes, and some networks refuse
+anything that opens like nothing they recognise while letting ordinary web traffic
+through. When you choose plain, the menu asks whether to make it **open like web
+traffic**, and for a site name to use (any believable name, default
+`www.bing.com`; it does not have to be yours). The side that connects sends a
+short, browser-like web request naming that site, the other side answers with a
+normal-looking reply, and the tunnel carries on exactly as before.
+
+Measured on a real route into Iran, from outside, with a 6 MB download through the
+tunnel: the plain link stalled after a few kilobytes and the same tunnel with this
+turned on finished the download in about five seconds, both times it was tried.
+
+What it is and is not: it is not encryption, and after the first lines it is not
+real HTTP, so a filter that follows the whole conversation would see through it.
+It helps against filters that judge a connection by how it starts. Both servers
+must have it on or off together. The pairing code carries it (as version 7, used
+only when the header is on, so older servers keep working with every tunnel that
+does not use it), and if the two disagree each side says so in the log. In the
+settings file it is `http_header = on` and `http_host = <name>`, for the plain
+link only.
+
 ## Changing a tunnel's ports
 
 Menu option 7 (Edit a tunnel), then **Change ports**, on the Iran server. Three

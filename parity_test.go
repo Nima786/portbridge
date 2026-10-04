@@ -84,4 +84,23 @@ func TestPairingCodeFieldsMatch(t *testing.T) {
 	if strings.Join(menuKeys, ",") != strings.Join(engineKeys, ",") {
 		t.Fatalf("the menu writes %v\nthe engine reads %v", menuKeys, engineKeys)
 	}
+
+	// Version 7 is the same with the web header of a plain link added.
+	m7 := regexp.MustCompile(`printf 'v=7\\n([^']*)'`).FindStringSubmatch(menu)
+	if m7 == nil {
+		t.Fatalf("could not find the version 7 code format in the menu")
+	}
+	var keys7 []string
+	for _, part := range strings.Split(m7[1], `\n`) {
+		if k, _, ok := strings.Cut(part, "="); ok && k != "" {
+			keys7 = append(keys7, k)
+		}
+	}
+	keys7 = append(keys7, "v")
+	want7 := append(append([]string{}, engineKeys...), "http_header", "http_host")
+	sort.Strings(keys7)
+	sort.Strings(want7)
+	if strings.Join(keys7, ",") != strings.Join(want7, ",") {
+		t.Fatalf("the menu's version 7 code has %v\nthe engine reads %v", keys7, want7)
+	}
 }

@@ -54,6 +54,12 @@ func buildOriginConf(p *PairingData, secretFile, certFile, keyFile string) strin
 		fmt.Fprintf(&b, "local_ip = %s\n", p.ServerIP)
 	}
 	fmt.Fprintf(&b, "\ntransport = %s\n", p.Transport)
+	if p.Transport == "plain" && p.HTTPHeader == "on" {
+		fmt.Fprintf(&b, "http_header = on\n")
+		if p.HTTPHost != "" {
+			fmt.Fprintf(&b, "http_host = %s\n", p.HTTPHost)
+		}
+	}
 	if p.Transport != "plain" && p.Transport != "kcp" {
 		if p.ServerName != "" {
 			fmt.Fprintf(&b, "server_name = %s\n", p.ServerName)
