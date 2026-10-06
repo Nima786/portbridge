@@ -130,10 +130,12 @@ Two more things the CDN needs, both of which the menu states at setup time:
   server, which this refuses. Full (strict) demands a publicly trusted
   certificate, which is unnecessary here because the shared password is what
   proves identity.
-- The port the two servers use between themselves must be one the CDN forwards.
-  For Cloudflare that is 443, 2053, 2083, 2087, 2096 or 8443 ([their port
+- The CDN must forward the port the two servers use between themselves.
+  Cloudflare forwards only 443, 2053, 2083, 2087, 2096 and 8443 ([their port
   list](https://developers.cloudflare.com/fundamentals/reference/network-ports/)).
-  The menu only accepts those once you pick a CDN option.
+  Other providers, ArvanCloud for one, forward more, so the menu does not refuse
+  any port: it points out that a port is not one Cloudflare forwards and carries
+  on, and it is up to you to make sure your provider forwards it.
 
 Only the third option hides your foreign server's address; the fourth keeps the
 CDN in reserve and uses the direct address while it works, which is faster.

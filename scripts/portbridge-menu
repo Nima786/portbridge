@@ -573,7 +573,8 @@ ask_disguise() {
         warn "    Flexible sends plain traffic to your server, which this refuses."
         warn "    Strict demands a publicly trusted certificate, which this has no"
         warn "    need for, because the shared password is what proves who is who."
-        warn "  - the port below must be one it forwards: $CDN_PORTS"
+        warn "  - the CDN must forward the port below. Cloudflare forwards only: $CDN_PORTS"
+        warn "    Other providers, such as ArvanCloud, may allow more; check yours."
         say ""
         warn "Because the link can arrive from the CDN rather than from your other"
         warn "server, the tunnel port cannot be locked to one address, so it is left"
@@ -612,7 +613,8 @@ ask_disguise() {
             warn "Three things to set on Cloudflare for gRPC mode:"
             warn "  - Network -> gRPC must be turned ON."
             warn "  - SSL/TLS encryption mode must be Full."
-            warn "  - The port below must be one Cloudflare forwards: $CDN_PORTS"
+            warn "  - Cloudflare forwards only these ports: $CDN_PORTS"
+            warn "    Another provider may allow more; check yours."
         else
             DG_CDN=off
             say ""
@@ -711,10 +713,9 @@ cdn_involved() {
     [ "$1" = on ] || [ -n "${2-}" ]
 }
 
-# The only ports a CDN's proxy will carry a secure connection on. A CDN is a web
-# front end, not a general forwarder: ask it for anything else and the connection
-# is simply not passed through, which looks exactly like a tunnel that does not
-# work for no reason. Cloudflare's list; the other big ones match it closely.
+# The ports Cloudflare's proxy will carry a secure connection on. This is only
+# advice: other providers, ArvanCloud for one, forward more, so a port outside the
+# list is pointed out and never refused.
 CDN_PORTS="443 2053 2083 2087 2096 8443"
 
 cdn_port_ok() {
@@ -726,9 +727,8 @@ cdn_port_ok() {
 }
 
 explain_cdn_ports() {
-    err "  A CDN will not carry a secure connection on port $1."
-    info "  It only forwards these: $CDN_PORTS"
-    info "  Pick one of those, or go back and choose a link that does not use a CDN."
+    warn "  Port $1 is not one Cloudflare forwards ($CDN_PORTS)."
+    info "  Other CDNs, such as ArvanCloud, may forward it. Make sure yours does; carrying on."
 }
 
 # ------------------------------------------------------------------- sharing
@@ -1263,7 +1263,8 @@ create_tunnel() {
     info "Your users never see it. 443 is suggested because it is the port normal"
     info "websites use, so this link does not stand out."
     if cdn_involved "$DG_CDN" "$DG_ALTHOST"; then
-        info "With a CDN in the picture it has to be one of: $CDN_PORTS"
+        info "With a CDN in the picture the CDN has to forward this port. Cloudflare forwards"
+        info "only: $CDN_PORTS. Other providers, such as ArvanCloud, may allow others."
     fi
     while :; do
         if [ "$mode" = reverse ]; then
@@ -1279,11 +1280,9 @@ create_tunnel() {
             # Direct: it is opened on the foreign server, so it cannot be checked here.
             tport=$(ask_remote_port "Port between the two servers" "$DEFAULT_TUNNEL_PORT" link)
         fi
-        # A CDN only forwards a handful of ports, so anything else would leave the
-        # tunnel silently unable to come up.
+        # Pointed out, not refused: only Cloudflare limits the ports.
         if cdn_involved "$DG_CDN" "$DG_ALTHOST" && ! cdn_port_ok "$tport"; then
             explain_cdn_ports "$tport"
-            continue
         fi
         break
     done
@@ -1930,7 +1929,6 @@ edit_tunnel_ports() {
             fi
             if cdn_involved "$(read_conf "$name" cdn)" "$alt" && ! cdn_port_ok "$new_link"; then
                 explain_cdn_ports "$new_link"
-                continue
             fi
             if printf ', %s, ' "$new_users" | grep -q ", $new_link, " && [ "$mode" = reverse ]; then
                 err "  The link port cannot also be one of your users' ports."
@@ -2360,12 +2358,11 @@ test_tunnel() {
     result "link appearance" note "$(describe_disguise "$transport" "$cdn" "$alt" "$(http_header_host "$name")")"
     result "connections" note "$(describe_sharing "$mux" "$(read_conf "$name" mux_links)")"
 
-    # A tunnel made before this check existed, or edited by hand, can end up on a
-    # port no CDN will carry. That looks like a tunnel broken for no reason.
+    # Only Cloudflare limits the ports, so this is a reminder and never a failure.
     if cdn_involved "$cdn" "$alt" && ! cdn_port_ok "${taddr##*:}"; then
-        result "port a CDN will carry" bad "no, ${taddr##*:} is not one of them"
-        note "A CDN only forwards these: $CDN_PORTS"
-        note "Make the tunnel again on one of those, or the CDN route cannot work."
+        result "CDN port" note "${taddr##*:} is not a Cloudflare port"
+        note "Cloudflare forwards only: $CDN_PORTS"
+        note "Another provider, such as ArvanCloud, may forward it; make sure yours does."
     fi
 
     if [ -n "$alt" ]; then
