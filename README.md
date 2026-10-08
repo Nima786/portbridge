@@ -229,6 +229,43 @@ does not use it), and if the two disagree each side says so in the log. In the
 settings file it is `http_header = on` and `http_host = <name>`, for the plain
 link only.
 
+## Carrying a tunnel over a private GRE link
+
+Some networks cut ordinary connections that leave the country after a few packets
+(a few kilobytes get through, then nothing), yet let **GRE** through. GRE is IP
+protocol 47, not TCP or UDP: a plain wrapper that joins two servers with a private
+network between them. When you create a tunnel the menu asks **"Carry it over a
+private GRE link?"**. If you say yes, the tunnel talks to the other server's
+*private* address on that link, so the only thing that crosses the border between
+the two public addresses is GRE.
+
+Measured between a real Iran server and a foreign one, where an ordinary plain
+tunnel stalled after a few kilobytes: with GRE, 20 MB came down in about 1.5
+seconds and 10 MB went up in about 2, in both direct and reverse mode, at
+13 to 18 MB per second, on a plain link with no disguise and no CDN.
+
+What to know before using it:
+
+- It is **not encrypted and not disguised**. Anyone watching can tell it is GRE,
+  and a network that blocks GRE blocks it. Use it when a normal tunnel connects but
+  no data flows; it is a different way across, not a hiding place.
+- **Both servers must hold their own public IPv4 address** on a network card. A
+  server behind address translation (a private address on the card, a public one
+  added by the host) cannot receive GRE, and the menu says so before changing
+  anything. The host must also allow GRE: some low-cost plans and containers
+  (OpenVZ, LXC) do not. The menu tests for this first (`portbridge-firewall gre-check`).
+- It cannot be combined with a CDN or a disguise. The link inside GRE is plain.
+- The private addresses come from `10.99.0.0/16`, worked out from the two public
+  addresses alone, so both servers agree without any extra step. All tunnels
+  between the same two servers share one link, and it is removed when the last of
+  them is deleted. It is remade on every start, so it survives a reboot.
+- The other server's IP cannot be edited on a GRE tunnel, because the link is tied
+  to that pair of addresses. Delete the tunnel and create it again for a new server.
+- In the settings file it is `gre = on`, `gre_local` (this server's public address)
+  and `gre_remote` (the other's); `tunnel_addr` and `peer_ip` then hold addresses
+  on the link. The pairing code carries it as version 8, used only when GRE is on.
+  **Check a tunnel for problems** tests the link and says whether the other end
+  answers.
 ## Changing a tunnel's ports
 
 Menu option 5 (Edit a tunnel), then **Change ports**, on the Iran server. Three
@@ -407,7 +444,7 @@ the retry, which then moves the user to a different shared connection.
 ```
 /usr/local/bin/portbridge              the engine
 /usr/local/bin/portbridge-menu         the menu
-/usr/local/bin/portbridge-firewall     port locking helper
+/usr/local/bin/portbridge-firewall     port locking and GRE link helper
 /usr/local/bin/portbridge-tune         speed tuning helper
 /etc/systemd/system/portbridge@.service one template for all tunnels
 /etc/systemd/system/portbridge-agent.service management agent daemon service

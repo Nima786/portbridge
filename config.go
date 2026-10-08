@@ -85,6 +85,15 @@ type Config struct {
 	// entirely by the firewall helper; the engine only checks it is valid.
 	Firewall string
 
+	// GRE runs the tunnel over a private GRE link between the two servers, so
+	// that only GRE crosses the border between their public addresses. The
+	// helper script makes the link from GRELocal (this server's public address)
+	// and GRERemote (the other server's); tunnel_addr then names a private
+	// address on it. See gre.go.
+	GRE       bool
+	GRELocal  string
+	GRERemote string
+
 	PoolSize    int
 	MaxConn     int
 	MaxPending  int
@@ -480,6 +489,21 @@ func (c *Config) set(key, val string) error {
 		default:
 			return fmt.Errorf("firewall must be on or off, got %q", val)
 		}
+	case "gre":
+		// The link itself is made by the helper script; the engine only checks
+		// the settings agree. See gre.go.
+		switch strings.ToLower(val) {
+		case "on", "yes", "true":
+			c.GRE = true
+		case "off", "no", "false":
+			c.GRE = false
+		default:
+			return fmt.Errorf("gre must be on or off, got %q", val)
+		}
+	case "gre_local":
+		c.GRELocal = strings.TrimSpace(val)
+	case "gre_remote":
+		c.GRERemote = strings.TrimSpace(val)
 	case "secret_file":
 		c.SecretFile = val
 	case "status_file":
@@ -629,6 +653,9 @@ func (c *Config) Validate() error {
 		if host == "" || host == "0.0.0.0" || host == "::" {
 			return fmt.Errorf("tunnel_addr must name the other server, since this side dials out in %s mode", c.Mode)
 		}
+	}
+	if err := c.validateGRE(); err != nil {
+		return err
 	}
 
 	switch c.Role {

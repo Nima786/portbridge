@@ -55,10 +55,15 @@ type PairingData struct {
 	// web header, and the name that header claims. See httpheader.go.
 	HTTPHeader string
 	HTTPHost   string
+
+	// Added in version 8, and only sent when used: the tunnel runs over a private
+	// GRE link between the two servers. Both ends work out the link's addresses
+	// from the two public addresses in the code; see gre.go.
+	GRE string
 }
 
 // pairingVersionMax is the newest code this build understands.
-const pairingVersionMax = 7
+const pairingVersionMax = 8
 
 // decodePairingCode parses a base64 encoded pairing code into structured data.
 func decodePairingCode(code string) (*PairingData, error) {
@@ -104,6 +109,7 @@ func decodePairingCode(code string) (*PairingData, error) {
 		UTLS:        kv["utls"],
 		TLSFragment: kv["tls_fragment"],
 		CleanIPs:    kv["clean_ips"],
+		GRE:         kv["gre"],
 		HTTPHeader:  kv["http_header"],
 		HTTPHost:    kv["http_host"],
 	}
@@ -231,6 +237,14 @@ func applyPairingWarn(p *PairingData, confDir string, warns *[]string) error {
 	}
 
 	if err := host.FirewallApply(p.Name); err != nil {
+		if cfg.GRE {
+			// The helper also makes the GRE link, and a tunnel that runs over
+			// one cannot start without it. Say why instead of leaving a service
+			// that fails to find its address.
+			_ = host.FirewallRemove(p.Name)
+			undo()
+			return fmt.Errorf("this server could not make the private GRE link: %w", err)
+		}
 		log.Printf("[%s] warning: %v", p.Name, err)
 	}
 

@@ -20,6 +20,14 @@
 # number, a web server's for instance, is never touched. Rules made by versions
 # that did not tag them are recognised by their exact shape and cleaned up only
 # on the side that accepts, where the port is this tunnel's own.
+#
+# The same helper also makes and removes the private GRE link of a tunnel that
+# has "gre = on" (see gre.go for why), because it already runs at exactly the
+# right moments: when the service starts, when a tunnel is deployed and when one
+# is deleted. The link's name and addresses are worked out from the two public
+# addresses alone, in the same way gre.go does it, so both servers agree without
+# talking. Tunnels between the same two servers share one link, and it is removed
+# only when the last of them goes.
 
 set -uo pipefail
 
@@ -34,9 +42,13 @@ usage() {
     cat >&2 <<'EOF'
 Usage:
   portbridge-firewall status                 every tunnel at a glance
-  portbridge-firewall apply  <tunnel-name>   lock, or unlock if turned off
+  portbridge-firewall apply  <tunnel-name>   lock, or unlock if turned off; make the GRE link
   portbridge-firewall remove <tunnel-name>
   portbridge-firewall show   <tunnel-name>
+  portbridge-firewall gre-check              can this server make GRE links at all?
+  portbridge-firewall gre-addr <this-ip> <other-ip>
+                                             the link's name and the two private addresses
+  portbridge-firewall gre-test <tunnel-name> is the other end of the GRE link answering?
 EOF
     exit 2
 }
@@ -102,6 +114,18 @@ load() {
 
 have() { command -v "$1" >/dev/null 2>&1; }
 
+# delete_rule <tool> <rule as printed by "-S"> - deletes that rule. The listing
+# puts a comment in double quotes, and a quote left in would become part of the
+# comment and match nothing, so rules the listing showed were never removed. Our
+# own comments never contain a space, so taking the quotes out is safe.
+delete_rule() {
+    local tool=$1 rule=$2
+    rule=${rule/-A/-D}
+    rule=${rule//\"/}
+    # shellcheck disable=SC2086 # the rule must be split back into words
+    "$tool" $rule 2>/dev/null || true
+}
+
 tag() { printf 'portbridge:%s' "$1"; }
 
 # rule_spec <name> <target> [source] - fills RULE with a rule for the loaded
@@ -135,8 +159,7 @@ purge_own() {
     "$tool" -S INPUT 2>/dev/null |
         grep -E -- "^-A INPUT .*--comment \"?$(tag "$name")\"?( |$)" |
         while read -r rule; do
-            # shellcheck disable=SC2086 # the rule must be split back into words
-            "$tool" ${rule/-A/-D} 2>/dev/null || true
+            delete_rule "$tool" "$rule"
         done
 }
 
@@ -150,8 +173,7 @@ purge_legacy() {
     "$tool" -S INPUT 2>/dev/null |
         grep -E -- "^-A INPUT( -s [^ ]+)? -p (tcp|udp) -m (tcp|udp) --dport $port -j (ACCEPT|DROP)$" |
         while read -r rule; do
-            # shellcheck disable=SC2086 # the rule must be split back into words
-            "$tool" ${rule/-A/-D} 2>/dev/null || true
+            delete_rule "$tool" "$rule"
         done
 }
 
@@ -165,7 +187,251 @@ purge_everything() {
     fi
 }
 
-cmd_apply() {
+# ---------------------------------------------------------- private GRE link
+#
+# Some networks cut ordinary connections that leave the country after a few
+# packets but let GRE (IP protocol 47) through. A tunnel with "gre = on" talks to
+# the other server's private address on a GRE link, so only GRE crosses the border.
+
+GRE_PREFIX=10.99
+GRE_MTU=1300
+
+# valid_ipv4 <text> - a plain dotted address: four numbers 0-255, no leading zeros.
+valid_ipv4() {
+    local ip=$1 part
+    [[ "$ip" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] || return 1
+    local IFS=.
+    # shellcheck disable=SC2086 # split on the dots on purpose
+    set -- $ip
+    for part in "$@"; do
+        [ "${#part}" -gt 1 ] && [ "${part:0:1}" = 0 ] && return 1
+        [ "$part" -le 255 ] || return 1
+    done
+    return 0
+}
+
+ip2int() {
+    local a b c d
+    IFS=. read -r a b c d <<<"$1"
+    echo $(((a << 24) | (b << 16) | (c << 8) | d))
+}
+
+# gre_pair <this-ip> <other-ip> - works out the link for two public addresses.
+# Sets GRE_IFACE, GRE_OWN (this server's private address) and GRE_PEER (the
+# other's). The same rule, byte for byte, as greLink in gre.go: the server with
+# the smaller public address gets the lower private one, and the block of four
+# addresses comes from a hash of the two.
+gre_pair() {
+    local mine=$1 other=$2 lo hi digest h8 block off third fourth low high
+    valid_ipv4 "$mine" && valid_ipv4 "$other" || return 1
+    [ "$mine" != "$other" ] || return 1
+    if [ "$(ip2int "$other")" -lt "$(ip2int "$mine")" ]; then
+        lo=$other hi=$mine
+    else
+        lo=$mine hi=$other
+    fi
+    digest=$(printf '%s' "$lo-$hi" | sha256sum)
+    h8=${digest:0:8}
+    block=$((16#$h8 % 16384))
+    off=$((block * 4))
+    third=$((off / 256))
+    fourth=$((off % 256))
+    low="$GRE_PREFIX.$third.$((fourth + 1))"
+    high="$GRE_PREFIX.$third.$((fourth + 2))"
+    GRE_IFACE="pbg$h8"
+    if [ "$mine" = "$lo" ]; then
+        GRE_OWN=$low GRE_PEER=$high
+    else
+        GRE_OWN=$high GRE_PEER=$low
+    fi
+}
+
+# gre_conf <name> - reads the GRE settings of a tunnel.
+gre_conf() {
+    local conf="$CONF_DIR/$1.conf"
+    GRE_ON=$(read_conf "$conf" gre)
+    [ -n "$GRE_ON" ] || GRE_ON=off
+    GRE_LOCAL=$(read_conf "$conf" gre_local)
+    GRE_REMOTE=$(read_conf "$conf" gre_remote)
+}
+
+gre_tag() { printf 'portbridge-gre:%s' "$1"; }
+
+# gre_firewall_open / gre_firewall_close - let the other server's GRE packets in.
+# Only matters on a server whose firewall drops what it has not been told to
+# accept; harmless where it does not. Tagged with the link, not the tunnel,
+# because tunnels share a link.
+gre_firewall_open() {
+    have iptables || return 0
+    iptables -C INPUT -s "$GRE_REMOTE" -p gre -m comment --comment "$(gre_tag "$GRE_IFACE")" -j ACCEPT 2>/dev/null ||
+        iptables -I INPUT 1 -s "$GRE_REMOTE" -p gre -m comment --comment "$(gre_tag "$GRE_IFACE")" -j ACCEPT 2>/dev/null || true
+}
+
+gre_firewall_close() {
+    local rule
+    have iptables || return 0
+    iptables -S INPUT 2>/dev/null |
+        grep -E -- "^-A INPUT .*--comment \"?$(gre_tag "$GRE_IFACE")\"?( |$)" |
+        while read -r rule; do
+            delete_rule iptables "$rule"
+        done
+}
+
+# gre_unsupported_hint - what to say when the kernel will not make a GRE link.
+gre_unsupported_hint() {
+    echo "this server cannot make GRE links. The host does not allow it: this is common on"
+    echo "OpenVZ or LXC containers and on some low-cost plans. Ask the provider, or use a"
+    echo "different kind of tunnel on this server."
+}
+
+# gre_used_by_others <name> - does another tunnel use the same link?
+gre_used_by_others() {
+    local self=$1 f n
+    for f in "$CONF_DIR"/*.conf; do
+        [ -e "$f" ] || continue
+        n=$(basename "$f" .conf)
+        [ "$n" = "$self" ] && continue
+        [ "$(read_conf "$f" gre)" = on ] || continue
+        if [ "$(read_conf "$f" gre_local)" = "$GRE_LOCAL" ] && [ "$(read_conf "$f" gre_remote)" = "$GRE_REMOTE" ]; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+# link_release <name> - takes the link down unless another tunnel still needs it.
+link_release() {
+    local name=$1
+    gre_conf "$name"
+    [ -n "$GRE_LOCAL" ] && [ -n "$GRE_REMOTE" ] || return 0
+    gre_pair "$GRE_LOCAL" "$GRE_REMOTE" || return 0
+    if gre_used_by_others "$name"; then
+        return 0
+    fi
+    if have ip && ip link show "$GRE_IFACE" >/dev/null 2>&1; then
+        ip link del "$GRE_IFACE" 2>/dev/null && echo "private GRE link $GRE_IFACE removed"
+    fi
+    gre_firewall_close
+    return 0
+}
+
+# link_apply <name> - makes the GRE link a tunnel needs, if it does. Safe to run
+# again and again: whatever is already right is left alone.
+link_apply() {
+    local name=$1
+    gre_conf "$name"
+    if [ "$GRE_ON" != on ]; then
+        # Turned off since the link was made: drop it if nothing else uses it.
+        link_release "$name"
+        return 0
+    fi
+
+    if ! gre_pair "$GRE_LOCAL" "$GRE_REMOTE"; then
+        echo "tunnel $name has gre = on but gre_local '$GRE_LOCAL' and gre_remote '$GRE_REMOTE' are not two different IPv4 addresses" >&2
+        return 1
+    fi
+    if ! have ip; then
+        echo "the 'ip' command is missing; install iproute2 to use a GRE link" >&2
+        return 1
+    fi
+    # The link is built on this server's own public address. A server that only
+    # sees it through address translation cannot receive GRE on it.
+    if ! ip -4 -o addr show 2>/dev/null | grep -qF "inet $GRE_LOCAL/"; then
+        echo "this server does not carry the address $GRE_LOCAL on any of its network cards," >&2
+        echo "so it sits behind address translation, and a GRE link cannot be made from it" >&2
+        return 1
+    fi
+
+    modprobe ip_gre 2>/dev/null || true
+    local err
+    if ! ip link show "$GRE_IFACE" >/dev/null 2>&1; then
+        if ! err=$(ip tunnel add "$GRE_IFACE" mode gre local "$GRE_LOCAL" remote "$GRE_REMOTE" ttl 64 2>&1); then
+            echo "could not make the GRE link $GRE_IFACE: $err" >&2
+            gre_unsupported_hint >&2
+            return 1
+        fi
+    fi
+    if ! ip -4 addr show dev "$GRE_IFACE" 2>/dev/null | grep -qF "inet $GRE_OWN/"; then
+        # The block of four addresses is picked from a hash; if another network
+        # on this server already uses the address, say so rather than overlap it.
+        if ip -4 -o addr show 2>/dev/null | grep -v " $GRE_IFACE " | grep -qF "inet $GRE_OWN/"; then
+            echo "the private address $GRE_OWN is already used by another network card here;" >&2
+            echo "change the tunnel's name or the server pair to get a different one" >&2
+            return 1
+        fi
+        ip addr add "$GRE_OWN/30" dev "$GRE_IFACE" 2>/dev/null || {
+            echo "could not give the GRE link its address $GRE_OWN" >&2
+            return 1
+        }
+    fi
+    ip link set "$GRE_IFACE" mtu "$GRE_MTU" up 2>/dev/null || {
+        echo "could not bring the GRE link $GRE_IFACE up" >&2
+        return 1
+    }
+    gre_firewall_open
+    echo "private GRE link $GRE_IFACE is up: this server $GRE_OWN, the other server $GRE_PEER"
+    return 0
+}
+
+# cmd_gre_check - can this server make a GRE link at all? Makes a throw-away
+# link that goes nowhere and removes it again.
+cmd_gre_check() {
+    have ip || {
+        echo "the 'ip' command is missing; install iproute2 to use a GRE link"
+        exit 1
+    }
+    modprobe ip_gre 2>/dev/null || true
+    local err probe=pbgchk$$
+    if err=$(ip tunnel add "$probe" mode gre local 127.0.0.1 remote 192.0.2.1 ttl 64 2>&1); then
+        ip link del "$probe" 2>/dev/null
+        echo "this server can make GRE links"
+        return 0
+    fi
+    echo "$err"
+    gre_unsupported_hint
+    exit 1
+}
+
+# cmd_gre_addr <this-ip> <other-ip> - prints the link's name, this server's
+# private address and the other server's.
+cmd_gre_addr() {
+    gre_pair "$1" "$2" || {
+        echo "portbridge-firewall: '$1' and '$2' must be two different plain IPv4 addresses" >&2
+        exit 1
+    }
+    echo "$GRE_IFACE $GRE_OWN $GRE_PEER"
+}
+
+# cmd_gre_test <name> - is the link up and does the other end answer?
+cmd_gre_test() {
+    local name=$1
+    load "$name" || exit 1
+    gre_conf "$name"
+    if [ "$GRE_ON" != on ]; then
+        echo "tunnel $name does not use a GRE link"
+        return 0
+    fi
+    gre_pair "$GRE_LOCAL" "$GRE_REMOTE" || {
+        echo "tunnel $name has unusable GRE addresses"
+        exit 1
+    }
+    if ! ip link show "$GRE_IFACE" >/dev/null 2>&1; then
+        echo "the GRE link $GRE_IFACE is not there on this server"
+        exit 1
+    fi
+    if ! have ping; then
+        echo "the GRE link $GRE_IFACE is up (ping is not installed, so the other end was not tried)"
+        return 0
+    fi
+    if ping -c 3 -W 2 "$GRE_PEER" >/dev/null 2>&1; then
+        echo "the other end of the GRE link answers ($GRE_PEER)"
+        return 0
+    fi
+    echo "the GRE link $GRE_IFACE is up here, but the other end ($GRE_PEER) does not answer"
+    exit 1
+}
+
+firewall_apply() {
     local name=$1
     load "$name" || exit 1
 
@@ -208,6 +474,17 @@ cmd_apply() {
     echo "tunnel port $TPORT ($PROTO) is restricted to $PEER"
 }
 
+# cmd_apply makes the GRE link first, since a tunnel over one cannot start
+# without it, then sets the port rule. A link that cannot be made is reported
+# and makes the command fail, but the port rule is still dealt with.
+cmd_apply() {
+    local name=$1 rc=0
+    load "$name" || exit 1
+    link_apply "$name" || rc=1
+    firewall_apply "$name"
+    return "$rc"
+}
+
 cmd_remove() {
     local name=$1
     load "$name" || exit 1
@@ -215,6 +492,9 @@ cmd_remove() {
     # since the rules were added, and leaving them behind shuts a port for good.
     purge_everything "$name"
     echo "firewall rules for tunnel $name removed"
+    # The GRE link goes too, unless another tunnel between the same two servers
+    # is still using it.
+    link_release "$name"
 }
 
 cmd_status() {
@@ -241,6 +521,28 @@ cmd_status() {
         printf '%-16s %-8s %-7s %-10s %s\n' "$name" "$TPORT" "$ENABLED" "$state" \
             "$([ "$state" = locked ] && echo "$PEER only" || echo "everyone")"
     done
+
+    # The GRE links, for the tunnels that use one.
+    local shown=0 up
+    for f in "$CONF_DIR"/*.conf; do
+        [ -e "$f" ] || continue
+        name=$(basename "$f" .conf)
+        gre_conf "$name"
+        [ "$GRE_ON" = on ] || continue
+        if [ "$shown" -eq 0 ]; then
+            printf '\n%-16s %-13s %s\n' "TUNNEL" "GRE LINK" "THIS SERVER <-> OTHER SERVER"
+            shown=1
+        fi
+        if ! gre_pair "$GRE_LOCAL" "$GRE_REMOTE"; then
+            printf '%-16s %-13s %s\n' "$name" "?" "unusable addresses in its settings"
+            continue
+        fi
+        up=down
+        if have ip && ip link show "$GRE_IFACE" 2>/dev/null | grep -q 'UP'; then
+            up=up
+        fi
+        printf '%-16s %-13s %s <-> %s  (%s)\n' "$name" "$GRE_IFACE" "$GRE_OWN" "$GRE_PEER" "$up"
+    done
 }
 
 cmd_show() {
@@ -263,5 +565,8 @@ case "${1-}:$#" in
     apply:2) cmd_apply "$2" ;;
     remove:2) cmd_remove "$2" ;;
     show:2) cmd_show "$2" ;;
+    gre-check:1) cmd_gre_check ;;
+    gre-addr:3) cmd_gre_addr "$2" "$3" ;;
+    gre-test:2) cmd_gre_test "$2" ;;
     *) usage ;;
 esac

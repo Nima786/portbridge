@@ -603,6 +603,9 @@ func describeTransport(cfg *Config) string {
 	case TransportKCP:
 		return fmt.Sprintf("loss-resistant KCP/UDP transport with FEC (%d/%d shards)", cfg.KCPDataShards, cfg.KCPParityShards)
 	default:
+		if cfg.GRE {
+			return "plain, carried over a private GRE link between the two servers (not encrypted)"
+		}
 		if cfg.HTTPHeader {
 			host := cfg.HTTPHost
 			if host == "" {

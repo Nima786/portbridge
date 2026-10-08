@@ -35,10 +35,29 @@ func buildOriginConf(p *PairingData, secretFile, certFile, keyFile string) strin
 	} else {
 		tunnelAddr = net.JoinHostPort(p.RelayIP, p.TunnelPort)
 	}
+	peerIP := p.RelayIP
 
 	firewall := "on"
 	if p.CDN == "on" || p.AltHost != "" || p.Mode == "reverse" {
 		firewall = "off"
+	}
+
+	// Over a private GRE link the two servers talk to each other's private
+	// address, not the public one: this side listens on its own (direct mode) or
+	// calls the Iran server's (reverse mode). The port is only reachable through
+	// the link, so there is nothing for the firewall rule to guard.
+	greOn := p.GRE == "on"
+	if greOn {
+		own, peer, err := greAddrs(p.ServerIP, p.RelayIP)
+		if err == nil {
+			if p.Mode == "direct" {
+				tunnelAddr = net.JoinHostPort(own, p.TunnelPort)
+			} else {
+				tunnelAddr = net.JoinHostPort(peer, p.TunnelPort)
+			}
+			peerIP = peer
+			firewall = "off"
+		}
 	}
 
 	var b strings.Builder
@@ -48,10 +67,16 @@ func buildOriginConf(p *PairingData, secretFile, certFile, keyFile string) strin
 	fmt.Fprintf(&b, "role = origin\n")
 	fmt.Fprintf(&b, "tunnel_addr = %s\n", tunnelAddr)
 	fmt.Fprintf(&b, "inbound_addr = %s\n", inboundAddr)
-	fmt.Fprintf(&b, "peer_ip = %s\n", p.RelayIP)
+	fmt.Fprintf(&b, "peer_ip = %s\n", peerIP)
 	fmt.Fprintf(&b, "firewall = %s\n", firewall)
 	if p.ServerIP != "" {
 		fmt.Fprintf(&b, "local_ip = %s\n", p.ServerIP)
+	}
+	if greOn {
+		fmt.Fprintf(&b, "\n# Carried over a private GRE link between the two servers.\n")
+		fmt.Fprintf(&b, "gre = on\n")
+		fmt.Fprintf(&b, "gre_local = %s\n", p.ServerIP)
+		fmt.Fprintf(&b, "gre_remote = %s\n", p.RelayIP)
 	}
 	fmt.Fprintf(&b, "\ntransport = %s\n", p.Transport)
 	if p.Transport == "plain" && p.HTTPHeader == "on" {
@@ -305,6 +330,10 @@ func updatePairingData(p *PairingData, confDir string, warns *[]string) error {
 
 	// The firewall rule follows the port, then the service starts on it.
 	if err := host.FirewallApply(p.Name); err != nil {
+		if cfg.GRE {
+			restore()
+			return fmt.Errorf("this server could not make the private GRE link, so the old settings were put back: %w", err)
+		}
 		log.Printf("[%s] warning: %v", p.Name, err)
 	}
 	if err := host.Restart(p.Name); err != nil {

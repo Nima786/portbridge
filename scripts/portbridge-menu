@@ -123,6 +123,18 @@ read_conf() {
         tail -1 | sed -E 's/[[:space:]]+$//'
 }
 
+# other_public_ip <name> - the other server's real address. For a tunnel over a
+# GRE link, peer_ip holds the private address on the link, and the public one is
+# kept as gre_remote. Everything that looks the other server up, or tells the
+# user where it is, wants this one.
+other_public_ip() {
+    if [ "$(read_conf "$1" gre)" = on ]; then
+        read_conf "$1" gre_remote
+    else
+        read_conf "$1" peer_ip
+    fi
+}
+
 # write_conf <name> <key> <value>  (replaces the line, or appends it)
 write_conf() {
     local f
@@ -507,6 +519,49 @@ explain_disguise() {
     hr
 }
 
+# gre_plan <this-server-ip> <other-server-ip> - the private addresses of the GRE
+# link between two servers, asked of the helper, which follows the same rule as
+# the engine. Sets GRE_OWN (this server's) and GRE_PEER (the other's).
+# Fails if either address is not a plain IPv4 address.
+gre_plan() {
+    local out
+    out=$("$FIREWALL" gre-addr "$1" "$2" 2>/dev/null) || return 1
+    read -r _ GRE_OWN GRE_PEER <<<"$out"
+    [ -n "${GRE_PEER-}" ]
+}
+
+# ask_gre - whether the tunnel runs over a private GRE link. Sets DG_GRE to on or
+# off. The link between the servers is then plain and needs no disguise, since the
+# only thing that crosses the border is GRE, so the caller skips that question.
+ask_gre() {
+    DG_GRE=off
+    DG_GRE_LOCAL=""
+    DG_GRE_REMOTE=""
+    hr
+    say "${B}Carry it over a private GRE link?${R}"
+    say ""
+    say "Some networks cut ordinary connections that leave the country after a few"
+    say "packets, yet let GRE through. GRE joins your two servers with a private network"
+    say "between them. The tunnel then runs inside it, so the only thing that crosses"
+    say "the border is GRE."
+    say ""
+    say "  ${DIM}Use it when a normal tunnel connects but no data flows.${R}"
+    say "  ${DIM}It is not encrypted or disguised: anyone watching can tell it is GRE.${R}"
+    say "  ${DIM}Both servers must hold their own public IPv4 address, and the host must${R}"
+    say "  ${DIM}allow GRE. Some low-cost plans and containers do not.${R}"
+    hr
+    confirm "Use a GRE link?" || return 0
+    local out
+    if ! out=$("$FIREWALL" gre-check 2>&1); then
+        err "$out"
+        say ""
+        info "So a GRE link is not possible on this server. Choose another kind of link."
+        return 0
+    fi
+    ok "$out"
+    DG_GRE=on
+}
+
 # ask_disguise <mode> - fills the DG_* variables.
 ask_disguise() {
     local mode=$1 choice
@@ -860,11 +915,20 @@ make_pairing_code() {
     local name=$1 mode=$2 tport=$3 relay_ip=$4 server_ip=$5 inbound_port=$6 pool=$7 secret=$8
     local transport=$9 servername=${10} wspath=${11} cdn=${12} mux=${13} muxlinks=${14}
     local althost=${15-} utls=${16-} fragment=${17-} cleanips=${18-}
-    local httpheader=${19-} httphost=${20-}
+    local httpheader=${19-} httphost=${20-} gre=${21-}
     # Version 6 adds the browser hello, the split hello and the clean addresses,
     # which a CDN tunnel needs on the foreign side as well. Version 7 adds the web
     # header of a plain link. A code says 7 only when it uses it, so a server that
-    # knows up to 6 keeps working with every tunnel that does not.
+    # knows up to 6 keeps working with every tunnel that does not. Version 8 adds
+    # the private GRE link, and is sent only for a tunnel that uses one.
+    if [ "$gre" = on ]; then
+        printf 'v=8\nname=%s\nmode=%s\ntunnel_port=%s\nrelay_ip=%s\nserver_ip=%s\ninbound_port=%s\npool=%s\ntransport=%s\nserver_name=%s\nws_path=%s\ncdn=%s\nalt_host=%s\nmux=%s\nmux_links=%s\nutls=%s\ntls_fragment=%s\nclean_ips=%s\ngre=%s\nsecret=%s\n' \
+            "$name" "$mode" "$tport" "$relay_ip" "$server_ip" "$inbound_port" "$pool" \
+            "$transport" "$servername" "$wspath" "$cdn" "$althost" "${mux:-off}" "${muxlinks:-4}" \
+            "$utls" "$fragment" "$cleanips" "on" "$secret" |
+            base64 | tr -d '\n'
+        return 0
+    fi
     if [ "$httpheader" = on ]; then
         printf 'v=7\nname=%s\nmode=%s\ntunnel_port=%s\nrelay_ip=%s\nserver_ip=%s\ninbound_port=%s\npool=%s\ntransport=%s\nserver_name=%s\nws_path=%s\ncdn=%s\nalt_host=%s\nmux=%s\nmux_links=%s\nutls=%s\ntls_fragment=%s\nclean_ips=%s\nhttp_header=%s\nhttp_host=%s\nsecret=%s\n' \
             "$name" "$mode" "$tport" "$relay_ip" "$server_ip" "$inbound_port" "$pool" \
@@ -890,7 +954,7 @@ get_tunnel_pairing_code() {
     secret=$(cat "$(secret_of "$name")" 2>/dev/null)
     relay_ip=$(read_conf "$name" local_ip)
     [ -n "$relay_ip" ] || relay_ip=$(public_ip)
-    server_ip=$(read_conf "$name" peer_ip)
+    server_ip=$(other_public_ip "$name")
     inbound_port=$(read_conf "$name" server_inbound_port)
     pool=$(read_conf "$name" pool_size)
 
@@ -912,7 +976,8 @@ get_tunnel_pairing_code() {
 
     make_pairing_code "$name" "$mode" "$tport" "$relay_ip" "$server_ip" "$inbound_port" \
         "$pool" "$secret" "$transport" "$servername" "$wspath" "$cdn" "$mux" "$muxlinks" "$althost" \
-        "$utls" "$fragment" "$cleanips" "$(read_conf "$name" http_header)" "$(read_conf "$name" http_host)"
+        "$utls" "$fragment" "$cleanips" "$(read_conf "$name" http_header)" "$(read_conf "$name" http_host)" \
+        "$(read_conf "$name" gre)"
 }
 
 show_pairing_code() {
@@ -921,7 +986,7 @@ show_pairing_code() {
         warn "Codes are made on the Iran server. Use 'Show a tunnel's code' there instead."
         return 1
     }
-    server_ip=$(read_conf "$name" peer_ip)
+    server_ip=$(other_public_ip "$name")
 
     hr
     say "${B}Code for your foreign server${R}"
@@ -932,7 +997,34 @@ show_pairing_code() {
     printf '%s\n' "$code"
     say ""
     warn "This line contains the tunnel's password, so do not post it anywhere public."
+    if [ "$(read_conf "$name" gre)" = on ]; then
+        say ""
+        info "This tunnel runs over a private GRE link. The foreign server makes its end of"
+        info "the link when it joins, so its host must allow GRE."
+    fi
     hr
+}
+
+# report_gre_link <name> - after a tunnel over a GRE link is up on both servers,
+# says whether the other end of the link answers. It can take a few seconds for
+# the foreign side to finish, so it tries for a short while before giving up.
+report_gre_link() {
+    local name=$1 i out
+    [ "$(read_conf "$name" gre)" = on ] || return 0
+    printf '%s' "${DIM}Checking the private GRE link...${R}" >&2
+    for i in 1 2 3 4 5; do
+        if out=$("$FIREWALL" gre-test "$name" 2>&1); then
+            printf '\r%*s\r' 45 '' >&2
+            ok "$out"
+            return 0
+        fi
+        sleep 2
+    done
+    printf '\r%*s\r' 45 '' >&2
+    warn "$out"
+    warn "The tunnel is set up, but the GRE link is not carrying packets yet. Either the"
+    warn "network drops GRE between these two servers, or a firewall in front of one of"
+    warn "them blocks IP protocol 47. 'Check a tunnel for problems' shows more."
 }
 
 # ------------------------------------------------------------ write a tunnel
@@ -970,7 +1062,10 @@ write_tunnel() {
         [ -n "$sinport" ] && printf '\n# The inbound port on the foreign server, kept for the code.\nserver_inbound_port = %s\n' "$sinport"
         printf '\n# The other machine.\n'
         printf 'peer_ip = %s\n' "$peer"
-        if cdn_involved "${DG_CDN:-off}" "${DG_ALTHOST-}"; then
+        if [ "${DG_GRE:-off}" = on ]; then
+            printf '# off because the port can only be reached through the private GRE link.\n'
+            printf 'firewall = off\n'
+        elif cdn_involved "${DG_CDN:-off}" "${DG_ALTHOST-}"; then
             printf '# off because the link can arrive from a CDN, whose address is not\n'
             printf '# the other server, so the port cannot be locked to one address.\n'
             printf 'firewall = off\n'
@@ -979,6 +1074,13 @@ write_tunnel() {
             printf 'firewall = on\n'
         fi
         [ -n "$localip" ] && printf 'local_ip = %s\n' "$localip"
+        if [ "${DG_GRE:-off}" = on ]; then
+            printf '\n# Runs over a private GRE link between the two servers: peer_ip and\n'
+            printf '# tunnel_addr are addresses on that link, and these are the real ones.\n'
+            printf 'gre = on\n'
+            printf 'gre_local = %s\n' "${DG_GRE_LOCAL-}"
+            printf 'gre_remote = %s\n' "${DG_GRE_REMOTE-}"
+        fi
         printf '\n# What the link looks like to anyone watching it. See the menu.\n'
         printf 'transport = %s\n' "${DG_TRANSPORT:-plain}"
         if [ "${DG_TRANSPORT:-plain}" = plain ] && [ "${DG_HTTPHEADER:-off}" = on ]; then
@@ -1161,7 +1263,7 @@ looks_like_foreign_server() {
 
 create_tunnel() {
     local name mode tport taddr ulisten peer localip secret inport uport
-    local pool=25 target_agent="" agent_url="" agent_token=""
+    local pool=25 target_agent="" agent_url="" agent_token="" peer_conf=""
 
     hr
     say "${B}Create a tunnel${R}"
@@ -1292,7 +1394,24 @@ create_tunnel() {
     done
     ulisten="$uport"
 
-    ask_disguise "$mode"
+    ask_gre
+    if [ "$DG_GRE" = on ]; then
+        # Nothing to disguise: only GRE crosses the border. Everything the other
+        # questions would have set is put back to its plain value, so nothing is
+        # left over from an earlier tunnel made in the same session.
+        DG_TRANSPORT=plain
+        DG_SERVERNAME=""
+        DG_WSPATH=""
+        DG_CDN=off
+        DG_ALTHOST=""
+        DG_CLEAN_IPS=""
+        DG_UTLS=off
+        DG_FRAGMENT=off
+        DG_HTTPHEADER=off
+        DG_HTTPHOST=""
+    else
+        ask_disguise "$mode"
+    fi
     ask_sharing
 
     say ""
@@ -1345,6 +1464,30 @@ create_tunnel() {
 
     secret=$(gen_secret)
 
+    peer_conf=$peer
+    if [ "$DG_GRE" = on ]; then
+        if ! gre_plan "$localip" "$peer"; then
+            err "A GRE link needs plain IPv4 addresses for both servers, and these are not:"
+            err "  this server $localip, foreign server $peer"
+            say "Nothing was changed."
+            return 1
+        fi
+        if ! this_machine_has_ip "$localip"; then
+            err "$localip is not an address this server has on any of its network cards."
+            err "It sits behind address translation, and a GRE link cannot be made from it."
+            say "Nothing was changed."
+            return 1
+        fi
+        DG_GRE_LOCAL=$localip
+        DG_GRE_REMOTE=$peer
+        peer_conf=$GRE_PEER
+        if [ "$mode" = direct ]; then
+            taddr="$GRE_PEER:$tport"
+        else
+            taddr="$GRE_OWN:$tport"
+        fi
+    fi
+
     hr
     say "${B}Ready to set this up:${R}"
     say "  tunnel name        $name"
@@ -1355,7 +1498,14 @@ create_tunnel() {
     fi
     say "  your users use     $localip port $uport"
     say "  traffic goes to    $peer port $inport"
-    if [ "$mode" = direct ]; then
+    if [ "$DG_GRE" = on ]; then
+        if [ "$mode" = direct ]; then
+            say "  connection         direct: this Iran server connects out to $GRE_PEER:$tport,"
+        else
+            say "  connection         reverse: $peer connects in to $GRE_OWN:$tport,"
+        fi
+        say "                     inside a private GRE link between $localip and $peer"
+    elif [ "$mode" = direct ]; then
         say "  connection         direct: this Iran server connects out to $peer:$tport"
     else
         say "  connection         reverse: $peer connects in to this Iran server on port $tport"
@@ -1377,7 +1527,7 @@ create_tunnel() {
     confirm "Set it up?" || { say "Cancelled. Nothing was changed."; return 1; }
 
     write_tunnel "$name" "$mode" edge "$taddr" "$ulisten" "" \
-        "$peer" "$localip" "$pool" "$secret" "$inport"
+        "$peer_conf" "$localip" "$pool" "$secret" "$inport"
 
     validate_and_enable "$name" || return 1
 
@@ -1399,6 +1549,7 @@ create_tunnel() {
             ok "Both servers are now running and linked."
             ok "============================================================"
             auto_ok=1
+            report_gre_link "$name"
         else
             say ""
             err "The foreign server could not set this tunnel up:"
@@ -1426,7 +1577,7 @@ create_tunnel() {
 
 join_tunnel() {
     local code decoded v name mode tport relay_ip server_ip inport pool secret
-    local taddr inbound
+    local taddr inbound gre_own="" gre_peer="" gre_out
 
     hr
     say "${B}Join a tunnel${R}"
@@ -1450,7 +1601,7 @@ join_tunnel() {
         err "Update the Iran server, then create the tunnel there again for a new code."
         return 1
     fi
-    if [ "$v" != 5 ] && [ "$v" != 6 ] && [ "$v" != 7 ]; then
+    if [ "$v" != 5 ] && [ "$v" != 6 ] && [ "$v" != 7 ] && [ "$v" != 8 ]; then
         err "That code was made by a newer PortBridge than this one, or is not a code."
         err "Update this server, then try again."
         return 1
@@ -1474,6 +1625,10 @@ join_tunnel() {
     DG_CLEAN_IPS=$(get clean_ips)
     DG_HTTPHEADER=$(get http_header); [ -n "$DG_HTTPHEADER" ] || DG_HTTPHEADER=off
     DG_HTTPHOST=$(get http_host)
+    # Version 8: the tunnel runs over a private GRE link between the two servers.
+    DG_GRE=$(get gre); [ -n "$DG_GRE" ] || DG_GRE=off
+    DG_GRE_LOCAL=""
+    DG_GRE_REMOTE=""
 
     # So does whether connections are shared: it must match on both ends or
     # neither side would understand the other.
@@ -1493,6 +1648,11 @@ join_tunnel() {
     case "$DG_CDN" in on | off) ;; *) err "That code has a bad CDN setting."; return 1 ;; esac
     case "$MX_MUX" in on | off) ;; *) err "That code has a bad sharing setting."; return 1 ;; esac
     case "$DG_HTTPHEADER" in on | off) ;; *) err "That code has a bad web header setting."; return 1 ;; esac
+    case "$DG_GRE" in on | off) ;; *) err "That code has a bad link setting."; return 1 ;; esac
+    if [ "$DG_GRE" = on ] && { [ "$DG_TRANSPORT" != plain ] || [ "$DG_CDN" = on ] || [ -n "$DG_ALTHOST" ]; }; then
+        err "That code puts a GRE link together with a disguise or a CDN, which cannot work."
+        return 1
+    fi
     if [ -n "$DG_HTTPHOST" ] && ! valid_hostname "$DG_HTTPHOST"; then err "That code has a bad web header name."; return 1; fi
     if [ "$DG_HTTPHEADER" = on ] && [ "$DG_TRANSPORT" != plain ]; then err "That code puts a web header on a link that is not plain."; return 1; fi
     case "$DG_UTLS" in '' | on | off) ;; *) err "That code has a bad setting."; return 1 ;; esac
@@ -1542,6 +1702,31 @@ join_tunnel() {
         return 1
     fi
 
+    # A tunnel over a GRE link: this server's end of the link is made when the
+    # tunnel starts, so first make sure it can be, and work out the addresses.
+    gre_peer=$relay_ip
+    if [ "$DG_GRE" = on ]; then
+        if ! gre_plan "$server_ip" "$relay_ip"; then
+            err "A GRE link needs plain IPv4 addresses for both servers. This code has:"
+            err "  this server ${server_ip:-(none)}, Iran server $relay_ip"
+            return 1
+        fi
+        if ! this_machine_has_ip "$server_ip"; then
+            err "$server_ip is not an address this server has on any of its network cards."
+            err "It sits behind address translation, and a GRE link cannot be made from it."
+            return 1
+        fi
+        if ! gre_out=$("$FIREWALL" gre-check 2>&1); then
+            err "$gre_out"
+            err "Nothing was set up. Create the tunnel again on the Iran server without GRE."
+            return 1
+        fi
+        gre_own=$GRE_OWN
+        gre_peer=$GRE_PEER
+        DG_GRE_LOCAL=$server_ip
+        DG_GRE_REMOTE=$relay_ip
+    fi
+
     # Both ports are checked before anything is written. A service port is meant
     # to be in use, by the service; what it must not be is the private link port,
     # or a port one of this server's other tunnels already uses.
@@ -1577,7 +1762,14 @@ join_tunnel() {
     say "  tunnel name        $name"
     say "  your users use     $relay_ip"
     say "  traffic goes to    your inbound on port $inport, on this server"
-    if [ "$mode" = direct ]; then
+    if [ "$DG_GRE" = on ]; then
+        if [ "$mode" = direct ]; then
+            say "  connection         direct: $relay_ip connects in to $gre_own:$tport,"
+        else
+            say "  connection         reverse: this server connects out to $gre_peer:$tport,"
+        fi
+        say "                     inside a private GRE link between $server_ip and $relay_ip"
+    elif [ "$mode" = direct ]; then
         say "  connection         direct: $relay_ip connects in to this server on port $tport"
         if cdn_involved "$DG_CDN" "$DG_ALTHOST"; then
             say "  firewall           port $tport here left open, because the link can"
@@ -1613,16 +1805,19 @@ join_tunnel() {
             return 1
         fi
         taddr="0.0.0.0:$tport"
+        [ "$DG_GRE" = on ] && taddr="$gre_own:$tport"
     else
         taddr="$relay_ip:$tport"
+        [ "$DG_GRE" = on ] && taddr="$gre_peer:$tport"
     fi
 
     confirm "Set it up?" || { say "Cancelled. Nothing was changed."; return 1; }
 
     write_tunnel "$name" "$mode" origin "$taddr" "" "$inbound" \
-        "$relay_ip" "${server_ip:-}" "$pool" "$secret"
+        "$gre_peer" "${server_ip:-}" "$pool" "$secret"
 
     validate_and_enable "$name" || return 1
+    report_gre_link "$name"
 
     say ""
     # In direct mode the Iran server has been retrying since it was set up and
@@ -1705,6 +1900,7 @@ status_line() {
             ;;
         *) look=plain ;;
     esac
+    [ "$(read_conf "$name" gre)" = on ] && look=gre
 
     # Said plainly when the tunnel has found that nothing gets through, so a row
     # that shows connections "ready" is not read as a tunnel that works.
@@ -1777,11 +1973,12 @@ pick_row() {
         ports="service ${port##*:}"
     fi
     tport=$(read_conf "$name" tunnel_addr)
-    peer=$(read_conf "$name" peer_ip)
+    peer=$(other_public_ip "$name")
 
     detail="$side | $mode | $ports"
     [ -n "$tport" ] && detail="$detail | link ${tport##*:}"
     [ -n "$peer" ] && detail="$detail | other $peer"
+    [ "$(read_conf "$name" gre)" = on ] && detail="$detail | GRE"
     printf '  %s%2s%s)  %s%s%s %s%-*s%s  %s%-9s%s %s%s%s\n' \
         "$NUM" "$idx" "$R" "$colour" "$DOT" "$R" "$B" "$width" "$name" "$R" \
         "$colour" "$word" "$R" "$DIM" "$detail" "$R"
@@ -1868,7 +2065,7 @@ agent_for_tunnel() {
     init_agents_dir
     a=$(read_conf "$name" foreign_agent 2>/dev/null || true)
     if [ -z "$a" ] || [ ! -f "$(agent_conf_of "$a")" ]; then
-        a=$(find_agent_by_target "$(read_conf "$name" peer_ip 2>/dev/null || true)" 2>/dev/null || true)
+        a=$(find_agent_by_target "$(other_public_ip "$name" 2>/dev/null || true)" 2>/dev/null || true)
     fi
     if [ -n "$a" ] && [ -f "$(agent_conf_of "$a")" ]; then
         printf '%s' "$a"
@@ -2201,18 +2398,25 @@ edit_tunnel_settings() {
     new=$(ask "How long to let sessions finish when restarting" "$cur")
     [ "$new" != "$cur" ] && { write_conf "$name" drain "$new"; changed=1; }
 
-    cur=$(read_conf "$name" peer_ip)
-    new=$(ask "The other server's IP" "$cur")
-    if [ "$new" != "$cur" ] && valid_host "$new"; then
-        write_conf "$name" peer_ip "$new"
-        # Keep the dial target in step with it.
-        local taddr
-        taddr=$(read_conf "$name" tunnel_addr)
-        case "$taddr" in
-            0.0.0.0:*|:::*) : ;;
-            *) write_conf "$name" tunnel_addr "$new:${taddr##*:}" ;;
-        esac
-        changed=1
+    if [ "$(read_conf "$name" gre)" = on ]; then
+        # The addresses of a GRE link come from the two public addresses, so
+        # changing one means a different link, and a different tunnel.
+        say "${DIM}This tunnel runs over a private GRE link, so the other server's IP cannot${R}"
+        say "${DIM}be changed here. Delete the tunnel and create it again for a new server.${R}"
+    else
+        cur=$(read_conf "$name" peer_ip)
+        new=$(ask "The other server's IP" "$cur")
+        if [ "$new" != "$cur" ] && valid_host "$new"; then
+            write_conf "$name" peer_ip "$new"
+            # Keep the dial target in step with it.
+            local taddr
+            taddr=$(read_conf "$name" tunnel_addr)
+            case "$taddr" in
+                0.0.0.0:*|:::*) : ;;
+                *) write_conf "$name" tunnel_addr "$new:${taddr##*:}" ;;
+            esac
+            changed=1
+        fi
     fi
 
     local role cur_u
@@ -2285,7 +2489,7 @@ delete_tunnel() {
             # Only an agent whose address is exactly this tunnel's other server
             # is used. Falling back to "the last agent linked" could delete a
             # tunnel of the same name on a different server.
-            target_agent=$(find_agent_by_target "$(read_conf "$name" peer_ip 2>/dev/null || true)" 2>/dev/null || true)
+            target_agent=$(find_agent_by_target "$(other_public_ip "$name" 2>/dev/null || true)" 2>/dev/null || true)
         fi
         if [ -n "$target_agent" ] && [ -f "$(agent_conf_of "$target_agent")" ]; then
             if agent_call_alias "$target_agent" -delete "$name" >/dev/null 2>&1; then
@@ -2353,6 +2557,18 @@ test_tunnel() {
     else
         result "service running" bad "no"
         note "Start it from the menu, or look at the log for why it stopped."
+    fi
+
+    # A tunnel over a GRE link depends on the link being up at both ends.
+    if [ "$(read_conf "$name" gre)" = on ]; then
+        local greout
+        if greout=$("$FIREWALL" gre-test "$name" 2>&1); then
+            result "private GRE link" good "$greout"
+        else
+            result "private GRE link" bad "$greout"
+            note "GRE (IP protocol 47) may be dropped between these two servers, or the other"
+            note "end of the link is not set up yet. The tunnel cannot carry data without it."
+        fi
     fi
 
     # Settings may list several addresses, so each is checked in turn.

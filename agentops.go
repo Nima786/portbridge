@@ -312,7 +312,7 @@ func validatePairing(p *PairingData) error {
 	}
 	for _, f := range []struct{ name, val string }{
 		{"cdn", p.CDN}, {"mux", p.Mux}, {"utls", p.UTLS}, {"tls_fragment", p.TLSFragment},
-		{"http_header", p.HTTPHeader},
+		{"http_header", p.HTTPHeader}, {"gre", p.GRE},
 	} {
 		if f.val != "" && f.val != "on" && f.val != "off" {
 			return fmt.Errorf("%s must be on or off, got %q", f.name, f.val)
@@ -323,6 +323,17 @@ func validatePairing(p *PairingData) error {
 	}
 	if p.HTTPHeader == "on" && p.Transport != "plain" {
 		return errors.New("the web header only applies to a plain link")
+	}
+	if p.GRE == "on" {
+		if p.Transport != "plain" {
+			return errors.New("a GRE link carries the plain link only")
+		}
+		if p.CDN == "on" || p.AltHost != "" {
+			return errors.New("a GRE link cannot be combined with a CDN")
+		}
+		if _, _, err := greAddrs(p.ServerIP, p.RelayIP); err != nil {
+			return fmt.Errorf("a GRE tunnel needs both servers' public IPv4 addresses in its code: %w", err)
+		}
 	}
 	if p.HTTPHost != "" && !hostnameRe.MatchString(p.HTTPHost) {
 		return fmt.Errorf("web header name %q is not a hostname", p.HTTPHost)
