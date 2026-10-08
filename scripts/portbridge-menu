@@ -35,12 +35,33 @@ SUSPICIOUS_PORTS="8388 1080 1081 9050 9051 8388 8080 8880 2080 2052 2082 2086 20
 
 # ---------------------------------------------------------------- presentation
 
-if [ -t 1 ]; then
-    B=$'\033[1m'; DIM=$'\033[2m'; R=$'\033[0m'
+# Colours carry meaning, so the same colour always says the same thing:
+#   green  = working          yellow = be careful        red = a problem or a
+#   cyan numbers = what to type                          destructive choice
+#   magenta = a group heading  grey = a side note
+# NO_COLOR (any value) turns all of it off, as does output that is not a terminal.
+if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
+    B=$'\033[1m'; R=$'\033[0m'
     RED=$'\033[31m'; GREEN=$'\033[32m'; YELLOW=$'\033[33m'; CYAN=$'\033[36m'
+    NUM=$'\033[1;96m'
+    HEAD=$'\033[1;35m'
+    # The plain "dim" attribute turns grey text almost invisible on many dark
+    # themes, which made the side notes hard to read. A real light grey is used
+    # where the terminal has 256 colours; otherwise dim, as before.
+    if [ "$(tput colors 2>/dev/null || echo 8)" -ge 256 ] 2>/dev/null; then
+        DIM=$'\033[38;5;247m'
+    else
+        DIM=$'\033[2m'
+    fi
 else
-    B=''; DIM=''; R=''; RED=''; GREEN=''; YELLOW=''; CYAN=''
+    B=''; DIM=''; R=''; RED=''; GREEN=''; YELLOW=''; CYAN=''; NUM=''; HEAD=''
 fi
+
+# The status dot. A plain star where the terminal cannot show it.
+case "${LC_ALL:-${LC_CTYPE:-${LANG:-}}}" in
+    *UTF-8* | *utf-8* | *UTF8* | *utf8*) DOT='●' ;;
+    *) DOT='*' ;;
+esac
 
 # Only say() and deliberate printfs go to stdout. Everything decorative goes to
 # stderr, so that helpers whose output is captured in a variable cannot be
@@ -51,6 +72,22 @@ ok()   { printf '%s\n' "${GREEN}$*${R}" >&2; }
 warn() { printf '%s\n' "${YELLOW}$*${R}" >&2; }
 err()  { printf '%s\n' "${RED}$*${R}" >&2; }
 hr()   { printf '%s\n' "${DIM}------------------------------------------------------------${R}"; }
+
+# group <title> - a heading that starts a block of menu items, with a blank line
+# above it so the blocks read as separate lists.
+group() { printf '\n  %s%s%s\n' "$HEAD" "$1" "$R"; }
+
+# item <key> <text> [note] [colour] - one menu line: the key to type in colour,
+# the text in plain, the side note in grey and lined up in its own column. The
+# colour argument is for destructive choices, which are shown in red.
+item() {
+    local key=$1 text=$2 note=${3-} tone=${4-}
+    if [ -n "$note" ]; then
+        printf '  %s%2s%s)  %s%-34s%s %s%s%s\n' "$NUM" "$key" "$R" "$tone" "$text" "$R" "$DIM" "$note" "$R"
+    else
+        printf '  %s%2s%s)  %s%s%s\n' "$NUM" "$key" "$R" "$tone" "$text" "$R"
+    fi
+}
 
 pause() {
     printf '\n%s' "${DIM}Press Enter to continue...${R}"
@@ -585,8 +622,8 @@ ask_disguise() {
         info "HTTP/2 / gRPC stream can connect directly to your foreign server, or"
         info "route through Cloudflare CDN (with the gRPC setting turned on in Cloudflare)."
         say ""
-        say "  ${B}1${R}) Direct to foreign server IP ${DIM}(claims any normal website name, e.g. www.google.com)${R}"
-        say "  ${B}2${R}) Through Cloudflare CDN ${DIM}(needs your domain pointed to Cloudflare with gRPC enabled)${R}"
+        say "  ${NUM}1${R}) Direct to foreign server IP ${DIM}(claims any normal website name, e.g. www.google.com)${R}"
+        say "  ${NUM}2${R}) Through Cloudflare CDN ${DIM}(needs your domain pointed to Cloudflare with gRPC enabled)${R}"
         local grpc_choice
         grpc_choice=$(choose "Choose 1 or 2" "1" 1 2)
         if [ "$grpc_choice" = 2 ]; then
@@ -1164,12 +1201,12 @@ create_tunnel() {
         for aname in $(agent_names); do
             au=$(read_file_key "$(agent_conf_of "$aname")" url)
             aip=$(read_file_key "$(agent_conf_of "$aname")" server_ip)
-            say "  ${B}$i${R}) $aname ${DIM}($aip, $au)${R}"
+            say "  ${NUM}$i${R})  ${B}$aname${R}  ${DIM}($aip, $au)${R}"
             names+=("$aname")
             i=$((i + 1))
         done
-        say "  ${B}$i${R}) Link a new Foreign server now ${DIM}(automated 1-click setup)${R}"
-        say "  ${B}M${R}) Enter IP manually ${DIM}(without agent / manual pairing code)${R}"
+        say "  ${NUM}$i${R}) Link a new Foreign server now ${DIM}(automated 1-click setup)${R}"
+        say "  ${NUM}M${R}) Enter IP manually ${DIM}(without agent / manual pairing code)${R}"
         hr
         local sel
         sel=$(ask "Choose [1-$i, M]" "1")
@@ -1194,8 +1231,8 @@ create_tunnel() {
         hr
         say "${B}Target Foreign Server${R}"
         say "${DIM}No foreign servers linked yet.${R}"
-        say "  ${B}1${R}) Link a Foreign server now ${DIM}(automated 1-click setup)${R}"
-        say "  ${B}2${R}) Enter Foreign server IP manually ${DIM}(manual pairing code)${R}"
+        say "  ${NUM}1${R}) Link a Foreign server now ${DIM}(automated 1-click setup)${R}"
+        say "  ${NUM}2${R}) Enter Foreign server IP manually ${DIM}(manual pairing code)${R}"
         hr
         local sel
         sel=$(ask "Choose [1-2]" "1")
@@ -1677,8 +1714,10 @@ status_line() {
         blocked) warn_tag="  ${RED}NO DATA GETS THROUGH${R}" ;;
         degraded) warn_tag="  ${YELLOW}unhealthy${R}" ;;
     esac
-    printf '  %-14s %-8s %-12s %s%-8s%s %-10s users:%-5s %s:%s%s\n' \
-        "$name" "$mode" "$job" "$colour" "$state" "$R" "$look" "$active_s" "$label" "$parked" "$warn_tag"
+    # A stopped or failed tunnel gets the colour of its state on the dot as well,
+    # so the eye finds it before reading anything.
+    printf '  %s%s%s %s%-16s%s %-8s %-12s %s%-8s%s %-10s users:%-5s %s:%s%s\n' \
+        "$colour" "$DOT" "$R" "$B" "$name" "$R" "$mode" "$job" "$colour" "$state" "$R" "$look" "$active_s" "$label" "$parked" "$warn_tag"
 }
 
 list_tunnels() {
@@ -1691,12 +1730,61 @@ list_tunnels() {
         return 0
     fi
     local n
+    # Column headings, lined up with the rows below (the two blank spaces stand
+    # in for the status dot).
+    printf '  %s  %-16s %-8s %-12s %-8s %-10s %s%s\n' \
+        "$DIM" "NAME" "MODE" "SIDE" "STATE" "LOOKS LIKE" "ACTIVITY" "$R"
     for n in $(tunnel_names); do
         status_line "$n"
     done
     hr
     say "${DIM}users = sessions right now. spares = ready connections waiting,${R}"
     say "${DIM}or links = shared connections open, for tunnels set up that way.${R}"
+}
+
+# pick_row <number> <name> <name-width> - one line of the "which tunnel" list:
+# a coloured dot for how it is doing, the name in bold, and in grey which side
+# this is, the mode, the ports and the other server, so tunnels can be told apart
+# without having to remember what each name was for.
+pick_row() {
+    local idx=$1 name=$2 width=$3
+    local active colour word pstate role mode side ports port tport peer detail
+    active=$(systemctl is-active "$(unit_of "$name")" 2>/dev/null)
+    case "$active" in
+        active)   colour=$GREEN;  word=running ;;
+        inactive) colour=$DIM;    word=stopped ;;
+        failed)   colour=$RED;    word=failed ;;
+        *)        colour=$YELLOW; word=${active:-unknown} ;;
+    esac
+    # Running, but the tunnel itself has found that nothing gets through.
+    if [ "$active" = active ]; then
+        pstate=$(json_field "$RUN_DIR/$name.json" path_state 2>/dev/null)
+        case "$pstate" in
+            blocked)  colour=$RED;    word="no data" ;;
+            degraded) colour=$YELLOW; word=unhealthy ;;
+        esac
+    fi
+
+    role=$(read_conf "$name" role)
+    mode=$(read_conf "$name" mode); [ -n "$mode" ] || mode=direct
+    if [ "$role" = edge ]; then
+        side="Iran side"
+        port=$(read_conf "$name" user_listen)
+        ports="users ${port##*:}"
+    else
+        side="foreign side"
+        port=$(read_conf "$name" inbound_addr)
+        ports="service ${port##*:}"
+    fi
+    tport=$(read_conf "$name" tunnel_addr)
+    peer=$(read_conf "$name" peer_ip)
+
+    detail="$side | $mode | $ports"
+    [ -n "$tport" ] && detail="$detail | link ${tport##*:}"
+    [ -n "$peer" ] && detail="$detail | other $peer"
+    printf '  %s%2s%s)  %s%s%s %s%-*s%s  %s%-9s%s %s%s%s\n' \
+        "$NUM" "$idx" "$R" "$colour" "$DOT" "$R" "$B" "$width" "$name" "$R" \
+        "$colour" "$word" "$R" "$DIM" "$detail" "$R"
 }
 
 pick_tunnel() {
@@ -1707,11 +1795,18 @@ pick_tunnel() {
         err "There are no tunnels on this server yet."
         return 1
     fi
+    # Names are padded to the longest one (at most 24 wide) so the details after
+    # them line up in a column.
+    local width=0
+    for n in $names; do
+        [ "${#n}" -gt "$width" ] && width=${#n}
+    done
+    [ "$width" -gt 24 ] && width=24
     say "" >&2
     i=0
     for n in $names; do
         i=$((i + 1))
-        printf '  %d) %s\n' "$i" "$n" >&2
+        pick_row "$i" "$n" "$width" >&2
     done
     say "" >&2
     choice=$(ask "Which one (number, or name)" "")
@@ -2015,13 +2110,13 @@ edit_tunnel() {
     say "${B}Edit '$name'${R}"
     hr
     if [ "$role" = edge ]; then
-        say "  ${B}1${R}) Change ports ${DIM}(users, service and link ports; the foreign server follows)${R}"
-        say "  ${B}2${R}) Change other settings ${DIM}(limits, timing, the other server's IP)${R}"
+        say "  ${NUM}1${R}) Change ports ${DIM}(users, service and link ports; the foreign server follows)${R}"
+        say "  ${NUM}2${R}) Change other settings ${DIM}(limits, timing, the other server's IP)${R}"
     else
-        say "  ${B}1${R}) Change ports ${DIM}(done from the Iran server)${R}"
-        say "  ${B}2${R}) Change other settings ${DIM}(limits, timing, your service address)${R}"
+        say "  ${NUM}1${R}) Change ports ${DIM}(done from the Iran server)${R}"
+        say "  ${NUM}2${R}) Change other settings ${DIM}(limits, timing, your service address)${R}"
     fi
-    say "  ${B}0${R}) Back"
+    say "  ${NUM}0${R}) Back"
     hr
     case "$(ask "Choose" "1")" in
         1) edit_tunnel_ports "$name" ;;
@@ -2808,8 +2903,7 @@ list_foreign_agents() {
         return 0
     fi
 
-    printf "  %-15s %-25s %-12s %s\n" "Alias" "Address" "Status" "Active Tunnels"
-    printf "  %-15s %-25s %-12s %s\n" "---------------" "-------------------------" "------------" "--------------"
+    printf "  %s%-15s %-25s %-12s %s%s\n" "$DIM" "ALIAS" "ADDRESS" "STATUS" "ACTIVE TUNNELS" "$R"
     local name
     for name in $(agent_names); do
         local f u out st="ONLINE" tun="?"
@@ -2827,7 +2921,7 @@ list_foreign_agents() {
             st="${RED}OFFLINE${R}"
             tun="unreachable"
         fi
-        printf "  %-15s %-25s %-21b %s\n" "$name" "$hostport" "$st" "$tun"
+        printf "  %s%-15s%s %-25s %-21b %s\n" "$B" "$name" "$R" "$hostport" "$st" "$tun"
     done
     hr
 }
@@ -3014,12 +3108,12 @@ test_foreign_agent() {
     for name in $(agent_names); do
         local u
         u=$(read_file_key "$(agent_conf_of "$name")" url)
-        say "  ${B}$i${R}) $name ($u)"
+        say "  ${NUM}$i${R})  ${B}$name${R}  ${DIM}($u)${R}"
         names+=("$name")
         i=$((i + 1))
     done
-    say "  ${B}A${R}) Test ALL servers"
-    say "  ${B}0${R}) Cancel"
+    say "  ${NUM}A${R}) Test ALL servers"
+    say "  ${NUM}0${R}) Cancel"
     hr
     local choice
     choice=$(ask "Choose" "A")
@@ -3065,12 +3159,12 @@ unlink_foreign_agent() {
     for name in $(agent_names); do
         local u
         u=$(read_file_key "$(agent_conf_of "$name")" url)
-        say "  ${B}$i${R}) $name ($u)"
+        say "  ${NUM}$i${R})  ${B}$name${R}  ${DIM}($u)${R}"
         names+=("$name")
         i=$((i + 1))
     done
-    say "  ${B}ALL${R}) Unlink ALL foreign servers"
-    say "  ${B}0${R}) Cancel"
+    say "  ${NUM}ALL${R}) Unlink ALL foreign servers"
+    say "  ${NUM}0${R}) Cancel"
     hr
     local choice
     choice=$(ask "Choose" "0")
@@ -3135,20 +3229,19 @@ agent_menu() {
             say "  ${DIM}Linked Foreign Servers (Iran role): none linked yet${R}"
         fi
         hr
-        say "  ${CYAN}[ Iran Server: Manage Remote Foreign Servers ]${R}"
-        say "  ${B}1${R}) List linked Foreign servers & test status"
-        say "  ${B}2${R}) Link a new Foreign server       ${DIM}(1-click deployment)${R}"
-        say "  ${B}3${R}) Test connection to Foreign server(s)"
-        say "  ${B}4${R}) Unlink / remove a Foreign server"
+        group "Iran server: manage remote foreign servers"
+        say "  ${NUM}1${R}) List linked Foreign servers & test status"
+        say "  ${NUM}2${R}) Link a new Foreign server       ${DIM}(1-click deployment)${R}"
+        say "  ${NUM}3${R}) Test connection to Foreign server(s)"
+        say "  ${NUM}4${R}) Unlink / remove a Foreign server"
+        group "Foreign server: agent daemon"
+        say "  ${NUM}5${R}) Enable & start Agent daemon on this server"
+        say "  ${NUM}6${R}) Show Agent Link String & Token  ${DIM}(pb-agent://...)${R}"
+        say "  ${NUM}7${R}) Change Agent listen port"
+        say "  ${NUM}8${R}) Regenerate Agent token"
+        say "  ${NUM}9${R}) Stop & disable Agent daemon on this server"
         say ""
-        say "  ${CYAN}[ Foreign Server: Agent Daemon ]${R}"
-        say "  ${B}5${R}) Enable & start Agent daemon on this server"
-        say "  ${B}6${R}) Show Agent Link String & Token  ${DIM}(pb-agent://...)${R}"
-        say "  ${B}7${R}) Change Agent listen port"
-        say "  ${B}8${R}) Regenerate Agent token"
-        say "  ${B}9${R}) Stop & disable Agent daemon on this server"
-        say ""
-        say "  ${B}0${R}) Back"
+        say "  ${NUM}0${R}) Back"
         hr
         local c
         c=$(ask "Choose" "0")
@@ -3169,28 +3262,50 @@ agent_menu() {
 
 # -------------------------------------------------------------------- main menu
 
+# tunnel_summary - one line for the top of the main menu: how many tunnels there
+# are and how many are running, so a stopped one is noticed before anything else.
+tunnel_summary() {
+    local total=0 running=0 n
+    for n in $(tunnel_names); do
+        total=$((total + 1))
+        [ "$(systemctl is-active "$(unit_of "$n")" 2>/dev/null)" = active ] && running=$((running + 1))
+    done
+    if [ "$total" -eq 0 ]; then
+        printf '%s' "${DIM}$(hostname)  -  no tunnels yet${R}"
+    elif [ "$running" -eq "$total" ]; then
+        printf '%s' "${DIM}$(hostname)  -  ${R}${GREEN}${running} of ${total} tunnel(s) running${R}"
+    else
+        printf '%s' "${DIM}$(hostname)  -  ${R}${RED}${running} of ${total} tunnel(s) running${R}"
+    fi
+}
+
 main_menu() {
     while :; do
         clear 2>/dev/null || true
         say "${B}PortBridge${R} ${DIM}$(engine_version)${R}"
-        say "${DIM}$(hostname) - $(tunnel_count) tunnel(s) configured${R}"
+        say "$(tunnel_summary)"
         hr
-        say "  ${B}1${R}) List tunnels and status"
-        say "  ${B}2${R}) Create a tunnel        ${DIM}on your Iran server${R}"
-        say "  ${B}3${R}) Join a tunnel          ${DIM}then on your foreign server${R}"
-        say "  ${B}4${R}) Show a tunnel's code   ${DIM}on your Iran server, if needed again${R}"
-        say "  ${B}5${R}) Tunnel details"
-        say "  ${B}6${R}) Check a tunnel for problems"
-        say "  ${B}7${R}) Edit a tunnel"
-        say "  ${B}8${R}) Start, stop or restart a tunnel"
-        say "  ${B}9${R}) View a tunnel's log"
-        say " ${B}10${R}) Delete a tunnel"
-        say " ${B}11${R}) Management Agent     ${DIM}automate foreign setup from Iran${R}"
-        say " ${B}12${R}) Firewall"
-        say " ${B}13${R}) Speed tuning           ${DIM}run on both servers${R}"
-        say " ${B}14${R}) Uninstall PortBridge"
-        say " ${B}15${R}) Speed test a tunnel"
-        say "  ${B}0${R}) Quit"
+        group "Tunnels"
+        item 1 "List tunnels and status"
+        item 2 "Create a tunnel" "on your Iran server"
+        item 3 "Join a tunnel" "then on your foreign server"
+        item 4 "Tunnel details"
+        item 5 "Edit a tunnel"
+        item 6 "Start, stop or restart a tunnel"
+        item 7 "Show a tunnel's code" "on your Iran server, if needed again"
+        group "Check and fix"
+        item 8 "Check a tunnel for problems"
+        item 9 "View a tunnel's log"
+        item 10 "Speed test a tunnel"
+        group "Settings"
+        item 11 "Management Agent" "automate foreign setup from Iran"
+        item 12 "Speed tuning" "run on both servers"
+        item 13 "Firewall"
+        group "Remove"
+        item 14 "Delete a tunnel" "" "$RED"
+        item 15 "Uninstall PortBridge" "" "$RED"
+        say ""
+        item 0 "Quit"
         hr
         local choice name
         choice=$(ask "Choose" "")
@@ -3198,24 +3313,23 @@ main_menu() {
             1) list_tunnels; pause ;;
             2) create_tunnel; pause ;;
             3) join_tunnel; pause ;;
-            4) name=$(pick_tunnel) && show_pairing_code "$name"; pause ;;
-            5) name=$(pick_tunnel) && show_details "$name"; pause ;;
-            6) name=$(pick_tunnel) && test_tunnel "$name"; pause ;;
-            7) name=$(pick_tunnel) && edit_tunnel "$name"; pause ;;
-            8) name=$(pick_tunnel) && service_menu "$name"; pause ;;
+            4) name=$(pick_tunnel) && show_details "$name"; pause ;;
+            5) name=$(pick_tunnel) && edit_tunnel "$name"; pause ;;
+            6) name=$(pick_tunnel) && service_menu "$name"; pause ;;
+            7) name=$(pick_tunnel) && show_pairing_code "$name"; pause ;;
+            8) name=$(pick_tunnel) && test_tunnel "$name"; pause ;;
             9) name=$(pick_tunnel) && show_logs "$name"; pause ;;
-            10) name=$(pick_tunnel) && delete_tunnel "$name"; pause ;;
+            10) name=$(pick_tunnel) && speedtest_tunnel "$name"; pause ;;
             11) agent_menu ;;
-            12) firewall_menu ;;
-            13) tuning_menu; pause ;;
-            14) uninstall_all ;;
-            15) name=$(pick_tunnel) && speedtest_tunnel "$name"; pause ;;
+            12) tuning_menu; pause ;;
+            13) firewall_menu ;;
+            14) name=$(pick_tunnel) && delete_tunnel "$name"; pause ;;
+            15) uninstall_all ;;
             0 | q | Q) say "Bye."; exit 0 ;;
             *) err "Not a valid choice."; sleep 1 ;;
         esac
     done
 }
-
 # set_firewall <name> <on|off> - records the choice and applies it at once
 set_firewall() {
     # A tunnel that can arrive from a CDN cannot have its port locked to one
@@ -3242,9 +3356,9 @@ tuning_menu() {
     hr
     "$TUNE" status | sed 's/^/  /'
     hr
-    say "  ${B}1${R}) Turn the tuning on"
-    say "  ${B}2${R}) Turn it off again"
-    say "  ${B}0${R}) Back"
+    say "  ${NUM}1${R}) Turn the tuning on"
+    say "  ${NUM}2${R}) Turn it off again"
+    say "  ${NUM}0${R}) Back"
     hr
     case "$(ask "Choose" "0")" in
         1)
@@ -3268,12 +3382,12 @@ firewall_menu() {
         hr
         "$FIREWALL" status | sed 's/^/  /'
         hr
-        say "  ${B}1${R}) Turn the firewall off for a tunnel"
-        say "  ${B}2${R}) Turn the firewall on for a tunnel"
-        say "  ${B}3${R}) Change which address a tunnel allows"
-        say "  ${B}4${R}) Turn it off for every tunnel"
-        say "  ${B}5${R}) Turn it on for every tunnel"
-        say "  ${B}0${R}) Back"
+        say "  ${NUM}1${R}) Turn the firewall off for a tunnel"
+        say "  ${NUM}2${R}) Turn the firewall on for a tunnel"
+        say "  ${NUM}3${R}) Change which address a tunnel allows"
+        say "  ${NUM}4${R}) Turn it off for every tunnel"
+        say "  ${NUM}5${R}) Turn it on for every tunnel"
+        say "  ${NUM}0${R}) Back"
         hr
         choice=$(ask "Choose" "0")
         case "$choice" in
@@ -3315,10 +3429,10 @@ service_menu() {
     hr
     say "${B}'$name' is currently: $(systemctl is-active "$unit")${R}"
     hr
-    say "  ${B}1${R}) Start"
-    say "  ${B}2${R}) Stop"
-    say "  ${B}3${R}) Restart"
-    say "  ${B}4${R}) Back"
+    say "  ${NUM}1${R}) Start"
+    say "  ${NUM}2${R}) Stop"
+    say "  ${NUM}3${R}) Restart"
+    say "  ${NUM}4${R}) Back"
     hr
     case "$(ask "Choose" "3")" in
         1) systemctl start "$unit" && ok "Started." ;;

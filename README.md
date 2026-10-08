@@ -231,7 +231,7 @@ link only.
 
 ## Changing a tunnel's ports
 
-Menu option 7 (Edit a tunnel), then **Change ports**, on the Iran server. Three
+Menu option 5 (Edit a tunnel), then **Change ports**, on the Iran server. Three
 kinds of port can be changed, together or one at a time:
 
 - the ports your users connect to (on the Iran server),
@@ -334,7 +334,7 @@ Worth running on both servers.
 PortBridge includes a built-in benchmarking tool to test live latency, jitter, download throughput, and upload throughput directly through an active tunnel without requiring external speedtest scripts or third-party servers:
 
 ```bash
-# Using the interactive menu (Option 14)
+# Using the interactive menu (Option 10)
 portbridge-menu speedtest <tunnel-name>
 
 # Or directly via the CLI
