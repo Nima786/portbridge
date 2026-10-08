@@ -65,6 +65,9 @@ type agentHost interface {
 	Restart(name string) error
 	// Listening reports whether something on this machine answers on the port.
 	Listening(port int) bool
+	// ListenOwner names the program listening on the port, or says nothing if
+	// the machine will not tell.
+	ListenOwner(port int) string
 }
 
 // agentHostOverride replaces the host for tests that want to watch what would be

@@ -818,6 +818,161 @@ cdn_port_ok() {
     return 1
 }
 
+# ------------------------------------------------------------------ free ports
+#
+# The link between the servers needs a port that is free on whichever server
+# listens for it, and a CDN forwards only some ports. Both are easy to forget, so
+# the menu asks both servers (the foreign one through its agent) and shows the
+# answers side by side.
+
+# The ports worth looking at: the ones Cloudflare forwards, then the extra ones
+# other CDNs, ArvanCloud for one, forward.
+PORTS_OTHER_CDNS="80 8080 8880 2052 2082 2086 2095"
+
+# ports_here <list> - this server's answer, as lines of port, state and owner
+# separated by tabs.
+ports_here() { "$BIN" ports "$1" 2>/dev/null; }
+
+# ports_there <alias> <list> - the foreign server's, through its agent. Says
+# nothing and fails when there is no agent, it cannot be reached, or it is too old.
+ports_there() { agent_call_alias "$1" -ports "$2" 2>/dev/null; }
+
+# port_cell <state> <owner> - one cell of the table, coloured and padded to 24.
+port_cell() {
+    local state=$1 by=${2-} text colour
+    case "$state" in
+        free) text=free; colour=$GREEN ;;
+        busy) text=busy; colour=$RED ;;
+        reserved) text=reserved; colour=$YELLOW ;;
+        *) text="not known"; colour=$DIM ;;
+    esac
+    # "PortBridge tunnel m-a (its users)" is shown as "tunnel m-a", to fit.
+    by=${by#PortBridge }
+    by=${by%% (*}
+    [ -n "$by" ] && text="$text ($(printf '%.12s' "$by"))"
+    printf '%s%-24s%s' "$colour" "$text" "$R"
+}
+
+# show_port_table <ports> <agent alias or empty> <direct|reverse|both>
+#
+# Prints this server and the foreign server side by side, with whether a CDN
+# forwards each port. Sets PORT_BEST to the first port that suits the tunnel: free
+# on both servers if there is one, otherwise free where the link is opened (the
+# foreign server in direct mode, this one in reverse). It is empty when nothing
+# suits or the answer is not known.
+show_port_table() {
+    local list=$1 alias=${2-} need=${3-both}
+    local -A lstate=() lby=() fstate=() fby=()
+    local port state by have_foreign=no ls fs ok verdict cdn best_both="" best_need=""
+    PORT_BEST=""
+
+    printf '%s' "${DIM}Checking the ports...${R}" >&2
+    while IFS=$'\t' read -r port state by; do
+        [ -n "$port" ] || continue
+        lstate[$port]=$state
+        lby[$port]=$by
+    done < <(ports_here "$list")
+    if [ -n "$alias" ] && [ -f "$(agent_conf_of "$alias")" ]; then
+        while IFS=$'\t' read -r port state by; do
+            [ -n "$port" ] || continue
+            fstate[$port]=$state
+            fby[$port]=$by
+            have_foreign=yes
+        done < <(ports_there "$alias" "$list")
+    fi
+    printf '\r%*s\r' 30 '' >&2
+
+    printf '  %s%-6s %-24s %-24s %-11s%s\n' "$DIM" PORT "THIS SERVER" "FOREIGN SERVER" "CDN" "$R"
+    for port in ${list//,/ }; do
+        ls=${lstate[$port]-}
+        fs=${fstate[$port]-}
+        verdict=""
+        ok=no
+        if [ "$ls" = free ] && [ "$fs" = free ]; then
+            verdict="${GREEN}free on both${R}"
+            ok=both
+        elif [ "$need" = direct ] && [ "$fs" = free ]; then
+            verdict="${GREEN}usable${R}"
+            ok=need
+        elif [ "$need" = reverse ] && [ "$ls" = free ]; then
+            verdict="${GREEN}usable${R}"
+            ok=need
+        fi
+        [ "$ok" = both ] && [ -z "$best_both" ] && best_both=$port
+        [ "$ok" != no ] && [ -z "$best_need" ] && best_need=$port
+        if cdn_port_ok "$port"; then cdn=Cloudflare; else cdn="other CDNs"; fi
+        printf '  %s%-6s%s %s %s %s%-11s%s %s\n' "$B" "$port" "$R" \
+            "$(port_cell "$ls" "${lby[$port]-}")" "$(port_cell "$fs" "${fby[$port]-}")" \
+            "$DIM" "$cdn" "$R" "$verdict"
+    done
+    say "${DIM}busy = something is using it.  reserved = free now, but a tunnel here is set to use it.${R}"
+    if [ -z "$alias" ]; then
+        say "${DIM}No agent is linked for the foreign server, so only this server is checked there.${R}"
+        say "${DIM}Link one under 'Management Agent' to see both.${R}"
+    elif [ "$have_foreign" = no ]; then
+        warn "The foreign server did not answer (is its agent running, and up to date?),"
+        warn "so only this server is shown."
+    fi
+    PORT_BEST=${best_both:-$best_need}
+}
+
+# suggest_link_port <direct|reverse> <agent alias or empty> <cdn: on|off> - shows
+# the ports worth considering for the link and leaves the best one in PORT_BEST.
+suggest_link_port() {
+    local mode=$1 alias=${2-} cdn=${3:-off}
+    say ""
+    if [ "$cdn" = on ]; then
+        say "${B}Ports a CDN forwards, and whether they are free${R}"
+        say "${DIM}Cloudflare forwards only the ones marked Cloudflare. A port must be free on${R}"
+        say "${DIM}the server that opens it: the foreign server in direct mode, this one in reverse.${R}"
+        show_port_table "$(printf '%s' "$CDN_PORTS $PORTS_OTHER_CDNS" | tr ' ' ',')" "$alias" "$mode"
+    else
+        say "${B}Some ports to choose from, and whether they are free${R}"
+        say "${DIM}A port must be free on the server that opens it: the foreign server in${R}"
+        say "${DIM}direct mode, this one in reverse. Free on both is the safest choice.${R}"
+        show_port_table "$(printf '%s' "$CDN_PORTS" | tr ' ' ',')" "$alias" "$mode"
+    fi
+    if [ -n "$PORT_BEST" ]; then
+        info "Suggested: $PORT_BEST"
+    fi
+}
+
+# ports_overview - the menu's own page: which ports are free on both servers.
+ports_overview() {
+    local alias="" count list names=() i=1 n sel
+    init_agents_dir
+    hr
+    say "${B}Free ports on both servers${R}"
+    say "${DIM}Useful when you forget which ports a CDN forwards and which are already taken.${R}"
+    hr
+    count=$(agent_count)
+    if [ "$count" -eq 1 ]; then
+        alias=$(agent_names | head -n 1)
+    elif [ "$count" -gt 1 ]; then
+        say "Which foreign server?"
+        for n in $(agent_names); do
+            say "  ${NUM}$i${R})  ${B}$n${R}"
+            names+=("$n")
+            i=$((i + 1))
+        done
+        sel=$(ask "Choose [1-$((i - 1))]" "1")
+        if valid_count "$sel" && [ "$sel" -le "${#names[@]}" ]; then
+            alias="${names[$((sel - 1))]}"
+        fi
+    fi
+    list=$(ask "Ports to check (Enter for the usual CDN ports)" "")
+    if [ -z "$list" ]; then
+        list=$(printf '%s' "$CDN_PORTS $PORTS_OTHER_CDNS" | tr ' ' ',')
+    elif ! printf '%s' "$list" | grep -Eq '^[0-9]+([ ,]+[0-9]+)*$'; then
+        err "That is not a list of port numbers."
+        return 1
+    fi
+    say ""
+    [ -n "$alias" ] && say "Foreign server: ${B}$alias${R}"
+    show_port_table "$list" "$alias" both
+    [ -n "$PORT_BEST" ] && info "Free on both: the first is $PORT_BEST"
+    return 0
+}
 explain_cdn_ports() {
     warn "  Port $1 is not one Cloudflare forwards ($CDN_PORTS)."
     info "  Other CDNs, such as ArvanCloud, may forward it. Make sure yours does; carrying on."
@@ -1422,19 +1577,20 @@ create_tunnel() {
         info "With a CDN in the picture the CDN has to forward this port. Cloudflare forwards"
         info "only: $CDN_PORTS. Other providers, such as ArvanCloud, may allow others."
     fi
+    suggest_link_port "$mode" "$target_agent" "$(cdn_involved "$DG_CDN" "$DG_ALTHOST" && echo on || echo off)"
     while :; do
         if [ "$mode" = reverse ]; then
             # Reverse: it is opened here on the Iran server, so check it here.
             local link_proto=tcp
             [ "$DG_TRANSPORT" = kcp ] && link_proto=udp
-            tport=$(ask_port "Port between the two servers" "$DEFAULT_TUNNEL_PORT" "" link "$link_proto")
+            tport=$(ask_port "Port between the two servers" "${PORT_BEST:-$DEFAULT_TUNNEL_PORT}" "" link "$link_proto")
             if printf ',%s,' "$uport" | tr -d ' ' | grep -q ",$tport,"; then
                 err "  It cannot be the same as your users' port."
                 continue
             fi
         else
             # Direct: it is opened on the foreign server, so it cannot be checked here.
-            tport=$(ask_remote_port "Port between the two servers" "$DEFAULT_TUNNEL_PORT" link)
+            tport=$(ask_remote_port "Port between the two servers" "${PORT_BEST:-$DEFAULT_TUNNEL_PORT}" link)
         fi
         # Pointed out, not refused: only Cloudflare limits the ports.
         if cdn_involved "$DG_CDN" "$DG_ALTHOST" && ! cdn_port_ok "$tport"; then
@@ -2213,6 +2369,9 @@ edit_tunnel_ports() {
             continue
         fi
 
+        suggest_link_port "$mode" "$(agent_for_tunnel "$name" 2>/dev/null || true)" \
+            "$(cdn_involved "$(read_conf "$name" cdn)" "$alt" && echo on || echo off)"
+        say "${DIM}This tunnel uses $cur_link now, so it shows as busy or reserved above.${R}"
         while :; do
             if [ "$mode" = reverse ]; then
                 new_link=$(ask_port "Link port (opened on this Iran server)" "$cur_link" "$name" link "$proto")
@@ -2988,7 +3147,7 @@ enable_agent() {
         say "  ${B}Copy this Link String to your Iran server:${R}"
         say "  ${GREEN}pb-agent://${tok}@${my_ip}:${p}${afp:+?fp=$afp}${R}"
         say ""
-        say "  ${DIM}On your Iran server, open 'portbridge' -> Option 11 -> Option 2 (Link a new Foreign server)${R}"
+        say "  ${DIM}On your Iran server, open 'portbridge' -> Option 12 -> Option 2 (Link a new Foreign server)${R}"
         say "  ${DIM}and paste the link string above.${R}"
         hr
         return 0
@@ -3044,7 +3203,7 @@ show_agent_link() {
     say "  ${B}Iran Link String:${R}"
     say "  ${GREEN}pb-agent://${tok}@${my_ip}:${p}${afp:+?fp=$afp}${R}"
     say ""
-    say "  ${DIM}Copy the link string above and paste it in Option 11 -> Option 2 on your Iran server.${R}"
+    say "  ${DIM}Copy the link string above and paste it in Option 12 -> Option 2 on your Iran server.${R}"
     hr
 }
 
@@ -3513,13 +3672,14 @@ main_menu() {
         item 8 "Check a tunnel for problems"
         item 9 "View a tunnel's log"
         item 10 "Speed test a tunnel"
+        item 11 "Show free ports on both servers" "which ones a CDN forwards"
         group "Settings"
-        item 11 "Management Agent" "automate foreign setup from Iran"
-        item 12 "Speed tuning" "run on both servers"
-        item 13 "Firewall"
+        item 12 "Management Agent" "automate foreign setup from Iran"
+        item 13 "Speed tuning" "run on both servers"
+        item 14 "Firewall"
         group "Remove"
-        item 14 "Delete a tunnel" "" "$RED"
-        item 15 "Uninstall PortBridge" "" "$RED"
+        item 15 "Delete a tunnel" "" "$RED"
+        item 16 "Uninstall PortBridge" "" "$RED"
         say ""
         item 0 "Quit"
         hr
@@ -3536,11 +3696,12 @@ main_menu() {
             8) name=$(pick_tunnel) && test_tunnel "$name"; pause ;;
             9) name=$(pick_tunnel) && show_logs "$name"; pause ;;
             10) name=$(pick_tunnel) && speedtest_tunnel "$name"; pause ;;
-            11) agent_menu ;;
-            12) tuning_menu; pause ;;
-            13) firewall_menu ;;
-            14) name=$(pick_tunnel) && delete_tunnel "$name"; pause ;;
-            15) uninstall_all ;;
+            11) ports_overview; pause ;;
+            12) agent_menu ;;
+            13) tuning_menu; pause ;;
+            14) firewall_menu ;;
+            15) name=$(pick_tunnel) && delete_tunnel "$name"; pause ;;
+            16) uninstall_all ;;
             0 | q | Q) say "Bye."; exit 0 ;;
             *) err "Not a valid choice."; sleep 1 ;;
         esac

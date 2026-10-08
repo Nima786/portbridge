@@ -22,7 +22,7 @@ Then:
 2. On your **foreign server** (the one with your panel), choose **Join a
    tunnel** and paste that code. It asks nothing else.
 
-> **💡 Zero-Copy Automation**: If you enable the **Management Agent** on your foreign server (menu option 11), your Iran server can automatically provision and start tunnels on the foreign server over HTTPS — completely eliminating manual copy-pasting of pairing codes!
+> **💡 Zero-Copy Automation**: If you enable the **Management Agent** on your foreign server (menu option 12), your Iran server can automatically provision and start tunnels on the foreign server over HTTPS — completely eliminating manual copy-pasting of pairing codes!
 
 That order is the same for direct and reverse.
 
@@ -266,6 +266,36 @@ What to know before using it:
   on the link. The pairing code carries it as version 8, used only when GRE is on.
   **Check a tunnel for problems** tests the link and says whether the other end
   answers.
+## Which ports are free, on both servers
+
+The link between the servers needs a port that is free on the server that opens
+it, and a CDN forwards only some ports. Both are easy to forget, so the menu shows
+them side by side: **Show free ports on both servers** (menu option 11), and the
+same table appears when you pick the link port while creating a tunnel or changing
+its ports.
+
+```
+PORT   THIS SERVER             FOREIGN SERVER          CDN
+443    busy (nginx)            free                    Cloudflare
+2053   free                    busy (x-ui)             Cloudflare
+2083   free                    free                    Cloudflare   free on both
+8080   free                    free                    other CDNs   free on both
+```
+
+- **busy** means a program is listening on it, and the table says which.
+  **reserved** means nothing is listening yet, but one of that server's own
+  tunnels is set to use it, so it would clash the moment that tunnel starts.
+- The CDN column says whether Cloudflare forwards the port. The rest are ports other
+  providers, such as ArvanCloud, forward; check yours does.
+- A port must be free on the server that *opens* it: the foreign server in direct
+  mode, the Iran server in reverse. **Free on both** is the safest choice, since it
+  keeps working if you switch modes later. The question that follows suggests the
+  first port that suits.
+- The foreign server is asked through its agent (see the Management Agent below),
+  so it needs one linked, and the same PortBridge version. Without that, only this
+  server is shown and the table says so. From the command line:
+  `portbridge ports 443,2053,8443` for this server, and
+  `portbridge join -agent <alias> -ports 443,2053,8443` for the foreign one.
 ## Changing a tunnel's ports
 
 Menu option 5 (Edit a tunnel), then **Change ports**, on the Iran server. Three
