@@ -927,10 +927,12 @@ suggest_link_port() {
         say "${DIM}the server that opens it: the foreign server in direct mode, this one in reverse.${R}"
         show_port_table "$(printf '%s' "$CDN_PORTS $PORTS_OTHER_CDNS" | tr ' ' ',')" "$alias" "$mode"
     else
-        say "${B}Some ports to choose from, and whether they are free${R}"
-        say "${DIM}A port must be free on the server that opens it: the foreign server in${R}"
-        say "${DIM}direct mode, this one in reverse. Free on both is the safest choice.${R}"
-        show_port_table "$(printf '%s' "$CDN_PORTS" | tr ' ' ',')" "$alias" "$mode"
+        # Without a CDN in the way any port will do, so none is singled out. The
+        # table is still there for anyone who wants to see what is free.
+        PORT_BEST=""
+        say "${DIM}Any port will do for this link. 'Show free ports on both servers' in the main${R}"
+        say "${DIM}menu shows which are free.${R}"
+        return 0
     fi
     if [ -n "$PORT_BEST" ]; then
         info "Suggested: $PORT_BEST"
@@ -1449,7 +1451,30 @@ create_tunnel() {
         2) mode=reverse ;;
     esac
 
+    # What the link looks like, and so whether a CDN is involved, is settled before any
+    # port is asked about: only a tunnel through a CDN is limited in which ports it can
+    # use, so the questions about ports depend on this answer.
+    ask_gre
+    if [ "$DG_GRE" = on ]; then
+        # Nothing to disguise: only GRE crosses the border. Everything the other
+        # questions would have set is put back to its plain value, so nothing is
+        # left over from an earlier tunnel made in the same session.
+        DG_TRANSPORT=plain
+        DG_SERVERNAME=""
+        DG_WSPATH=""
+        DG_CDN=off
+        DG_ALTHOST=""
+        DG_CLEAN_IPS=""
+        DG_UTLS=off
+        DG_FRAGMENT=off
+        DG_HTTPHEADER=off
+        DG_HTTPHOST=""
+    else
+        ask_disguise "$mode"
+    fi
+    ask_sharing
     init_agents_dir
+
     local count
     count=$(agent_count)
 
@@ -1553,25 +1578,6 @@ create_tunnel() {
     done
     ulisten="$uport"
 
-    ask_gre
-    if [ "$DG_GRE" = on ]; then
-        # Nothing to disguise: only GRE crosses the border. Everything the other
-        # questions would have set is put back to its plain value, so nothing is
-        # left over from an earlier tunnel made in the same session.
-        DG_TRANSPORT=plain
-        DG_SERVERNAME=""
-        DG_WSPATH=""
-        DG_CDN=off
-        DG_ALTHOST=""
-        DG_CLEAN_IPS=""
-        DG_UTLS=off
-        DG_FRAGMENT=off
-        DG_HTTPHEADER=off
-        DG_HTTPHOST=""
-    else
-        ask_disguise "$mode"
-    fi
-    ask_sharing
 
     say ""
     info "Last port: a private one the two servers use between themselves."

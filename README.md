@@ -270,9 +270,11 @@ What to know before using it:
 
 The link between the servers needs a port that is free on the server that opens
 it, and a CDN forwards only some ports. Both are easy to forget, so the menu shows
-them side by side: **Show free ports on both servers** (menu option 11), and the
-same table appears when you pick the link port while creating a tunnel or changing
-its ports.
+them side by side: **Show free ports on both servers** (menu option 11). The
+same table appears when you pick the link port of a tunnel that goes through a CDN,
+while creating it or changing its ports. Only those tunnels are limited in which ports
+they can use, so the menu asks what the link looks like (GRE, plain, website, CDN...)
+before it asks about any port, and every other kind of tunnel can use any port.
 
 ```
 PORT   THIS SERVER             FOREIGN SERVER          CDN
