@@ -1300,9 +1300,13 @@ write_tunnel() {
 # the firewall view while never being able to run.
 discard_tunnel() {
     systemctl disable --now "$(unit_of "$1")" >/dev/null 2>&1
+    # Starting it may already have set a firewall rule or a GRE link, so those go
+    # while the settings that name them are still here.
+    "$FIREWALL" remove "$1" >/dev/null 2>&1
     rm -f "$(conf_of "$1")" "$(secret_of "$1")" "$RUN_DIR/$1.json" \
         "$CONF_DIR/$1.crt" "$CONF_DIR/$1.key"
     systemctl daemon-reload
+    "$FIREWALL" sweep quiet >/dev/null 2>&1
 }
 
 validate_and_enable() {
@@ -2673,6 +2677,9 @@ delete_tunnel() {
     rm -f "$(conf_of "$name")" "$(secret_of "$name")" "$RUN_DIR/$name.json" \
         "$RUN_DIR/$name.sock" "$CONF_DIR/$name.crt" "$CONF_DIR/$name.key"
     systemctl daemon-reload
+    # Whatever the steps above or the other server's clean-up missed, now that the
+    # settings are gone nothing of this tunnel's can be mistaken for something wanted.
+    "$FIREWALL" sweep quiet >/dev/null 2>&1
     ok "Tunnel '$name' removed."
 }
 
@@ -2932,6 +2939,9 @@ uninstall_all() {
         systemctl disable --now "$(unit_of "$n")" >/dev/null 2>&1
         "$FIREWALL" remove "$n" >/dev/null 2>&1
     done
+    # Anything of PortBridge's still in the firewall, or any GRE link, whether or
+    # not a tunnel was left to name it.
+    "$FIREWALL" sweep all >/dev/null 2>&1
     systemctl disable --now "$AGENT_UNIT" >/dev/null 2>&1
     rm -f /etc/systemd/system/portbridge@.service /etc/systemd/system/portbridge-agent.service
     systemctl daemon-reload
@@ -3764,6 +3774,7 @@ firewall_menu() {
         say "  ${NUM}3${R}) Change which address a tunnel allows"
         say "  ${NUM}4${R}) Turn it off for every tunnel"
         say "  ${NUM}5${R}) Turn it on for every tunnel"
+        say "  ${NUM}6${R}) Remove leftovers of tunnels that no longer exist"
         say "  ${NUM}0${R}) Back"
         hr
         choice=$(ask "Choose" "0")
@@ -3794,6 +3805,9 @@ firewall_menu() {
                 ;;
             5)
                 for n in $(tunnel_names); do set_firewall "$n" on; done
+                ;;
+            6)
+                "$FIREWALL" sweep
                 ;;
             *) return 0 ;;
         esac

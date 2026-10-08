@@ -53,6 +53,9 @@ type agentHost interface {
 	PortFree(transport Transport, port int) error
 	FirewallApply(name string) error
 	FirewallRemove(name string) error
+	// FirewallSweep removes what is left in the firewall by tunnels that no
+	// longer exist.
+	FirewallSweep() error
 	Reload() error
 	// Enable turns the service on and starts it.
 	Enable(name string) error
@@ -92,6 +95,7 @@ type noHost struct{}
 func (noHost) PortFree(Transport, int) error { return nil }
 func (noHost) FirewallApply(string) error    { return nil }
 func (noHost) FirewallRemove(string) error   { return nil }
+func (noHost) FirewallSweep() error          { return nil }
 func (noHost) Reload() error                 { return nil }
 func (noHost) Enable(string) error           { return nil }
 func (noHost) Disable(string) error          { return nil }
@@ -161,6 +165,19 @@ func (systemHost) FirewallRemove(name string) error {
 	}
 	if out, err := hostRun(firewallHelper, "remove", name); err != nil {
 		return fmt.Errorf("firewall: %s: %w", out, err)
+	}
+	return nil
+}
+
+// FirewallSweep clears away whatever is left in the firewall, and any GRE link,
+// for tunnels whose settings no longer exist. It is run after a tunnel's files
+// are removed, when nothing of its can be mistaken for something wanted.
+func (systemHost) FirewallSweep() error {
+	if _, err := os.Stat(firewallHelper); err != nil {
+		return nil
+	}
+	if out, err := hostRun(firewallHelper, "sweep", "quiet"); err != nil {
+		return fmt.Errorf("firewall sweep: %s: %w", out, err)
 	}
 	return nil
 }

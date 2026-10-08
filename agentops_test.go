@@ -27,6 +27,8 @@ func (h *recordingHost) note(s string) { h.calls = append(h.calls, s) }
 
 func (h *recordingHost) ListenOwner(int) string { return "" }
 
+func (h *recordingHost) FirewallSweep() error { h.note("sweep"); return nil }
+
 func (h *recordingHost) PortFree(Transport, int) error { h.note("port"); return h.portErr }
 func (h *recordingHost) FirewallApply(n string) error  { h.note("fw+" + n); return nil }
 func (h *recordingHost) FirewallRemove(n string) error { h.note("fw-" + n); return nil }

@@ -45,6 +45,7 @@ Usage:
   portbridge-firewall apply  <tunnel-name>   lock, or unlock if turned off; make the GRE link
   portbridge-firewall remove <tunnel-name>
   portbridge-firewall show   <tunnel-name>
+  portbridge-firewall sweep [all]            remove what is left behind by tunnels that no longer exist
   portbridge-firewall gre-check              can this server make GRE links at all?
   portbridge-firewall gre-addr <this-ip> <other-ip>
                                              the link's name and the two private addresses
@@ -474,6 +475,73 @@ firewall_apply() {
     echo "tunnel port $TPORT ($PROTO) is restricted to $PEER"
 }
 
+# cmd_sweep [quiet|all] - removes whatever PortBridge left behind for tunnels that
+# no longer exist: firewall rules carrying a tunnel's tag when that tunnel has no
+# settings file any more, GRE rules and links no tunnel needs. It is the safety net
+# under every other way of cleaning up: a tunnel deleted by hand, by an older
+# version, by a program that stopped half way, or on a server where the rule
+# listing was written in a form the older cleaning did not understand.
+#
+# It touches only rules whose comment is "portbridge:<name>" or
+# "portbridge-gre:<link>", and only links named like the ones this makes. Nobody
+# else's rules are looked at. If the settings directory is missing it does nothing,
+# since it could not tell what is still wanted; "all" is for uninstalling, when
+# nothing is.
+cmd_sweep() {
+    local mode=${1-} tool rule name iface f n used="" removed=0
+    local re_tunnel='--comment "?portbridge:([A-Za-z0-9_-]+)"?( |$)'
+    local re_link='--comment "?portbridge-gre:(pbg[0-9a-f]{8})"?( |$)'
+
+    if [ "$mode" != all ]; then
+        if [ ! -d "$CONF_DIR" ]; then
+            [ "$mode" = quiet ] || echo "there is no settings directory ($CONF_DIR), so nothing can be told apart; nothing swept"
+            return 0
+        fi
+        for f in "$CONF_DIR"/*.conf; do
+            [ -e "$f" ] || continue
+            n=$(basename "$f" .conf)
+            gre_conf "$n"
+            [ "$GRE_ON" = on ] || continue
+            gre_pair "$GRE_LOCAL" "$GRE_REMOTE" && used="$used $GRE_IFACE "
+        done
+    fi
+
+    for tool in iptables ip6tables; do
+        have "$tool" || continue
+        while read -r rule; do
+            if [[ "$rule" =~ $re_tunnel ]]; then
+                name=${BASH_REMATCH[1]}
+                [ "$mode" != all ] && [ -f "$CONF_DIR/$name.conf" ] && continue
+            elif [[ "$rule" =~ $re_link ]]; then
+                iface=${BASH_REMATCH[1]}
+                case "$used" in *" $iface "*) continue ;; esac
+            else
+                continue
+            fi
+            delete_rule "$tool" "$rule"
+            removed=$((removed + 1))
+        done < <("$tool" -S INPUT 2>/dev/null)
+    done
+
+    if have ip; then
+        for iface in $(ip -o link show 2>/dev/null | awk -F': ' '{print $2}' | sed 's/@.*//'); do
+            [[ "$iface" =~ ^pbg[0-9a-f]{8}$ ]] || continue
+            case "$used" in *" $iface "*) continue ;; esac
+            if ip link del "$iface" 2>/dev/null; then
+                echo "removed the GRE link $iface, which no tunnel uses"
+                removed=$((removed + 1))
+            fi
+        done
+    fi
+
+    if [ "$removed" -gt 0 ]; then
+        echo "swept $removed leftover rule(s) and link(s) of tunnels that no longer exist"
+    elif [ "$mode" != quiet ]; then
+        echo "nothing left behind"
+    fi
+    return 0
+}
+
 # cmd_apply makes the GRE link first, since a tunnel over one cannot start
 # without it, then sets the port rule. A link that cannot be made is reported
 # and makes the command fail, but the port rule is still dealt with.
@@ -482,6 +550,8 @@ cmd_apply() {
     load "$name" || exit 1
     link_apply "$name" || rc=1
     firewall_apply "$name"
+    # Starting a tunnel is a good moment to clear away what deleted ones left.
+    cmd_sweep quiet
     return "$rc"
 }
 
@@ -565,6 +635,13 @@ case "${1-}:$#" in
     apply:2) cmd_apply "$2" ;;
     remove:2) cmd_remove "$2" ;;
     show:2) cmd_show "$2" ;;
+    sweep:1) cmd_sweep ;;
+    sweep:2)
+        case "$2" in
+            all | quiet) cmd_sweep "$2" ;;
+            *) usage ;;
+        esac
+        ;;
     gre-check:1) cmd_gre_check ;;
     gre-addr:3) cmd_gre_addr "$2" "$3" ;;
     gre-test:2) cmd_gre_test "$2" ;;

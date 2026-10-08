@@ -21,6 +21,8 @@ case "$1 $2" in
     cat "$S/addrs" 2>/dev/null; exit 0 ;;
   "-4 addr") # ip -4 addr show dev NAME
     grep -F " $5 " "$S/addrs" 2>/dev/null; exit 0 ;;
+  "-o link") # ip -o link show: one line per interface, as the real one prints them
+    for f in "$S"/if_*; do [ -e "$f" ] || continue; echo "9: ${f##*/if_}@NONE: <POINTOPOINT,NOARP> mtu 1300"; done; exit 0 ;;
   "link show")
     [ -e "$S/if_$3" ] || exit 1
     echo "$3: <POINTOPOINT,NOARP,$(cat "$S/if_$3")> mtu 1300"; exit 0 ;;
@@ -47,7 +49,7 @@ exit 0
 // does, with the comment in double quotes. That detail matters: a rule can only
 // be deleted by giving its comment without the quotes.
 const fakeIptables = `#!/usr/bin/env bash
-R="$FAKE_STATE/rules"; touch "$R"
+R="$FAKE_STATE/rules"; [ "$(basename "$0")" = ip6tables ] && R="$FAKE_STATE/rules6"; touch "$R"
 echo "iptables $*" >> "$FAKE_STATE/log"
 cmd=$1; shift
 shift # the chain
@@ -82,7 +84,7 @@ func newGRERig(t *testing.T) *greRig {
 	}
 	r := &greRig{t: t, bash: bash, state: t.TempDir(), conf: t.TempDir()}
 	bin := t.TempDir()
-	for name, body := range map[string]string{"ip": fakeIP, "iptables": fakeIptables, "modprobe": fakeNoop, "ping": fakeNoop} {
+	for name, body := range map[string]string{"ip": fakeIP, "iptables": fakeIptables, "ip6tables": fakeIptables, "modprobe": fakeNoop, "ping": fakeNoop} {
 		if err := os.WriteFile(filepath.Join(bin, name), []byte(body), 0o755); err != nil {
 			t.Fatal(err)
 		}

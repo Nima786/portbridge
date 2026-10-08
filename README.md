@@ -546,6 +546,26 @@ match on both sides, and server clocks that disagree.
 The menu has an option that stops every tunnel, removes the firewall rules it
 added, and deletes everything it installed.
 
+## Nothing is left in the firewall
+
+Every firewall rule PortBridge adds carries a comment naming its tunnel
+(`portbridge:<name>`), and every GRE link a comment naming the link
+(`portbridge-gre:<link>`). Deleting a tunnel removes them, on both servers. As a
+safety net under that, **sweep** (`portbridge-firewall sweep`) removes any such rule,
+and any GRE link, whose tunnel no longer has a settings file. It runs by itself
+after every delete (from the menu, from the other server, or through the agent),
+after a setup that failed, whenever any tunnel starts, and in full when
+PortBridge is uninstalled. It can also be run from the menu (Firewall, then
+**Remove leftovers**). It never touches a rule that is not one of those: not
+yours, not one that merely looks similar. If the settings directory is missing it
+does nothing, since it could not tell what is still wanted.
+
+Earlier versions could leave rules behind on servers that list their rules with
+the comment in quotes (nftables does), because the clean-up did not recognise
+that form. Those are removed the first time a tunnel starts or is deleted after
+updating, or at once with the Firewall menu's last option. Rules from before
+rules were tagged cannot be told apart from someone else's and are never touched.
+
 ## Not included
 
 - Forwarding arbitrary raw client UDP ports (while PortBridge provides a loss-resistant UDP-based KCP transport with FEC for the cross-border link, client services forwarded through the tunnel are TCP).

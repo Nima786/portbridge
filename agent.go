@@ -243,6 +243,7 @@ func applyPairingWarn(p *PairingData, confDir string, warns *[]string) error {
 			// that fails to find its address.
 			_ = host.FirewallRemove(p.Name)
 			undo()
+			_ = host.FirewallSweep()
 			return fmt.Errorf("this server could not make the private GRE link: %w", err)
 		}
 		log.Printf("[%s] warning: %v", p.Name, err)
@@ -258,6 +259,7 @@ func applyPairingWarn(p *PairingData, confDir string, warns *[]string) error {
 		_ = host.Disable(p.Name)
 		_ = host.FirewallRemove(p.Name)
 		undo()
+		_ = host.FirewallSweep()
 		_ = host.Reload()
 		return err
 	}
@@ -265,6 +267,7 @@ func applyPairingWarn(p *PairingData, confDir string, warns *[]string) error {
 		_ = host.Disable(p.Name)
 		_ = host.FirewallRemove(p.Name)
 		undo()
+		_ = host.FirewallSweep()
 		_ = host.Reload()
 		return err
 	}
@@ -334,6 +337,11 @@ func deleteTunnel(name string, confDir string) error {
 	_ = os.Remove(keyFile)
 	host.RemoveRuntime(name)
 	_ = host.Reload()
+	// With the settings gone, anything of this tunnel's left in the firewall (by
+	// an older version, or a clean-up that stopped half way) is cleared too.
+	if err := host.FirewallSweep(); err != nil {
+		log.Printf("[%s] sweeping leftovers: %v", name, err)
+	}
 	return nil
 }
 

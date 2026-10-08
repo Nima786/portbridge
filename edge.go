@@ -584,6 +584,12 @@ func (e *edge) selfDelete() {
 		}
 	}
 
+	// With the settings gone, anything of this tunnel's still in the firewall can
+	// no longer be mistaken for something wanted.
+	if out, err := exec.Command("/usr/local/bin/portbridge-firewall", "sweep", "quiet").CombinedOutput(); err != nil {
+		log.Printf("[%s] sweeping leftovers: %s (err: %v)", name, string(out), err)
+	}
+
 	// 3. Stop and disable systemd unit
 	unit := fmt.Sprintf("portbridge@%s.service", name)
 	// Disabled first. Stopping is what ends this very process, so anything
