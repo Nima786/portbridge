@@ -464,7 +464,31 @@ func (r *router) dialRoute(i int, timeout time.Duration) (net.Conn, error) {
 		return kcpDial(r.targets[i].addr, r.cfg)
 	}
 	d := net.Dialer{Timeout: timeout}
+	if r.cfg != nil {
+		d.LocalAddr = r.cfg.sourceFor(r.targets[i].addr)
+	}
 	return d.Dial("tcp", r.targets[i].addr)
+}
+
+// sourceFor is the address to connect from when the other server is reached over
+// IPv6: this server's own IPv6 address from the settings. A server with several
+// IPv6 addresses would otherwise pick one itself, and the other side's firewall
+// lets in only the one it was told. Nothing is chosen for IPv4, for a name, or
+// when the two are not the same kind of address, so those connect as always.
+func (c *Config) sourceFor(target string) net.Addr {
+	local := net.ParseIP(c.LocalIP)
+	if local == nil || local.To4() != nil {
+		return nil
+	}
+	host, _, err := net.SplitHostPort(target)
+	if err != nil {
+		return nil
+	}
+	dst := net.ParseIP(host)
+	if dst == nil || dst.To4() != nil {
+		return nil
+	}
+	return &net.TCPAddr{IP: local}
 }
 
 // dialIdx tries each route in turn, beginning with the preferred one, and

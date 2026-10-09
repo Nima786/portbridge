@@ -462,14 +462,23 @@ firewall_apply() {
 
     # Added bottom to top, each at the top of the chain: the drop first, then the
     # addresses allowed through, which end up above it.
-    add_rule iptables "$name" DROP
-    add_rule iptables "$name" ACCEPT 127.0.0.1
-    add_rule iptables "$name" ACCEPT "$PEER"
-
-    # The port is bound on IPv6 too. The peer is recorded as IPv4, so close v6
-    # rather than leaving an unguarded way in.
-    if have ip6tables && [[ "$PEER" != *:* ]]; then
+    if [[ "$PEER" == *:* ]]; then
+        # The peer connects over IPv6: it is let in on the IPv6 side, and the same
+        # port is shut on the IPv4 side, where nobody has any business with it.
         add_rule ip6tables "$name" DROP
+        add_rule ip6tables "$name" ACCEPT ::1
+        add_rule ip6tables "$name" ACCEPT "$PEER"
+        add_rule iptables "$name" DROP
+        add_rule iptables "$name" ACCEPT 127.0.0.1
+    else
+        add_rule iptables "$name" DROP
+        add_rule iptables "$name" ACCEPT 127.0.0.1
+        add_rule iptables "$name" ACCEPT "$PEER"
+        # The port is bound on IPv6 too. The peer is recorded as IPv4, so close v6
+        # rather than leaving an unguarded way in.
+        if have ip6tables; then
+            add_rule ip6tables "$name" DROP
+        fi
     fi
 
     echo "tunnel port $TPORT ($PROTO) is restricted to $PEER"

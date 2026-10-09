@@ -530,6 +530,112 @@ gre_plan() {
     [ -n "${GRE_PEER-}" ]
 }
 
+# ---------------------------------------------------------------------- IPv6
+#
+# Some networks cut ordinary IPv4 connections between countries after a few packets
+# yet leave IPv6 alone. A tunnel over IPv6 is the plain link with IPv6 addresses
+# for the two servers, so nothing is made or set up: only the addresses differ.
+
+V6_ON=off
+V6_LOCAL=""
+V6_PEER=""
+
+# hostport <host> <port> - host:port, with an IPv6 address in brackets.
+hostport() {
+    case "$1" in
+        *:*) printf '[%s]:%s' "$1" "$2" ;;
+        *) printf '%s:%s' "$1" "$2" ;;
+    esac
+}
+
+# bare_host <host:port> - the host of an address as hostport writes it, without
+# the brackets, which the shell's own connection test does not understand.
+bare_host() {
+    local h=${1%:*}
+    h=${h#\[}
+    h=${h%\]}
+    printf '%s' "$h"
+}
+
+# first_global_ipv6 - this server's first public IPv6 address, or nothing.
+first_global_ipv6() {
+    "$BIN" addresses 2>/dev/null | awk '$1 == "ipv6" {print $2; exit}'
+}
+
+# foreign_ipv6 <agent alias> - the foreign server's first public IPv6 address,
+# asked of its agent. Prints it and returns 0; returns 1 if it was asked and has
+# none; 2 if it could not be asked (no agent, not reachable, too old).
+foreign_ipv6() {
+    local out
+    if [ -z "${1-}" ] || [ ! -f "$(agent_conf_of "$1")" ]; then
+        return 2
+    fi
+    out=$(agent_call_alias "$1" -addresses 2>/dev/null) || return 2
+    out=$(printf '%s\n' "$out" | awk '$1 == "ipv6" {print $2; exit}')
+    [ -n "$out" ] || return 1
+    printf '%s' "$out"
+}
+
+# ask_ipv6 <agent alias or empty> - offers to connect the two servers over IPv6
+# when both have a public IPv6 address. Sets V6_ON to on or off, and when on
+# V6_LOCAL (this server's address) and V6_PEER (the foreign server's). Says nothing
+# at all when this server has no IPv6, so it costs nobody who cannot use it a question.
+ask_ipv6() {
+    local alias=${1-} mine theirs typed st
+    V6_ON=off
+    V6_LOCAL=""
+    V6_PEER=""
+    mine=$(first_global_ipv6)
+    [ -n "$mine" ] || return 0
+
+    printf '%s' "${DIM}Looking for IPv6 on the foreign server...${R}" >&2
+    theirs=$(foreign_ipv6 "$alias")
+    st=$?
+    printf '\r%*s\r' 50 '' >&2
+    if [ "$st" -eq 1 ]; then
+        say "${DIM}The foreign server has no public IPv6 address, so this link uses IPv4.${R}"
+        return 0
+    fi
+
+    hr
+    say "${B}Connect the two servers over IPv6?${R}"
+    say ""
+    say "Some networks cut ordinary IPv4 connections between countries after a few packets"
+    say "but leave IPv6 alone. This Iran server has the IPv6 address ${B}$mine${R}."
+    if [ "$st" -eq 0 ]; then
+        say "The foreign server has ${B}$theirs${R}."
+    else
+        say "The foreign server's IPv6 address could not be found automatically."
+        typed=$(ask "Foreign server's IPv6 address (Enter to use IPv4)" "")
+        [ -n "$typed" ] || return 0
+        case "$typed" in
+            *:*) ;;
+            *) err "  That is not an IPv6 address; using IPv4."; return 0 ;;
+        esac
+        if ! valid_host "$typed"; then
+            err "  That does not look like an address; using IPv4."
+            return 0
+        fi
+        theirs=$typed
+    fi
+    say "${DIM}Like any plain link it is not encrypted or disguised.${R}"
+    hr
+    confirm "Use IPv6 between the two servers?" || return 0
+
+    if command -v ping >/dev/null 2>&1; then
+        if ping -6 -c 3 -W 3 "$theirs" >/dev/null 2>&1; then
+            ok "  IPv6 works between the two servers."
+        else
+            warn "  The foreign server did not answer over IPv6. Its firewall may block pings, or"
+            warn "  IPv6 may not be working on one of the servers."
+            confirm "  Use IPv6 anyway?" || return 0
+        fi
+    fi
+    V6_ON=on
+    V6_LOCAL=$mine
+    V6_PEER=$theirs
+}
+
 # ask_gre - whether the tunnel runs over a private GRE link. Sets DG_GRE to on or
 # off. The link between the servers is then plain and needs no disguise, since the
 # only thing that crosses the border is GRE, so the caller skips that question.
@@ -1698,6 +1804,15 @@ create_tunnel() {
         done
     fi
 
+    # IPv6 changes only the addresses. It is offered for the plain link, which is what
+    # has been tried over it; not for a CDN (which reaches the foreign server by name),
+    # GRE (IPv4 only), or the disguised links, whose certificates are made for a name.
+    V6_ON=off
+    if [ "$DG_GRE" != on ] && [ "$DG_TRANSPORT" = plain ] && ! cdn_involved "$DG_CDN" "$DG_ALTHOST"; then
+        ask_ipv6 "$target_agent"
+        [ "$V6_ON" = on ] && peer=$V6_PEER
+    fi
+
     say ""
     info "The port of your inbound on the foreign server, as shown in your panel."
     info "For multiple ports/services, separate them with commas (e.g. 443, 8443, 2083)."
@@ -1770,23 +1885,33 @@ create_tunnel() {
     done
 
     if [ "$mode" = direct ]; then
-        taddr="$peer:$tport"
+        taddr=$(hostport "$peer" "$tport")
+    elif [ "$V6_ON" = on ]; then
+        taddr="[::]:$tport"
     else
         taddr="0.0.0.0:$tport"
     fi
 
-    printf '%s' "${DIM}Working out this server's own IP...${R}" >&2
-    localip=$(public_ip)
-    printf '\r%*s\r' 45 '' >&2
-    say ""
-    info "Last thing: this Iran server's own IP, the one in your users' configs."
-    info "Detected: ${localip:-could not tell}"
-    info "Some hosts show a different address for outgoing traffic, so please check."
-    while :; do
-        localip=$(ask "This Iran server's IP" "$localip")
-        valid_host "$localip" && break
-        err "  That does not look like an address."
-    done
+    local users_ip
+    if [ "$V6_ON" = on ]; then
+        # The link uses the IPv6 addresses; your users still connect over IPv4.
+        localip=$V6_LOCAL
+        users_ip=$(public_ip)
+    else
+        printf '%s' "${DIM}Working out this server's own IP...${R}" >&2
+        localip=$(public_ip)
+        printf '\r%*s\r' 45 '' >&2
+        say ""
+        info "Last thing: this Iran server's own IP, the one in your users' configs."
+        info "Detected: ${localip:-could not tell}"
+        info "Some hosts show a different address for outgoing traffic, so please check."
+        while :; do
+            localip=$(ask "This Iran server's IP" "$localip")
+            valid_host "$localip" && break
+            err "  That does not look like an address."
+        done
+        users_ip=$localip
+    fi
 
     secret=$(gen_secret)
 
@@ -1822,7 +1947,8 @@ create_tunnel() {
     else
         say "  foreign server     $peer ${DIM}[manual pairing code]${R}"
     fi
-    say "  your users use     $localip port $uport"
+    say "  your users use     ${users_ip:-$localip} port $uport"
+    [ "$V6_ON" = on ] && say "  the two servers    talk over IPv6: $localip and $peer"
     say "  traffic goes to    $peer port $inport"
     if [ "$DG_GRE" = on ]; then
         if [ "$mode" = direct ]; then
@@ -1832,7 +1958,7 @@ create_tunnel() {
         fi
         say "                     inside a private GRE link between $localip and $peer"
     elif [ "$mode" = direct ]; then
-        say "  connection         direct: this Iran server connects out to $peer:$tport"
+        say "  connection         direct: this Iran server connects out to $(hostport "$peer" "$tport")"
     else
         say "  connection         reverse: $peer connects in to this Iran server on port $tport"
         if cdn_involved "$DG_CDN" "$DG_ALTHOST"; then
@@ -2086,7 +2212,10 @@ join_tunnel() {
     hr
     say "${B}This code sets up the foreign half of:${R}"
     say "  tunnel name        $name"
-    say "  your users use     $relay_ip"
+    case "$relay_ip" in
+        *:*) say "  link               over IPv6, with the Iran server at $relay_ip" ;;
+        *) say "  your users use     $relay_ip" ;;
+    esac
     say "  traffic goes to    your inbound on port $inport, on this server"
     if [ "$DG_GRE" = on ]; then
         if [ "$mode" = direct ]; then
@@ -2131,9 +2260,11 @@ join_tunnel() {
             return 1
         fi
         taddr="0.0.0.0:$tport"
+        # The Iran server connecting over IPv6 means listening on IPv6; [::] takes both.
+        case "$relay_ip" in *:*) taddr="[::]:$tport" ;; esac
         [ "$DG_GRE" = on ] && taddr="$gre_own:$tport"
     else
-        taddr="$relay_ip:$tport"
+        taddr=$(hostport "$relay_ip" "$tport")
         [ "$DG_GRE" = on ] && taddr="$gre_peer:$tport"
     fi
 
@@ -2227,6 +2358,7 @@ status_line() {
         *) look=plain ;;
     esac
     [ "$(read_conf "$name" gre)" = on ] && look=gre
+    case "$(read_conf "$name" peer_ip)" in *:*) [ "$look" = plain ] && look=ipv6 ;; esac
 
     # Said plainly when the tunnel has found that nothing gets through, so a row
     # that shows connections "ready" is not read as a tunnel that works.
@@ -2305,6 +2437,7 @@ pick_row() {
     [ -n "$tport" ] && detail="$detail | link ${tport##*:}"
     [ -n "$peer" ] && detail="$detail | other $peer"
     [ "$(read_conf "$name" gre)" = on ] && detail="$detail | GRE"
+    case "$peer" in *:*) detail="$detail | IPv6" ;; esac
     printf '  %s%2s%s)  %s%s%s %s%-*s%s  %s%-9s%s %s%s%s\n' \
         "$NUM" "$idx" "$R" "$colour" "$DOT" "$R" "$B" "$width" "$name" "$R" \
         "$colour" "$word" "$R" "$DIM" "$detail" "$R"
@@ -2744,8 +2877,8 @@ edit_tunnel_settings() {
             local taddr
             taddr=$(read_conf "$name" tunnel_addr)
             case "$taddr" in
-                0.0.0.0:*|:::*) : ;;
-                *) write_conf "$name" tunnel_addr "$new:${taddr##*:}" ;;
+                0.0.0.0:*|:::*|\[::\]:*) : ;;
+                *) write_conf "$name" tunnel_addr "$(hostport "$new" "${taddr##*:}")" ;;
             esac
             changed=1
         fi
@@ -2942,7 +3075,7 @@ test_tunnel() {
             # A UDP port cannot be probed by connecting to it; whether the two
             # servers are linked, below, is the real answer.
             result "other server reachable" note "UDP, cannot be probed; see whether the servers are linked below"
-        elif timeout 8 bash -c "echo > /dev/tcp/${taddr%:*}/${taddr##*:}" 2>/dev/null; then
+        elif timeout 8 bash -c "echo > /dev/tcp/$(bare_host "$taddr")/${taddr##*:}" 2>/dev/null; then
             result "other server reachable" good "yes, $taddr"
         else
             result "other server reachable" bad "no, cannot reach $taddr"

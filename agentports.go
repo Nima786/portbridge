@@ -32,6 +32,11 @@ func buildOriginConf(p *PairingData, secretFile, certFile, keyFile string) strin
 	var tunnelAddr string
 	if p.Mode == "direct" {
 		tunnelAddr = "0.0.0.0:" + p.TunnelPort
+		// When the Iran server connects over IPv6 (its address in the code is an
+		// IPv6 one), this side has to listen on IPv6. "[::]" takes both families.
+		if ip := net.ParseIP(p.RelayIP); ip != nil && ip.To4() == nil {
+			tunnelAddr = "[::]:" + p.TunnelPort
+		}
 	} else {
 		tunnelAddr = net.JoinHostPort(p.RelayIP, p.TunnelPort)
 	}

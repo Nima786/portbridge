@@ -524,6 +524,9 @@ func runAgentServer(listenAddr, token, certFile, keyFile, confDir string) error 
 	// POST /api/ports: which of a list of ports can this server give a tunnel?
 	mux.HandleFunc("/api/ports", portsHandler(token, confDir))
 
+	// GET /api/addresses: this server's public IPv4 and IPv6 addresses.
+	mux.HandleFunc("/api/addresses", addressesHandler(token))
+
 	// POST /api/tunnel/delete
 	mux.HandleFunc("/api/tunnel/delete", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
@@ -979,6 +982,7 @@ func cmdJoin(args []string) error {
 	isUpdate := fs.Bool("update", false, "change the ports and settings of a tunnel that already exists, from a new code")
 	isDelete := fs.Bool("delete", false, "delete remote tunnel instead of joining")
 	isStatus := fs.Bool("status", false, "check status/connectivity to remote agent")
+	wantAddresses := fs.Bool("addresses", false, "ask the remote agent for its server's public IPv4 and IPv6 addresses")
 	portsList := fs.String("ports", "", "ask the remote agent which of these ports (comma separated) are free on its server")
 	isListAgents := fs.Bool("list-agents", false, "list all saved foreign agent profiles")
 
@@ -1082,6 +1086,13 @@ func cmdJoin(args []string) error {
 			return errors.New("-agent-url, -agent, or agent config required for -ports")
 		}
 		return agentClientPorts(*agentURL, *token, *portsList, trust)
+	}
+
+	if *wantAddresses {
+		if *agentURL == "" {
+			return errors.New("-agent-url, -agent, or agent config required for -addresses")
+		}
+		return agentClientAddresses(*agentURL, *token, trust)
 	}
 
 	if *isDelete {

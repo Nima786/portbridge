@@ -229,6 +229,36 @@ does not use it), and if the two disagree each side says so in the log. In the
 settings file it is `http_header = on` and `http_host = <name>`, for the plain
 link only.
 
+## Connecting the two servers over IPv6
+
+Some networks cut ordinary IPv4 connections between countries after a few packets and
+leave IPv6 alone. Between a real Iran server and a foreign one where a plain IPv4 tunnel
+stalled after 13 KB, the same plain tunnel over IPv6 moved 20 MB down in about 1.3
+seconds and 10 MB up in about 1.9, at around 16 MB per second, with the firewall lock
+on. Nothing has to be made or set up: it is the plain link with IPv6 addresses.
+
+When you create a tunnel, if this server has a public IPv6 address, the menu asks
+**"Connect the two servers over IPv6?"**, after you have chosen the foreign server and
+before any port. It finds the foreign server's IPv6 address through its agent (without
+one, you type it), shows both, and pings it before going on. It asks nothing at all on
+a server with no IPv6.
+
+- Your users still connect to the Iran server the way they do now, over IPv4. Only the
+  link between your two servers uses IPv6.
+- It is offered for the plain link (with or without the web header). It is not offered
+  with a CDN, with GRE, or with the disguised links: those have not been tried over
+  IPv6, and a CDN reaches the foreign server by name.
+- The firewall lock works for IPv6 too: the port is open to the other server's IPv6
+  address only, and shut over IPv4. The tunnel connects from the address in its
+  settings, so a server with several IPv6 addresses always uses the one that is let in.
+- Both servers need working IPv6. The foreign server must run this version for the
+  menu to find its address; otherwise you type it.
+- In the settings file there is nothing new: `peer_ip`, `local_ip` and `tunnel_addr` hold
+  IPv6 addresses (`tunnel_addr` in brackets, `[2001:db8::1]:443`). The pairing code is
+  unchanged; an IPv6 address in it makes the foreign server listen on IPv6. From the
+  command line, `portbridge addresses` lists a server's public addresses, and
+  `portbridge join -agent <alias> -addresses` those of the foreign one.
+
 ## Carrying a tunnel over a private GRE link
 
 Some networks cut ordinary connections that leave the country after a few packets
