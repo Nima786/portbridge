@@ -240,8 +240,9 @@ on. Nothing has to be made or set up: it is the plain link with IPv6 addresses.
 When you create a tunnel, if this server has a public IPv6 address, the menu asks
 **"Connect the two servers over IPv6?"**, after you have chosen the foreign server and
 before any port. It finds the foreign server's IPv6 address through its agent (without
-one, you type it), shows both, and pings it before going on. It asks nothing at all on
-a server with no IPv6.
+one, you type it), shows both, and pings it before going on. On a server with no public
+IPv6 address (one that shows only an address starting fe80, which is for its own
+network only) it says so in one line and uses IPv4.
 
 - Your users still connect to the Iran server the way they do now, over IPv4. Only the
   link between your two servers uses IPv6.

@@ -578,15 +578,22 @@ foreign_ipv6() {
 
 # ask_ipv6 <agent alias or empty> - offers to connect the two servers over IPv6
 # when both have a public IPv6 address. Sets V6_ON to on or off, and when on
-# V6_LOCAL (this server's address) and V6_PEER (the foreign server's). Says nothing
-# at all when this server has no IPv6, so it costs nobody who cannot use it a question.
+# V6_LOCAL (this server's address) and V6_PEER (the foreign server's). When this
+# server has no public IPv6 address it says so in one line and asks nothing.
 ask_ipv6() {
     local alias=${1-} mine theirs typed st
     V6_ON=off
     V6_LOCAL=""
     V6_PEER=""
     mine=$(first_global_ipv6)
-    [ -n "$mine" ] || return 0
+    if [ -z "$mine" ]; then
+        # Said in one line, not skipped in silence: a server that shows only an
+        # address starting fe80 has IPv6 for its own network only, which the other
+        # server cannot reach, and someone looking for the question wonders why.
+        say "${DIM}IPv6 is not offered: this server has no public IPv6 address (only a local one,${R}"
+        say "${DIM}or none), so the link uses IPv4. Your hosting provider can give it one.${R}"
+        return 0
+    fi
 
     printf '%s' "${DIM}Looking for IPv6 on the foreign server...${R}" >&2
     theirs=$(foreign_ipv6 "$alias")
