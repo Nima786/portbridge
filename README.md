@@ -235,7 +235,7 @@ Some networks cut ordinary IPv4 connections between countries after a few packet
 leave IPv6 alone. Between a real Iran server and a foreign one where a plain IPv4 tunnel
 stalled after 13 KB, the same plain tunnel over IPv6 moved 20 MB down in about 1.3
 seconds and 10 MB up in about 1.9, at around 16 MB per second, with the firewall lock
-on. Nothing has to be made or set up: it is the plain link with IPv6 addresses.
+on. Nothing has to be made or set up: it is the same link with IPv6 addresses.
 
 When you create a tunnel, if this server has a public IPv6 address, the menu asks
 **"Connect the two servers over IPv6?"**, after you have chosen the foreign server and
@@ -246,9 +246,13 @@ network only) it says so in one line and uses IPv4.
 
 - Your users still connect to the Iran server the way they do now, over IPv4. Only the
   link between your two servers uses IPv6.
-- It is offered for the plain link (with or without the web header). It is not offered
-  with a CDN, with GRE, or with the disguised links: those have not been tried over
-  IPv6, and a CDN reaches the foreign server by name.
+- It is offered for the plain link (with or without the web header) and for the
+  disguised links that connect straight to the foreign server: the website (TLS),
+  HTTP/2 and gRPC links, which kept the disguise and ran at full speed over IPv6 in a
+  trial between a real Iran server and a foreign one. It is not offered with a CDN
+  (which reaches the foreign server by name), with GRE (IPv4 only), or with the
+  web-socket and KCP links, which have not been tried over IPv6. When it is not
+  offered the menu says why in one line instead of skipping the question.
 - The firewall lock works for IPv6 too: the port is open to the other server's IPv6
   address only, and shut over IPv4. The tunnel connects from the address in its
   settings, so a server with several IPv6 addresses always uses the one that is let in.

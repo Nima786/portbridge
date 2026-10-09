@@ -625,7 +625,11 @@ ask_ipv6() {
         fi
         theirs=$typed
     fi
-    say "${DIM}Like any plain link it is not encrypted or disguised.${R}"
+    if [ "$DG_TRANSPORT" = plain ]; then
+        say "${DIM}Like any plain link it is not encrypted or disguised.${R}"
+    else
+        say "${DIM}The link keeps the disguise you chose; only the addresses change.${R}"
+    fi
     hr
     confirm "Use IPv6 between the two servers?" || return 0
 
@@ -1811,13 +1815,27 @@ create_tunnel() {
         done
     fi
 
-    # IPv6 changes only the addresses. It is offered for the plain link, which is what
-    # has been tried over it; not for a CDN (which reaches the foreign server by name),
-    # GRE (IPv4 only), or the disguised links, whose certificates are made for a name.
+    # IPv6 changes only the addresses. It is offered for the plain link and for the
+    # disguised ones that connect straight to the foreign server (website, HTTP/2,
+    # gRPC), which have been tried over it. Not for a CDN (which reaches the foreign
+    # server by name), GRE (IPv4 only), the web-socket link or KCP (not tried over
+    # it). When it is not offered it says so, rather than skipping in silence.
     V6_ON=off
-    if [ "$DG_GRE" != on ] && [ "$DG_TRANSPORT" = plain ] && ! cdn_involved "$DG_CDN" "$DG_ALTHOST"; then
-        ask_ipv6 "$target_agent"
-        [ "$V6_ON" = on ] && peer=$V6_PEER
+    if [ "$DG_GRE" = on ]; then
+        say "${DIM}IPv6 is not offered with a GRE link, which carries IPv4 only.${R}"
+    elif cdn_involved "$DG_CDN" "$DG_ALTHOST"; then
+        say "${DIM}IPv6 is not offered through a CDN, which reaches your server by name.${R}"
+    else
+        case "$DG_TRANSPORT" in
+            plain | tls | h2 | grpc)
+                ask_ipv6 "$target_agent"
+                [ "$V6_ON" = on ] && peer=$V6_PEER
+                ;;
+            *)
+                say "${DIM}IPv6 is not offered with this kind of link; it has not been tried over IPv6.${R}"
+                say "${DIM}Choose the plain, website or HTTP/2 link to be asked about it.${R}"
+                ;;
+        esac
     fi
 
     say ""
