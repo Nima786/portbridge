@@ -106,6 +106,25 @@ A single tunnel can forward multiple ports / services at once: enter comma-separ
 
 The **KCP / UDP option** replaces the underlying TCP transport between the two servers with turbo-paced KCP packets over UDP. Reed-Solomon FEC (10 data + 3 parity shards) reconstructs dropped packets immediately without waiting for a retransmission round-trip, making it ideal for international links suffering heavy packet loss or middlebox TCP reset injection.
 
+How much one connection may have in flight matters most on a long route. It used to be
+128 packets, which limits a connection to about 2 MB per second when the route has a
+delay of 90 ms, however much room there is. It is now 2048. Between a real Iran server
+and a foreign one over IPv6, on a route losing about 12% of the packets coming back, an
+8 MB download that took 14 seconds took about 3, and on a clean route one that took 5
+took under one. Several downloads at once were also two to three times faster. More
+repair shards, a shorter tick, earlier resending and smaller packets made no
+measurable difference, so those are unchanged. For a server with very little memory,
+the setting can be lowered in the tunnel's settings file; none of these has to match on
+the two servers, only the shard counts do:
+
+```
+kcp_window = 2048             # packets in flight per direction (16 to 32768)
+kcp_mtu = 1400                # bytes in one UDP packet (500 to 1500)
+kcp_interval = 10             # milliseconds between ticks (5 to 100)
+kcp_resend = 2                # resend after this many later packets were acknowledged (0 = off)
+kcp_congestion_control = off  # on = slow down when packets are lost
+```
+
 The middle option needs nothing from you but a name for the link to claim, and
 that name does not have to be real or yours. A certificate is generated on the
 spot. It is not checked for trust, because the shared password already proves who

@@ -199,15 +199,74 @@ func kcpDial(addr string, cfg *Config) (net.Conn, error) {
 		return nil, fmt.Errorf("dialing kcp: %w", err)
 	}
 
+	tuneKCP(sess, cfg)
+	return newKCPConn(sess), nil
+}
+
+// What KCP does when nothing is set. The window used to be 128 packets, which on
+// a route with a delay of 90 ms limits one connection to about 2 MB per second
+// however much room the route has; measured between a real Iran server and a
+// foreign one, 2048 moved a download about five times faster on a route losing
+// 12% of its packets, and about six times faster on a clean one. The other
+// settings (repair shards, tick, resend, packet size) made no measurable
+// difference, so they are as they were.
+const (
+	kcpDefaultWindow   = 2048
+	kcpDefaultMTU      = 1400
+	kcpDefaultInterval = 10
+	kcpDefaultResend   = 2
+)
+
+// validateKCP checks the pacing settings. A zero means "not set", which is how a
+// Config built by hand, without a file, arrives.
+func (c *Config) validateKCP() error {
+	if c.KCPWindow != 0 && (c.KCPWindow < 16 || c.KCPWindow > 32768) {
+		return fmt.Errorf("kcp_window must be between 16 and 32768 packets, got %d", c.KCPWindow)
+	}
+	if c.KCPMTU != 0 && (c.KCPMTU < 500 || c.KCPMTU > 1500) {
+		return fmt.Errorf("kcp_mtu must be between 500 and 1500 bytes, got %d", c.KCPMTU)
+	}
+	if c.KCPInterval != 0 && (c.KCPInterval < 5 || c.KCPInterval > 100) {
+		return fmt.Errorf("kcp_interval must be between 5 and 100 milliseconds, got %d", c.KCPInterval)
+	}
+	if c.KCPResend < 0 || c.KCPResend > 10 {
+		return fmt.Errorf("kcp_resend must be between 0 and 10, got %d", c.KCPResend)
+	}
+	return nil
+}
+
+func orDefault(v, def int) int {
+	if v == 0 {
+		return def
+	}
+	return v
+}
+
+// tuneKCP applies the buffer sizes and pacing to one session. Both ends call it,
+// one for sessions it opens and one for sessions it accepts.
+func tuneKCP(sess *kcp.UDPSession, cfg *Config) {
 	_ = sess.SetReadBuffer(4 * 1024 * 1024)
 	_ = sess.SetWriteBuffer(4 * 1024 * 1024)
 	sess.SetStreamMode(true)
 	sess.SetWriteDelay(false)
-	// nodelay=1, interval=10ms, resend=2, nc=1 (no congestion window throttling on lossy WAN)
-	sess.SetNoDelay(1, 10, 2, 1)
-	sess.SetWindowSize(128, 128)
+	nc := 1
+	if cfg.KCPCongestion {
+		nc = 0
+	}
+	// nodelay=1 sends the first resend early; nc=1 turns off the congestion
+	// window, which on a route that loses packets for reasons other than load
+	// only slows the link down for nothing.
+	resend := cfg.KCPResend
+	if resend == 0 && !cfg.resendSet {
+		resend = kcpDefaultResend
+	}
+	sess.SetNoDelay(1, orDefault(cfg.KCPInterval, kcpDefaultInterval), resend, nc)
+	w := orDefault(cfg.KCPWindow, kcpDefaultWindow)
+	sess.SetWindowSize(w, w)
+	if m := orDefault(cfg.KCPMTU, kcpDefaultMTU); m != kcpDefaultMTU {
+		sess.SetMtu(m)
+	}
 	sess.SetACKNoDelay(true)
-	return newKCPConn(sess), nil
 }
 
 // kcpListen listens for incoming KCP connections over UDP.
@@ -233,11 +292,12 @@ func kcpListen(addr string, cfg *Config) (net.Listener, error) {
 	}
 	_ = ln.SetReadBuffer(4 * 1024 * 1024)
 	_ = ln.SetWriteBuffer(4 * 1024 * 1024)
-	return &kcpListenerWrap{Listener: ln}, nil
+	return &kcpListenerWrap{Listener: ln, cfg: cfg}, nil
 }
 
 type kcpListenerWrap struct {
 	*kcp.Listener
+	cfg *Config
 }
 
 func (l *kcpListenerWrap) Accept() (net.Conn, error) {
@@ -245,12 +305,6 @@ func (l *kcpListenerWrap) Accept() (net.Conn, error) {
 	if err != nil {
 		return nil, err
 	}
-	_ = sess.SetReadBuffer(4 * 1024 * 1024)
-	_ = sess.SetWriteBuffer(4 * 1024 * 1024)
-	sess.SetStreamMode(true)
-	sess.SetWriteDelay(false)
-	sess.SetNoDelay(1, 10, 2, 1)
-	sess.SetWindowSize(128, 128)
-	sess.SetACKNoDelay(true)
+	tuneKCP(sess, l.cfg)
 	return newKCPConn(sess), nil
 }

@@ -165,6 +165,14 @@ type Config struct {
 	KCPDataShards   int
 	KCPParityShards int
 
+	// KCP pacing. All are local to the side that reads them: the two sides
+	// need not agree, only the shard counts above must. See kcp.go.
+	KCPWindow     int  // packets in flight, per direction
+	KCPMTU        int  // bytes in one UDP packet, headers of the link layer included
+	KCPInterval   int  // milliseconds between KCP's internal timer ticks
+	KCPResend     int  // resend a packet after this many later ones were acknowledged (0 = off)
+	KCPCongestion bool // false (the default) ignores congestion control, sending as fast as the window allows
+
 	secret []byte
 
 	// TLS stealth & evasion settings
@@ -176,6 +184,7 @@ type Config struct {
 	CleanIPs         []string
 
 	fragmentSet bool
+	resendSet   bool // kcp_resend was written down, so 0 means off rather than unset
 	utlsSet     bool
 
 	// Disguise settings prepared once at startup and only read afterwards. They
@@ -327,6 +336,10 @@ func defaultConfig() *Config {
 		PathProbe:        true,
 		KCPDataShards:    10,
 		KCPParityShards:  3,
+		KCPWindow:        kcpDefaultWindow,
+		KCPMTU:           kcpDefaultMTU,
+		KCPInterval:      kcpDefaultInterval,
+		KCPResend:        kcpDefaultResend,
 		TLSFragment:      false,
 		TLSFragmentSize:  40,
 		TLSFragmentSleep: 3 * time.Millisecond,
@@ -522,6 +535,24 @@ func (c *Config) set(key, val string) error {
 		return num(&c.KCPDataShards)
 	case "kcp_parity_shards":
 		return num(&c.KCPParityShards)
+	case "kcp_window":
+		return num(&c.KCPWindow)
+	case "kcp_mtu":
+		return num(&c.KCPMTU)
+	case "kcp_interval":
+		return num(&c.KCPInterval)
+	case "kcp_resend":
+		c.resendSet = true
+		return num(&c.KCPResend)
+	case "kcp_congestion_control":
+		switch strings.ToLower(val) {
+		case "on", "yes", "true":
+			c.KCPCongestion = true
+		case "off", "no", "false":
+			c.KCPCongestion = false
+		default:
+			return fmt.Errorf("kcp_congestion_control must be on or off, got %q", val)
+		}
 	case "drain":
 		return dur(&c.Drain)
 	case "tls_fragment", "fragment":
@@ -757,6 +788,10 @@ func (c *Config) Validate() error {
 	}
 	if c.SecretFile == "" {
 		return fmt.Errorf("secret_file is required")
+	}
+
+	if err := c.validateKCP(); err != nil {
+		return err
 	}
 
 	if !validTransport(c.Transport) {
