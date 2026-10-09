@@ -1113,21 +1113,21 @@ explain_sharing() {
         rec_one=" ${DIM}(recommended)${R}"
     fi
     hr
-    say "${B}Should all users share a few connections, or get one each?${R}"
+    say "${B}How should your users' traffic travel between the two servers?${R}"
     say ""
-    say "  ${B}1) One connection per user${R}$rec_one"
-    say "     ${DIM}Each user opens their own connection. Fastest on a poor route, because${R}"
-    say "     ${DIM}one user's lost packet never holds up anybody else. The cost is many${R}"
-    say "     ${DIM}connection set-ups between your servers, which is easier to notice.${R}"
+    say "  ${B}1) A separate connection for each user${R}$rec_one"
+    say "     ${DIM}Every user gets their own path between the servers. If one user's${R}"
+    say "     ${DIM}connection has trouble, nobody else is affected. Best on a weak or${R}"
+    say "     ${DIM}unreliable route. The downside: many connections open and close between${R}"
+    say "     ${DIM}the servers, which a network can notice more easily.${R}"
     say ""
-    say "  ${B}2) Share a few connections (mux)${R}$rec_two"
-    say "     ${DIM}Everyone rides on $MX_LINKS connections that stay open for hours. Far${R}"
-    say "     ${DIM}fewer connections between your servers, so the tunnel is harder to${R}"
-    say "     ${DIM}pick out and busy times do not show. The cost is real: on a lossy${R}"
-    say "     ${DIM}route a hiccup is felt by everyone on that connection at once.${R}"
+    say "  ${B}2) Everyone shares a few connections${R}$rec_two"
+    say "     ${DIM}All users travel together over $MX_LINKS connections that stay open for hours.${R}"
+    say "     ${DIM}Far fewer connections to notice, so the tunnel is harder to spot. The${R}"
+    say "     ${DIM}downside: if one shared connection stalls, every user on it feels it at${R}"
+    say "     ${DIM}the same moment.${R}"
     say ""
-    say "  ${DIM}If your tunnel works well today, keep the recommended choice.${R}"
-    hr
+    say "  ${DIM}Not sure? Choose 1.${R}"    hr
 }
 
 # ask_mux_links - how many shared connections, 1 to 16.
@@ -1478,6 +1478,47 @@ ask_remote_ports() {
     done
 }
 
+# next_free_local_port <port> - the first port after this one that nothing on this
+# server uses, as a number, or nothing if there is none close by.
+next_free_local_port() {
+    local n=$1 tries=0
+    while [ "$tries" -lt 200 ]; do
+        n=$((n + 1))
+        tries=$((tries + 1))
+        [ "$n" -le 65535 ] || return 1
+        if [ -z "$(port_owner "$n" || true)" ] && ! port_in_use_by_system "$n"; then
+            printf '%s' "$n"
+            return 0
+        fi
+    done
+    return 1
+}
+
+# suggest_user_ports <inbound ports> - what to suggest for the users' ports: the
+# same numbers as the inbound ports, which is simplest, except where this Iran
+# server already uses that number (another tunnel's users, or another program),
+# when the next free one is suggested and the change is said out loud. The inbound
+# port lives on the foreign server and the users' port on this one, so the same
+# number being busy here says nothing against the inbound port itself.
+suggest_user_ports() {
+    local out="" p q owner
+    for p in $(printf '%s' "$1" | tr ',' ' '); do
+        q=$p
+        owner=$(port_owner "$p" || true)
+        if [ -n "$owner" ] || port_in_use_by_system "$p"; then
+            q=$(next_free_local_port "$p" || true)
+            q=${q:-$p}
+            if [ -n "$owner" ]; then
+                info "  Port $p is already used on this Iran server by tunnel '$owner', so $q is suggested for your users."
+            else
+                info "  Port $p is already in use on this Iran server, so $q is suggested for your users."
+            fi
+        fi
+        [ -n "$out" ] && out="$out, $q" || out="$q"
+    done
+    printf '%s' "$out"
+}
+
 # ask_user_ports <prompt> <default> [skip_name]
 ask_user_ports() {
     local prompt=$1 def=$2 skip_name=${3-} p item owner
@@ -1680,13 +1721,15 @@ create_tunnel() {
     say ""
     info "The port(s) your users put in their configs, next to this Iran server's IP."
     info "Keeping it the same as the inbound port(s) is simplest, so that is suggested."
-    uport=$(ask_user_ports "Port(s) for your users" "$inport")
+    local users_default
+    users_default=$(suggest_user_ports "$inport")
+    uport=$(ask_user_ports "Port(s) for your users" "$users_default")
     # Each port users connect to leads to one inbound port, in the same order, so
     # the two lists must be the same length.
     while [ "$(printf '%s' "$uport" | awk -F',' '{print NF}')" != "$(printf '%s' "$inport" | awk -F',' '{print NF}')" ]; do
         err "  You gave a different number of user ports than inbound ports. Each user port"
         err "  leads to one inbound port, in order, so give the same number of each."
-        uport=$(ask_user_ports "Port(s) for your users" "$inport")
+        uport=$(ask_user_ports "Port(s) for your users" "$users_default")
     done
     ulisten="$uport"
 
