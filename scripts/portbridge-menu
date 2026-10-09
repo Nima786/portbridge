@@ -562,6 +562,19 @@ first_global_ipv6() {
     "$BIN" addresses 2>/dev/null | awk '$1 == "ipv6" {print $2; exit}'
 }
 
+# print_agent_links <token> <ipv4> <port> <fingerprint> - the link string to paste
+# on the Iran server, and, when this server has a public IPv6 address, the same
+# with that, for when ordinary IPv4 does not work between the two servers.
+print_agent_links() {
+    local tok=$1 v4=$2 p=$3 afp=${4-} v6
+    say "  ${GREEN}pb-agent://${tok}@${v4}:${p}${afp:+?fp=$afp}${R}"
+    v6=$(first_global_ipv6)
+    if [ -n "$v6" ]; then
+        say ""
+        say "  ${DIM}If ordinary IPv4 does not work between your two servers, use this one instead:${R}"
+        say "  ${GREEN}pb-agent://${tok}@[${v6}]:${p}${afp:+?fp=$afp}${R}"
+    fi
+}
 # foreign_ipv6 <agent alias> - the foreign server's first public IPv6 address,
 # asked of its agent. Prints it and returns 0; returns 1 if it was asked and has
 # none; 2 if it could not be asked (no agent, not reachable, too old).
@@ -581,11 +594,18 @@ foreign_ipv6() {
 # V6_LOCAL (this server's address) and V6_PEER (the foreign server's). When this
 # server has no public IPv6 address it says so in one line and asks nothing.
 ask_ipv6() {
-    local alias=${1-} mine theirs typed st
+    local alias=${1-} preset=${2-} mine theirs typed st
     V6_ON=off
     V6_LOCAL=""
     V6_PEER=""
     mine=$(first_global_ipv6)
+    if [ -n "$preset" ] && [ -z "$mine" ]; then
+        # The foreign server was given by its IPv6 address, which this server
+        # cannot reach without one of its own.
+        say "${DIM}You gave an IPv6 address, but this server has no public IPv6 address, so it${R}"
+        say "${DIM}cannot reach it. Your hosting provider can give it one.${R}"
+        return 0
+    fi
     if [ -z "$mine" ]; then
         # Said in one line, not skipped in silence: a server that shows only an
         # address starting fe80 has IPv6 for its own network only, which the other
@@ -595,10 +615,16 @@ ask_ipv6() {
         return 0
     fi
 
-    printf '%s' "${DIM}Looking for IPv6 on the foreign server...${R}" >&2
-    theirs=$(foreign_ipv6 "$alias")
-    st=$?
-    printf '\r%*s\r' 50 '' >&2
+    if [ -n "$preset" ]; then
+        # Already known: it is the address that was given for the foreign server.
+        theirs=$preset
+        st=0
+    else
+        printf '%s' "${DIM}Looking for IPv6 on the foreign server...${R}" >&2
+        theirs=$(foreign_ipv6 "$alias")
+        st=$?
+        printf '\r%*s\r' 50 '' >&2
+    fi
     if [ "$st" -eq 1 ]; then
         say "${DIM}The foreign server has no public IPv6 address, so this link uses IPv4.${R}"
         return 0
@@ -1804,6 +1830,7 @@ create_tunnel() {
     if [ -z "${peer-}" ]; then
         say ""
         info "Your foreign server's IP, the one with your panel on it."
+        info "If ordinary IPv4 does not work between the two servers, give its IPv6 address."
         while :; do
             peer=$(ask "Foreign server IP" "")
             if this_machine_has_ip "$peer"; then
@@ -1827,16 +1854,35 @@ create_tunnel() {
         say "${DIM}IPv6 is not offered through a CDN, which reaches your server by name.${R}"
     else
         case "$DG_TRANSPORT" in
-            plain | tls | h2 | grpc)
-                ask_ipv6 "$target_agent"
+            plain | tls | h2 | grpc | kcp)
+                # A foreign server that was given by its IPv6 address is that
+                # address already, so it is not asked for again.
+                case "$peer" in
+                    *:*) ask_ipv6 "$target_agent" "$peer" ;;
+                    *) ask_ipv6 "$target_agent" ;;
+                esac
                 [ "$V6_ON" = on ] && peer=$V6_PEER
                 ;;
             *)
                 say "${DIM}IPv6 is not offered with this kind of link; it has not been tried over IPv6.${R}"
-                say "${DIM}Choose the plain, website or HTTP/2 link to be asked about it.${R}"
+                say "${DIM}Choose the plain, website, HTTP/2 or KCP link to be asked about it.${R}"
                 ;;
         esac
     fi
+    # The foreign server was given by an IPv6 address, but the link is not going
+    # to use IPv6: the two ends would be told different things, so it is stopped
+    # here rather than made and left not working.
+    case "$peer" in
+        *:*)
+            if [ "$V6_ON" != on ]; then
+                err "  The foreign server was given by an IPv6 address, but the link is not set to use IPv6"
+                err "  (this server may have none, or the link type cannot use it). Nothing was changed."
+                err "  Choose a link type that supports IPv6 (plain, website, HTTP/2 or KCP) on a"
+                err "  server with a public IPv6 address, or give the foreign server's IPv4 address."
+                return 1
+            fi
+            ;;
+    esac
 
     say ""
     info "The port of your inbound on the foreign server, as shown in your panel."
@@ -3344,6 +3390,8 @@ find_agent_by_target() {
         local host=${u#*://}
         host=${host%%/*}
         host=${host%:*}
+        host=${host#\[}
+        host=${host%\]}
         if [ -n "$target" ] && { [ "$ip" = "$target" ] || [ "$host" = "$target" ]; }; then
             basename "$f" .conf
             return 0
@@ -3482,7 +3530,7 @@ enable_agent() {
         ok "Foreign Management Agent is now ACTIVE and running on port $p!"
         hr
         say "  ${B}Copy this Link String to your Iran server:${R}"
-        say "  ${GREEN}pb-agent://${tok}@${my_ip}:${p}${afp:+?fp=$afp}${R}"
+        print_agent_links "$tok" "$my_ip" "$p" "$afp"
         say ""
         say "  ${DIM}On your Iran server, open 'portbridge' -> Option 12 -> Option 2 (Link a new Foreign server)${R}"
         say "  ${DIM}and paste the link string above.${R}"
@@ -3538,7 +3586,7 @@ show_agent_link() {
     say "  Certificate:    ${afp:-unknown}"
     say ""
     say "  ${B}Iran Link String:${R}"
-    say "  ${GREEN}pb-agent://${tok}@${my_ip}:${p}${afp:+?fp=$afp}${R}"
+    print_agent_links "$tok" "$my_ip" "$p" "$afp"
     say ""
     say "  ${DIM}Copy the link string above and paste it in Option 12 -> Option 2 on your Iran server.${R}"
     hr
@@ -3649,31 +3697,39 @@ link_foreign_agent() {
     say "${DIM}Enables 1-click automated tunnel deployment to that foreign server.${R}"
     say "${DIM}You can paste the Link String from the foreign server (pb-agent://...),${R}"
     say "${DIM}or enter the foreign server IP/domain, agent port, and token manually.${R}"
+    say "${DIM}If ordinary IPv4 does not work between the two servers, use the foreign${R}"
+    say "${DIM}server's IPv6 address instead; the agent answers on both.${R}"
     hr
 
     local input
     input=$(ask "Agent Link String or Foreign Server IP" "$default_ip")
     [ -n "$input" ] || { err "Nothing entered."; return 1; }
 
+    # A host is a name or IPv4 address, or an IPv6 address in square brackets.
+    local host_re='(\[[0-9a-fA-F:]+\]|[^/:?]+)'
     local target_host="" target_port="" tok="" fp=""
-    if [[ "$input" =~ ^pb-agent://([^@]+)@([^/:?]+)(:([0-9]+))?(\?fp=([0-9a-fA-F:]+))? ]]; then
+    if [[ "$input" =~ ^pb-agent://([^@]+)@${host_re}(:([0-9]+))?(\?fp=([0-9a-fA-F:]+))? ]]; then
         tok="${BASH_REMATCH[1]}"
         target_host="${BASH_REMATCH[2]}"
         target_port="${BASH_REMATCH[4]}"
         fp="${BASH_REMATCH[6]}"
-    elif [[ "$input" =~ ^https?://([^/:]+)(:([0-9]+))? ]]; then
+    elif [[ "$input" =~ ^https?://${host_re}(:([0-9]+))? ]]; then
         target_host="${BASH_REMATCH[1]}"
         target_port="${BASH_REMATCH[3]}"
-    elif [[ "$input" =~ ^([^/:]+):([0-9]+)$ ]]; then
+    elif [[ "$input" =~ ^${host_re}:([0-9]+)$ ]]; then
         target_host="${BASH_REMATCH[1]}"
         target_port="${BASH_REMATCH[2]}"
     else
         target_host="$input"
     fi
+    target_host=${target_host#\[}
+    target_host=${target_host%\]}
 
     say ""
     while :; do
         target_host=$(ask "Foreign server IP or Domain" "$target_host")
+        target_host=${target_host#\[}
+        target_host=${target_host%\]}
         if valid_host "$target_host"; then
             break
         fi
@@ -3695,6 +3751,8 @@ link_foreign_agent() {
     done
 
     local def_alias="$target_host"
+    # An IPv6 address is no use as a nickname once its colons are gone.
+    case "$target_host" in *:*) def_alias="foreign" ;; esac
     local alias
     say ""
     while :; do
@@ -3712,7 +3770,8 @@ link_foreign_agent() {
         break
     done
 
-    local url="https://${target_host}:${target_port}"
+    local url
+    url="https://$(hostport "$target_host" "$target_port")"
 
     # The agent's certificate is self-signed, so it is recognised by its
     # fingerprint. A link string carries it. Without one, it is read from the
@@ -3722,6 +3781,34 @@ link_foreign_agent() {
         say ""
         info "Reading the agent's certificate fingerprint..."
         fp=$("$BIN" join -agent-url "$url" -fetch-fingerprint 2>/dev/null || true)
+        if [ -z "$fp" ]; then
+            # Some Iran servers have no working IPv4 to the outside at all, only
+            # IPv6. Say so, and offer the other address, rather than just failing.
+            err "Could not reach the agent at $url."
+            case "$target_host" in
+                *:*) ;;
+                *)
+                    if [ -n "$(first_global_ipv6)" ]; then
+                        info "If ordinary IPv4 does not work between the two servers, give the foreign"
+                        info "server's IPv6 address instead (it is shown with the link string on that server)."
+                        local v6
+                        v6=$(ask "Foreign server's IPv6 address (Enter to give up)" "")
+                        v6=${v6#\[}
+                        v6=${v6%\]}
+                        case "$v6" in
+                            *:*)
+                                if valid_host "$v6"; then
+                                    target_host=$v6
+                                    url="https://$(hostport "$target_host" "$target_port")"
+                                    info "Trying $url..."
+                                    fp=$("$BIN" join -agent-url "$url" -fetch-fingerprint 2>/dev/null || true)
+                                fi
+                                ;;
+                        esac
+                    fi
+                    ;;
+            esac
+        fi
         if [ -z "$fp" ]; then
             err "Could not reach the agent at $url, so there is nothing to compare."
             warn "Check the address and port, and that the agent is running there."

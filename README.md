@@ -268,10 +268,21 @@ network only) it says so in one line and uses IPv4.
 - It is offered for the plain link (with or without the web header) and for the
   disguised links that connect straight to the foreign server: the website (TLS),
   HTTP/2 and gRPC links, which kept the disguise and ran at full speed over IPv6 in a
-  trial between a real Iran server and a foreign one. It is not offered with a CDN
-  (which reaches the foreign server by name), with GRE (IPv4 only), or with the
-  web-socket and KCP links, which have not been tried over IPv6. When it is not
-  offered the menu says why in one line instead of skipping the question.
+  trial between a real Iran server and a foreign one, and the KCP link, which held up
+  best on a route that was losing packets. It is not offered with a CDN (which reaches
+  the foreign server by name), with GRE (IPv4 only), or with the web-socket link, which
+  has not been tried over IPv6. When it is not offered the menu says why in one line
+  instead of skipping the question.
+- If ordinary IPv4 does not work between the two servers at all (some Iran servers can
+  reach only Iranian addresses over IPv4), give the foreign server's IPv6 address where
+  it asks for the foreign server's IP. The menu then asks nothing more about the
+  address, and sets up both ends for IPv6 together. If this server has no public IPv6
+  address, or the link type cannot use it, it stops and says so instead of making a
+  tunnel that cannot connect.
+- Linking the foreign server's agent works over IPv6 as well. The agent menu on the
+  foreign server shows a second link string with its IPv6 address in square brackets,
+  `pb-agent://<token>@[2001:db8::1]:<port>?fp=...`, and if linking over IPv4 fails the
+  menu offers to try the IPv6 address.
 - The firewall lock works for IPv6 too: the port is open to the other server's IPv6
   address only, and shut over IPv4. The tunnel connects from the address in its
   settings, so a server with several IPv6 addresses always uses the one that is let in.
