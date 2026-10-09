@@ -293,6 +293,22 @@ PORT   THIS SERVER             FOREIGN SERVER          CDN
   mode, the Iran server in reverse. **Free on both** is the safest choice, since it
   keeps working if you switch modes later. The question that follows suggests the
   first port that suits.
+- Whatever kind of tunnel it is, the ports you type are checked as you type them, on
+  both servers: your users' ports and the link port (when this server opens it) on this
+  one, and on the foreign server the link port (when it opens it, which must be free
+  there) and the service ports (which should already have your service listening, and
+  must not be another tunnel's link). A busy port is refused on the spot, with what is
+  using it; a service port nothing listens on yet asks whether to go on. When the
+  foreign server cannot be asked, the menu says so once and the foreign server checks
+  the ports itself when the tunnel is set up there.
+- Whatever kind of tunnel it is, the ports you type are checked as you type them, on
+  both servers: your users' ports and the link port (when this server opens it) on this
+  one, and on the foreign server the link port (when it opens it, which must be free
+  there) and the service ports (which should already have your service listening, and
+  must not be another tunnel's link). A busy port is refused on the spot, with what is
+  using it; a service port nothing listens on yet asks whether to go on. When the
+  foreign server cannot be asked, the menu says so once and the foreign server checks
+  the ports itself when the tunnel is set up there.
 - The foreign server is asked through its agent (see the Management Agent below),
   so it needs one linked, and the same PortBridge version. Without that, only this
   server is shown and the table says so. From the command line:

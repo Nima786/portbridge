@@ -939,6 +939,114 @@ suggest_link_port() {
     fi
 }
 
+# ---- checking the ports as they are typed
+#
+# The Iran server's own ports are checked on the spot. The foreign server's are
+# asked of its agent, so a busy port is caught as it is typed, not after the
+# tunnel's Iran half has been made. Without an agent, or when it cannot be
+# reached, the foreign server checks them itself when the tunnel is set up there.
+
+REMOTE_AGENT=""      # the agent alias to ask, or empty
+REMOTE_SELF=""       # the tunnel being changed, whose own ports are not "taken"
+REMOTE_STATE=unknown # unknown, up or down: once down it is not asked again
+declare -A FQ_STATE=() FQ_BY=()
+
+# use_foreign_agent <alias or empty> [tunnel being changed] - starts a round of
+# questions about the foreign server's ports.
+use_foreign_agent() {
+    REMOTE_AGENT=${1-}
+    REMOTE_SELF=${2-}
+    REMOTE_STATE=unknown
+    FQ_STATE=()
+    FQ_BY=()
+    if [ -z "$REMOTE_AGENT" ]; then
+        info "No agent is linked for the foreign server, so its ports cannot be checked as you"
+        info "type them. It checks them itself when the tunnel is set up there."
+    fi
+}
+
+# foreign_query <ports> - asks the foreign server about ports; fails quietly (and
+# says so once) when it cannot be asked.
+foreign_query() {
+    local list=$1 out port state by
+    [ -n "$REMOTE_AGENT" ] || return 1
+    [ "$REMOTE_STATE" = down ] && return 1
+    if ! out=$(ports_there "$REMOTE_AGENT" "$list"); then
+        REMOTE_STATE=down
+        warn "  The foreign server could not be asked about its ports (is its agent running, and"
+        warn "  up to date?). It checks them itself when the tunnel is set up there."
+        return 1
+    fi
+    FQ_STATE=()
+    FQ_BY=()
+    while IFS=$'\t' read -r port state by; do
+        [ -n "$port" ] || continue
+        FQ_STATE[$port]=$state
+        FQ_BY[$port]=$by
+    done <<<"$out"
+    REMOTE_STATE=up
+    return 0
+}
+
+# foreign_own <owner> - is this port held by the tunnel being changed itself?
+foreign_own() {
+    [ -n "$REMOTE_SELF" ] || return 1
+    case "$1" in "PortBridge tunnel $REMOTE_SELF ("*) return 0 ;; esac
+    return 1
+}
+
+# check_foreign_link_port <port> - the link port, opened on the foreign server in
+# direct mode, has to be free there. Returns 1, after saying why, if it is not.
+check_foreign_link_port() {
+    local p=$1 st by
+    foreign_query "$p" || return 0
+    st=${FQ_STATE[$p]-}
+    by=${FQ_BY[$p]-}
+    foreign_own "$by" && return 0
+    case "$st" in
+        busy | reserved)
+            err "  Port $p is already used on the foreign server${by:+ ($by)}. Choose another."
+            return 1
+            ;;
+        free) ok "  Port $p is free on the foreign server." ;;
+    esac
+    return 0
+}
+
+# check_foreign_service_ports <ports> - the service ports are where your inbound
+# listens on the foreign server, so something should be listening there already,
+# and it must not be the link of another tunnel. Returns 1 if they should be
+# entered again.
+check_foreign_service_ports() {
+    local p st by bad=0 quiet=0
+    foreign_query "$1" || return 0
+    for p in $(printf '%s' "$1" | tr ',' ' '); do
+        st=${FQ_STATE[$p]-}
+        by=${FQ_BY[$p]-}
+        case "$by" in
+            "PortBridge tunnel "*)
+                foreign_own "$by" && continue
+                err "  Port $p is used on the foreign server by ${by#PortBridge }, so it cannot also be your service."
+                bad=1
+                ;;
+        esac
+        [ "$bad" -eq 1 ] && continue
+        case "$st" in
+            free)
+                warn "  Nothing is listening on port $p on the foreign server yet."
+                quiet=1
+                ;;
+            busy) ok "  Port $p: something is listening on the foreign server${by:+ ($by)}." ;;
+        esac
+    done
+    [ "$bad" -eq 1 ] && return 1
+    if [ "$quiet" -eq 1 ]; then
+        warn "  Is the service (Xray) running there, with an inbound on that port?"
+        confirm "  Use it anyway?" || return 1
+    fi
+    return 0
+}
+
 # ports_overview - the menu's own page: which ports are free on both servers.
 ports_overview() {
     local alias="" count list names=() i=1 n sel
@@ -1552,7 +1660,11 @@ create_tunnel() {
     say ""
     info "The port of your inbound on the foreign server, as shown in your panel."
     info "For multiple ports/services, separate them with commas (e.g. 443, 8443, 2083)."
-    inport=$(ask_remote_ports "Inbound port(s)" "")
+    use_foreign_agent "$target_agent"
+    while :; do
+        inport=$(ask_remote_ports "Inbound port(s)" "")
+        check_foreign_service_ports "$inport" && break
+    done
 
     # The inbound port being busy HERE almost always means Xray is running here,
     # so this is the foreign server and the user is on the wrong machine.
@@ -1599,8 +1711,13 @@ create_tunnel() {
                 continue
             fi
         else
-            # Direct: it is opened on the foreign server, so it cannot be checked here.
+            # Direct: it is opened on the foreign server, so it is asked of its agent.
             tport=$(ask_remote_port "Port between the two servers" "${PORT_BEST:-$DEFAULT_TUNNEL_PORT}" link)
+            if printf ',%s,' "$inport" | tr -d ' ' | grep -q ",$tport,"; then
+                err "  It cannot be the same as a service port on the foreign server."
+                continue
+            fi
+            check_foreign_link_port "$tport" || continue
         fi
         # Pointed out, not refused: only Cloudflare limits the ports.
         if cdn_involved "$DG_CDN" "$DG_ALTHOST" && ! cdn_port_ok "$tport"; then
@@ -2347,6 +2464,7 @@ edit_tunnel_ports() {
     alt=$(read_conf "$name" alt_target)
     proto=tcp
     [ "$transport" = kcp ] && proto=udp
+    use_foreign_agent "$(agent_for_tunnel "$name" 2>/dev/null || true)" "$name"
 
     backup=$(mktemp)
     cp "$(conf_of "$name")" "$backup"
@@ -2371,6 +2489,7 @@ edit_tunnel_ports() {
 
         new_users=$(ask_port_list "Users' port(s)" "$cur_users" "$name" local)
         new_in=$(ask_port_list "Service port(s) on the foreign server" "${cur_in:-$cur_users}" "$name" remote)
+        check_foreign_service_ports "$new_in" || continue
         n_users=$(count_ports "$new_users")
         n_in=$(count_ports "$new_in")
         if [ "$n_users" != "$n_in" ]; then
@@ -2387,6 +2506,7 @@ edit_tunnel_ports() {
                 new_link=$(ask_port "Link port (opened on this Iran server)" "$cur_link" "$name" link "$proto")
             else
                 new_link=$(ask_remote_port "Link port (opened on the foreign server)" "$cur_link" link)
+                check_foreign_link_port "$new_link" || continue
             fi
             if cdn_involved "$(read_conf "$name" cdn)" "$alt" && ! cdn_port_ok "$new_link"; then
                 explain_cdn_ports "$new_link"

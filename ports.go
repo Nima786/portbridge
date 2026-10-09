@@ -179,7 +179,9 @@ func agentClientPorts(agentURL, token, list string, trust agentTrust) error {
 		req.Header.Set("Authorization", "Bearer "+token)
 	}
 	client := makeAgentHTTPClient(trust, agentURL)
-	client.Timeout = 30 * time.Second
+	// Short, since the menu asks while someone is waiting at a prompt and a
+	// server that does not answer should not hold them up for long.
+	client.Timeout = 12 * time.Second
 	resp, err := client.Do(req)
 	if err != nil {
 		return explainAgentError(fmt.Errorf("connecting to agent at %s: %w", agentURL, err), trust)
