@@ -183,6 +183,13 @@ type Config struct {
 	UTLSProfile      string
 	CleanIPs         []string
 
+	// RealSite passes any stranger who connects without proving who they are
+	// straight through to the real website (e.g. Bing), presenting Microsoft's
+	// genuine certificate instead of ours. On for direct website/TLS, HTTP/2,
+	// gRPC, and WebSocket links.
+	RealSite  bool
+	CoverSite string
+
 	fragmentSet bool
 	resendSet   bool // kcp_resend was written down, so 0 means off rather than unset
 	utlsSet     bool
@@ -233,6 +240,21 @@ func (c *Config) dialTarget() string {
 	return c.TunnelAddr
 }
 
+// coverTarget is the address strangers are passed to when RealSite is active.
+func (c *Config) coverTarget() string {
+	if c.CoverSite != "" {
+		if _, _, err := net.SplitHostPort(c.CoverSite); err == nil {
+			return c.CoverSite
+		}
+		return net.JoinHostPort(c.CoverSite, "443")
+	}
+	name := c.effectiveServerName()
+	if _, _, err := net.SplitHostPort(name); err == nil {
+		return name
+	}
+	return net.JoinHostPort(name, "443")
+}
+
 // withClaimedName returns this configuration with a different hostname claimed
 // on the wire, leaving everything else alone.
 //
@@ -272,9 +294,9 @@ func (c *Config) withRoute(name string, cdn bool) *Config {
 }
 
 // useUTLS says whether the browser fingerprint applies to a connection made with
-// this configuration: when asked for, or by default for a CDN unless the choice
-// was made explicitly.
-func (c *Config) useUTLS() bool { return c.UTLS || (c.CDN && !c.utlsSet) }
+// this configuration: when asked for, automatically when RealSite is active,
+// or by default for a CDN unless the choice was made explicitly.
+func (c *Config) useUTLS() bool { return c.UTLS || c.RealSite || (c.CDN && !c.utlsSet) }
 
 // useFragment is the same question for splitting the first packet.
 func (c *Config) useFragment() bool { return c.TLSFragment || (c.CDN && !c.fragmentSet) }
@@ -493,6 +515,17 @@ func (c *Config) set(key, val string) error {
 		c.ServerInboundPort = val
 	case "foreign_agent":
 		c.ForeignAgent = val
+	case "real_site":
+		switch strings.ToLower(val) {
+		case "on", "yes", "true":
+			c.RealSite = true
+		case "off", "no", "false":
+			c.RealSite = false
+		default:
+			return fmt.Errorf("real_site must be on or off, got %q", val)
+		}
+	case "cover_site":
+		c.CoverSite = strings.TrimSpace(val)
 	case "firewall":
 		// Read by the firewall helper, not by the engine. Accepted here so the
 		// engine does not refuse a config that contains it.

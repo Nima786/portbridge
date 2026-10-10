@@ -60,10 +60,15 @@ type PairingData struct {
 	// GRE link between the two servers. Both ends work out the link's addresses
 	// from the two public addresses in the code; see gre.go.
 	GRE string
+
+	// Added in version 9, and only sent when used: passes strangers to the real
+	// website instead of presenting our own certificate.
+	RealSite  string
+	CoverSite string
 }
 
 // pairingVersionMax is the newest code this build understands.
-const pairingVersionMax = 8
+const pairingVersionMax = 9
 
 // decodePairingCode parses a base64 encoded pairing code into structured data.
 func decodePairingCode(code string) (*PairingData, error) {
@@ -112,6 +117,8 @@ func decodePairingCode(code string) (*PairingData, error) {
 		GRE:         kv["gre"],
 		HTTPHeader:  kv["http_header"],
 		HTTPHost:    kv["http_host"],
+		RealSite:    kv["real_site"],
+		CoverSite:   kv["cover_site"],
 	}
 
 	if v, err := strconv.Atoi(p.Version); err == nil && v > pairingVersionMax {

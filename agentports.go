@@ -111,6 +111,12 @@ func buildOriginConf(p *PairingData, secretFile, certFile, keyFile string) strin
 		if p.CleanIPs != "" && p.Mode == "reverse" {
 			fmt.Fprintf(&b, "clean_ips = %s\n", p.CleanIPs)
 		}
+		if p.RealSite == "on" {
+			fmt.Fprintf(&b, "real_site = on\n")
+			if p.CoverSite != "" {
+				fmt.Fprintf(&b, "cover_site = %s\n", p.CoverSite)
+			}
+		}
 	}
 	if p.AltHost != "" && p.Mode == "reverse" {
 		fmt.Fprintf(&b, "alt_target = %s\n", net.JoinHostPort(p.AltHost, p.TunnelPort))

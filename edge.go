@@ -288,6 +288,9 @@ func (e *edge) acceptTunnel(ctx context.Context, ln net.Listener) {
 				tuneSocket(raw)
 				c, err := wrapAccept(raw, e.cfg, e.cert, e.guard)
 				if err != nil {
+					if errors.Is(err, errStrangerForwarded) {
+						return
+					}
 					e.logAuth.printf("refused a tunnel connection from %s: %v", raw.RemoteAddr(), err)
 					_ = raw.Close()
 					return
@@ -295,7 +298,7 @@ func (e *edge) acceptTunnel(ctx context.Context, ln net.Listener) {
 				purpose, err := recvAuthPurpose(c, e.cfg.secret, e.guard)
 				if err != nil {
 					e.logAuth.printf("refused a tunnel connection from %s: %v", c.RemoteAddr(), err)
-					_ = c.Close()
+					sinkGarbageAndClose(c)
 					return
 				}
 				if purpose == authPurposeSpeedtest {

@@ -729,6 +729,8 @@ ask_disguise() {
     DG_FRAGMENT=off
     DG_HTTPHEADER=off
     DG_HTTPHOST=""
+    DG_REAL_SITE=off
+    DG_COVER_SITE=""
 
     case "$choice" in
         1)
@@ -878,6 +880,56 @@ ask_disguise() {
             DG_UTLS=on
             DG_FRAGMENT=on
         fi
+    fi
+}
+
+# ask_real_site <mode> - asks whether strangers should be passed straight to the genuine website.
+ask_real_site() {
+    local mode=$1
+    DG_REAL_SITE=off
+    DG_COVER_SITE=""
+
+    # Does not apply to CDN links, GRE, plain, or KCP links.
+    if [ "${DG_CDN:-off}" = on ] || [ "${DG_TRANSPORT:-plain}" = plain ] || [ "${DG_TRANSPORT:-plain}" = kcp ]; then
+        return 0
+    fi
+
+    say ""
+    info "Show the real website to strangers:"
+    info "Strangers, censors or probe scanners connecting to this port will be passed"
+    info "straight through to the genuine website. They get Microsoft's authentic"
+    info "TLS certificate and real pages, so our server never exposes itself."
+    info "Authentic PortBridge clients carry a secret proof in their hello and connect normally."
+
+    if [ "$mode" = reverse ]; then
+        say ""
+        info "In reverse mode, this Iran server is the one listening on the port."
+        info "Testing accessible cover sites from this server..."
+        local candidate=""
+        local s
+        for s in "${DG_SERVERNAME:-}" www.bing.com www.varzesh3.com www.wikipedia.org; do
+            [ -n "$s" ] || continue
+            if curl -fsSIL --connect-timeout 3 "https://$s" >/dev/null 2>&1; then
+                candidate="$s"
+                break
+            fi
+        done
+        if [ -n "$candidate" ]; then
+            ok "Verified accessible cover site from this server: $candidate"
+            DG_SERVERNAME="$candidate"
+        else
+            warn "Could not automatically reach https://${DG_SERVERNAME:-www.bing.com}."
+            info "Enter a cover site that is accessible from this server."
+            DG_SERVERNAME=$(ask "Accessible cover site" "${DG_SERVERNAME:-www.bing.com}")
+        fi
+    fi
+
+    say ""
+    if confirm "Show the real website to strangers? (Recommended)" "y"; then
+        DG_REAL_SITE=on
+        # Automatically use browser look-alike hello (uTLS)
+        DG_UTLS=on
+        ok "Chosen: Strangers will be passed to $DG_SERVERNAME."
     fi
 }
 
@@ -1323,12 +1375,21 @@ make_pairing_code() {
     local name=$1 mode=$2 tport=$3 relay_ip=$4 server_ip=$5 inbound_port=$6 pool=$7 secret=$8
     local transport=$9 servername=${10} wspath=${11} cdn=${12} mux=${13} muxlinks=${14}
     local althost=${15-} utls=${16-} fragment=${17-} cleanips=${18-}
-    local httpheader=${19-} httphost=${20-} gre=${21-}
+    local httpheader=${19-} httphost=${20-} gre=${21-} realsite=${22-}
     # Version 6 adds the browser hello, the split hello and the clean addresses,
     # which a CDN tunnel needs on the foreign side as well. Version 7 adds the web
     # header of a plain link. A code says 7 only when it uses it, so a server that
     # knows up to 6 keeps working with every tunnel that does not. Version 8 adds
-    # the private GRE link, and is sent only for a tunnel that uses one.
+    # the private GRE link, and is sent only for a tunnel that uses one. Version 9
+    # passes strangers to the real website instead of presenting our own cert.
+    if [ "$realsite" = on ]; then
+        printf 'v=9\nname=%s\nmode=%s\ntunnel_port=%s\nrelay_ip=%s\nserver_ip=%s\ninbound_port=%s\npool=%s\ntransport=%s\nserver_name=%s\nws_path=%s\ncdn=%s\nalt_host=%s\nmux=%s\nmux_links=%s\nutls=%s\ntls_fragment=%s\nclean_ips=%s\nreal_site=%s\nsecret=%s\n' \
+            "$name" "$mode" "$tport" "$relay_ip" "$server_ip" "$inbound_port" "$pool" \
+            "$transport" "$servername" "$wspath" "$cdn" "$althost" "${mux:-off}" "${muxlinks:-4}" \
+            "$utls" "$fragment" "$cleanips" "on" "$secret" |
+            base64 | tr -d '\n'
+        return 0
+    fi
     if [ "$gre" = on ]; then
         printf 'v=8\nname=%s\nmode=%s\ntunnel_port=%s\nrelay_ip=%s\nserver_ip=%s\ninbound_port=%s\npool=%s\ntransport=%s\nserver_name=%s\nws_path=%s\ncdn=%s\nalt_host=%s\nmux=%s\nmux_links=%s\nutls=%s\ntls_fragment=%s\nclean_ips=%s\ngre=%s\nsecret=%s\n' \
             "$name" "$mode" "$tport" "$relay_ip" "$server_ip" "$inbound_port" "$pool" \
@@ -1385,7 +1446,7 @@ get_tunnel_pairing_code() {
     make_pairing_code "$name" "$mode" "$tport" "$relay_ip" "$server_ip" "$inbound_port" \
         "$pool" "$secret" "$transport" "$servername" "$wspath" "$cdn" "$mux" "$muxlinks" "$althost" \
         "$utls" "$fragment" "$cleanips" "$(read_conf "$name" http_header)" "$(read_conf "$name" http_host)" \
-        "$(read_conf "$name" gre)"
+        "$(read_conf "$name" gre)" "$(read_conf "$name" real_site)"
 }
 
 show_pairing_code() {
@@ -1526,6 +1587,12 @@ write_tunnel() {
         fi
         if [ "${DG_FRAGMENT:-off}" = on ]; then
             printf 'tls_fragment = on\n'
+        fi
+        if [ "${DG_REAL_SITE:-off}" = on ]; then
+            printf 'real_site = on\n'
+            if [ -n "${DG_COVER_SITE-}" ]; then
+                printf 'cover_site = %s\n' "$DG_COVER_SITE"
+            fi
         fi
 
         printf '\n# on = every user session shares a few long-lived connections.\n'
@@ -1761,8 +1828,11 @@ create_tunnel() {
         DG_FRAGMENT=off
         DG_HTTPHEADER=off
         DG_HTTPHOST=""
+        DG_REAL_SITE=off
+        DG_COVER_SITE=""
     else
         ask_disguise "$mode"
+        ask_real_site "$mode"
     fi
     ask_sharing
     init_agents_dir
@@ -2152,6 +2222,9 @@ join_tunnel() {
     DG_GRE=$(get gre); [ -n "$DG_GRE" ] || DG_GRE=off
     DG_GRE_LOCAL=""
     DG_GRE_REMOTE=""
+    # Version 9: passes strangers to the real website instead of presenting our cert.
+    DG_REAL_SITE=$(get real_site); [ -n "$DG_REAL_SITE" ] || DG_REAL_SITE=off
+    DG_COVER_SITE=$(get cover_site)
 
     # So does whether connections are shared: it must match on both ends or
     # neither side would understand the other.
@@ -2172,6 +2245,7 @@ join_tunnel() {
     case "$MX_MUX" in on | off) ;; *) err "That code has a bad sharing setting."; return 1 ;; esac
     case "$DG_HTTPHEADER" in on | off) ;; *) err "That code has a bad web header setting."; return 1 ;; esac
     case "$DG_GRE" in on | off) ;; *) err "That code has a bad link setting."; return 1 ;; esac
+    case "$DG_REAL_SITE" in on | off) ;; *) err "That code has a bad setting."; return 1 ;; esac
     if [ "$DG_GRE" = on ] && { [ "$DG_TRANSPORT" != plain ] || [ "$DG_CDN" = on ] || [ -n "$DG_ALTHOST" ]; }; then
         err "That code puts a GRE link together with a disguise or a CDN, which cannot work."
         return 1

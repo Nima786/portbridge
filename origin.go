@@ -202,6 +202,9 @@ func (o *origin) runDirect(ctx context.Context) error {
 				tuneSocket(raw)
 				c, err := wrapAccept(raw, o.cfg, o.cert, o.guard)
 				if err != nil {
+					if errors.Is(err, errStrangerForwarded) {
+						return
+					}
 					o.logAuth.printf("refused a tunnel connection from %s: %v", raw.RemoteAddr(), err)
 					_ = raw.Close()
 					return
@@ -209,7 +212,7 @@ func (o *origin) runDirect(ctx context.Context) error {
 				purpose, err := recvAuthPurpose(c, o.cfg.secret, o.guard)
 				if err != nil {
 					o.logAuth.printf("refused a tunnel connection from %s: %v", c.RemoteAddr(), err)
-					_ = c.Close()
+					sinkGarbageAndClose(c)
 					return
 				}
 				if purpose == authPurposeSpeedtest {

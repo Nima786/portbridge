@@ -521,3 +521,21 @@ func describeRejection(b byte) error {
 func isRejection(b byte) bool {
 	return b == rejClockSkew || b == rejReplay || b == rejMuxMismatch
 }
+
+// sinkGarbageAndClose drains any trailing probe bytes and closes with a brief,
+// realistic jitter so active scanners probing unauthenticated ports cannot detect
+// an instantaneous cryptographic rejection reaction.
+func sinkGarbageAndClose(c net.Conn) {
+	go func() {
+		defer c.Close()
+		_ = c.SetReadDeadline(time.Now().Add(250 * time.Millisecond))
+		buf := make([]byte, 1024)
+		for {
+			n, err := c.Read(buf)
+			if n == 0 || err != nil {
+				break
+			}
+		}
+		time.Sleep(100 * time.Millisecond)
+	}()
+}

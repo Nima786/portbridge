@@ -91,11 +91,23 @@ func alpnFor(t Transport) []string {
 // transport: the protocols it offers are the ones the disguise claims, and the
 // HTTP/2-only settings extension is dropped when HTTP/2 is not offered, since a
 // browser that does not offer h2 does not send it.
-func shapeUTLSHello(u *utls.UConn, t Transport) error {
+//
+// browserPaddingStyle ensures the ClientHello record is never smaller than 512 bytes,
+// matching the size of real modern browsers and preventing small ClientHello heuristic detection.
+func browserPaddingStyle(unpaddedLen int) (int, bool) {
+	if unpaddedLen < 512 {
+		return 512 - unpaddedLen, true
+	}
+	return utls.BoringPaddingStyle(unpaddedLen)
+}
+
+// When RealSite is active, it injects an authenticated 32-byte proof into the
+// ClientHello legacy_session_id.
+func shapeUTLSHello(u *utls.UConn, cfg *Config) error {
 	if err := u.BuildHandshakeState(); err != nil {
 		return fmt.Errorf("preparing the browser-style hello failed: %w", err)
 	}
-	alpn := alpnFor(t)
+	alpn := alpnFor(cfg.Transport)
 	offersH2 := false
 	for _, p := range alpn {
 		if p == "h2" {
@@ -103,6 +115,7 @@ func shapeUTLSHello(u *utls.UConn, t Transport) error {
 		}
 	}
 	kept := u.Extensions[:0]
+	hasPadding := false
 	for _, ext := range u.Extensions {
 		switch e := ext.(type) {
 		case *utls.ALPNExtension:
@@ -111,10 +124,23 @@ func shapeUTLSHello(u *utls.UConn, t Transport) error {
 			if !offersH2 {
 				continue
 			}
+		case *utls.UtlsPaddingExtension:
+			e.GetPaddingLen = browserPaddingStyle
+			hasPadding = true
 		}
 		kept = append(kept, ext)
 	}
+	if !hasPadding {
+		kept = append(kept, &utls.UtlsPaddingExtension{GetPaddingLen: browserPaddingStyle})
+	}
 	u.Extensions = kept
+	if cfg.RealSite {
+		proof, err := generateRealSiteProof(cfg.secret)
+		if err != nil {
+			return fmt.Errorf("preparing the real-site client proof failed: %w", err)
+		}
+		u.HandshakeState.Hello.SessionId = proof
+	}
 	if err := u.MarshalClientHello(); err != nil {
 		return fmt.Errorf("preparing the browser-style hello failed: %w", err)
 	}
@@ -472,7 +498,7 @@ func wrapDialPurpose(raw net.Conn, cfg *Config, purpose byte) (net.Conn, error) 
 			// A hello that could not be built must stop the dial. Carrying on
 			// with the library's default would send something other than what
 			// was asked for, without saying so.
-			if err := shapeUTLSHello(uClient, cfg.Transport); err != nil {
+			if err := shapeUTLSHello(uClient, cfg); err != nil {
 				_ = raw.Close()
 				return nil, err
 			}
@@ -540,19 +566,32 @@ func wrapAccept(raw net.Conn, cfg *Config, cert *tls.Certificate, guard ...*repl
 		return raw, nil
 
 	case TransportTLS, TransportWSS, TransportH2, TransportGRPC:
+		connToWrap := raw
+		if cfg.RealSite && !cfg.CDN {
+			var g *replayGuard
+			if len(guard) > 0 {
+				g = guard[0]
+			}
+			prefixed, err := sniffAndCheckRealSite(raw, cfg, g)
+			if err != nil {
+				return nil, err
+			}
+			connToWrap = prefixed
+		}
+
 		serverCfg, err := cfg.serverTLS(cert)
 		if err != nil {
 			return nil, err
 		}
-		ts := tls.Server(raw, serverCfg)
-		if err := raw.SetDeadline(time.Now().Add(tlsHandshakeTimeout)); err != nil {
+		ts := tls.Server(connToWrap, serverCfg)
+		if err := connToWrap.SetDeadline(time.Now().Add(tlsHandshakeTimeout)); err != nil {
 			return nil, err
 		}
 		if err := ts.Handshake(); err != nil {
-			_ = raw.Close()
+			_ = connToWrap.Close()
 			return nil, fmt.Errorf("securing the link failed: %w", err)
 		}
-		if err := raw.SetDeadline(time.Time{}); err != nil {
+		if err := connToWrap.SetDeadline(time.Time{}); err != nil {
 			return nil, err
 		}
 		if cfg.Transport == TransportTLS {
@@ -614,6 +653,10 @@ func describeTransport(cfg *Config) string {
 			return fmt.Sprintf("plain, opening like web traffic to %s (not encrypted)", host)
 		}
 		return "plain, no disguise"
+	}
+
+	if cfg.RealSite && !cfg.CDN {
+		base += " (real site shown to strangers)"
 	}
 
 	if cfg.Dials() {

@@ -848,6 +848,29 @@ func TestAuthFrameV2Checks(t *testing.T) {
 	}
 }
 
+func TestSinkGarbageAndClose(t *testing.T) {
+	c1, c2 := net.Pipe()
+	defer c1.Close()
+
+	start := time.Now()
+	sinkGarbageAndClose(c2)
+
+	go func() {
+		_, _ = c1.Write([]byte("probe garbage data"))
+	}()
+
+	buf := make([]byte, 64)
+	_ = c1.SetReadDeadline(time.Now().Add(1 * time.Second))
+	_, err := c1.Read(buf)
+	if err == nil {
+		t.Fatal("expected EOF or close")
+	}
+	elapsed := time.Since(start)
+	if elapsed < 50*time.Millisecond {
+		t.Fatalf("expected graceful jitter delay >= 50ms, closed in %v", elapsed)
+	}
+}
+
 func TestConfigValidation(t *testing.T) {
 	base := func() *Config {
 		c := defaultConfig()

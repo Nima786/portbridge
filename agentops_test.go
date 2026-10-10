@@ -233,9 +233,21 @@ func encodeCode(fields string) string {
 }
 
 func TestNewerPairingCodeIsRefusedByName(t *testing.T) {
-	_, err := decodePairingCode(encodeCode("v=9\nname=x\nmode=direct\ntunnel_port=1\nsecret=0123456789abcdef\n"))
+	_, err := decodePairingCode(encodeCode("v=10\nname=x\nmode=direct\ntunnel_port=1\nsecret=0123456789abcdef\n"))
 	if err == nil || !strings.Contains(err.Error(), "newer") {
 		t.Fatalf("got %v", err)
+	}
+}
+
+func TestVersion9CarriesRealSiteSettings(t *testing.T) {
+	code := encodeCode("v=9\nname=rsite\nmode=direct\ntunnel_port=443\nrelay_ip=1.2.3.4\nserver_ip=5.6.7.8\ninbound_port=80\n" +
+		"transport=tls\nserver_name=www.bing.com\nreal_site=on\nsecret=0123456789abcdef0123456789abcdef\n")
+	p, err := decodePairingCode(code)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p.RealSite != "on" {
+		t.Fatalf("real_site field lost: %+v", p)
 	}
 }
 

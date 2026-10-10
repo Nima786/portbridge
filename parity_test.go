@@ -122,4 +122,23 @@ func TestPairingCodeFieldsMatch(t *testing.T) {
 	if strings.Join(keys8, ",") != strings.Join(want8, ",") {
 		t.Fatalf("the menu's version 8 code has %v\nthe engine reads %v", keys8, want8)
 	}
+
+	// Version 9 is the same as 6 with real_site added.
+	m9 := regexp.MustCompile(`printf 'v=9\\n([^']*)'`).FindStringSubmatch(menu)
+	if m9 == nil {
+		t.Fatalf("could not find the version 9 code format in the menu")
+	}
+	var keys9 []string
+	for _, part := range strings.Split(m9[1], `\n`) {
+		if k, _, ok := strings.Cut(part, "="); ok && k != "" {
+			keys9 = append(keys9, k)
+		}
+	}
+	keys9 = append(keys9, "v")
+	want9 := append(append([]string{}, engineKeys...), "real_site")
+	sort.Strings(keys9)
+	sort.Strings(want9)
+	if strings.Join(keys9, ",") != strings.Join(want9, ",") {
+		t.Fatalf("the menu's version 9 code has %v\nthe engine reads %v", keys9, want9)
+	}
 }

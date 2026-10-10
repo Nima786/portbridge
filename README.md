@@ -130,6 +130,18 @@ that name does not have to be real or yours. A certificate is generated on the
 spot. It is not checked for trust, because the shared password already proves who
 is who; the certificate is only there to make the handshake look normal.
 
+### Active Probing Defense: Show the real website to strangers
+
+When an active probe or censor connects to a disguised port (`tls`, `h2`, `grpc`, or direct `wss`), the default defense is to never answer for itself. With **"Show the real website to strangers"** (`real_site = on`, enabled by default for new website, HTTP/2, gRPC, and WebSocket links):
+
+1. **Foreign-server check**: The listening server reads the opening message (`ClientHello`) without answering.
+2. **Client proof**: An authentic PortBridge client embeds a 32-byte cryptographic proof (masked timestamp, random nonce, and HMAC-SHA256 signature derived from the shared secret) inside the TLS ClientHello's `legacy_session_id`, using a realistic Chrome browser fingerprint (`uTLS`).
+3. **Transparent Splicing to the Real Site**: Any visitor without the authentic proof—such as censors, security scanners, arbitrary probes, or invalid protocols—is instantly and transparently piped directly to the genuine cover site (e.g. `www.bing.com:443`). Probers negotiate TLS directly with Microsoft or the chosen cover site and receive their authentic certificate, cipher suites, and real pages. PortBridge's server never answers or exposes its own certificate to strangers.
+4. **Anti-Replay Protection**: A copied ClientHello from a real client cannot be replayed by a censor to elicit PortBridge's certificate; replayed packets fail the replay guard cache and are forwarded straight to the real cover site.
+5. **Reverse Mode Support**: In reverse mode where the Iran server is the listener, the setup menu automatically tests candidates to suggest a cover website that is reachable and unblocked from inside Iran.
+
+Existing tunnels stay unchanged. Pairing codes carry `real_site` (as pairing code version 9), ensuring both servers agree automatically.
+
 Be clear about what that option does and does not do. It stops the link being
 picked out for matching no known protocol, and it answers a genuine handshake if
 the port is probed. It does not hide where the traffic is going: your foreign
@@ -232,8 +244,17 @@ anything that opens like nothing they recognise while letting ordinary web traff
 through. When you choose plain, the menu asks whether to make it **open like web
 traffic**, and for a site name to use (any believable name, default
 `www.bing.com`; it does not have to be yours). The side that connects sends a
-short, browser-like web request naming that site, the other side answers with a
+realistic browser web request naming that site, the other side answers with a
 normal-looking reply, and the tunnel carries on exactly as before.
+
+Requests are dynamically rotated across modern browser profiles (Chrome, Edge,
+Firefox, Safari on Windows and macOS), including modern browser headers (`Sec-Ch-Ua`,
+`Sec-Fetch-*`, `Accept-*`) and plausible cookies, bringing the initial greeting to a
+realistic browser request size (500–800+ bytes) and preventing static byte fingerprinting.
+If scanners probe the port with non-HTTP garbage, the server answers with an authentic
+nginx `HTTP/1.1 400 Bad Request` page before closing, completely masking the tunnel.
+On plain links without web traffic disguise, probes are drained and closed with natural jitter
+to eliminate instantaneous timing tells.
 
 Measured on a real route into Iran, from outside, with a 6 MB download through the
 tunnel: the plain link stalled after a few kilobytes and the same tunnel with this
@@ -535,6 +556,7 @@ the retry, which then moves the user to a different shared connection.
 - **Zero-Magic Protocol v2 Framing**: Cross-border connection framing is disguised with an ephemeral HMAC mask derived from the shared secret. Handshake frames contain no fixed magic bytes or protocol signatures, making them indistinguishable from random encrypted entropy to DPI sniffers.
 - **Randomized Handshake Padding**: Handshake frames append 16 to 64 bytes of cryptographically randomized padding to eliminate static packet size fingerprints.
 - **Anti-Replay Sliding Window**: A timestamp window combined with a bitmask nonces cache ensures captured handshake packets cannot be replayed.
+- **Active Probing Cover Splicing**: For disguised links with `real_site` enabled, unauthorized probes and censors scanning the tunnel port are transparently proxied to the real cover site (e.g. Bing), obtaining Microsoft's authentic certificate and HTTP responses while keeping PortBridge's server completely invisible.
 - **0-RTT Early Data**: When using WebSocket / CDN transports, authentication is carried directly in the HTTP Upgrade handshake (`Sec-WebSocket-Protocol`), establishing authenticated connections with zero round-trip delay.
 - On whichever half accepts the connection, the tunnel port is locked to the
   other server's address automatically. The rule is reapplied on every start, so

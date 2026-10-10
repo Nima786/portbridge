@@ -265,3 +265,57 @@ func TestPairingCodeCarriesTheWebHeader(t *testing.T) {
 		t.Fatalf("a web header on a website link was accepted")
 	}
 }
+
+// Ensure the fake web request is not static or identical across connections,
+// and has a realistic browser size (> 500 bytes).
+func TestHTTPHeaderDynamicAndRandomized(t *testing.T) {
+	req1 := httpHeaderRequest("www.bing.com")
+	req2 := httpHeaderRequest("www.bing.com")
+
+	if len(req1) < 400 || len(req2) < 400 {
+		t.Fatalf("request size is too small: len1=%d len2=%d", len(req1), len(req2))
+	}
+
+	// Over a few samples, requests must not be identical
+	different := false
+	for i := 0; i < 5; i++ {
+		r := httpHeaderRequest("www.bing.com")
+		if string(r) != string(req1) {
+			different = true
+			break
+		}
+	}
+	if !different {
+		t.Fatal("httpHeaderRequest generated identical bytes across connections")
+	}
+}
+
+// Scanners sending garbage or non-HTTP data receive a realistic 400 Bad Request
+// from nginx instead of being abruptly disconnected with zero bytes.
+func TestHTTPHeaderAnswersBadRequestToProbes(t *testing.T) {
+	c, s := tcpPair(t)
+	go func() {
+		// Scanner sends binary garbage
+		_, _ = c.Write([]byte("\x16\x03\x01\x02\x00some non-http probe"))
+	}()
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- httpHeaderAccept(s)
+	}()
+
+	buf := make([]byte, 1024)
+	_ = c.SetReadDeadline(time.Now().Add(2 * time.Second))
+	n, err := c.Read(buf)
+	if err != nil {
+		t.Fatalf("expected 400 Bad Request reply, got read error: %v", err)
+	}
+	reply := string(buf[:n])
+	if !strings.HasPrefix(reply, "HTTP/1.1 400 Bad Request\r\n") || !strings.Contains(reply, "nginx") {
+		t.Fatalf("expected authentic nginx 400 Bad Request, got:\n%s", reply)
+	}
+
+	if err := <-errCh; !errors.Is(err, errHTTPNotHeader) {
+		t.Fatalf("expected errHTTPNotHeader, got %v", err)
+	}
+}

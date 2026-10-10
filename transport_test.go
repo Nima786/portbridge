@@ -276,22 +276,6 @@ func TestLinkLooksLikeHTTPS(t *testing.T) {
 	}
 }
 
-// prefixConn replays bytes already read, so the handshake can be inspected and
-// then completed.
-type prefixConn struct {
-	net.Conn
-	pre []byte
-}
-
-func (p *prefixConn) Read(b []byte) (int, error) {
-	if len(p.pre) > 0 {
-		n := copy(b, p.pre)
-		p.pre = p.pre[n:]
-		return n, nil
-	}
-	return p.Conn.Read(b)
-}
-
 // With the CDN disguise the link must begin with a real HTTP upgrade request,
 // because that is what a CDN needs in order to forward it.
 func TestCDNLinkSendsHTTPUpgrade(t *testing.T) {
@@ -877,5 +861,31 @@ func TestUTLSHandshakeWithFragmentation(t *testing.T) {
 
 	if err := <-serverDone; err != nil {
 		t.Fatalf("server error: %v", err)
+	}
+}
+
+// TestShapeUTLSHelloPadding ensures that shaped uTLS ClientHellos are always
+// padded to at least 512 bytes, matching realistic browser ClientHello sizes.
+func TestShapeUTLSHelloPadding(t *testing.T) {
+	c1, c2 := net.Pipe()
+	defer c1.Close()
+	defer c2.Close()
+
+	cfg := &Config{
+		Transport:  TransportTLS,
+		ServerName: "www.example.com",
+		RealSite:   true,
+		secret:     []byte("0123456789abcdef0123456789abcdef"),
+	}
+
+	uCfg := &utls.Config{ServerName: "www.example.com"}
+	uClient := utls.UClient(c1, uCfg, utls.HelloChrome_Auto)
+	if err := shapeUTLSHello(uClient, cfg); err != nil {
+		t.Fatalf("shapeUTLSHello: %v", err)
+	}
+
+	rawHello := uClient.HandshakeState.Hello.Raw
+	if len(rawHello) < 512 {
+		t.Fatalf("expected ClientHello size >= 512, got %d bytes", len(rawHello))
 	}
 }

@@ -2,6 +2,8 @@ package main
 
 import (
 	"bytes"
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -55,35 +57,146 @@ var (
 		"http_header must be on at both ends or off at both")
 )
 
-// httpHeaderRequest is what the dialling side sends.
+var (
+	browserProfiles = []struct {
+		userAgent   string
+		secChUa     string
+		secPlatform string
+		accept      string
+		acceptLang  string
+		acceptEnc   string
+	}{
+		{
+			// Chrome on Windows
+			userAgent:   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+			secChUa:     `"Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";v="24"`,
+			secPlatform: `"Windows"`,
+			accept:      "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
+			acceptLang:  "en-US,en;q=0.9",
+			acceptEnc:   "gzip, deflate, br, zstd",
+		},
+		{
+			// Chrome on macOS
+			userAgent:   "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+			secChUa:     `"Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";v="24"`,
+			secPlatform: `"macOS"`,
+			accept:      "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+			acceptLang:  "en-US,en;q=0.9",
+			acceptEnc:   "gzip, deflate, br, zstd",
+		},
+		{
+			// Edge on Windows
+			userAgent:   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36 Edg/131.0.0.0",
+			secChUa:     `"Microsoft Edge";v="131", "Chromium";v="131", "Not_A Brand";v="24"`,
+			secPlatform: `"Windows"`,
+			accept:      "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8",
+			acceptLang:  "en-US,en;q=0.9",
+			acceptEnc:   "gzip, deflate, br",
+		},
+		{
+			// Firefox on Windows
+			userAgent:   "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:132.0) Gecko/20100101 Firefox/132.0",
+			secChUa:     "",
+			secPlatform: "",
+			accept:      "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+			acceptLang:  "en-US,en;q=0.5",
+			acceptEnc:   "gzip, deflate, br, zstd",
+		},
+		{
+			// Safari on macOS
+			userAgent:   "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_7_1) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.1 Safari/605.1.15",
+			secChUa:     "",
+			secPlatform: "",
+			accept:      "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+			acceptLang:  "en-US,en;q=0.9",
+			acceptEnc:   "gzip, deflate, br",
+		},
+	}
+
+	serverNames = []string{
+		"nginx/1.24.0",
+		"nginx",
+		"Apache/2.4.58 (Ubuntu)",
+		"cloudflare",
+		"Microsoft-IIS/10.0",
+	}
+)
+
+func randInt(n int) int {
+	if n <= 1 {
+		return 0
+	}
+	var b [1]byte
+	_, _ = rand.Read(b[:])
+	return int(b[0]) % n
+}
+
+func generatePlausibleCookie() string {
+	var rnd [16]byte
+	_, _ = rand.Read(rnd[:])
+	hexPart := hex.EncodeToString(rnd[:])
+	return fmt.Sprintf("_ga=GA1.2.%d.%d; _gid=GA1.2.%d; session_token=%s",
+		time.Now().Unix(),
+		100000000+randInt(900000000),
+		100000000+randInt(900000000),
+		hexPart)
+}
+
+// httpHeaderRequest is what the dialling side sends. It rotates across modern
+// browser profiles, varies headers and cookies, and pads to realistic browser size (500-800+ bytes).
 func httpHeaderRequest(host string) []byte {
 	if host == "" {
 		host = defaultHTTPHost
 	}
+
+	prof := browserProfiles[randInt(len(browserProfiles))]
+
 	var b bytes.Buffer
 	b.WriteString("GET / HTTP/1.1\r\n")
 	b.WriteString("Host: " + host + "\r\n")
-	b.WriteString("User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36\r\n")
-	b.WriteString("Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8\r\n")
-	b.WriteString("Accept-Language: en-US,en;q=0.9\r\n")
-	b.WriteString("Accept-Encoding: gzip, deflate\r\n")
+	b.WriteString("User-Agent: " + prof.userAgent + "\r\n")
+	b.WriteString("Accept: " + prof.accept + "\r\n")
+	b.WriteString("Accept-Language: " + prof.acceptLang + "\r\n")
+	b.WriteString("Accept-Encoding: " + prof.acceptEnc + "\r\n")
+	b.WriteString("Upgrade-Insecure-Requests: 1\r\n")
+
+	if prof.secChUa != "" {
+		b.WriteString("Sec-Ch-Ua: " + prof.secChUa + "\r\n")
+		b.WriteString("Sec-Ch-Ua-Mobile: ?0\r\n")
+		b.WriteString("Sec-Ch-Ua-Platform: " + prof.secPlatform + "\r\n")
+		b.WriteString("Sec-Fetch-Site: none\r\n")
+		b.WriteString("Sec-Fetch-Mode: navigate\r\n")
+		b.WriteString("Sec-Fetch-User: ?1\r\n")
+		b.WriteString("Sec-Fetch-Dest: document\r\n")
+	}
+
 	b.WriteString("Connection: keep-alive\r\n")
+	b.WriteString("Cookie: " + generatePlausibleCookie() + "\r\n")
 	b.WriteString("\r\n")
 	return b.Bytes()
 }
 
-// httpHeaderReply is what the accepting side answers with. The body is whatever
-// follows, until the connection closes, which is what "Connection: close" says.
+// httpHeaderReply is what the accepting side answers with.
 func httpHeaderReply() []byte {
+	srv := serverNames[randInt(len(serverNames))]
 	var b bytes.Buffer
 	b.WriteString("HTTP/1.1 200 OK\r\n")
-	b.WriteString("Server: nginx\r\n")
+	b.WriteString("Server: " + srv + "\r\n")
 	b.WriteString("Date: " + time.Now().UTC().Format(time.RFC1123) + "\r\n")
-	b.WriteString("Content-Type: application/octet-stream\r\n")
-	b.WriteString("Cache-Control: no-cache\r\n")
+	b.WriteString("Content-Type: text/html; charset=UTF-8\r\n")
+	b.WriteString("Cache-Control: private, max-age=0\r\n")
 	b.WriteString("Connection: close\r\n")
 	b.WriteString("\r\n")
 	return b.Bytes()
+}
+
+// writeHTTPBadRequest answers probes and scanners with an authentic nginx 400 error page.
+func writeHTTPBadRequest(c net.Conn) {
+	_ = c.SetWriteDeadline(time.Now().Add(2 * time.Second))
+	body := "<html>\r\n<head><title>400 Bad Request</title></head>\r\n<body>\r\n<center><h1>400 Bad Request</h1></center>\r\n<hr><center>nginx</center>\r\n</body>\r\n</html>\r\n"
+	resp := fmt.Sprintf("HTTP/1.1 400 Bad Request\r\nServer: nginx\r\nDate: %s\r\nContent-Type: text/html\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s",
+		time.Now().UTC().Format(time.RFC1123), len(body), body)
+	_, _ = c.Write([]byte(resp))
 }
 
 // readHTTPHead reads up to and including the blank line that ends an HTTP header,
@@ -143,13 +256,16 @@ func httpHeaderAccept(c net.Conn) error {
 		return fmt.Errorf("reading the web header: %w", err)
 	}
 	if string(first[:]) != "GET " {
+		writeHTTPBadRequest(c)
 		return errHTTPNotHeader
 	}
 	head, err := readHTTPHeadFrom(c, first[:])
 	if err != nil {
+		writeHTTPBadRequest(c)
 		return fmt.Errorf("reading the web header: %w", err)
 	}
 	if !strings.Contains(strings.ToLower(string(head)), "\r\nhost:") {
+		writeHTTPBadRequest(c)
 		return errHTTPNotHeader
 	}
 	if _, err := c.Write(httpHeaderReply()); err != nil {
