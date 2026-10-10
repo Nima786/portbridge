@@ -365,7 +365,9 @@ func cmdSpeedtest(args []string) {
 		defer raw.Close()
 		tuneSocket(raw)
 
-		c, err := wrapDial(raw, cfg.withClaimedName(claim))
+		// Announce the purpose up front: a websocket link carries it in the
+		// upgrade request, and a speed test announced as a tunnel never works.
+		c, err := wrapDialPurpose(raw, cfg.withClaimedName(claim), authPurposeSpeedtest)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "securing link: %v\n", err)
 			os.Exit(1)

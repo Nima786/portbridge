@@ -718,7 +718,9 @@ func handleOriginControlConn(c net.Conn, o *origin) {
 			}
 			defer raw.Close()
 			tuneSocket(raw)
-			tc, err := wrapDial(raw, o.cfg.withClaimedName(claim))
+			// The purpose is said here too: a websocket link announces it in the
+			// upgrade request, and a speed test announced as a tunnel never works.
+			tc, err := wrapDialPurpose(raw, o.cfg.withClaimedName(claim), authPurposeSpeedtest)
 			if err != nil {
 				_, _ = fmt.Fprintf(c, "securing link: %v\n", err)
 				return
