@@ -47,6 +47,10 @@ const (
 	sniffTimeout     = 5 * time.Second
 )
 
+// strangerSlots bounds how many strangers are being passed to the cover site at
+// once.
+var strangerSlots = make(chan struct{}, 256)
+
 var (
 	errStrangerForwarded = errors.New("connection passed to real site")
 	errNotRealSiteProof  = errors.New("not a valid real-site proof")
@@ -169,6 +173,18 @@ func sniffAndCheckRealSite(raw net.Conn, cfg *Config, guard *replayGuard) (net.C
 	}
 	buffered := buf[:n]
 
+	// A very small first segment (a hello split into tiny pieces) can arrive
+	// with fewer bytes than the record header. Wait for the rest of the header
+	// rather than mistaking a genuine client for a stranger.
+	for n > 0 && n < realSiteSniffHeader && buf[0] == 0x16 {
+		nr, rerr := raw.Read(buf[n:])
+		n += nr
+		buffered = buf[:n]
+		if rerr != nil {
+			break
+		}
+	}
+
 	// Must start with TLS Handshake record: 0x16 0x03
 	if len(buffered) < realSiteSniffHeader || buffered[0] != 0x16 || buffered[1] != 0x03 {
 		_ = raw.SetReadDeadline(time.Time{})
@@ -212,7 +228,17 @@ func sniffAndCheckRealSite(raw net.Conn, cfg *Config, guard *replayGuard) (net.C
 
 // forwardStranger transparently proxies a stranger to the cover website.
 func forwardStranger(client net.Conn, coverTarget string, prefix []byte) {
+	// A flood of strangers must not turn this server into a flood of
+	// connections to the cover site. Past the limit the extra ones are simply
+	// closed, which looks like any busy server.
+	select {
+	case strangerSlots <- struct{}{}:
+	default:
+		_ = client.Close()
+		return
+	}
 	go func() {
+		defer func() { <-strangerSlots }()
 		defer client.Close()
 
 		cover, err := net.DialTimeout("tcp", coverTarget, 5*time.Second)

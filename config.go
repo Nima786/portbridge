@@ -671,6 +671,18 @@ func (c *Config) Validate() error {
 			c.HTTPHost = defaultHTTPHost
 		}
 	}
+	if c.RealSite {
+		// Said out loud rather than quietly doing nothing, or worse, quietly
+		// sending a CDN's connection to the real website instead of to us.
+		switch {
+		case c.Transport == TransportPlain || c.Transport == TransportKCP:
+			return fmt.Errorf("real_site needs a website-style link (tls, wss, h2 or grpc); the %s link has no handshake to hide behind", c.Transport)
+		case c.CDN:
+			return fmt.Errorf("real_site cannot be used with cdn = on: a CDN makes its own connection and cannot carry the proof")
+		case c.AltTarget != "":
+			return fmt.Errorf("real_site cannot be used with a CDN backup route (alt_target): the CDN's connection cannot carry the proof, so it would be shown the real website")
+		}
+	}
 	if c.HTTPHost != "" && !hostnameRe.MatchString(c.HTTPHost) {
 		return fmt.Errorf("http_host %q is not a hostname (letters, digits, dots and dashes)", c.HTTPHost)
 	}

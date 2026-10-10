@@ -890,7 +890,10 @@ ask_real_site() {
     DG_COVER_SITE=""
 
     # Does not apply to CDN links, GRE, plain, or KCP links.
-    if [ "${DG_CDN:-off}" = on ] || [ "${DG_TRANSPORT:-plain}" = plain ] || [ "${DG_TRANSPORT:-plain}" = kcp ]; then
+    # A CDN backup route is left out too: the CDN makes its own connection to
+    # this server, which cannot carry the proof, so it would be shown the real site.
+    if [ "${DG_CDN:-off}" = on ] || [ -n "${DG_ALTHOST:-}" ] ||
+        [ "${DG_TRANSPORT:-plain}" = plain ] || [ "${DG_TRANSPORT:-plain}" = kcp ]; then
         return 0
     fi
 

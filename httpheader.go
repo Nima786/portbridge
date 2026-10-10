@@ -3,11 +3,13 @@ package main
 import (
 	"bytes"
 	"crypto/rand"
+	"encoding/binary"
 	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
 	"net"
+	"net/http"
 	"strings"
 	"time"
 )
@@ -122,23 +124,31 @@ var (
 	}
 )
 
+// randInt returns a uniformly spread number in [0, n). It reads four random
+// bytes, not one, so that large ranges (cookie numbers) really are spread
+// across the whole range rather than only its first 256 values.
 func randInt(n int) int {
 	if n <= 1 {
 		return 0
 	}
-	var b [1]byte
+	var b [8]byte
 	_, _ = rand.Read(b[:])
-	return int(b[0]) % n
+	return int(binary.BigEndian.Uint64(b[:]) % uint64(n))
 }
 
+// generatePlausibleCookie follows the shape Google Analytics cookies really
+// have: _ga is GA1.2.<random number>.<first-visit time>, _gid is
+// GA1.2.<random number>.<time>.
 func generatePlausibleCookie() string {
 	var rnd [16]byte
 	_, _ = rand.Read(rnd[:])
 	hexPart := hex.EncodeToString(rnd[:])
-	return fmt.Sprintf("_ga=GA1.2.%d.%d; _gid=GA1.2.%d; session_token=%s",
-		time.Now().Unix(),
-		100000000+randInt(900000000),
-		100000000+randInt(900000000),
+	now := time.Now().Unix()
+	// First visit was some days ago; _gid is from the last day or so.
+	firstVisit := now - int64(86400*(1+randInt(60)))
+	return fmt.Sprintf("_ga=GA1.2.%d.%d; _gid=GA1.2.%d.%d; session_token=%s",
+		1000000000+randInt(1000000000), firstVisit,
+		1000000000+randInt(1000000000), now-int64(randInt(86400)),
 		hexPart)
 }
 
@@ -182,7 +192,7 @@ func httpHeaderReply() []byte {
 	var b bytes.Buffer
 	b.WriteString("HTTP/1.1 200 OK\r\n")
 	b.WriteString("Server: " + srv + "\r\n")
-	b.WriteString("Date: " + time.Now().UTC().Format(time.RFC1123) + "\r\n")
+	b.WriteString("Date: " + time.Now().UTC().Format(http.TimeFormat) + "\r\n")
 	b.WriteString("Content-Type: text/html; charset=UTF-8\r\n")
 	b.WriteString("Cache-Control: private, max-age=0\r\n")
 	b.WriteString("Connection: close\r\n")
@@ -195,7 +205,7 @@ func writeHTTPBadRequest(c net.Conn) {
 	_ = c.SetWriteDeadline(time.Now().Add(2 * time.Second))
 	body := "<html>\r\n<head><title>400 Bad Request</title></head>\r\n<body>\r\n<center><h1>400 Bad Request</h1></center>\r\n<hr><center>nginx</center>\r\n</body>\r\n</html>\r\n"
 	resp := fmt.Sprintf("HTTP/1.1 400 Bad Request\r\nServer: nginx\r\nDate: %s\r\nContent-Type: text/html\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s",
-		time.Now().UTC().Format(time.RFC1123), len(body), body)
+		time.Now().UTC().Format(http.TimeFormat), len(body), body)
 	_, _ = c.Write([]byte(resp))
 }
 
