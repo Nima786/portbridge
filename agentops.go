@@ -332,7 +332,7 @@ func validatePairing(p *PairingData) error {
 	}
 	for _, f := range []struct{ name, val string }{
 		{"cdn", p.CDN}, {"mux", p.Mux}, {"utls", p.UTLS}, {"tls_fragment", p.TLSFragment},
-		{"http_header", p.HTTPHeader}, {"gre", p.GRE},
+		{"ech", p.ECH}, {"http_header", p.HTTPHeader}, {"gre", p.GRE},
 	} {
 		if f.val != "" && f.val != "on" && f.val != "off" {
 			return fmt.Errorf("%s must be on or off, got %q", f.name, f.val)

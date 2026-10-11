@@ -108,6 +108,9 @@ func buildOriginConf(p *PairingData, secretFile, certFile, keyFile string) strin
 		if p.TLSFragment != "" {
 			fmt.Fprintf(&b, "tls_fragment = %s\n", p.TLSFragment)
 		}
+		if p.ECH != "" {
+			fmt.Fprintf(&b, "ech = %s\n", p.ECH)
+		}
 		if p.CleanIPs != "" && p.Mode == "reverse" {
 			fmt.Fprintf(&b, "clean_ips = %s\n", p.CleanIPs)
 		}

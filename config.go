@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"crypto/tls"
+	"encoding/base64"
 	"fmt"
 	"net"
 	"os"
@@ -181,6 +182,8 @@ type Config struct {
 	TLSFragmentSleep time.Duration
 	UTLS             bool
 	UTLSProfile      string
+	ECH              bool
+	ECHConfig        string
 	CleanIPs         []string
 
 	// RealSite passes any stranger who connects without proving who they are
@@ -193,6 +196,7 @@ type Config struct {
 	fragmentSet bool
 	resendSet   bool // kcp_resend was written down, so 0 means off rather than unset
 	utlsSet     bool
+	echSet      bool
 
 	// Disguise settings prepared once at startup and only read afterwards. They
 	// are what makes a repeat connection cheap; see prepareTLS in transport.go
@@ -623,6 +627,24 @@ func (c *Config) set(key, val string) error {
 			return fmt.Errorf("utls_profile %q is not one I know: use %s", val, utlsProfileNames())
 		}
 		c.UTLSProfile = profile
+	case "ech":
+		c.echSet = true
+		switch strings.ToLower(val) {
+		case "on", "yes", "true":
+			c.ECH = true
+		case "off", "no", "false":
+			c.ECH = false
+		default:
+			return fmt.Errorf("ech must be on or off, got %q", val)
+		}
+	case "ech_config":
+		trimmed := strings.TrimSpace(val)
+		if trimmed != "" {
+			if raw, err := base64.StdEncoding.DecodeString(trimmed); err != nil || len(raw) == 0 {
+				return fmt.Errorf("ech_config must be base64-encoded ECHConfigList")
+			}
+		}
+		c.ECHConfig = trimmed
 	case "clean_ips", "clean_ip":
 		parts := strings.Split(val, ",")
 		for _, p := range parts {
@@ -661,6 +683,9 @@ func (c *Config) Validate() error {
 		}
 		if !c.fragmentSet {
 			c.TLSFragment = true
+		}
+		if !c.echSet {
+			c.ECH = true
 		}
 	}
 	if c.HTTPHeader {

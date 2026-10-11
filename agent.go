@@ -49,6 +49,7 @@ type PairingData struct {
 	// browser hello, the split hello and the clean addresses.
 	UTLS        string
 	TLSFragment string
+	ECH         string
 	CleanIPs    string
 
 	// Added in version 7, and only sent when used: a plain link that opens with a
@@ -113,6 +114,7 @@ func decodePairingCode(code string) (*PairingData, error) {
 		Secret:      kv["secret"],
 		UTLS:        kv["utls"],
 		TLSFragment: kv["tls_fragment"],
+		ECH:         kv["ech"],
 		CleanIPs:    kv["clean_ips"],
 		GRE:         kv["gre"],
 		HTTPHeader:  kv["http_header"],

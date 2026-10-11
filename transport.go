@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
@@ -114,24 +115,38 @@ func shapeUTLSHello(u *utls.UConn, cfg *Config) error {
 			offersH2 = true
 		}
 	}
+	echActive := cfg.useECH()
 	kept := u.Extensions[:0]
 	hasPadding := false
+	hasECHExt := false
 	for _, ext := range u.Extensions {
+		if _, ok := ext.(utls.EncryptedClientHelloExtension); ok {
+			hasECHExt = true
+		}
 		switch e := ext.(type) {
 		case *utls.ALPNExtension:
 			e.AlpnProtocols = alpn
-		case *utls.ApplicationSettingsExtension:
+		case *utls.ApplicationSettingsExtension, *utls.ApplicationSettingsExtensionNew:
 			if !offersH2 {
 				continue
 			}
 		case *utls.UtlsPaddingExtension:
+			if echActive {
+				// ECH already pads the inner ClientHello and adds the outer
+				// ECH payload, and uTLS's outer-extension compressor cannot
+				// serialize an inactive UtlsPaddingExtension.
+				continue
+			}
 			e.GetPaddingLen = browserPaddingStyle
 			hasPadding = true
 		}
 		kept = append(kept, ext)
 	}
-	if !hasPadding {
+	if !hasPadding && !echActive {
 		kept = append(kept, &utls.UtlsPaddingExtension{GetPaddingLen: browserPaddingStyle})
+	}
+	if echActive && !hasECHExt {
+		kept = append(kept, utls.BoringGREASEECH())
 	}
 	u.Extensions = kept
 	if cfg.RealSite {
@@ -477,80 +492,139 @@ func wrapDialPurpose(raw net.Conn, cfg *Config, purpose byte) (net.Conn, error) 
 		return raw, nil
 
 	case TransportTLS, TransportWSS, TransportH2, TransportGRPC:
-		connToWrap := raw
-		if cfg.useFragment() {
-			size := cfg.TLSFragmentSize
-			if size <= 0 {
-				size = 40
-			}
-			sleep := cfg.TLSFragmentSleep
-			if sleep <= 0 {
-				sleep = 3 * time.Millisecond
-			}
-			connToWrap = newFragmentConn(raw, size, sleep)
+		echList, echErr := resolveECHConfigList(cfg, raw.RemoteAddr())
+		if echErr != nil {
+			_ = raw.Close()
+			return nil, echErr
 		}
 
-		if cfg.useUTLS() {
-			// A copy for this connection. Building the hello changes the
-			// settings it is given, and the prepared ones are shared by every
-			// connection made at once; the copy keeps the shared session cache.
-			uClient := utls.UClient(connToWrap, cfg.clientUTLS(cfg.effectiveClientName()).Clone(), cfg.utlsHelloID())
-			// A hello that could not be built must stop the dial. Carrying on
-			// with the library's default would send something other than what
-			// was asked for, without saying so.
-			if err := shapeUTLSHello(uClient, cfg); err != nil {
-				_ = raw.Close()
-				return nil, err
-			}
-			if err := raw.SetDeadline(time.Now().Add(tlsHandshakeTimeout)); err != nil {
-				return nil, err
-			}
-			if err := uClient.Handshake(); err != nil {
-				_ = raw.Close()
-				return nil, fmt.Errorf("securing the link with uTLS failed: %w", err)
-			}
-			if err := raw.SetDeadline(time.Time{}); err != nil {
-				return nil, err
-			}
-			if err := checkNegotiated(uClient.ConnectionState().NegotiatedProtocol, cfg.Transport); err != nil {
-				_ = raw.Close()
-				return nil, err
-			}
-			if cfg.Transport == TransportTLS {
-				return uClient, nil
-			}
-			if cfg.Transport == TransportWSS {
-				return wsDialPurpose(uClient, cfg, purpose)
-			}
-			return h2Dial(uClient, cfg)
+		conn, err := wrapDialTLSOnce(raw, cfg, purpose, echList)
+		if err == nil || len(echList) == 0 {
+			return conn, err
 		}
 
-		tc := tls.Client(connToWrap, cfg.clientTLS(cfg.effectiveClientName()))
-		if err := raw.SetDeadline(time.Now().Add(tlsHandshakeTimeout)); err != nil {
-			return nil, err
+		domain := cfg.effectiveClientName()
+		// If the server rejected ECH and supplied an updated RetryConfigList
+		// (for example, Cloudflare rotated its ECH key), cache it and retry once
+		// with the new ECH key.
+		if retryList, isRej := extractECHRetryConfigs(err); isRej && len(retryList) > 0 && !bytes.Equal(retryList, echList) {
+			cacheECHConfigList(domain, retryList)
+			if fresh, dialErr := redialPeer(raw); dialErr == nil {
+				if conn2, err2 := wrapDialTLSOnce(fresh, cfg, purpose, retryList); err2 == nil {
+					return conn2, nil
+				}
+			}
 		}
-		if err := tc.Handshake(); err != nil {
-			_ = raw.Close()
-			return nil, fmt.Errorf("securing the link failed: %w", err)
+
+		// Automatic fallback: if ECH was rejected or dropped (for example, ECH
+		// is disabled on the CDN zone, the CDN is not Cloudflare, or an ISP
+		// blocks the outer ECH SNI), immediately retry without ECH using the
+		// standard uTLS fingerprint + fragmentation, and remember the bypass so
+		// subsequent pool connections do not pay an ECH retry penalty.
+		if fresh, dialErr := redialPeer(raw); dialErr == nil {
+			if connFallback, errFallback := wrapDialTLSOnce(fresh, cfg.withoutECH(), purpose, nil); errFallback == nil {
+				markECHBypass(domain)
+				echFallbackLog.printf("ECH handshake to %s was not accepted (%v); fell back automatically to standard TLS", domain, err)
+				return connFallback, nil
+			}
 		}
-		if err := raw.SetDeadline(time.Time{}); err != nil {
-			return nil, err
-		}
-		if err := checkNegotiated(tc.ConnectionState().NegotiatedProtocol, cfg.Transport); err != nil {
-			_ = raw.Close()
-			return nil, err
-		}
-		if cfg.Transport == TransportTLS {
-			return tc, nil
-		}
-		if cfg.Transport == TransportWSS {
-			return wsDialPurpose(tc, cfg, purpose)
-		}
-		return h2Dial(tc, cfg)
+		return nil, err
 
 	default:
 		return nil, fmt.Errorf("unknown transport %q", cfg.Transport)
 	}
+}
+
+func wrapDialTLSOnce(raw net.Conn, cfg *Config, purpose byte, echConfigList []byte) (net.Conn, error) {
+	connToWrap := raw
+	if cfg.useFragment() {
+		size := cfg.TLSFragmentSize
+		if size <= 0 {
+			size = 40
+		}
+		sleep := cfg.TLSFragmentSleep
+		if sleep <= 0 {
+			sleep = 3 * time.Millisecond
+		}
+		connToWrap = newFragmentConn(raw, size, sleep)
+	}
+
+	if cfg.useUTLS() {
+		// A copy for this connection. Building the hello changes the
+		// settings it is given, and the prepared ones are shared by every
+		// connection made at once; the copy keeps the shared session cache.
+		uCfg := cfg.clientUTLS(cfg.effectiveClientName()).Clone()
+		if len(echConfigList) > 0 {
+			uCfg.EncryptedClientHelloConfigList = echConfigList
+			uCfg.EncryptedClientHelloRejectionVerify = func(utls.ConnectionState) error {
+				return nil
+			}
+		}
+		uClient := utls.UClient(connToWrap, uCfg, cfg.utlsHelloID())
+		helloCfg := cfg
+		if len(echConfigList) == 0 {
+			helloCfg = cfg.withoutECH()
+		}
+		// A hello that could not be built must stop the dial. Carrying on
+		// with the library's default would send something other than what
+		// was asked for, without saying so.
+		if err := shapeUTLSHello(uClient, helloCfg); err != nil {
+			_ = raw.Close()
+			return nil, err
+		}
+		if err := raw.SetDeadline(time.Now().Add(tlsHandshakeTimeout)); err != nil {
+			return nil, err
+		}
+		if err := uClient.Handshake(); err != nil {
+			_ = raw.Close()
+			return nil, fmt.Errorf("securing the link with uTLS failed: %w", err)
+		}
+		if err := raw.SetDeadline(time.Time{}); err != nil {
+			return nil, err
+		}
+		if err := checkNegotiated(uClient.ConnectionState().NegotiatedProtocol, cfg.Transport); err != nil {
+			_ = raw.Close()
+			return nil, err
+		}
+		if cfg.Transport == TransportTLS {
+			return uClient, nil
+		}
+		if cfg.Transport == TransportWSS {
+			return wsDialPurpose(uClient, cfg, purpose)
+		}
+		return h2Dial(uClient, cfg)
+	}
+
+	tCfg := cfg.clientTLS(cfg.effectiveClientName()).Clone()
+	if len(echConfigList) > 0 {
+		tCfg.MinVersion = tls.VersionTLS13
+		tCfg.EncryptedClientHelloConfigList = echConfigList
+		tCfg.EncryptedClientHelloRejectionVerify = func(tls.ConnectionState) error {
+			return nil
+		}
+	}
+	tc := tls.Client(connToWrap, tCfg)
+	if err := raw.SetDeadline(time.Now().Add(tlsHandshakeTimeout)); err != nil {
+		return nil, err
+	}
+	if err := tc.Handshake(); err != nil {
+		_ = raw.Close()
+		return nil, fmt.Errorf("securing the link failed: %w", err)
+	}
+	if err := raw.SetDeadline(time.Time{}); err != nil {
+		return nil, err
+	}
+	if err := checkNegotiated(tc.ConnectionState().NegotiatedProtocol, cfg.Transport); err != nil {
+		_ = raw.Close()
+		return nil, err
+	}
+	if cfg.Transport == TransportTLS {
+		return tc, nil
+	}
+	if cfg.Transport == TransportWSS {
+		return wsDialPurpose(tc, cfg, purpose)
+	}
+	return h2Dial(tc, cfg)
 }
 
 // wrapAccept is the same from the point of view of the side that accepted.
@@ -671,6 +745,9 @@ func describeTransport(cfg *Config) string {
 		}
 		if cfg.useFragment() || (backupOnly && !cfg.fragmentSet) {
 			stealth = append(stealth, "ClientHello fragmentation"+suffix)
+		}
+		if cfg.useECH() || (backupOnly && !cfg.echSet) {
+			stealth = append(stealth, "ECH"+suffix)
 		}
 		if len(cfg.CleanIPs) > 0 {
 			stealth = append(stealth, fmt.Sprintf("%d clean CF IPs", len(cfg.CleanIPs)))

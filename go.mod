@@ -1,10 +1,10 @@
 module github.com/Nima786/portbridge
 
-go 1.21
+go 1.24.0
 
 require (
-	github.com/refraction-networking/utls v1.6.7
-	github.com/xtaci/kcp-go/v5 v5.6.8
+	github.com/refraction-networking/utls v1.8.2
+	github.com/xtaci/kcp-go/v5 v5.6.72
 )
 
 require (
@@ -17,7 +17,8 @@ require (
 	github.com/templexxx/cpu v0.1.0 // indirect
 	github.com/templexxx/xorsimd v0.4.2 // indirect
 	github.com/tjfoc/gmsm v1.4.1 // indirect
-	golang.org/x/crypto v0.21.0 // indirect
-	golang.org/x/net v0.23.0 // indirect
-	golang.org/x/sys v0.18.0 // indirect
+	golang.org/x/crypto v0.45.0 // indirect
+	golang.org/x/net v0.47.0 // indirect
+	golang.org/x/sys v0.38.0 // indirect
+	golang.org/x/time v0.14.0 // indirect
 )
