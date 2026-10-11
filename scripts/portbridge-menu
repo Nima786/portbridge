@@ -1968,7 +1968,10 @@ create_tunnel() {
                 if [ -n "$v4_peer" ]; then
                     peer=$v4_peer
                     ok "Using foreign server's IPv4 address for this tunnel: $peer"
-                elif [ "$DG_CDN" != on ]; then
+                else
+                    # Also for a CDN tunnel: the pairing code and the other
+                    # server's settings still carry this address, and an IPv6 one
+                    # would leave the two ends disagreeing about the link.
                     info "The foreign server was linked over IPv6, and this tunnel needs its IPv4 address."
                     while :; do
                         v4_peer=$(ask "Foreign server IPv4 address" "")

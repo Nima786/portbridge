@@ -499,7 +499,8 @@ func wrapDialPurpose(raw net.Conn, cfg *Config, purpose byte) (net.Conn, error) 
 		}
 
 		conn, err := wrapDialTLSOnce(raw, cfg, purpose, echList)
-		if err == nil || len(echList) == 0 {
+		// Only a failed handshake is grounds for retrying without ECH.
+		if err == nil || len(echList) == 0 || !isTLSStageError(err) {
 			return conn, err
 		}
 
@@ -510,8 +511,15 @@ func wrapDialPurpose(raw net.Conn, cfg *Config, purpose byte) (net.Conn, error) 
 		if retryList, isRej := extractECHRetryConfigs(err); isRej && len(retryList) > 0 && !bytes.Equal(retryList, echList) {
 			cacheECHConfigList(domain, retryList)
 			if fresh, dialErr := redialPeer(raw); dialErr == nil {
-				if conn2, err2 := wrapDialTLSOnce(fresh, cfg, purpose, retryList); err2 == nil {
+				conn2, err2 := wrapDialTLSOnce(fresh, cfg, purpose, retryList)
+				if err2 == nil {
 					return conn2, nil
+				}
+				_ = fresh.Close()
+				if !isTLSStageError(err2) {
+					// The handshake worked with the new key; what failed came
+					// after it, and says nothing about ECH.
+					return nil, err2
 				}
 			}
 		}
@@ -527,6 +535,7 @@ func wrapDialPurpose(raw net.Conn, cfg *Config, purpose byte) (net.Conn, error) 
 				echFallbackLog.printf("ECH handshake to %s was not accepted (%v); fell back automatically to standard TLS", domain, err)
 				return connFallback, nil
 			}
+			_ = fresh.Close()
 		}
 		return nil, err
 
@@ -577,7 +586,7 @@ func wrapDialTLSOnce(raw net.Conn, cfg *Config, purpose byte, echConfigList []by
 		}
 		if err := uClient.Handshake(); err != nil {
 			_ = raw.Close()
-			return nil, fmt.Errorf("securing the link with uTLS failed: %w", err)
+			return nil, &tlsStageError{fmt.Errorf("securing the link with uTLS failed: %w", err)}
 		}
 		if err := raw.SetDeadline(time.Time{}); err != nil {
 			return nil, err
@@ -609,7 +618,7 @@ func wrapDialTLSOnce(raw net.Conn, cfg *Config, purpose byte, echConfigList []by
 	}
 	if err := tc.Handshake(); err != nil {
 		_ = raw.Close()
-		return nil, fmt.Errorf("securing the link failed: %w", err)
+		return nil, &tlsStageError{fmt.Errorf("securing the link failed: %w", err)}
 	}
 	if err := raw.SetDeadline(time.Time{}); err != nil {
 		return nil, err

@@ -388,5 +388,32 @@ func redialPeer(raw net.Conn) (net.Conn, error) {
 	if network == "" {
 		network = "tcp"
 	}
-	return net.DialTimeout(network, raw.RemoteAddr().String(), 5*time.Second)
+	d := net.Dialer{Timeout: 5 * time.Second}
+	// Leave from the same address as the first attempt. The original dial may
+	// have been bound to a chosen source address (local_ip), and the other
+	// server's firewall may only accept that one.
+	if la, ok := raw.LocalAddr().(*net.TCPAddr); ok && la != nil && la.IP != nil {
+		d.LocalAddr = &net.TCPAddr{IP: la.IP}
+	}
+	fresh, err := d.Dial(network, raw.RemoteAddr().String())
+	if err != nil {
+		return nil, err
+	}
+	tuneSocket(fresh)
+	return fresh, nil
+}
+
+// tlsStageError marks a failure of the TLS handshake itself, as opposed to
+// what happens after it (the websocket upgrade, HTTP/2 setup). Only a
+// handshake failure says anything about ECH; an origin that is down, or a
+// wrong path, must not be mistaken for an ECH problem, or the link would be
+// quietly redone with the real site name in plain view.
+type tlsStageError struct{ err error }
+
+func (e *tlsStageError) Error() string { return e.err.Error() }
+func (e *tlsStageError) Unwrap() error { return e.err }
+
+func isTLSStageError(err error) bool {
+	var t *tlsStageError
+	return errors.As(err, &t)
 }
