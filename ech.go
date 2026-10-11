@@ -161,28 +161,69 @@ func resolveECHConfigList(cfg *Config, peerAddr net.Addr) ([]byte, error) {
 		return defaultCloudflareECHList(), nil
 	}
 
-	list := fetchECHConfigList(domain)
-	if len(list) > 0 {
-		cacheECHConfigList(domain, list)
-	}
-	return list, nil
+	// Every Cloudflare site shares one ECH key, so the tunnel's own domain is
+	// never looked up: that question would go out as plain DNS naming the very
+	// domain ECH is meant to hide. A key for another CDN is set by hand with
+	// ech_config.
+	return currentCloudflareECH(), nil
 }
 
-// fetchECHConfigList queries DNS HTTPS (Type 65) records for the domain's ECH
-// key, falling back to cloudflare-ech.com and finally the built-in Cloudflare
-// ECHConfigList if DNS queries are blocked or stripped.
-func fetchECHConfigList(domain string) []byte {
-	for _, target := range []string{domain, "cloudflare-ech.com"} {
-		for _, srv := range []string{"1.1.1.1:53", "8.8.8.8:53"} {
-			if list := queryDNSHTTPSUDP(target, srv, 1200*time.Millisecond); len(list) > 0 {
-				return list
-			}
+// cloudflareECH is the key shared by every Cloudflare site. It starts as the
+// copy built into the program and is refreshed in the background from the
+// record Cloudflare publishes under its own ECH name, which says nothing about
+// this tunnel. A key that has since changed is also corrected by the server
+// during the handshake (RetryConfigList).
+var cloudflareECH = struct {
+	sync.RWMutex
+	list       []byte
+	checkedAt  time.Time
+	refreshing bool
+}{}
+
+// currentCloudflareECH returns the best known Cloudflare ECH key right away and
+// starts a refresh in the background when it is due. A dial never waits for DNS.
+func currentCloudflareECH() []byte {
+	cloudflareECH.RLock()
+	list, checkedAt, busy := cloudflareECH.list, cloudflareECH.checkedAt, cloudflareECH.refreshing
+	cloudflareECH.RUnlock()
+
+	if time.Since(checkedAt) > echCacheTTL && !busy {
+		cloudflareECH.Lock()
+		if !cloudflareECH.refreshing && time.Since(cloudflareECH.checkedAt) > echCacheTTL {
+			cloudflareECH.refreshing = true
+			go refreshCloudflareECH()
 		}
-		if list := queryDNSHTTPSDoH(target, "https://1.1.1.1/dns-query", 2000*time.Millisecond); len(list) > 0 {
+		cloudflareECH.Unlock()
+	}
+	if len(list) == 0 {
+		return defaultCloudflareECHList()
+	}
+	return list
+}
+
+func refreshCloudflareECH() {
+	list := fetchCloudflareECHConfigList()
+	cloudflareECH.Lock()
+	if len(list) > 0 {
+		cloudflareECH.list = list
+	}
+	// Also stamped when nothing came back, so a blocked DNS is retried after
+	// the usual interval rather than on every connection.
+	cloudflareECH.checkedAt = time.Now()
+	cloudflareECH.refreshing = false
+	cloudflareECH.Unlock()
+}
+
+// fetchCloudflareECHConfigList reads the HTTPS (type 65) record Cloudflare
+// publishes for its shared ECH name. Returns nil if DNS is blocked or stripped.
+func fetchCloudflareECHConfigList() []byte {
+	const target = "cloudflare-ech.com"
+	for _, srv := range []string{"1.1.1.1:53", "8.8.8.8:53"} {
+		if list := queryDNSHTTPSUDP(target, srv, 1200*time.Millisecond); len(list) > 0 {
 			return list
 		}
 	}
-	return defaultCloudflareECHList()
+	return queryDNSHTTPSDoH(target, "https://1.1.1.1/dns-query", 2000*time.Millisecond)
 }
 
 func queryDNSHTTPSUDP(domain, server string, timeout time.Duration) []byte {
