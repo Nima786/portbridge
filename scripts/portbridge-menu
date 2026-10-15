@@ -29,6 +29,14 @@ LAST_LINKED_AGENT=""
 # Shadowsocks port and therefore one of the first things filtering looks for.
 DEFAULT_TUNNEL_PORT=443
 
+# The newest kind of pairing code this menu makes, and so the newest it must be
+# able to read back in "Join a tunnel". The engine keeps the same number
+# (pairingVersionMax in agent.go). A test holds the two together, and holds
+# every code the menu writes to it, so a new kind of code cannot be made without
+# also being accepted. Version 9 once was made here and refused here, which went
+# unnoticed because the agent's automatic setup reads codes in the engine.
+PAIRING_VERSION_MAX=9
+
 # Ports strongly associated with proxy and VPN software. Using one of these for
 # the link between the two servers is an easy giveaway, so the menu warns.
 SUSPICIOUS_PORTS="8388 1080 1081 9050 9051 8388 8080 8880 2080 2052 2082 2086 2095 8008 8081 3128 1194 500 4500 51820 8388 9000 10000 7100 8964 2222"
@@ -341,19 +349,27 @@ ask() {
     printf '%s' "${reply:-$def}"
 }
 
-# Only a clear yes or no is accepted. Anything else is asked again rather than
-# being taken as "no", so a stray keystroke can never silently cancel something.
-# An empty answer still means no, which keeps it safe to just press Enter.
+# confirm <question> [y] - only a clear yes or no is accepted. Anything else is
+# asked again rather than being taken as "no", so a stray keystroke can never
+# silently cancel something. An empty answer means no, which keeps it safe to
+# just press Enter. A question whose recommended answer is yes passes "y": it
+# then shows [Y/n], and Enter means yes, as the prompt says. Running out of
+# input altogether is always no.
 confirm() {
-    local reply
+    local reply def=n hint='[y/N]'
+    if [ "${2-}" = y ]; then
+        def=y
+        hint='[Y/n]'
+    fi
     while :; do
-        printf '%s' "$1 ${DIM}[y/N]${R}: " >&2
+        printf '%s' "$1 ${DIM}${hint}${R}: " >&2
         if ! read -r reply; then
             return 1 # no input available at all
         fi
+        [ -n "$reply" ] || reply=$def
         case "$reply" in
             [yY] | [yY][eE][sS]) return 0 ;;
-            '' | [nN] | [nN][oO]) return 1 ;;
+            [nN] | [nN][oO]) return 1 ;;
             *) err "  Please answer y or n." ;;
         esac
     done
@@ -1338,7 +1354,10 @@ explain_sharing() {
     say "     ${DIM}downside: if one shared connection stalls, every user on it feels it at${R}"
     say "     ${DIM}the same moment.${R}"
     say ""
-    say "  ${DIM}Not sure? Choose 1.${R}"    hr
+    # The suggestion is 1 for most links and 2 for some, so the hint names
+    # neither: Enter takes whichever one is marked recommended above.
+    say "  ${DIM}Not sure? Press Enter to keep the recommended choice.${R}"
+    hr
 }
 
 # ask_mux_links - how many shared connections, 1 to 16.
@@ -2224,13 +2243,19 @@ join_tunnel() {
     get() { printf '%s\n' "$decoded" | sed -nE "s/^$1=(.*)$/\1/p" | head -1; }
 
     v=$(get v)
-    if [ "$v" = 1 ] || [ "$v" = 2 ] || [ "$v" = 3 ] || [ "$v" = 4 ]; then
+    # Anything but a short plain number is not a code at all. The length cap keeps
+    # the comparisons below honest: a number too big for the shell makes every
+    # one of them fail, and so it would slip past all of them.
+    case "$v" in '' | *[!0-9]* | ?????*) v=0 ;; esac
+    if [ "$v" -ge 1 ] && [ "$v" -le 4 ]; then
         err "That code was made by an older version of PortBridge, and does not say"
         err "everything this one needs to know about the link."
         err "Update the Iran server, then create the tunnel there again for a new code."
         return 1
     fi
-    if [ "$v" != 5 ] && [ "$v" != 6 ] && [ "$v" != 7 ] && [ "$v" != 8 ]; then
+    # Every version from 5 up to the newest this menu makes is understood. The
+    # newest is the one number at the top of this file, not a list kept here.
+    if [ "$v" -lt 5 ] || [ "$v" -gt "$PAIRING_VERSION_MAX" ]; then
         err "That code was made by a newer PortBridge than this one, or is not a code."
         err "Update this server, then try again."
         return 1
@@ -2480,7 +2505,16 @@ join_tunnel() {
         warn "Use 'Check a tunnel for problems' to see why."
     fi
     say ""
-    info "Test it with a config pointing at $relay_ip and your users' port."
+    case "$relay_ip" in
+        *:*)
+            # Over IPv6 the code carries the address the two servers use between
+            # themselves, not the one in users' configs, which stays IPv4. Naming
+            # the IPv6 one here sent people testing with the wrong address.
+            info "Test it with a config pointing at your Iran server's usual IPv4 address,"
+            info "the one in your users' configs, and your users' port."
+            ;;
+        *) info "Test it with a config pointing at $relay_ip and your users' port." ;;
+    esac
 }
 
 # ------------------------------------------------------------------- list/status

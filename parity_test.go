@@ -4,6 +4,7 @@ import (
 	"os"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -140,5 +141,48 @@ func TestPairingCodeFieldsMatch(t *testing.T) {
 	sort.Strings(want9)
 	if strings.Join(keys9, ",") != strings.Join(want9, ",") {
 		t.Fatalf("the menu's version 9 code has %v\nthe engine reads %v", keys9, want9)
+	}
+}
+
+// Every kind of code the menu makes must also be accepted when it is pasted into
+// "Join a tunnel" on the other server, and by the engine. Version 9 was once made
+// by the menu and refused by its own join, which only the agent's automatic setup
+// hid: the agent reads codes in the engine, and the engine already knew 9.
+func TestMenuAcceptsEveryCodeItMakes(t *testing.T) {
+	menu := readMenu(t)
+
+	m := regexp.MustCompile(`(?m)^PAIRING_VERSION_MAX=(\d+)$`).FindStringSubmatch(menu)
+	if m == nil {
+		t.Fatalf("could not find PAIRING_VERSION_MAX in the menu")
+	}
+	menuMax, err := strconv.Atoi(m[1])
+	if err != nil {
+		t.Fatalf("PAIRING_VERSION_MAX is not a number: %q", m[1])
+	}
+	if menuMax != pairingVersionMax {
+		t.Fatalf("the menu accepts codes up to version %d, the engine up to %d", menuMax, pairingVersionMax)
+	}
+
+	newest := 0
+	for _, w := range regexp.MustCompile(`printf 'v=(\d+)\\n`).FindAllStringSubmatch(menu, -1) {
+		v, _ := strconv.Atoi(w[1])
+		if v > menuMax {
+			t.Errorf("the menu makes version %d codes but its join accepts only up to %d", v, menuMax)
+		}
+		if v > newest {
+			newest = v
+		}
+	}
+	if newest == 0 {
+		t.Fatalf("found no codes being made in the menu; the pattern no longer matches it")
+	}
+	if newest != menuMax {
+		t.Errorf("the newest code the menu makes is version %d, but PAIRING_VERSION_MAX says %d", newest, menuMax)
+	}
+
+	// The join must compare against that one number rather than keep a list of
+	// its own, which is how version 9 was left out.
+	if !strings.Contains(menu, `-gt "$PAIRING_VERSION_MAX"`) {
+		t.Errorf(`"Join a tunnel" no longer checks codes against PAIRING_VERSION_MAX`)
 	}
 }
