@@ -29,6 +29,7 @@ import (
 
 	"github.com/Nima786/portbridge/internal/agent"
 	"github.com/Nima786/portbridge/internal/engine"
+	"github.com/Nima786/portbridge/internal/panel"
 )
 
 // version is stamped at build time by the release workflow, and handed to the
@@ -70,6 +71,11 @@ func main() {
 			fmt.Fprintf(os.Stderr, "ports error: %v\n", err)
 			os.Exit(1)
 		}
+	case "panel":
+		if err := panel.CmdPanel(os.Args[2:]); err != nil {
+			fmt.Fprintf(os.Stderr, "panel: %v\n", err)
+			os.Exit(1)
+		}
 	case "version", "-v", "--version":
 		fmt.Println(engine.Version)
 	case "help", "-h", "--help":
@@ -93,6 +99,7 @@ Usage:
   portbridge join      <code>                       Join and configure tunnel from pairing code
   portbridge ports     [port,port,...]              Which ports can this server give a tunnel?
   portbridge addresses                              This server's public IPv4 and IPv6 addresses
+  portbridge panel     run|setup|status|...         The web panel (see: portbridge panel help)
   portbridge version                                Print the version
 
 Tunnels are normally created and managed with the menu:

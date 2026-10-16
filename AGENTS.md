@@ -12,6 +12,11 @@
   `agent`, `join`, `ports` and `addresses` commands. It uses the engine; the
   engine never uses it.
 - `internal/proxyproto/` – the PROXY protocol header (users' real addresses).
+- `internal/panel/` – the web panel (`portbridge panel ...`): login, adding
+  servers over SSH, talking to each server's agent directly or through the hub
+  agents call in on, and the page itself in `web/` (built into the program, no
+  libraries, no inline script). It uses the agent and the engine; neither uses it.
+  It never writes a server's SSH password or key anywhere.
 - `scripts/` – the menu, the firewall helper and the tuning helper.
 - `packaging/` – the systemd units.
 - `docs/` – the long explanations; the README links to them.

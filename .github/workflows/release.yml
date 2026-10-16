@@ -87,8 +87,10 @@ jobs:
 
             cp scripts/portbridge-menu scripts/portbridge-firewall scripts/portbridge-tune "$stage/scripts/"
             cp packaging/*.service "$stage/packaging/"
-            cp README.md LICENSE "$stage/"
-            chmod 755 "$stage/portbridge" "$stage/scripts/"*
+            # The installer travels with the release, so the web panel can install
+            # a server it adds from its own copy, without GitHub.
+            cp install.sh README.md LICENSE "$stage/"
+            chmod 755 "$stage/portbridge" "$stage/scripts/"* "$stage/install.sh"
 
             tar -czf "dist/portbridge_${BARE}_linux_${arch}.tar.gz" -C "$stage" .
           done

@@ -23,6 +23,8 @@ AGENT_CONF=/etc/portbridge/agent.conf
 AGENT_CLIENT_CONF=/etc/portbridge/agent-client.conf
 AGENTS_DIR=/etc/portbridge/agents
 AGENT_UNIT=portbridge-agent.service
+PANEL_UNIT=portbridge-panel.service
+PANEL_DIR=/etc/portbridge/panel
 LAST_LINKED_AGENT=""
 # 443 is the port ordinary secure websites use, so a connection to it looks
 # unremarkable. The previous default was 8388, which is the well-known
@@ -3628,9 +3630,11 @@ uninstall_all() {
     # not a tunnel was left to name it.
     "$FIREWALL" sweep all >/dev/null 2>&1
     systemctl disable --now "$AGENT_UNIT" >/dev/null 2>&1
-    rm -f /etc/systemd/system/portbridge@.service /etc/systemd/system/portbridge-agent.service
+    systemctl disable --now "$PANEL_UNIT" >/dev/null 2>&1
+    rm -f /etc/systemd/system/portbridge@.service /etc/systemd/system/portbridge-agent.service \
+        "/etc/systemd/system/$PANEL_UNIT"
     systemctl daemon-reload
-    rm -rf /etc/portbridge "$RUN_DIR"
+    rm -rf /etc/portbridge "$RUN_DIR" /usr/local/share/portbridge
     # Put the network settings back before removing the helper that manages them.
     [ -x "$TUNE" ] && "$TUNE" undo >/dev/null 2>&1
     rm -f "$BIN" "$FIREWALL" "$TUNE" /usr/local/bin/portbridge-menu
@@ -4371,6 +4375,231 @@ agent_menu() {
     done
 }
 
+# -------------------------------------------------------------------- web panel
+#
+# The panel itself is the engine ("portbridge panel ..."); the menu only asks the
+# questions and hands the answers over. Passwords go to it on standard input,
+# never on its command line, where any user on the server could read them.
+
+panel_get() { "$BIN" panel status -get "$1" 2>/dev/null; }
+
+# ask_new_password - asks twice, without showing what is typed, and prints it.
+ask_new_password() {
+    local a b
+    while :; do
+        printf '%s' "Password (at least 10 characters, not shown): " >&2
+        IFS= read -rs a || { printf '\n' >&2; return 1; }
+        printf '\n' >&2
+        if [ "${#a}" -lt 10 ]; then
+            err "  At least 10 characters, please."
+            continue
+        fi
+        printf '%s' "Type it again: " >&2
+        IFS= read -rs b || { printf '\n' >&2; return 1; }
+        printf '\n' >&2
+        if [ "$a" != "$b" ]; then
+            err "  The two were not the same. Once more."
+            continue
+        fi
+        printf '%s' "$a"
+        return 0
+    done
+}
+
+find_free_panel_port() {
+    local p
+    for p in 2096 8443 2053 2087 2083; do
+        if ! port_in_use_by_system "$p"; then
+            echo "$p"
+            return 0
+        fi
+    done
+    echo 2096
+}
+
+panel_setup() {
+    local first=no user="" pw="" cur_port def_port port domain email group g_def rc
+    local -a args=()
+    [ -f "$PANEL_DIR/panel.conf" ] || first=yes
+    hr
+    if [ "$first" = yes ]; then
+        say "${B}Set up the web panel${R}"
+        say "${DIM}Set it up on one of your servers only. In the panel you then add the${R}"
+        say "${DIM}others: it logs in to each one once, installs PortBridge there if needed,${R}"
+        say "${DIM}and shows all your servers and tunnels in one place.${R}"
+    else
+        say "${B}Change the web panel's settings${R}"
+        say "${DIM}Press Enter to keep a setting as it is.${R}"
+    fi
+    hr
+
+    if [ "$first" = yes ]; then
+        while :; do
+            user=$(ask "Username to log in with" "admin")
+            case "$user" in
+                '' | *[[:space:]]*) err "  A username without spaces, please." ;;
+                *) break ;;
+            esac
+        done
+        pw=$(ask_new_password) || return 1
+        args+=(-user "$user" -password-stdin)
+    fi
+
+    # The panel's own port counts as free: it is stopped while this changes.
+    cur_port=$(panel_get port)
+    [ "$cur_port" = 0 ] && cur_port=""
+    def_port=${cur_port:-$(find_free_panel_port)}
+    say ""
+    say "${DIM}You open the panel in a browser at https://<this server>:<port>. These ports${R}"
+    say "${DIM}also work if you later put it behind Cloudflare: 2053, 2083, 2087, 2096, 8443.${R}"
+    while :; do
+        port=$(ask "Port" "$def_port")
+        if ! valid_port "$port"; then
+            err "  A port must be a number from 1 to 65535."
+            continue
+        fi
+        if [ "$port" != "$cur_port" ] && port_in_use_by_system "$port"; then
+            err "  Something is already listening on port $port. Pick another."
+            continue
+        fi
+        break
+    done
+    args+=(-port "$port")
+
+    domain=$(panel_get domain)
+    say ""
+    say "${DIM}With a domain name the panel gets a real certificate, so the browser does not${R}"
+    say "${DIM}warn. Point the name (an A record) at this server first. Getting the certificate${R}"
+    say "${DIM}needs port 80 free on this server, unless the panel itself is on port 443.${R}"
+    if [ -n "$domain" ]; then
+        say "${DIM}Type 'off' to stop using $domain.${R}"
+    else
+        say "${DIM}Leave it empty for none; you can add one later.${R}"
+    fi
+    while :; do
+        domain=$(ask "Domain name (optional)" "$domain")
+        case "$domain" in
+            '' | off) break ;;
+        esac
+        if valid_hostname "$domain" && [[ "$domain" == *.* ]]; then
+            break
+        fi
+        err "  That does not look like a domain name, like panel.example.com."
+    done
+    if [ -n "$domain" ]; then
+        args+=(-domain "$domain")
+        if [ "$domain" != off ]; then
+            email=$(ask "Email for the certificate's notices (optional)" "$(panel_get email)")
+            [ -n "$email" ] && args+=(-email "$email")
+        fi
+    fi
+
+    g_def=3
+    case "$(panel_get group)" in
+        relay) g_def=1 ;;
+        foreign) g_def=2 ;;
+    esac
+    say ""
+    say "Is this server one of your relay (Iran) servers, or a foreign one?"
+    say "  ${NUM}1${R}) Relay (Iran)"
+    say "  ${NUM}2${R}) Foreign"
+    say "  ${NUM}3${R}) Neither: only the panel runs here"
+    case "$(choose "Choose" "$g_def" 1 2 3)" in
+        1) group=relay ;;
+        2) group=foreign ;;
+        *) group=none ;;
+    esac
+    args+=(-group "$group")
+
+    say ""
+    info "Setting up the panel..."
+    if [ "$first" = yes ]; then
+        printf '%s\n' "$pw" | "$BIN" panel setup "${args[@]}"
+        rc=$?
+    else
+        "$BIN" panel setup "${args[@]}" </dev/null
+        rc=$?
+    fi
+    pw=""
+    [ "$rc" -eq 0 ] || err "The panel could not be set up (see above)."
+    return "$rc"
+}
+
+panel_change_login() {
+    hr
+    say "${B}Change the panel's login${R}"
+    say "${DIM}Also the way back in if the password is forgotten. Anyone logged in to the${R}"
+    say "${DIM}panel is logged out.${R}"
+    hr
+    local user pw
+    user=$(ask "Username" "$(panel_get user)")
+    case "$user" in
+        '' | *[[:space:]]*) err "A username without spaces, please."; return 1 ;;
+    esac
+    pw=$(ask_new_password) || return 1
+    printf '%s\n' "$pw" | "$BIN" panel reset-password -user "$user"
+}
+
+panel_menu() {
+    local state
+    while :; do
+        hr
+        say "${B}Web panel${R}"
+        say "${DIM}See all your servers and tunnels from a browser.${R}"
+        hr
+        "$BIN" panel status 2>&1 | sed 's/^/  /'
+        hr
+        state=$(panel_get state)
+        if [ -z "$state" ]; then
+            err "  This version of PortBridge has no web panel. Update it first."
+            return 1
+        fi
+        if [ "$state" = "not set up" ]; then
+            item 1 "Set up the web panel" "on one of your servers only"
+            say ""
+            item 0 "Back"
+            hr
+            case "$(ask "Choose" "0")" in
+                1) panel_setup; pause ;;
+                *) return 0 ;;
+            esac
+            continue
+        fi
+        item 1 "Change its settings" "port, domain name, group"
+        item 2 "Change the login" "if the password is forgotten"
+        if [ "$state" = running ]; then
+            item 3 "Turn the panel off" "your tunnels are not affected"
+        else
+            item 3 "Turn the panel on"
+        fi
+        item 4 "View the panel's log"
+        say ""
+        item 0 "Back"
+        hr
+        case "$(ask "Choose" "0")" in
+            1) panel_setup; pause ;;
+            2) panel_change_login; pause ;;
+            3)
+                if [ "$state" = running ]; then
+                    if confirm "Turn the web panel off?"; then
+                        systemctl disable --now "$PANEL_UNIT" >/dev/null 2>&1 && ok "The panel is off."
+                    fi
+                else
+                    if systemctl enable --now "$PANEL_UNIT" >/dev/null 2>&1; then
+                        ok "The panel is on."
+                    else
+                        err "It did not start. Its log:"
+                        journalctl -u "$PANEL_UNIT" -n 20 --no-pager
+                    fi
+                fi
+                pause
+                ;;
+            4) journalctl -u "$PANEL_UNIT" -n 40 --no-pager; pause ;;
+            *) return 0 ;;
+        esac
+    done
+}
+
 # -------------------------------------------------------------------- main menu
 
 # tunnel_summary - one line for the top of the main menu: how many tunnels there
@@ -4413,9 +4642,10 @@ main_menu() {
         item 12 "Management Agent" "automate foreign setup from Iran"
         item 13 "Speed tuning" "run on both servers"
         item 14 "Firewall"
+        item 15 "Web panel" "all your servers in a browser"
         group "Remove"
-        item 15 "Delete a tunnel" "" "$RED"
-        item 16 "Uninstall PortBridge" "" "$RED"
+        item 16 "Delete a tunnel" "" "$RED"
+        item 17 "Uninstall PortBridge" "" "$RED"
         say ""
         item 0 "Quit"
         hr
@@ -4436,8 +4666,9 @@ main_menu() {
             12) agent_menu ;;
             13) tuning_menu; pause ;;
             14) firewall_menu ;;
-            15) name=$(pick_tunnel) && delete_tunnel "$name"; pause ;;
-            16) uninstall_all ;;
+            15) panel_menu ;;
+            16) name=$(pick_tunnel) && delete_tunnel "$name"; pause ;;
+            17) uninstall_all ;;
             0 | q | Q) say "Bye."; exit 0 ;;
             *) err "Not a valid choice."; sleep 1 ;;
         esac
@@ -4579,6 +4810,7 @@ case "${1-}" in
     speedtest) shift; speedtest_tunnel "${1:?tunnel name required}" ;;
     firewall) "$FIREWALL" status ;;
     agent) agent_menu ;;
+    panel) panel_menu ;;
     '' ) main_menu ;;
-    *) say "Usage: portbridge-menu [list|check <name>|code <name>|speedtest <name>|firewall|agent]" ;;
+    *) say "Usage: portbridge-menu [list|check <name>|code <name>|speedtest <name>|firewall|agent|panel]" ;;
 esac

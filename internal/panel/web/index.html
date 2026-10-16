@@ -1,0 +1,200 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<meta name="color-scheme" content="dark">
+<title>PortBridge</title>
+<link rel="icon" href="icon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="app.css">
+<script src="app.js" defer></script>
+</head>
+<body>
+<noscript><p class="noscript">The PortBridge panel needs JavaScript turned on.</p></noscript>
+
+<!-- Logging in -->
+<main id="login" class="login" hidden>
+  <form id="login-form" class="card login-card" novalidate>
+    <h1 class="brand-big"><img src="icon.svg" alt="" width="36" height="36"> PortBridge</h1>
+    <p class="muted">Log in to manage your servers and tunnels.</p>
+    <label for="login-user">Username</label>
+    <input id="login-user" name="user" autocomplete="username" autocapitalize="none" spellcheck="false" required>
+    <label for="login-pass">Password</label>
+    <input id="login-pass" name="password" type="password" autocomplete="current-password" required>
+    <p id="login-error" class="error" role="alert"></p>
+    <button type="submit" class="primary wide">Log in</button>
+  </form>
+</main>
+
+<!-- The panel itself -->
+<div id="shell" hidden>
+  <a class="skip" href="#main">Skip to content</a>
+  <header class="top">
+    <div class="brand"><img src="icon.svg" alt="" width="26" height="26"> PortBridge <span id="version" class="muted small"></span></div>
+    <nav class="tabs" role="tablist" aria-label="Sections">
+      <button type="button" role="tab" id="tab-servers" aria-controls="view-servers" aria-selected="true">Servers</button>
+      <button type="button" role="tab" id="tab-tunnels" aria-controls="view-tunnels" aria-selected="false" tabindex="-1">Tunnels</button>
+      <button type="button" role="tab" id="tab-settings" aria-controls="view-settings" aria-selected="false" tabindex="-1">Settings</button>
+    </nav>
+    <button type="button" id="logout" class="ghost">Log out</button>
+  </header>
+
+  <main id="main" tabindex="-1">
+    <section id="view-servers" role="tabpanel" aria-labelledby="tab-servers">
+      <div class="toolbar">
+        <h2>Servers</h2>
+        <button type="button" id="add-server" class="primary">Add server</button>
+      </div>
+      <div id="this-unassigned" class="notice" hidden>
+        <p><strong>The panel's own server is not in a group yet.</strong> Is it one of your relay (Iran) servers, or a foreign one?</p>
+        <div class="actions left">
+          <button type="button" data-this-group="relay">It is a relay (Iran) server</button>
+          <button type="button" data-this-group="foreign">It is a foreign server</button>
+        </div>
+        <div id="this-card" class="cards this-card"></div>
+      </div>
+      <div class="columns">
+        <section class="column" aria-labelledby="h-relay">
+          <h3 id="h-relay">Relay servers <span class="muted">(Iran)</span></h3>
+          <div id="col-relay" class="cards"></div>
+        </section>
+        <section class="column" aria-labelledby="h-foreign">
+          <h3 id="h-foreign">Foreign servers</h3>
+          <div id="col-foreign" class="cards"></div>
+        </section>
+      </div>
+    </section>
+
+    <section id="view-tunnels" role="tabpanel" aria-labelledby="tab-tunnels" hidden>
+      <div class="toolbar">
+        <h2>Tunnels</h2>
+      </div>
+      <p class="muted">Every tunnel on your servers, with both of its ends. Creating and deleting tunnels here comes in the next update; for now use the menu on the servers.</p>
+      <div id="tunnel-list" class="tunnels"></div>
+    </section>
+
+    <section id="view-settings" role="tabpanel" aria-labelledby="tab-settings" hidden>
+      <div class="toolbar"><h2>Settings</h2></div>
+      <div class="grid2">
+        <form id="account-form" class="card" novalidate>
+          <h3>Change the login</h3>
+          <p class="muted small">Everyone else logged in is logged out when this changes.</p>
+          <label for="acc-current">Current password</label>
+          <input id="acc-current" type="password" autocomplete="current-password" required>
+          <label for="acc-user">Username</label>
+          <input id="acc-user" autocomplete="username" autocapitalize="none" spellcheck="false">
+          <label for="acc-new">New password <span class="muted">(leave empty to keep it)</span></label>
+          <input id="acc-new" type="password" autocomplete="new-password" minlength="10" aria-describedby="acc-new-hint">
+          <p id="acc-new-hint" class="muted small">At least 10 characters.</p>
+          <label for="acc-again">New password again</label>
+          <input id="acc-again" type="password" autocomplete="new-password">
+          <p id="acc-msg" role="status"></p>
+          <button type="submit" class="primary">Save</button>
+        </form>
+        <section class="card" aria-labelledby="h-about">
+          <h3 id="h-about">This panel</h3>
+          <dl id="panel-info" class="facts-list"></dl>
+        </section>
+      </div>
+    </section>
+  </main>
+  <p id="status-line" class="status-line" role="status" aria-live="polite"></p>
+</div>
+
+<!-- Adding a server -->
+<dialog id="add-dialog" aria-labelledby="add-title">
+  <form id="add-form" novalidate>
+    <h2 id="add-title">Add a server</h2>
+    <p class="muted small">The panel logs in to it over SSH once, installs PortBridge there if needed, and from then on talks to it without SSH. The password or key is used only for this, and is never saved.</p>
+    <fieldset>
+      <legend>What kind of server is it?</legend>
+      <label class="choice"><input type="radio" name="group" value="relay"> Relay (Iran)</label>
+      <label class="choice"><input type="radio" name="group" value="foreign"> Foreign</label>
+    </fieldset>
+    <label for="add-address">Address <span class="muted">(IP address or host name)</span></label>
+    <input id="add-address" autocapitalize="none" spellcheck="false" required placeholder="203.0.113.5">
+    <div class="row">
+      <div>
+        <label for="add-user">SSH user</label>
+        <input id="add-user" value="root" autocapitalize="none" spellcheck="false">
+      </div>
+      <div>
+        <label for="add-port">SSH port</label>
+        <input id="add-port" type="number" min="1" max="65535" value="22" inputmode="numeric">
+      </div>
+    </div>
+    <label for="add-name">Name <span class="muted">(optional, for you)</span></label>
+    <input id="add-name" maxlength="64" placeholder="for example Tehran 1">
+    <fieldset>
+      <legend>Log in with</legend>
+      <label class="choice"><input type="radio" name="auth" value="password" checked> Password</label>
+      <label class="choice"><input type="radio" name="auth" value="key"> Paste a private key</label>
+      <label class="choice"><input type="radio" name="auth" value="file"> Private key file</label>
+    </fieldset>
+    <div id="auth-password">
+      <label for="add-password">Password</label>
+      <input id="add-password" type="password" autocomplete="off">
+    </div>
+    <div id="auth-key" hidden>
+      <label for="add-key">Private key</label>
+      <textarea id="add-key" rows="5" spellcheck="false" autocomplete="off" placeholder="-----BEGIN OPENSSH PRIVATE KEY-----"></textarea>
+    </div>
+    <div id="auth-file" hidden>
+      <label for="add-file">Private key file</label>
+      <input id="add-file" type="file">
+    </div>
+    <div id="auth-passphrase" hidden>
+      <label for="add-passphrase">Key passphrase <span class="muted">(only if the key has one)</span></label>
+      <input id="add-passphrase" type="password" autocomplete="off">
+    </div>
+    <label class="check"><input type="checkbox" id="add-update"> If it has an older PortBridge, update it. Its tunnels restart for a few seconds.</label>
+    <p id="add-error" class="error" role="alert"></p>
+    <div class="actions">
+      <button type="button" id="add-cancel">Cancel</button>
+      <button type="submit" class="primary">Add server</button>
+    </div>
+  </form>
+  <div id="add-progress" hidden>
+    <h2 id="add-progress-title" tabindex="-1">Adding the server</h2>
+    <ol id="add-log" class="log"></ol>
+    <p id="add-result" role="status" aria-live="polite"></p>
+    <p id="add-note" class="muted small">You can close this; adding carries on.</p>
+    <div class="actions">
+      <button type="button" id="add-back" hidden>Back</button>
+      <button type="button" id="add-close" class="primary">Close</button>
+    </div>
+  </div>
+</dialog>
+
+<!-- Renaming or moving a server -->
+<dialog id="edit-dialog" aria-labelledby="edit-title">
+  <form id="edit-form" novalidate>
+    <h2 id="edit-title">Server</h2>
+    <label for="edit-name">Name</label>
+    <input id="edit-name" maxlength="64">
+    <fieldset>
+      <legend>Group</legend>
+      <label class="choice"><input type="radio" name="edit-group" value="relay"> Relay (Iran)</label>
+      <label class="choice"><input type="radio" name="edit-group" value="foreign"> Foreign</label>
+    </fieldset>
+    <p id="edit-error" class="error" role="alert"></p>
+    <div class="actions">
+      <button type="button" id="edit-cancel">Cancel</button>
+      <button type="submit" class="primary">Save</button>
+    </div>
+  </form>
+</dialog>
+
+<!-- Asking before something is removed -->
+<dialog id="confirm-dialog" aria-labelledby="confirm-title" aria-describedby="confirm-text">
+  <h2 id="confirm-title"></h2>
+  <p id="confirm-text"></p>
+  <p id="confirm-error" class="error" role="alert"></p>
+  <div class="actions">
+    <button type="button" id="confirm-no">Cancel</button>
+    <button type="button" id="confirm-yes" class="danger"></button>
+  </div>
+</dialog>
+</body>
+</html>

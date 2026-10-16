@@ -50,6 +50,9 @@ func publicAddresses(addrs []net.Addr) (v4, v6 []string) {
 	return v4, v6
 }
 
+// PublicAddresses is this server's public IPv4 and IPv6 addresses.
+func PublicAddresses() (v4, v6 []string) { return localPublicAddresses() }
+
 func localPublicAddresses() (v4, v6 []string) {
 	addrs, err := net.InterfaceAddrs()
 	if err != nil {

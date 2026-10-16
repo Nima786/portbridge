@@ -14,3 +14,5 @@ LICENSE         text eol=lf
 scripts/portbridge-menu     text eol=lf
 scripts/portbridge-firewall text eol=lf
 scripts/portbridge-tune     text eol=lf
+# The web panel's page, built into the program.
+internal/panel/web/*        text eol=lf

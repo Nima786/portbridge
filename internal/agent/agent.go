@@ -2,6 +2,7 @@ package agent
 
 import (
 	"bytes"
+	"context"
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/subtle"
@@ -480,7 +481,16 @@ func runAgentServer(listenAddr, token, certFile, keyFile, confDir string) error 
 	if listenAddr == "" {
 		listenAddr = "0.0.0.0:2083"
 	}
+	return serveAgent(listenAddr, certFile, keyFile, newAgentHandler(token, confDir))
+}
 
+// NewHandler is newAgentHandler, for the panel's tests.
+func NewHandler(token, confDir string) http.Handler { return newAgentHandler(token, confDir) }
+
+// newAgentHandler is everything the agent answers. The same handler serves both
+// requests that come in on the agent's own port and those the panel hands over
+// while the agent is calling it (see callhome.go).
+func newAgentHandler(token, confDir string) *http.ServeMux {
 	mux := http.NewServeMux()
 
 	// POST /api/tunnel/join and /api/tunnel/update take the same pairing code. One
@@ -607,6 +617,21 @@ func runAgentServer(listenAddr, token, certFile, keyFile, confDir string) error 
 		})
 	})
 
+	// GET /api/overview: this server and every tunnel on it, for the panel.
+	mux.HandleFunc("/api/overview", func(w http.ResponseWriter, r *http.Request) {
+		if !checkAgentAuth(r, token) {
+			http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(LocalOverview(confDir))
+	})
+
+	return mux
+}
+
+// serveAgent listens on the agent's own port, over TLS with its own certificate.
+func serveAgent(listenAddr, certFile, keyFile string, mux http.Handler) error {
 	// Prepare TLS certificate
 	if certFile == "" || keyFile == "" {
 		certFile = "/etc/portbridge/agent.crt"
@@ -933,6 +958,9 @@ func listSavedAgents() error {
 
 // cmdAgent handles the "portbridge agent" command line.
 func CmdAgent(args []string) error {
+	if len(args) > 0 && args[0] == "setup" {
+		return cmdAgentSetup(args[1:])
+	}
 	fs := flag.NewFlagSet("agent", flag.ExitOnError)
 	confPath := fs.String("config", "/etc/portbridge/agent.conf", "path to agent config file")
 	listen := fs.String("listen", "", "listen address (e.g. 0.0.0.0:2083)")
@@ -982,7 +1010,15 @@ func CmdAgent(args []string) error {
 		*listen = "0.0.0.0:2083"
 	}
 
-	return runAgentServer(*listen, *token, *cert, *key, "/etc/portbridge/tunnels")
+	// A panel this agent should call, if one was set up. It is in addition to
+	// the agent's own port, not instead of it: the Iran server's menu still
+	// reaches the agent there.
+	if ac, err := readAgentConfig(*confPath); err == nil && ac.PanelURL != "" {
+		go callHome(context.Background(), ac.PanelURL, ac.PanelFingerprint, *token,
+			newAgentHandler(*token, defaultTunnelsDir))
+	}
+
+	return runAgentServer(*listen, *token, *cert, *key, defaultTunnelsDir)
 }
 
 // cmdJoin handles pairing code application locally or against a remote agent.

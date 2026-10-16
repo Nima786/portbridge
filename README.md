@@ -95,6 +95,7 @@ a port, and the menu checks that for you.
 - [Speed and busy days](docs/performance.md): one connection per user or a few shared, many users at
   once, speed tuning and the built-in speed test.
 - [Management agent](docs/management-agent.md): setting up and deleting tunnels from the Iran server alone.
+- [Web panel](docs/web-panel.md): every server and tunnel in a browser, and adding servers from it.
 - [How it works](docs/how-it-works.md): how a connection is made, security, the files PortBridge owns,
   and how it keeps the firewall clean.
 

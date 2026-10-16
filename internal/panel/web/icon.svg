@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" role="img" aria-label="PortBridge">
+  <rect width="32" height="32" rx="7" fill="#1e252e"/>
+  <circle cx="8" cy="20" r="3.2" fill="#4fd18b"/>
+  <circle cx="24" cy="20" r="3.2" fill="#5fb0ff"/>
+  <path d="M8 20 C 11 9, 21 9, 24 20" fill="none" stroke="#e7ebef" stroke-width="2.4" stroke-linecap="round"/>
+</svg>

@@ -1,0 +1,18 @@
+[Unit]
+Description=PortBridge web panel
+Documentation=https://github.com/Nima786/portbridge
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+ExecStart=/usr/local/bin/portbridge panel run
+Restart=always
+RestartSec=3
+LimitNOFILE=65535
+NoNewPrivileges=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target

@@ -17,6 +17,10 @@ FIREWALL=/usr/local/bin/portbridge-firewall
 TUNE=/usr/local/bin/portbridge-tune
 UNIT=/etc/systemd/system/portbridge@.service
 AGENT_UNIT=/etc/systemd/system/portbridge-agent.service
+PANEL_UNIT=/etc/systemd/system/portbridge-panel.service
+# A copy of this installer, kept so the web panel can install PortBridge on the
+# servers it adds from what is on this one, without needing GitHub.
+SHARE_DIR=/usr/local/share/portbridge
 CONF_DIR=/etc/portbridge/tunnels
 
 if [ -t 1 ]; then
@@ -36,10 +40,17 @@ step() { printf '\n%s\n' "${B}==> $*${R}"; }
 FORCE=no
 NOMENU=no
 VERSION_ASKED=""
+FROM_DIR=""
 while [ $# -gt 0 ]; do
     case "$1" in
         --force | --reinstall) FORCE=yes ;;
         --no-menu) NOMENU=yes ;;
+        --from-dir)
+            [ $# -ge 2 ] || die "--from-dir needs a directory"
+            FROM_DIR=$2
+            shift
+            ;;
+        --from-dir=*) FROM_DIR=${1#--from-dir=} ;;
         --version)
             [ $# -ge 2 ] || die "--version needs a value, for example --version v0.4.6"
             VERSION_ASKED=$2
@@ -55,6 +66,8 @@ goes straight to the menu if there is nothing to do.
 
   --force            reinstall even if it is already up to date
   --version vX.Y.Z   install that release instead of the latest
+  --from-dir DIR     install the copy already unpacked in DIR, without
+                     downloading anything (the web panel uses this)
   --no-menu          do not open the menu afterwards
 EOF
             exit 0
@@ -72,6 +85,10 @@ if [ -n "$VERSION_ASKED" ]; then
         *[!a-zA-Z0-9.+-]*) die "A version looks like v0.4.6, not '$VERSION_ASKED'." ;;
     esac
     FORCE=yes
+fi
+if [ -n "$FROM_DIR" ]; then
+    [ -n "$VERSION_ASKED" ] && die "--from-dir and --version cannot be used together."
+    [ -f "$FROM_DIR/portbridge" ] || die "$FROM_DIR does not hold a copy of PortBridge."
 fi
 
 open_menu_and_exit() {
@@ -106,7 +123,10 @@ case "$(uname -m)" in
 esac
 say "  Linux, $ARCH, systemd present"
 
-for t in curl tar; do
+NEEDED="curl tar"
+# Nothing is downloaded when the copy is already here.
+[ -n "$FROM_DIR" ] && NEEDED=""
+for t in $NEEDED; do
     command -v "$t" >/dev/null 2>&1 || MISSING="${MISSING-} $t"
 done
 if [ -n "${MISSING-}" ]; then
@@ -188,6 +208,16 @@ build_from_source() {
     mkdir -p "$TMP/rel/scripts" "$TMP/rel/packaging"
     cp "$dir"/scripts/* "$TMP/rel/scripts/" || return 1
     cp "$dir"/packaging/*.service "$TMP/rel/packaging/" || return 1
+    [ -f "$dir/install.sh" ] && cp "$dir/install.sh" "$TMP/rel/install.sh"
+    return 0
+}
+
+# use_from_dir - takes the copy the web panel (or a person) unpacked already.
+use_from_dir() {
+    mkdir -p "$TMP/rel"
+    cp -R "$FROM_DIR"/. "$TMP/rel/" || return 1
+    [ -f "$TMP/rel/portbridge" ] || return 1
+    chmod 755 "$TMP/rel/portbridge"
     return 0
 }
 
@@ -200,7 +230,15 @@ if [ -x "$BIN" ] && [ -x "$MENU" ] && [ -f "$UNIT" ]; then
 fi
 
 WANTED=$VERSION_ASKED
-if [ -z "$WANTED" ] && [ -n "$INSTALLED" ] && [ "$FORCE" = no ]; then
+if [ -n "$FROM_DIR" ]; then
+    chmod 755 "$FROM_DIR/portbridge" 2>/dev/null
+    WANTED=$("$FROM_DIR/portbridge" version 2>/dev/null)
+    [ -n "$WANTED" ] || die "The copy in $FROM_DIR does not run on this server, so nothing was changed."
+    if [ "$WANTED" = "$INSTALLED" ] && [ "$FORCE" = no ]; then
+        ok "  PortBridge $INSTALLED is already installed."
+        open_menu_and_exit
+    fi
+elif [ -z "$WANTED" ] && [ -n "$INSTALLED" ] && [ "$FORCE" = no ]; then
     step "Checking for a newer version"
     WANTED=$(latest_tag)
     if [ -z "$WANTED" ]; then
@@ -220,7 +258,10 @@ step "Fetching PortBridge"
 [ -n "$WANTED" ] || die "Could not find out which version is the latest. This server may not be able to reach GitHub.
 Try again later, or name a version yourself with --version vX.Y.Z"
 say "  Release $WANTED"
-if fetch_release "$WANTED"; then
+if [ -n "$FROM_DIR" ]; then
+    use_from_dir || die "Could not use the copy in $FROM_DIR."
+    ok "  Using the copy that was sent here"
+elif fetch_release "$WANTED"; then
     ok "  Downloaded a prebuilt copy, checksum verified"
 elif build_from_source "$WANTED"; then
     ok "  Built from source"
@@ -246,6 +287,11 @@ done
 [ -f "$TMP/rel/packaging/portbridge@.service" ] || die "The download is missing the service template."
 cp "$TMP/rel/packaging/portbridge@.service" "$STAGE/portbridge@.service"
 [ -f "$TMP/rel/packaging/portbridge-agent.service" ] && cp "$TMP/rel/packaging/portbridge-agent.service" "$STAGE/portbridge-agent.service"
+[ -f "$TMP/rel/packaging/portbridge-panel.service" ] && cp "$TMP/rel/packaging/portbridge-panel.service" "$STAGE/portbridge-panel.service"
+if [ -f "$TMP/rel/install.sh" ]; then
+    bash -n "$TMP/rel/install.sh" || die "install.sh did not pass a syntax check, so it will not be installed."
+    cp "$TMP/rel/install.sh" "$STAGE/install.sh"
+fi
 cp "$TMP/rel/portbridge" "$STAGE/portbridge"
 chmod 755 "$STAGE/portbridge"
 "$STAGE/portbridge" version >/dev/null 2>&1 || die "The new engine does not run on this server, so nothing was changed."
@@ -253,12 +299,22 @@ say "  Engine $("$STAGE/portbridge" version), scripts and service files look sou
 
 step "Installing"
 
+# Tunnels only need restarting when the engine itself changes. When it is the
+# same, as when only the menu or the service files are refreshed, they are left
+# running.
+ENGINE_CHANGED=yes
+if [ -f "$BIN" ] && [ "$(sha256sum "$BIN" | awk '{print $1}')" = "$(sha256sum "$STAGE/portbridge" | awk '{print $1}')" ]; then
+    ENGINE_CHANGED=no
+fi
+
 install -m 755 "$STAGE/portbridge" "$BIN"
 install -m 755 "$STAGE/portbridge-menu" "$MENU"
 install -m 755 "$STAGE/portbridge-firewall" "$FIREWALL"
 install -m 755 "$STAGE/portbridge-tune" "$TUNE"
 install -m 644 "$STAGE/portbridge@.service" "$UNIT"
 [ -f "$STAGE/portbridge-agent.service" ] && install -m 644 "$STAGE/portbridge-agent.service" "$AGENT_UNIT"
+[ -f "$STAGE/portbridge-panel.service" ] && install -m 644 "$STAGE/portbridge-panel.service" "$PANEL_UNIT"
+[ -f "$STAGE/install.sh" ] && install -D -m 755 "$STAGE/install.sh" "$SHARE_DIR/install.sh"
 
 mkdir -p "$CONF_DIR" /etc/portbridge/agents /run/portbridge
 chmod 700 /etc/portbridge "$CONF_DIR" /etc/portbridge/agents
@@ -277,17 +333,24 @@ done
 # Existing tunnels keep working across an upgrade; restart them on the new engine.
 step "Finishing up"
 restarted=0
-for f in "$CONF_DIR"/*.conf; do
-    [ -e "$f" ] || continue
-    n=$(basename "$f" .conf)
-    if systemctl is-enabled "portbridge@$n.service" >/dev/null 2>&1; then
-        systemctl restart "portbridge@$n.service" && restarted=$((restarted + 1))
-    fi
-done
-[ "$restarted" -gt 0 ] && say "  Restarted $restarted existing tunnel(s) on the new version"
+if [ "$ENGINE_CHANGED" = yes ]; then
+    for f in "$CONF_DIR"/*.conf; do
+        [ -e "$f" ] || continue
+        n=$(basename "$f" .conf)
+        if systemctl is-enabled "portbridge@$n.service" >/dev/null 2>&1; then
+            systemctl restart "portbridge@$n.service" && restarted=$((restarted + 1))
+        fi
+    done
+    [ "$restarted" -gt 0 ] && say "  Restarted $restarted existing tunnel(s) on the new version"
+else
+    say "  The engine is unchanged, so the tunnels were left running"
+fi
 
 if systemctl is-active portbridge-agent.service >/dev/null 2>&1; then
     systemctl restart portbridge-agent.service && say "  Restarted management agent on the new version"
+fi
+if systemctl is-active portbridge-panel.service >/dev/null 2>&1; then
+    systemctl restart portbridge-panel.service && say "  Restarted the web panel on the new version"
 fi
 
 if [ -n "$NOFIREWALL" ]; then
