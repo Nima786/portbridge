@@ -287,7 +287,7 @@ func TestPinnedFingerprintRefusesTheWrongCertificate(t *testing.T) {
 	addr := l.Addr().String()
 	_ = l.Close()
 	go func() {
-		_ = runAgentServer(addr, "tok", filepath.Join(dir, "a.crt"), filepath.Join(dir, "a.key"), dir)
+		_ = runAgentServer(addr, "tok", filepath.Join(dir, "a.crt"), filepath.Join(dir, "a.key"), dir, nil)
 	}()
 	var fp string
 	for i := 0; i < 30; i++ {
@@ -578,7 +578,7 @@ func TestAgentUpdatesPortsAndReportsABusyOne(t *testing.T) {
 	addr := l.Addr().String()
 	_ = l.Close()
 	go func() {
-		_ = runAgentServer(addr, "tok", filepath.Join(dir, "a.crt"), filepath.Join(dir, "a.key"), dir)
+		_ = runAgentServer(addr, "tok", filepath.Join(dir, "a.crt"), filepath.Join(dir, "a.key"), dir, nil)
 	}()
 	var fp string
 	for i := 0; i < 30; i++ {

@@ -38,7 +38,7 @@ func TestAServerThatCallsInIsReached(t *testing.T) {
 	if _, _, err := p.hub.do(ctx, srv.ID, http.MethodGet, "/api/overview", nil); !errors.Is(err, errNotCalling) {
 		t.Fatalf("before it calls, asking it should say it is not calling, not %v", err)
 	}
-	go agent.CallHome(ctx, ts.URL, p.ownFingerprint(), token, agent.NewHandler(token, t.TempDir()))
+	go agent.CallHome(ctx, ts.URL, p.ownFingerprint(), token, agent.NewHandler(token, t.TempDir(), nil))
 
 	deadline := time.Now().Add(10 * time.Second)
 	for !p.hub.connected(srv.ID) {
@@ -97,7 +97,7 @@ func TestOnlyKnownServersMayCallIn(t *testing.T) {
 func TestAServerReachedDirectlyIsPinned(t *testing.T) {
 	p := newTestPanel(t)
 	const token = "pba_direct"
-	agentSrv := httptest.NewTLSServer(agent.NewHandler(token, t.TempDir()))
+	agentSrv := httptest.NewTLSServer(agent.NewHandler(token, t.TempDir(), nil))
 	defer agentSrv.Close()
 
 	srv := addTestServer(t, p, Server{ID: "d", AgentURL: agentSrv.URL, Fingerprint: fingerprintOf(agentSrv.Certificate().Raw)}, token)

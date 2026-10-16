@@ -107,10 +107,17 @@
     return (list.length === 1 ? 'port ' : 'ports ') + list.join(', ');
   }
 
+  // setStatus shows a short message at the foot of the page. A problem stays until
+  // things work again; good news goes after a little while.
+  let statusTimer = null;
+  let statusIsProblem = false;
   function setStatus(msg, bad) {
     const el = $('status-line');
     el.textContent = msg || '';
     el.classList.toggle('bad', !!bad);
+    statusIsProblem = !!bad;
+    if (statusTimer) clearTimeout(statusTimer);
+    statusTimer = msg && !bad ? setTimeout(() => setStatus(''), 8000) : null;
   }
 
   // Re-drawing a list must not throw away where the keyboard was.
@@ -232,7 +239,7 @@
       if (currentTab === 'servers') await loadServers();
       else if (currentTab === 'tunnels') await loadTunnels();
       else await loadSettings();
-      setStatus('');
+      if (statusIsProblem) setStatus('');
     } catch (e) {
       if (e.status !== 401) setStatus(e.message, true);
     }
@@ -257,9 +264,13 @@
 
   // ---------------------------------------------------------------- servers
 
+  let serversCache = [];
+  let updatesCache = null;
+
   async function loadServers() {
-    const data = await api('GET', '/api/servers');
-    const text = JSON.stringify(data.servers || []);
+    const [data] = await Promise.all([api('GET', '/api/servers'), loadUpdates()]);
+    serversCache = data.servers || [];
+    const text = JSON.stringify(serversCache) + JSON.stringify(updatesCache && updatesCache.servers);
     if (text === lastServers) return;
     lastServers = text;
     keepFocus(() => renderServers(data.servers || []));
@@ -318,17 +329,66 @@
         h('span', { class: 'state ' + (t.running ? 'ok' : 'bad') }, t.running ? 'Running' : 'Stopped'),
         ' ', t.name))) : null;
 
-    return h('article', { class: 'card server', 'aria-labelledby': headingId },
+    const upd = updatesCache && (updatesCache.servers || []).find((u) => u.id === s.id);
+    const sshUpdate = upd && upd.needs_ssh ? h('p', { class: 'problem' },
+      `Its PortBridge (${upd.version}) is older than the panel's, and from before one-click updates. `,
+      h('button', { type: 'button', class: 'link', 'data-focus': `srv-${s.id}-ssh`, onclick: () => openSSHUpdate(s) },
+        'Update it with its SSH login')) : null;
+
+    const card = h('article', { class: 'card server', 'aria-labelledby': headingId },
       h('div', { class: 'head' }, h('h4', { id: headingId }, name), serverState(s)),
       h('p', { class: 'meta' }, meta.join(' · ')),
       badges.length ? h('div', { class: 'badges' }, badges) : null,
       problem,
+      sshUpdate,
       mini,
       h('div', { class: 'actions' },
+        (s.group === 'relay' || s.group === 'foreign')
+          ? h('button', { type: 'button', 'data-focus': `srv-${s.id}-tunnel`, 'aria-label': `New tunnel with ${name}`, onclick: () => openNewTunnel(s.group === 'relay' ? s.id : '', s.group === 'foreign' ? s.id : '') }, 'New tunnel')
+          : null,
         h('button', { type: 'button', 'data-focus': `srv-${s.id}-edit`, 'aria-label': `Rename or move ${name}`, onclick: () => openEdit(s) },
           'Rename or move'),
         s.this ? null : h('button', { type: 'button', 'data-focus': `srv-${s.id}-remove`, 'aria-label': `Remove ${name} from the panel`, onclick: () => confirmRemove(s) },
           'Remove')));
+    makeDraggable(card, s);
+    return card;
+  }
+
+  // Dragging a relay server onto a foreign one (or the other way round) starts
+  // a new tunnel between them. "New tunnel" on each card does the same from the
+  // keyboard.
+  let dragged = null;
+
+  function makeDraggable(card, s) {
+    if (s.group !== 'relay' && s.group !== 'foreign') return;
+    card.draggable = true;
+    card.addEventListener('dragstart', (ev) => {
+      dragged = s;
+      ev.dataTransfer.effectAllowed = 'link';
+      ev.dataTransfer.setData('text/plain', s.id);
+      card.classList.add('dragging');
+    });
+    card.addEventListener('dragend', () => {
+      dragged = null;
+      card.classList.remove('dragging');
+      for (const c of document.querySelectorAll('.drop-target')) c.classList.remove('drop-target');
+    });
+    card.addEventListener('dragover', (ev) => {
+      if (!dragged || dragged.group === s.group) return;
+      ev.preventDefault();
+      ev.dataTransfer.dropEffect = 'link';
+      card.classList.add('drop-target');
+    });
+    card.addEventListener('dragleave', () => card.classList.remove('drop-target'));
+    card.addEventListener('drop', (ev) => {
+      ev.preventDefault();
+      card.classList.remove('drop-target');
+      if (!dragged || dragged.group === s.group) return;
+      const relay = dragged.group === 'relay' ? dragged : s;
+      const foreign = dragged.group === 'foreign' ? dragged : s;
+      dragged = null;
+      openNewTunnel(relay.id, foreign.id);
+    });
   }
 
   for (const btn of document.querySelectorAll('[data-this-group]')) {
@@ -469,11 +529,35 @@
     reader.readAsText(f);
   });
 
-  $('add-server').addEventListener('click', () => {
+  // The same form adds a server, or updates one too old to be updated with one
+  // click, with its SSH login, once.
+  let addMode = { kind: 'add' };
+
+  function setAddMode(mode) {
+    addMode = mode;
+    const add = mode.kind === 'add';
+    $('add-only').hidden = !add;
+    $('add-only-name').hidden = !add;
+    $('add-update-row').hidden = !add;
+    $('add-title').textContent = add ? 'Add a server' : `Update ${mode.server.name} with its SSH login`;
+    $('add-intro').textContent = add
+      ? 'The panel logs in to it over SSH once, installs PortBridge there if needed, and from then on talks to it without SSH. The password or key is used only for this, and is never saved.'
+      : 'Its PortBridge is from before one-click updates, so the panel logs in over SSH once to update it. Its tunnels restart for a few seconds. From then on it updates with one click. The password or key is used only for this, and is never saved.';
+    $('add-submit').textContent = add ? 'Add server' : 'Update it';
     $('add-form').hidden = false;
     $('add-progress').hidden = true;
     $('add-error').textContent = '';
     showAuth();
+  }
+
+  function openSSHUpdate(s) {
+    setAddMode({ kind: 'ssh-update', server: s });
+    openDialog($('add-dialog'));
+    $('add-user').focus();
+  }
+
+  $('add-server').addEventListener('click', () => {
+    setAddMode({ kind: 'add' });
     openDialog($('add-dialog'));
     const first = document.querySelector('input[name="group"]:checked') || document.querySelector('input[name="group"]');
     first.focus();
@@ -488,7 +572,7 @@
     $('add-progress').hidden = true;
     $('add-form').hidden = false;
     $('add-error').textContent = 'Enter the password or key again: it is not kept.';
-    $('add-address').focus();
+    (addMode.kind === 'add' ? $('add-address') : $('add-user')).focus();
   });
 
   $('add-form').addEventListener('submit', async (ev) => {
@@ -511,8 +595,15 @@
     else body.private_key = kind === 'key' ? $('add-key').value : keyFromFile;
     if (kind !== 'password' && $('add-passphrase').value) body.passphrase = $('add-passphrase').value;
 
-    if (!body.group) { err.textContent = 'Choose whether it is a relay (Iran) or a foreign server.'; return; }
-    if (!address) { err.textContent = "Enter the server's address."; $('add-address').focus(); return; }
+    const updating = addMode.kind === 'ssh-update';
+    if (updating) {
+      delete body.name;
+      delete body.group;
+      delete body.address;
+      delete body.allow_update;
+    }
+    if (!updating && !body.group) { err.textContent = 'Choose whether it is a relay (Iran) or a foreign server.'; return; }
+    if (!updating && !address) { err.textContent = "Enter the server's address."; $('add-address').focus(); return; }
     if (!Number.isInteger(port) || port < 1 || port > 65535) { err.textContent = 'The SSH port must be from 1 to 65535.'; return; }
     if (kind === 'password' && !body.password) { err.textContent = "Enter the server's password."; $('add-password').focus(); return; }
     if (kind === 'key' && !body.private_key.trim()) { err.textContent = 'Paste the private key.'; $('add-key').focus(); return; }
@@ -521,7 +612,8 @@
     const btn = ev.target.querySelector('button[type=submit]');
     btn.disabled = true;
     try {
-      const res = await api('POST', '/api/servers', body);
+      const path = updating ? `/api/servers/${encodeURIComponent(addMode.server.id)}/ssh-update` : '/api/servers';
+      const res = await api('POST', path, body);
       clearSecrets();
       startJob(res.job);
     } catch (e) {
@@ -562,12 +654,14 @@
         return;
       }
       $('add-note').hidden = true;
+      const updating = addMode.kind === 'ssh-update';
       if (job.error) {
-        $('add-result').textContent = 'The server was not added. ' + sentence(job.error);
+        $('add-result').textContent = (updating ? 'It was not updated. ' : 'The server was not added. ') + sentence(job.error);
         $('add-result').className = 'bad';
         $('add-back').hidden = false;
       } else {
-        $('add-result').textContent = 'Done: the server is in the panel.';
+        $('add-result').textContent = updating ? 'Done: it is up to date, and updates with one click from now on.'
+          : 'Done: the server is in the panel.';
         $('add-result').className = 'good';
         $('add-address').value = '';
         $('add-name').value = '';
@@ -577,6 +671,70 @@
     };
     poll();
   }
+
+  // ---------------------------------------------------------- following a job
+
+  // followJob shows a job's progress in the job dialog until it is done.
+  function followJob(id, title, okText, failText) {
+    $('job-title').textContent = title;
+    $('job-log').replaceChildren();
+    $('job-result').textContent = 'Working...';
+    $('job-result').className = '';
+    $('job-note').hidden = false;
+    if (!$('job-dialog').open) openDialog($('job-dialog'));
+    $('job-title').focus();
+    let seen = 0;
+    const poll = async () => {
+      let job;
+      try {
+        job = await api('GET', '/api/jobs/' + encodeURIComponent(id));
+      } catch (e) {
+        if (e.status === 401) return;
+        // The panel may be restarting on a new version.
+        $('job-result').textContent = e.status === 0 || e.status === 404
+          ? 'The panel is restarting. This page logs you out; log in again in a minute to see how the update went.'
+          : e.message;
+        $('job-note').hidden = true;
+        setTimeout(waitForPanel, 5000);
+        return;
+      }
+      const lines = job.lines || [];
+      for (; seen < lines.length; seen++) $('job-log').append(h('li', null, lines[seen]));
+      $('job-log').scrollTop = $('job-log').scrollHeight;
+      if (!job.done) {
+        setTimeout(poll, 1500);
+        return;
+      }
+      $('job-note').hidden = true;
+      $('job-result').textContent = job.error ? `${failText} ${sentence(job.error)}` : okText;
+      $('job-result').className = job.error ? 'bad' : 'good';
+      lastServers = lastTunnels = '';
+      refresh();
+    };
+    poll();
+  }
+
+  // waitForPanel waits for a restarting panel to answer again, then asks for a
+  // fresh login.
+  async function waitForPanel() {
+    try {
+      await api('GET', '/api/me');
+    } catch (e) {
+      if (e.status === 0) setTimeout(waitForPanel, 5000);
+    }
+  }
+  $('job-close').addEventListener('click', () => $('job-dialog').close());
+
+  // A list of what happened on each server, with what to do by hand.
+  function showResults(title, results) {
+    $('msg-title').textContent = title;
+    $('msg-list').replaceChildren(...(results || []).map((r) => h('li', { class: r.ok ? 'good' : 'bad' },
+      h('strong', null, r.server + ': '), r.ok ? 'done.' : sentence(r.error),
+      r.manual ? h('p', { class: 'manual' }, 'To do it by hand: ' + r.manual) : null)));
+    openDialog($('msg-dialog'));
+    $('msg-close').focus();
+  }
+  $('msg-close').addEventListener('click', () => $('msg-dialog').close());
 
   // ---------------------------------------------------------------- tunnels
 
@@ -592,7 +750,7 @@
     const box = $('tunnel-list');
     if (!list.length) {
       box.replaceChildren(h('p', { class: 'empty' },
-        'No tunnels yet. Create one with the menu on your relay (Iran) server: portbridge-menu, then "Create a tunnel".'));
+        'No tunnels yet. Make one with "New tunnel", or drag a relay server onto a foreign server on the Servers page.'));
       return;
     }
     box.replaceChildren(...list.map(tunnelCard));
@@ -699,13 +857,89 @@
       diagram,
       h('dl', { class: 'facts' }, facts),
       problems.map((p) => h('p', { class: 'problem' }, p)),
-      t.stale ? h('p', { class: 'muted small' }, 'One of its servers cannot be reached right now, so this may be out of date.') : null);
+      t.stale ? h('p', { class: 'muted small' }, 'One of its servers cannot be reached right now, so this may be out of date.') : null,
+      tunnelActions(t, halves));
+  }
+
+  // tunnelActions are the buttons for one tunnel: both of its halves at once.
+  function tunnelActions(t, halves) {
+    const target = { name: t.name, edge: t.edge ? t.edge.server_id : '', origin: t.origin ? t.origin.server_id : '' };
+    const key = `tun-${t.name}-${target.edge}-${target.origin}`;
+    const allRunning = halves.length > 0 && halves.every((x) => x.info.running);
+    const service = (action, doing) => async (ev) => {
+      const btn = ev.currentTarget;
+      btn.disabled = true;
+      setStatus(`${doing} ${t.name}...`);
+      try {
+        const res = await api('POST', '/api/tunnels/service', { ...target, action });
+        const bad = (res.results || []).filter((r) => !r.ok);
+        setStatus(bad.length ? '' : `${t.name}: done.`);
+        if (bad.length) showResults(`${t.name}: not everything worked`, res.results);
+        lastTunnels = '';
+        await refresh();
+      } catch (e) {
+        setStatus(e.message, true);
+      } finally {
+        btn.disabled = false;
+      }
+    };
+    return h('div', { class: 'actions left tunnel-actions' },
+      h('button', { type: 'button', 'data-focus': key + '-restart', onclick: service('restart', 'Restarting') }, 'Restart'),
+      allRunning
+        ? h('button', { type: 'button', 'data-focus': key + '-stop', onclick: service('stop', 'Stopping') }, 'Stop')
+        : h('button', { type: 'button', 'data-focus': key + '-start', onclick: service('start', 'Starting') }, 'Start'),
+      target.edge ? h('button', { type: 'button', 'data-focus': key + '-code', onclick: () => showCode(target) }, 'Show its code') : null,
+      h('button', { type: 'button', class: 'danger-text', 'data-focus': key + '-delete', onclick: () => confirmDeleteTunnel(t, target) }, 'Delete'));
+  }
+
+  async function showCode(target) {
+    try {
+      const res = await api('POST', '/api/tunnels/code', target);
+      $('code-text').value = res.code;
+      $('code-msg').textContent = '';
+      openDialog($('code-dialog'));
+      $('code-text').select();
+    } catch (e) {
+      setStatus(e.message, true);
+    }
+  }
+  $('code-close').addEventListener('click', () => {
+    $('code-text').value = '';
+    $('code-dialog').close();
+  });
+  $('code-copy').addEventListener('click', async () => {
+    try {
+      await navigator.clipboard.writeText($('code-text').value);
+      $('code-msg').textContent = 'Copied.';
+    } catch (e) {
+      $('code-text').select();
+      $('code-msg').textContent = 'Press Ctrl+C (or Cmd+C) to copy the selected code.';
+    }
+  });
+
+  function confirmDeleteTunnel(t, target) {
+    const where = [t.edge && t.edge.server_name, t.origin && t.origin.server_name].filter(Boolean).join(' and ');
+    openConfirm(`Delete ${t.name}?`,
+      `It is stopped and removed from ${where}. Users of it lose their connection. This cannot be undone.`,
+      'Delete the tunnel',
+      async () => {
+        const res = await api('POST', '/api/tunnels/delete', target);
+        lastTunnels = lastServers = '';
+        await refresh();
+        const bad = (res.results || []).filter((r) => !r.ok);
+        if (bad.length) {
+          $('confirm-dialog').close();
+          showResults(`${t.name} was not removed everywhere`, res.results);
+        } else {
+          setStatus(`${t.name} was deleted from ${where}.`);
+        }
+      });
   }
 
   // --------------------------------------------------------------- settings
 
   async function loadSettings() {
-    const info = await api('GET', '/api/panel');
+    const [info] = await Promise.all([api('GET', '/api/panel'), loadUpdates()]);
     const rows = [];
     const row = (k, v) => rows.push(h('dt', null, k), h('dd', null, v));
     row('Version', info.version || '');
@@ -755,6 +989,310 @@
       msg.textContent = 'Saved. Use the new login from now on.';
     } catch (e) {
       fail(e.message);
+    } finally {
+      btn.disabled = false;
+    }
+  });
+
+  // ------------------------------------------------------------- new tunnel
+
+  const radio = (name) => {
+    const c = document.querySelector(`input[name="${name}"]:checked`);
+    return c ? c.value : '';
+  };
+  const setRadio = (name, value) => {
+    for (const r of document.querySelectorAll(`input[name="${name}"]`)) r.checked = r.value === value;
+  };
+  let sharingTouched = false;
+
+  function serverOption(s) {
+    return h('option', { value: s.id }, `${s.name || s.address}${s.address ? ' (' + s.address + ')' : ''}${s.online ? '' : ' — cannot be reached'}`);
+  }
+
+  function serverById(id) {
+    return serversCache.find((s) => s.id === id);
+  }
+
+  function hasIPv6(s) {
+    const ov = s && s.overview;
+    return !!(ov && ov.ipv6 && ov.ipv6.length);
+  }
+
+  // showTunnelOptions shows the questions that apply to what is chosen so far,
+  // as the menu asks only those.
+  function showTunnelOptions() {
+    const mode = radio('tn-mode');
+    const gre = $('tn-gre').checked;
+    $('tn-links').hidden = gre;
+    const backup = $('tn-backup-choice');
+    backup.hidden = mode !== 'direct';
+    if (mode !== 'direct' && radio('tn-link') === 'website-cdn-backup') setRadio('tn-link', 'website');
+    const link = gre ? 'plain' : radio('tn-link');
+    $('tn-opt-webheader').hidden = gre || link !== 'plain';
+    $('tn-webhost').disabled = !$('tn-webheader').checked;
+    $('tn-opt-claim').hidden = !['website', 'website-cdn-backup', 'grpc'].includes(link);
+    $('tn-opt-domain').hidden = !['cdn', 'website-cdn-backup', 'grpc-cdn'].includes(link);
+    $('tn-opt-clean').hidden = !['cdn', 'grpc-cdn'].includes(link);
+    $('tn-opt-stealth').hidden = !['website', 'grpc'].includes(link);
+    if (link === 'grpc' && $('tn-claim').value === 'www.bing.com') $('tn-claim').value = 'www.google.com';
+    if (link !== 'grpc' && $('tn-claim').value === 'www.google.com') $('tn-claim').value = 'www.bing.com';
+    // IPv6 is offered as the menu offers it: both servers need an address, and
+    // not with GRE, a CDN or the web-socket link.
+    const v6ok = !gre && ['plain', 'website', 'grpc', 'kcp'].includes(link) &&
+      hasIPv6(serverById($('tn-relay').value)) && hasIPv6(serverById($('tn-foreign').value));
+    $('tn-ipv6-row').hidden = !v6ok;
+    if (!v6ok) $('tn-ipv6').checked = false;
+    // Shared connections suit the links that carry a lot per connection.
+    if (!sharingTouched) setRadio('tn-shared', ['kcp', 'cdn', 'website-cdn-backup', 'grpc', 'grpc-cdn'].includes(link) ? 'shared' : 'one');
+    $('tn-opt-links').hidden = radio('tn-shared') !== 'shared';
+  }
+
+  for (const el of document.querySelectorAll('#tunnel-form input[name="tn-mode"], #tunnel-form input[name="tn-link"], #tn-gre, #tn-webheader, #tn-relay, #tn-foreign')) {
+    el.addEventListener('change', showTunnelOptions);
+  }
+  for (const el of document.querySelectorAll('input[name="tn-shared"]')) {
+    el.addEventListener('change', () => { sharingTouched = true; showTunnelOptions(); });
+  }
+
+  async function openNewTunnel(relayID, foreignID) {
+    if (!serversCache.length) {
+      try { serversCache = (await api('GET', '/api/servers')).servers || []; } catch (e) { setStatus(e.message, true); return; }
+    }
+    const relays = serversCache.filter((s) => s.group === 'relay');
+    const foreigns = serversCache.filter((s) => s.group === 'foreign');
+    if (!relays.length || !foreigns.length) {
+      setStatus('A tunnel joins a relay (Iran) server and a foreign server. Add one of each first, or move this server into its group.', true);
+      return;
+    }
+    $('tn-relay').replaceChildren(...relays.map(serverOption));
+    $('tn-foreign').replaceChildren(...foreigns.map(serverOption));
+    if (relayID) $('tn-relay').value = relayID;
+    if (foreignID) $('tn-foreign').value = foreignID;
+    $('tn-error').textContent = '';
+    $('tn-ports-result').replaceChildren();
+    $('tunnel-form').hidden = false;
+    $('tn-progress').hidden = true;
+    sharingTouched = false;
+    showTunnelOptions();
+    openDialog($('tunnel-dialog'));
+    $('tn-name').focus();
+  }
+
+  for (const b of document.querySelectorAll('.new-tunnel')) b.addEventListener('click', () => openNewTunnel('', ''));
+  $('tn-cancel').addEventListener('click', () => $('tunnel-dialog').close());
+  $('tn-close').addEventListener('click', () => $('tunnel-dialog').close());
+  $('tn-back').addEventListener('click', () => {
+    $('tn-progress').hidden = true;
+    $('tunnel-form').hidden = false;
+    $('tn-name').focus();
+  });
+
+  function tunnelRequest() {
+    const gre = $('tn-gre').checked;
+    const shared = radio('tn-shared') === 'shared';
+    return {
+      name: $('tn-name').value.trim(),
+      relay: $('tn-relay').value,
+      foreign: $('tn-foreign').value,
+      mode: radio('tn-mode'),
+      link: gre ? 'plain' : radio('tn-link'),
+      server_name: $('tn-claim').value.trim(),
+      domain: $('tn-domain').value.trim(),
+      clean_ips: $('tn-cleanips').value.replace(/\s+/g, ''),
+      stealth: $('tn-stealth').checked,
+      web_header: !gre && $('tn-webheader').checked,
+      web_host: $('tn-webhost').value.trim(),
+      real_site: $('tn-realsite').checked,
+      gre,
+      ipv6: $('tn-ipv6').checked,
+      shared,
+      shared_links: shared ? Number($('tn-links-n').value || 4) : 0,
+      service_ports: $('tn-service').value.trim(),
+      user_ports: $('tn-users').value.trim(),
+      link_port: Number($('tn-linkport').value || 0),
+      proxy_protocol: radio('tn-proxy'),
+      relay_ip: $('tn-relayip').value.trim(),
+    };
+  }
+
+  const portList = /^\s*\d{1,5}(\s*,\s*\d{1,5})*\s*$/;
+
+  $('tn-check').addEventListener('click', async () => {
+    const r = tunnelRequest();
+    const out = $('tn-ports-result');
+    const users = r.user_ports || r.service_ports;
+    if (!portList.test(r.service_ports) || !portList.test(users) || !r.link_port) {
+      out.replaceChildren(h('li', { class: 'bad' }, 'Fill in the ports first.'));
+      return;
+    }
+    out.replaceChildren(h('li', null, 'Asking both servers...'));
+    const relayPorts = users + (r.mode === 'reverse' ? ',' + r.link_port : '');
+    const foreignPorts = r.service_ports + (r.mode === 'direct' ? ',' + r.link_port : '');
+    const describe = async (server, list, role) => {
+      const s = serverById(server);
+      try {
+        const res = await api('POST', '/api/ports', { server, ports: list });
+        return res.ports.map((p) => {
+          let what = 'users\' port';
+          if (p.port === r.link_port && ((role === 'relay' && r.mode === 'reverse') || (role === 'foreign' && r.mode === 'direct'))) what = 'port between the servers';
+          else if (role === 'foreign') what = 'service port';
+          const by = p.by ? ` (${p.by.replace(/^PortBridge /, '')})` : '';
+          let cls = 'good', text;
+          if (what === 'service port') {
+            text = p.state === 'free' ? 'nothing is listening there yet; is your service running?' : `something is listening${by}, as it should`;
+            if (p.state === 'free') cls = 'warn';
+            if (/^PortBridge tunnel/.test(p.by || '')) { cls = 'bad'; text = `used by ${p.by.replace(/^PortBridge /, '')}`; }
+          } else {
+            text = p.state === 'free' ? 'free' : `${p.state}${by}`;
+            if (p.state !== 'free') cls = 'bad';
+          }
+          return h('li', { class: cls }, `${s ? s.name : server}, ${what} ${p.port}: ${text}`);
+        });
+      } catch (e) {
+        return [h('li', { class: 'warn' }, `${s ? s.name : server}: could not be asked (${e.message})`)];
+      }
+    };
+    const [a, b] = await Promise.all([describe(r.relay, relayPorts, 'relay'), describe(r.foreign, foreignPorts, 'foreign')]);
+    out.replaceChildren(...a, ...b);
+  });
+
+  $('tunnel-form').addEventListener('submit', async (ev) => {
+    ev.preventDefault();
+    const err = $('tn-error');
+    err.textContent = '';
+    const r = tunnelRequest();
+    const fail = (msg, el) => { err.textContent = msg; if (el) el.focus(); };
+    if (!/^[A-Za-z0-9_-]{1,40}$/.test(r.name)) return fail('Give it a short name: letters, digits, dash and underscore, up to 40 characters.', $('tn-name'));
+    if (!r.relay || !r.foreign) return fail('Choose both servers.', $('tn-relay'));
+    if (!portList.test(r.service_ports)) return fail('Give the service port or ports, separated by commas.', $('tn-service'));
+    if (r.user_ports && !portList.test(r.user_ports)) return fail("Give your users' port or ports, separated by commas, or leave it empty.", $('tn-users'));
+    if (r.user_ports && r.user_ports.split(',').length !== r.service_ports.split(',').length) {
+      return fail("Each users' port leads to one service port, in order, so give the same number of each.", $('tn-users'));
+    }
+    if (!(r.link_port >= 1 && r.link_port <= 65535)) return fail('The port between the servers must be from 1 to 65535.', $('tn-linkport'));
+    if (['cdn', 'website-cdn-backup', 'grpc-cdn'].includes(r.link) && !r.domain) return fail('Give your domain for the CDN.', $('tn-domain'));
+    if (r.shared && !(r.shared_links >= 1 && r.shared_links <= 16)) return fail('The number of shared connections must be from 1 to 16.', $('tn-links-n'));
+    const btn = ev.target.querySelector('button[type=submit]');
+    btn.disabled = true;
+    try {
+      const res = await api('POST', '/api/tunnels', r);
+      followTunnelJob(res.job, r.name);
+    } catch (e) {
+      fail(e.message);
+    } finally {
+      btn.disabled = false;
+    }
+  });
+
+  function followTunnelJob(id, name) {
+    $('tunnel-form').hidden = true;
+    $('tn-progress').hidden = false;
+    $('tn-log').replaceChildren();
+    $('tn-result').textContent = 'Working...';
+    $('tn-result').className = '';
+    $('tn-back').hidden = true;
+    $('tn-progress-title').focus();
+    let seen = 0;
+    const poll = async () => {
+      let job;
+      try {
+        job = await api('GET', '/api/jobs/' + encodeURIComponent(id));
+      } catch (e) {
+        if (e.status === 401) return;
+        $('tn-result').textContent = e.message;
+        $('tn-result').className = 'bad';
+        return;
+      }
+      const lines = job.lines || [];
+      for (; seen < lines.length; seen++) $('tn-log').append(h('li', null, lines[seen]));
+      $('tn-log').scrollTop = $('tn-log').scrollHeight;
+      if (!job.done) {
+        setTimeout(poll, 1000);
+        return;
+      }
+      if (job.error) {
+        $('tn-result').textContent = 'The tunnel was not made. ' + sentence(job.error);
+        $('tn-result').className = 'bad';
+        $('tn-back').hidden = false;
+      } else {
+        $('tn-result').textContent = `Done: ${name} is running on both servers.`;
+        $('tn-result').className = 'good';
+        $('tn-name').value = '';
+      }
+      lastTunnels = lastServers = '';
+      refresh();
+    };
+    poll();
+  }
+
+  // ---------------------------------------------------------------- updates
+
+  async function loadUpdates() {
+    try {
+      updatesCache = await api('GET', '/api/updates');
+    } catch (e) {
+      if (e.status === 401) throw e;
+      return;
+    }
+    renderUpdates();
+  }
+
+  function renderUpdates() {
+    const u = updatesCache;
+    if (!u) return;
+    let text = '';
+    if (u.panel_older) {
+      text = `PortBridge ${u.latest} is available. This panel has ${u.panel}`;
+      text += u.older ? `, and ${plural(u.older, 'server has', 'servers have')} older versions than that.` : '.';
+    } else if (u.older) {
+      text = `${plural(u.older, 'server has', 'servers have')} an older PortBridge than the panel's ${u.panel}.`;
+    }
+    if (u.note) text = sentence(u.note) + (text ? ' ' + text : '');
+    $('update-banner').hidden = !text && !u.running;
+    $('update-text').textContent = u.running ? 'An update is running.' : text;
+    for (const b of document.querySelectorAll('.update-all')) b.hidden = u.running || (!u.panel_older && !u.older);
+    for (const b of document.querySelectorAll('.update-progress')) b.hidden = !u.job;
+
+    const rows = [];
+    const row = (k, v) => rows.push(h('dt', null, k), h('dd', null, v));
+    row('This panel', u.panel);
+    row('Newest release', u.latest ? u.latest + (u.checked ? ` (checked ${ago(u.checked)})` : '') : (u.check_error ? sentence(u.check_error) : 'not checked yet'));
+    for (const s of u.servers || []) {
+      const words = { current: 'up to date', older: 'older', newer: 'newer than the panel', unknown: 'not known' }[s.state] || s.state;
+      row(s.name, `${s.version || '—'}, ${words}${s.needs_ssh ? '; needs its SSH login once to update' : ''}`);
+    }
+    $('update-info').replaceChildren(...rows);
+  }
+
+  for (const b of document.querySelectorAll('.update-all')) {
+    b.addEventListener('click', () => {
+      const u = updatesCache || {};
+      const self = u.panel_older
+        ? ` This panel's own server is updated first, to ${u.latest}: the panel restarts and you log in again, and it then updates the other servers by itself.`
+        : '';
+      openConfirm('Update everything?',
+        `Each server is updated in turn, and its tunnels restart for a few seconds while it does.${self}`,
+        'Update everything',
+        async () => {
+          const res = await api('POST', '/api/updates');
+          $('confirm-dialog').close();
+          followJob(res.job, 'Updating', 'Done: everything is up to date.', 'Not everything was updated.');
+        });
+    });
+  }
+  for (const b of document.querySelectorAll('.update-progress')) {
+    b.addEventListener('click', () => {
+      if (updatesCache && updatesCache.job) followJob(updatesCache.job, 'Updating', 'Done: everything is up to date.', 'Not everything was updated.');
+    });
+  }
+  $('update-check').addEventListener('click', async (ev) => {
+    const btn = ev.currentTarget;
+    btn.disabled = true;
+    try {
+      updatesCache = await api('POST', '/api/updates/check');
+      renderUpdates();
+    } catch (e) {
+      setStatus(e.message, true);
     } finally {
       btn.disabled = false;
     }

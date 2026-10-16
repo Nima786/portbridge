@@ -3,6 +3,7 @@ package panel
 // What the panel's page asks of it, and the rules every request goes through.
 
 import (
+	"context"
 	"crypto/subtle"
 	"encoding/json"
 	"errors"
@@ -17,6 +18,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Nima786/portbridge/internal/agent"
 	"github.com/Nima786/portbridge/internal/engine"
 )
 
@@ -24,7 +26,8 @@ const (
 	cookieName = "__Host-pb_session"
 	csrfHeader = "X-PB-CSRF"
 	apiBodyMax = 1 << 20
-	hubBodyMax = 4 << 20
+	// An agent's answer can carry a release it downloaded for the panel.
+	hubBodyMax = agent.HubBodyLimit
 )
 
 // The page loads nothing from anywhere else and runs no script that is not one
@@ -43,6 +46,7 @@ func (p *Panel) routes() http.Handler {
 
 	mux.HandleFunc("GET /hub/poll", p.hub.handlePoll)
 	mux.HandleFunc("POST /hub/reply", p.hub.handleReply)
+	mux.HandleFunc("GET /hub/release/{id}", p.handleRelease)
 
 	mux.HandleFunc("POST /api/login", p.handleLogin)
 	mux.HandleFunc("POST /api/logout", p.withAuth(p.handleLogout))
@@ -54,6 +58,15 @@ func (p *Panel) routes() http.Handler {
 	mux.HandleFunc("DELETE /api/servers/{id}", p.withAuth(p.handleRemoveServer))
 	mux.HandleFunc("GET /api/jobs/{id}", p.withAuth(p.handleJob))
 	mux.HandleFunc("GET /api/tunnels", p.withAuth(p.handleTunnels))
+	mux.HandleFunc("POST /api/tunnels", p.withAuth(p.handleCreateTunnel))
+	mux.HandleFunc("POST /api/tunnels/delete", p.withAuth(p.handleDeleteTunnel))
+	mux.HandleFunc("POST /api/tunnels/service", p.withAuth(p.handleServiceTunnel))
+	mux.HandleFunc("POST /api/tunnels/code", p.withAuth(p.handleTunnelCode))
+	mux.HandleFunc("POST /api/ports", p.withAuth(p.handlePorts))
+	mux.HandleFunc("GET /api/updates", p.withAuth(p.handleUpdates))
+	mux.HandleFunc("POST /api/updates", p.withAuth(p.handleStartUpdate))
+	mux.HandleFunc("POST /api/updates/check", p.withAuth(p.handleCheckUpdates))
+	mux.HandleFunc("POST /api/servers/{id}/ssh-update", p.withAuth(p.handleSSHUpdate))
 	mux.HandleFunc("GET /api/panel", p.withAuth(p.handlePanelInfo))
 
 	return secureHeaders(mux)
@@ -469,6 +482,160 @@ func (p *Panel) handlePanelInfo(w http.ResponseWriter, _ *http.Request, _ authed
 		"fingerprint": p.selfFP,
 		"certificate": p.certStatus(),
 	})
+}
+
+func (p *Panel) handleCreateTunnel(w http.ResponseWriter, r *http.Request, _ authed) {
+	var req createRequest
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	id, err := p.startCreate(req)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, capitalise(err.Error())+".")
+		return
+	}
+	writeJSON(w, http.StatusAccepted, map[string]string{"job": id})
+}
+
+// knownTarget refuses a tunnel whose servers are not in the panel.
+func (p *Panel) knownTarget(t tunnelTarget) error {
+	if err := checkTunnelName(t.Name); err != nil {
+		return err
+	}
+	if len(t.servers()) == 0 {
+		return errors.New("say which servers the tunnel is on")
+	}
+	for _, id := range t.servers() {
+		if _, ok := p.viewOf(id); !ok {
+			return errors.New("one of those servers is not in the panel")
+		}
+	}
+	return nil
+}
+
+func checkTunnelName(name string) error {
+	if name == "" || len(name) > 40 || strings.Trim(name, "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-") != "" {
+		return errors.New("that is not a tunnel name")
+	}
+	return nil
+}
+
+func (p *Panel) handleDeleteTunnel(w http.ResponseWriter, r *http.Request, _ authed) {
+	var t tunnelTarget
+	if !decodeJSON(w, r, &t) {
+		return
+	}
+	if err := p.knownTarget(t); err != nil {
+		writeErr(w, http.StatusBadRequest, capitalise(err.Error())+".")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"results": p.deleteTunnel(t)})
+}
+
+func (p *Panel) handleServiceTunnel(w http.ResponseWriter, r *http.Request, _ authed) {
+	var req struct {
+		tunnelTarget
+		Action string `json:"action"`
+	}
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	if err := p.knownTarget(req.tunnelTarget); err != nil {
+		writeErr(w, http.StatusBadRequest, capitalise(err.Error())+".")
+		return
+	}
+	switch req.Action {
+	case "start", "stop", "restart":
+	default:
+		writeErr(w, http.StatusBadRequest, "The action must be start, stop or restart.")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"results": p.serviceTunnel(req.tunnelTarget, req.Action)})
+}
+
+func (p *Panel) handleTunnelCode(w http.ResponseWriter, r *http.Request, _ authed) {
+	var t tunnelTarget
+	if !decodeJSON(w, r, &t) {
+		return
+	}
+	if t.Edge == "" {
+		writeErr(w, http.StatusBadRequest, "Codes are made on the relay (Iran) server, which is not in the panel for this tunnel.")
+		return
+	}
+	if err := p.knownTarget(t); err != nil {
+		writeErr(w, http.StatusBadRequest, capitalise(err.Error())+".")
+		return
+	}
+	code, err := p.tunnelCode(t.Edge, t.Name)
+	if err != nil {
+		writeErr(w, http.StatusBadGateway, capitalise(plainAgentError(err))+".")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"code": code})
+}
+
+func (p *Panel) handlePorts(w http.ResponseWriter, r *http.Request, _ authed) {
+	var req struct {
+		Server string `json:"server"`
+		Ports  string `json:"ports"`
+	}
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	if _, ok := p.viewOf(req.Server); !ok {
+		writeErr(w, http.StatusBadRequest, "That server is not in the panel.")
+		return
+	}
+	ports := intsOf(req.Ports)
+	if len(ports) == 0 || len(ports) > 32 {
+		writeErr(w, http.StatusBadRequest, "Give from 1 to 32 ports.")
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), agentTimeout)
+	defer cancel()
+	st, err := p.portsThere(ctx, req.Server, ports)
+	if err != nil {
+		writeErr(w, http.StatusBadGateway, capitalise(plainAgentError(err))+".")
+		return
+	}
+	out := make([]portState, 0, len(ports))
+	for _, n := range ports {
+		out = append(out, st[n])
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ports": out})
+}
+
+func (p *Panel) handleUpdates(w http.ResponseWriter, _ *http.Request, _ authed) {
+	writeJSON(w, http.StatusOK, p.updates.status())
+}
+
+func (p *Panel) handleCheckUpdates(w http.ResponseWriter, r *http.Request, _ authed) {
+	ctx, cancel := context.WithTimeout(r.Context(), time.Minute)
+	defer cancel()
+	p.updates.check(ctx)
+	writeJSON(w, http.StatusOK, p.updates.status())
+}
+
+func (p *Panel) handleStartUpdate(w http.ResponseWriter, _ *http.Request, _ authed) {
+	writeJSON(w, http.StatusAccepted, map[string]string{"job": p.updates.start()})
+}
+
+func (p *Panel) handleSSHUpdate(w http.ResponseWriter, r *http.Request, _ authed) {
+	srv, ok := p.serverByID(r.PathValue("id"))
+	if !ok {
+		writeErr(w, http.StatusNotFound, "That server is not in the panel.")
+		return
+	}
+	var req addRequest
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	if req.Password == "" && strings.TrimSpace(req.PrivateKey) == "" {
+		writeErr(w, http.StatusBadRequest, "Give the server's password, or its private key.")
+		return
+	}
+	id := p.startJob(func(j *job) (string, error) { return srv.ID, p.sshUpdate(j, srv, req) })
+	writeJSON(w, http.StatusAccepted, map[string]string{"job": id})
 }
 
 // capitalise starts a message with a capital letter, for showing on its own.

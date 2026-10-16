@@ -29,7 +29,7 @@ func newTestPanel(t *testing.T) *Panel {
 		t.Fatal(err)
 	}
 	p := newPanel(dir, Config{Listen: "127.0.0.1:2096"}, st)
-	p.tunnelsDir = t.TempDir()
+	p.setLocal(t.TempDir())
 	if err := p.loadSelfCert(); err != nil {
 		t.Fatal(err)
 	}

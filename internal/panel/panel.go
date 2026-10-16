@@ -60,6 +60,13 @@ type Panel struct {
 	// Each password check takes a fair amount of memory on purpose, so only a
 	// couple run at once, however many logins arrive together.
 	loginSem chan struct{}
+
+	// The panel's own server is managed through the agent's code, run here
+	// in-process, so it is handled exactly like every other server.
+	local      http.Handler
+	localToken string
+
+	updates *updater
 }
 
 func newPanel(dir string, cfg Config, st *store) *Panel {
@@ -75,7 +82,17 @@ func newPanel(dir string, cfg Config, st *store) *Panel {
 	}
 	p.hub = newHub(p.hubTokens)
 	p.fleet = newFleet(p)
+	p.setLocal(defaultTunnelsDir)
+	p.updates = newUpdater(p)
 	return p
+}
+
+// setLocal points the panel at the tunnels folder of its own server.
+func (p *Panel) setLocal(tunnelsDir string) {
+	p.tunnelsDir = tunnelsDir
+	p.localToken = randomToken()
+	// The panel runs as root on its own server, so it may update it.
+	p.local = agent.NewHandler(p.localToken, tunnelsDir, func() bool { return true })
 }
 
 // loadSelfCert makes the panel's own certificate the first time and loads it
@@ -229,6 +246,9 @@ func Run(dir string) error {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, os.Interrupt)
 	defer stop()
 	go p.fleet.run(ctx)
+	go p.updates.run(ctx)
+	// An update that restarted the panel carries on from where it was.
+	p.updates.resume()
 	if cfg.Domain != "" {
 		p.certs = newCerts(dir, cfg)
 		go p.certs.run(ctx)

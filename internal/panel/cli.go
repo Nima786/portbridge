@@ -12,6 +12,7 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -240,10 +241,16 @@ func cmdSetup(args []string) error {
 		cfg.PublicURL = u
 	}
 
+	// The panel's service runs the panel in the usual folder only. A panel set
+	// up in another folder is run by hand, and the service is left alone.
+	owned := filepath.Clean(*dir) == DefaultDir
+
 	// Stopped first, so its own port counts as free, and so it cannot write
 	// over the settings while they change.
-	wasActive := panelActive()
-	_, _ = systemctl("stop", panelUnit)
+	wasActive := owned && panelActive()
+	if owned {
+		_, _ = systemctl("stop", panelUnit)
+	}
 	restore := func() {
 		if wasActive {
 			_, _ = systemctl("start", panelUnit)
@@ -294,6 +301,12 @@ func cmdSetup(args []string) error {
 		return err
 	}
 
+	if !owned {
+		fmt.Printf("The panel in %s is set up. Its service only runs the panel in %s, so run this one with:\n", *dir, DefaultDir)
+		fmt.Printf("  portbridge panel run -dir %s\n", *dir)
+		fmt.Printf("Its certificate's fingerprint is %s\n", p.selfFP)
+		return nil
+	}
 	_, _ = systemctl("daemon-reload")
 	if out, err := systemctl("enable", panelUnit); err != nil {
 		return fmt.Errorf("turning the panel's service on failed (%s); update PortBridge with its installer, "+
@@ -379,8 +392,9 @@ func cmdResetPassword(args []string) error {
 		return err
 	}
 	// The running panel holds its own copy of the settings and would write the
-	// old login back, so it is stopped while this changes.
-	wasActive := panelActive()
+	// old login back, so it is stopped while this changes. Only the panel in
+	// the usual folder is the service's.
+	wasActive := filepath.Clean(*dir) == DefaultDir && panelActive()
 	if wasActive {
 		_, _ = systemctl("stop", panelUnit)
 	}

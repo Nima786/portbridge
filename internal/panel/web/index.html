@@ -44,8 +44,19 @@
     <section id="view-servers" role="tabpanel" aria-labelledby="tab-servers">
       <div class="toolbar">
         <h2>Servers</h2>
-        <button type="button" id="add-server" class="primary">Add server</button>
+        <div class="actions">
+          <button type="button" class="new-tunnel">New tunnel</button>
+          <button type="button" id="add-server" class="primary">Add server</button>
+        </div>
       </div>
+      <div id="update-banner" class="notice update" hidden>
+        <p id="update-text"></p>
+        <div class="actions left">
+          <button type="button" class="update-all primary">Update everything</button>
+          <button type="button" class="update-progress" hidden>Show the update's progress</button>
+        </div>
+      </div>
+      <p class="muted small">Tip: drag a relay server onto a foreign server (or the other way round) to make a tunnel between them.</p>
       <div id="this-unassigned" class="notice" hidden>
         <p><strong>The panel's own server is not in a group yet.</strong> Is it one of your relay (Iran) servers, or a foreign one?</p>
         <div class="actions left">
@@ -69,8 +80,9 @@
     <section id="view-tunnels" role="tabpanel" aria-labelledby="tab-tunnels" hidden>
       <div class="toolbar">
         <h2>Tunnels</h2>
+        <button type="button" class="new-tunnel primary">New tunnel</button>
       </div>
-      <p class="muted">Every tunnel on your servers, with both of its ends. Creating and deleting tunnels here comes in the next update; for now use the menu on the servers.</p>
+      <p class="muted">Every tunnel on your servers, with both of its ends. Tunnels made here are the same as ones made with the menu, which can still show, edit and delete them.</p>
       <div id="tunnel-list" class="tunnels"></div>
     </section>
 
@@ -96,6 +108,15 @@
           <h3 id="h-about">This panel</h3>
           <dl id="panel-info" class="facts-list"></dl>
         </section>
+        <section class="card" aria-labelledby="h-updates">
+          <h3 id="h-updates">Updates</h3>
+          <dl id="update-info" class="facts-list"></dl>
+          <div class="actions left">
+            <button type="button" id="update-check">Check for updates now</button>
+            <button type="button" class="update-all primary">Update everything</button>
+            <button type="button" class="update-progress" hidden>Show the update's progress</button>
+          </div>
+        </section>
       </div>
     </section>
   </main>
@@ -106,7 +127,8 @@
 <dialog id="add-dialog" aria-labelledby="add-title">
   <form id="add-form" novalidate>
     <h2 id="add-title">Add a server</h2>
-    <p class="muted small">The panel logs in to it over SSH once, installs PortBridge there if needed, and from then on talks to it without SSH. The password or key is used only for this, and is never saved.</p>
+    <p id="add-intro" class="muted small">The panel logs in to it over SSH once, installs PortBridge there if needed, and from then on talks to it without SSH. The password or key is used only for this, and is never saved.</p>
+    <div id="add-only">
     <fieldset>
       <legend>What kind of server is it?</legend>
       <label class="choice"><input type="radio" name="group" value="relay"> Relay (Iran)</label>
@@ -114,6 +136,7 @@
     </fieldset>
     <label for="add-address">Address <span class="muted">(IP address or host name)</span></label>
     <input id="add-address" autocapitalize="none" spellcheck="false" required placeholder="203.0.113.5">
+    </div>
     <div class="row">
       <div>
         <label for="add-user">SSH user</label>
@@ -124,8 +147,10 @@
         <input id="add-port" type="number" min="1" max="65535" value="22" inputmode="numeric">
       </div>
     </div>
+    <div id="add-only-name">
     <label for="add-name">Name <span class="muted">(optional, for you)</span></label>
     <input id="add-name" maxlength="64" placeholder="for example Tehran 1">
+    </div>
     <fieldset>
       <legend>Log in with</legend>
       <label class="choice"><input type="radio" name="auth" value="password" checked> Password</label>
@@ -148,11 +173,11 @@
       <label for="add-passphrase">Key passphrase <span class="muted">(only if the key has one)</span></label>
       <input id="add-passphrase" type="password" autocomplete="off">
     </div>
-    <label class="check"><input type="checkbox" id="add-update"> If it has an older PortBridge, update it. Its tunnels restart for a few seconds.</label>
+    <label class="check" id="add-update-row"><input type="checkbox" id="add-update"> If it has an older PortBridge, update it. Its tunnels restart for a few seconds.</label>
     <p id="add-error" class="error" role="alert"></p>
     <div class="actions">
       <button type="button" id="add-cancel">Cancel</button>
-      <button type="submit" class="primary">Add server</button>
+      <button type="submit" class="primary" id="add-submit">Add server</button>
     </div>
   </form>
   <div id="add-progress" hidden>
@@ -184,6 +209,148 @@
       <button type="submit" class="primary">Save</button>
     </div>
   </form>
+</dialog>
+
+<!-- Making a tunnel -->
+<dialog id="tunnel-dialog" class="wide" aria-labelledby="tn-title">
+  <form id="tunnel-form" novalidate>
+    <h2 id="tn-title">New tunnel</h2>
+    <div class="row2">
+      <div>
+        <label for="tn-relay">Relay (Iran) server</label>
+        <select id="tn-relay" required></select>
+      </div>
+      <div>
+        <label for="tn-foreign">Foreign server</label>
+        <select id="tn-foreign" required></select>
+      </div>
+    </div>
+    <label for="tn-name">A short name <span class="muted">(letters, digits, dash)</span></label>
+    <input id="tn-name" maxlength="40" autocapitalize="none" spellcheck="false" pattern="[A-Za-z0-9_-]+" required>
+
+    <fieldset>
+      <legend>Which server starts the connection?</legend>
+      <label class="choice block"><input type="radio" name="tn-mode" value="direct" checked> <span><strong>Direct</strong>: the relay connects out to the foreign server. <span class="muted">Try this first.</span></span></label>
+      <label class="choice block"><input type="radio" name="tn-mode" value="reverse"> <span><strong>Reverse</strong>: the foreign server connects in to the relay. <span class="muted">Use if direct stops working.</span></span></label>
+    </fieldset>
+
+    <fieldset>
+      <legend>How the link between the two servers looks</legend>
+      <label class="check"><input type="checkbox" id="tn-gre"> <span>Carry it over a private GRE link <span class="muted">(when a normal tunnel connects but no data flows; not disguised, and both servers need their own public IPv4 address)</span></span></label>
+      <div id="tn-links">
+        <label class="choice block"><input type="radio" name="tn-link" value="plain"> <span><strong>Plain</strong> <span class="muted">— fastest, but the easiest to single out</span></span></label>
+        <label class="choice block"><input type="radio" name="tn-link" value="website" checked> <span><strong>Look like a normal website</strong> <span class="muted">(recommended)</span></span></label>
+        <label class="choice block"><input type="radio" name="tn-link" value="cdn"> <span><strong>Go through Cloudflare or another CDN</strong> <span class="muted">— needs your domain, pointed at the CDN</span></span></label>
+        <label class="choice block" id="tn-backup-choice"><input type="radio" name="tn-link" value="website-cdn-backup"> <span><strong>Website, with a CDN standing by</strong> <span class="muted">— moves to your domain through the CDN if the direct route is blocked</span></span></label>
+        <label class="choice block"><input type="radio" name="tn-link" value="grpc"> <span><strong>HTTP/2 (gRPC) stream</strong> <span class="muted">— straight to the foreign server</span></span></label>
+        <label class="choice block"><input type="radio" name="tn-link" value="grpc-cdn"> <span><strong>HTTP/2 (gRPC) through Cloudflare</strong> <span class="muted">— turn gRPC on in Cloudflare</span></span></label>
+        <label class="choice block"><input type="radio" name="tn-link" value="kcp"> <span><strong>KCP over UDP</strong> <span class="muted">— repairs lost packets, ignores forged resets</span></span></label>
+      </div>
+      <div id="tn-opt-webheader" class="sub" hidden>
+        <label class="check"><input type="checkbox" id="tn-webheader"> <span>Open like web traffic <span class="muted">(a short fake web request and reply first)</span></span></label>
+        <label for="tn-webhost">Site name it opens with</label>
+        <input id="tn-webhost" value="www.bing.com" autocapitalize="none" spellcheck="false">
+      </div>
+      <div id="tn-opt-claim" class="sub" hidden>
+        <label for="tn-claim">Name the link claims to be <span class="muted">(any ordinary site; it need not be yours)</span></label>
+        <input id="tn-claim" value="www.bing.com" autocapitalize="none" spellcheck="false">
+      </div>
+      <div id="tn-opt-domain" class="sub" hidden>
+        <label for="tn-domain">Your domain <span class="muted">(pointed at the CDN, with its proxy on)</span></label>
+        <input id="tn-domain" placeholder="link.example.com" autocapitalize="none" spellcheck="false">
+        <p class="muted small">Set the CDN's encryption to Full (not Flexible, not Full Strict). Cloudflare forwards only ports 443, 2053, 2083, 2087, 2096 and 8443.</p>
+      </div>
+      <div id="tn-opt-clean" class="sub" hidden>
+        <label for="tn-cleanips">Clean Cloudflare addresses <span class="muted">(optional, comma-separated, for when the usual ones are throttled)</span></label>
+        <input id="tn-cleanips" placeholder="104.16.12.34, 172.67.45.67" autocapitalize="none" spellcheck="false">
+      </div>
+      <div id="tn-opt-stealth" class="sub" hidden>
+        <label class="check"><input type="checkbox" id="tn-realsite" checked> <span>Show strangers the real website <span class="muted">(recommended: anyone probing the port gets the genuine site)</span></span></label>
+        <label class="check"><input type="checkbox" id="tn-stealth"> <span>Stealth: a browser's fingerprint, with the opening split up</span></label>
+      </div>
+      <label class="check" id="tn-ipv6-row" hidden><input type="checkbox" id="tn-ipv6"> <span>Connect the two servers over IPv6 <span class="muted">(some networks cut IPv4 between countries but leave IPv6 alone; users still connect over IPv4)</span></span></label>
+    </fieldset>
+
+    <fieldset>
+      <legend>Connections between the servers</legend>
+      <label class="choice block"><input type="radio" name="tn-shared" value="one" checked> <span>One per user <span class="muted">(simplest)</span></span></label>
+      <label class="choice block"><input type="radio" name="tn-shared" value="shared"> <span>Shared: all users share a few connections <span class="muted">(fewer connections to spot; better for many users)</span></span></label>
+      <div id="tn-opt-links" class="sub" hidden>
+        <label for="tn-links-n">How many shared connections <span class="muted">(1 to 16)</span></label>
+        <input id="tn-links-n" type="number" min="1" max="16" value="4" inputmode="numeric">
+      </div>
+    </fieldset>
+
+    <fieldset>
+      <legend>Ports</legend>
+      <label for="tn-service">Service port(s) on the foreign server <span class="muted">(your inbound, e.g. 443, 8443)</span></label>
+      <input id="tn-service" inputmode="numeric" required placeholder="443">
+      <label for="tn-users">Port(s) your users connect to on the relay <span class="muted">(empty: the same as the service ports)</span></label>
+      <input id="tn-users" inputmode="numeric" placeholder="the same as the service ports">
+      <label for="tn-linkport">Port between the two servers <span class="muted">(users never see it)</span></label>
+      <input id="tn-linkport" type="number" min="1" max="65535" value="443" inputmode="numeric">
+      <div class="actions left"><button type="button" id="tn-check">Check these ports on both servers</button></div>
+      <ul id="tn-ports-result" class="ports-result" aria-live="polite"></ul>
+    </fieldset>
+
+    <fieldset>
+      <legend>Your users' real addresses</legend>
+      <label class="choice block"><input type="radio" name="tn-proxy" value="off" checked> <span>Not passed on</span></label>
+      <label class="choice block"><input type="radio" name="tn-proxy" value="v1"> <span>Passed on with PROXY protocol v1</span></label>
+      <label class="choice block"><input type="radio" name="tn-proxy" value="v2"> <span>Passed on with PROXY protocol v2</span></label>
+      <p class="muted small">Only turn this on if your service is set to expect it; otherwise it refuses every connection.</p>
+    </fieldset>
+
+    <details>
+      <summary>Advanced</summary>
+      <label for="tn-relayip">This relay's address, the one in your users' configs <span class="muted">(empty: worked out)</span></label>
+      <input id="tn-relayip" autocapitalize="none" spellcheck="false">
+    </details>
+
+    <p id="tn-error" class="error" role="alert"></p>
+    <div class="actions">
+      <button type="button" id="tn-cancel">Cancel</button>
+      <button type="submit" class="primary">Make the tunnel</button>
+    </div>
+  </form>
+  <div id="tn-progress" hidden>
+    <h2 id="tn-progress-title" tabindex="-1">Making the tunnel</h2>
+    <ol id="tn-log" class="log"></ol>
+    <p id="tn-result" role="status" aria-live="polite"></p>
+    <div class="actions">
+      <button type="button" id="tn-back" hidden>Back</button>
+      <button type="button" id="tn-close" class="primary">Close</button>
+    </div>
+  </div>
+</dialog>
+
+<!-- Following a long job, such as an update -->
+<dialog id="job-dialog" aria-labelledby="job-title">
+  <h2 id="job-title" tabindex="-1">Working</h2>
+  <ol id="job-log" class="log"></ol>
+  <p id="job-result" role="status" aria-live="polite"></p>
+  <p id="job-note" class="muted small">You can close this; it carries on.</p>
+  <div class="actions"><button type="button" id="job-close" class="primary">Close</button></div>
+</dialog>
+
+<!-- A tunnel's code, to paste by hand -->
+<dialog id="code-dialog" aria-labelledby="code-title">
+  <h2 id="code-title">Code for the foreign server</h2>
+  <p class="muted small">On the foreign server, open portbridge-menu, choose "Join a tunnel" and paste this one line. It holds the tunnel's password, so keep it private.</p>
+  <label for="code-text" class="visually-hidden">The code</label>
+  <textarea id="code-text" rows="4" readonly spellcheck="false"></textarea>
+  <p id="code-msg" role="status"></p>
+  <div class="actions">
+    <button type="button" id="code-copy">Copy</button>
+    <button type="button" id="code-close" class="primary">Close</button>
+  </div>
+</dialog>
+
+<!-- What happened on each server -->
+<dialog id="msg-dialog" aria-labelledby="msg-title">
+  <h2 id="msg-title"></h2>
+  <ul id="msg-list" class="msg-list"></ul>
+  <div class="actions"><button type="button" id="msg-close" class="primary">Close</button></div>
 </dialog>
 
 <!-- Asking before something is removed -->

@@ -224,9 +224,47 @@ dialog::backdrop { background: rgba(0, 0, 0, .6); }
 #add-result.bad { color: var(--bad); }
 #add-result.good { color: var(--ok); }
 
+/* Making tunnels, updates */
+
+select {
+  width: 100%;
+  background: var(--bg);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: .55rem .7rem;
+}
+select:focus { border-color: var(--accent); }
+
+dialog.wide { width: min(46rem, calc(100vw - 1.5rem)); }
+.row2 { display: grid; grid-template-columns: 1fr 1fr; gap: .8rem; }
+label.choice.block { display: flex; align-items: flex-start; margin: .45rem 0; gap: .55rem; }
+label.choice.block input { margin-top: .25rem; flex: none; }
+.sub { margin: .2rem 0 .4rem 1.8rem; padding-left: .8rem; border-left: 2px solid var(--line); }
+details { margin-top: 1rem; }
+summary { cursor: pointer; font-weight: 500; }
+
+.ports-result, .msg-list { list-style: none; margin: .6rem 0 0; padding: 0; display: grid; gap: .3rem; font-size: .92rem; }
+.ports-result li, .msg-list li { padding-left: 1.1rem; position: relative; }
+.ports-result li::before, .msg-list li::before { content: "•"; position: absolute; left: 0; }
+li.good { color: var(--ok); }
+li.warn { color: var(--warn); }
+li.bad { color: var(--bad); }
+.msg-list .manual { color: var(--text); margin: .2rem 0 0; }
+
+.tunnel-actions { margin-top: .8rem; }
+.tunnel-actions button { min-height: 2.1rem; padding: .3rem .8rem; font-size: .9rem; }
+button.danger-text { color: #ffb4ad; border-color: #6b2b27; }
+
+.notice.update { background: #1c2533; border-color: #34507a; }
+
+.server[draggable="true"] { cursor: grab; }
+.server.dragging { opacity: .55; }
+.server.drop-target { outline: 3px dashed var(--accent); outline-offset: 2px; }
+
 /* Narrow screens: everything in one column, the tunnel drawn top to bottom. */
 @media (max-width: 760px) {
   .columns { grid-template-columns: 1fr; }
+  .row2 { grid-template-columns: 1fr; }
   .diagram { flex-direction: column; }
   .node, .node.end { flex: 1 1 auto; }
   .wire { flex-direction: row; gap: .5rem; padding: .1rem 0; }

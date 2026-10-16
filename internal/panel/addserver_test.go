@@ -8,6 +8,8 @@ import (
 	"testing"
 
 	"golang.org/x/crypto/ssh"
+
+	"github.com/Nima786/portbridge/internal/engine"
 )
 
 func TestVersionsCompare(t *testing.T) {
@@ -55,6 +57,27 @@ func TestLookingAtAServerIgnoresNoise(t *testing.T) {
 	// Only noise, no answers at all: no uid, so the panel says it could not read it.
 	if _, ok := parseFacts("some error\nand another\n")["pb_uid"]; ok {
 		t.Fatalf("noise produced a user id")
+	}
+}
+
+func TestTheVersionAServerEndsUpWith(t *testing.T) {
+	old := engine.Version
+	engine.Version = "v0.15.0"
+	t.Cleanup(func() { engine.Version = old })
+	for _, tc := range []struct {
+		installed string
+		update    bool
+		want      string
+	}{
+		{"", false, "v0.15.0"},        // installed by the panel
+		{"v0.14.1", true, "v0.15.0"},  // updated by the panel
+		{"v0.14.1", false, "v0.14.1"}, // refused before this is reached, but left as it is
+		{"v0.15.0", false, "v0.15.0"}, // the same
+		{"v0.16.0", false, "v0.16.0"}, // newer, left as it is
+	} {
+		if got := installedAfter(tc.installed, tc.update); got != tc.want {
+			t.Fatalf("%q, update %v: want %s, got %s", tc.installed, tc.update, tc.want, got)
+		}
 	}
 }
 

@@ -474,24 +474,111 @@ func checkAgentAuth(r *http.Request, token string) bool {
 }
 
 // runAgentServer starts the HTTP/JSON management server.
-func runAgentServer(listenAddr, token, certFile, keyFile, confDir string) error {
+func runAgentServer(listenAddr, token, certFile, keyFile, confDir string, allowUpdates func() bool) error {
 	if token == "" {
 		return errors.New("agent token cannot be empty")
 	}
 	if listenAddr == "" {
 		listenAddr = "0.0.0.0:2083"
 	}
-	return serveAgent(listenAddr, certFile, keyFile, newAgentHandler(token, confDir))
+	return serveAgent(listenAddr, certFile, keyFile, newAgentHandler(token, confDir, allowUpdates))
 }
 
-// NewHandler is newAgentHandler, for the panel's tests.
-func NewHandler(token, confDir string) http.Handler { return newAgentHandler(token, confDir) }
+// NewHandler is everything an agent answers, for the panel: for its own server,
+// which it serves in-process, and for its tests. allowUpdates says whether
+// POST /api/update may install a release; nil means never.
+func NewHandler(token, confDir string, allowUpdates func() bool) http.Handler {
+	return newAgentHandler(token, confDir, allowUpdates)
+}
 
 // newAgentHandler is everything the agent answers. The same handler serves both
 // requests that come in on the agent's own port and those the panel hands over
 // while the agent is calling it (see callhome.go).
-func newAgentHandler(token, confDir string) *http.ServeMux {
+func newAgentHandler(token, confDir string, allowUpdates func() bool) *http.ServeMux {
 	mux := http.NewServeMux()
+
+	// POST /api/tunnel/create-edge: make and start the Iran half of a tunnel, as
+	// the menu's "Create a tunnel" does, and give back the code for the other half.
+	mux.HandleFunc("/api/tunnel/create-edge", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, `{"error":"method not allowed"}`, http.StatusMethodNotAllowed)
+			return
+		}
+		if !checkAgentAuth(r, token) {
+			http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
+			return
+		}
+		var spec EdgeSpec
+		dec := json.NewDecoder(io.LimitReader(r.Body, 64*1024))
+		dec.DisallowUnknownFields()
+		if err := dec.Decode(&spec); err != nil {
+			writeJSONReply(w, http.StatusBadRequest, EdgeResult{Error: "the tunnel's settings could not be read: " + err.Error()})
+			return
+		}
+		res, err := CreateEdge(spec, confDir)
+		if err != nil {
+			res.Error = err.Error()
+			writeJSONReply(w, http.StatusUnprocessableEntity, res)
+			return
+		}
+		writeJSONReply(w, http.StatusOK, res)
+	})
+
+	// POST /api/tunnel/service: start, stop or restart one tunnel.
+	mux.HandleFunc("/api/tunnel/service", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, `{"error":"method not allowed"}`, http.StatusMethodNotAllowed)
+			return
+		}
+		if !checkAgentAuth(r, token) {
+			http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
+			return
+		}
+		var req struct {
+			Name   string `json:"name"`
+			Action string `json:"action"`
+		}
+		if err := json.NewDecoder(io.LimitReader(r.Body, 4096)).Decode(&req); err != nil {
+			writeJSONReply(w, http.StatusBadRequest, map[string]any{"ok": false, "error": "name and action required"})
+			return
+		}
+		if err := tunnelService(confDir, req.Name, req.Action); err != nil {
+			writeJSONReply(w, http.StatusUnprocessableEntity, map[string]any{"ok": false, "error": err.Error()})
+			return
+		}
+		writeJSONReply(w, http.StatusOK, map[string]any{"ok": true})
+	})
+
+	// POST /api/tunnel/code: the pairing code of a tunnel made on this server,
+	// to paste on its foreign server by hand.
+	mux.HandleFunc("/api/tunnel/code", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, `{"error":"method not allowed"}`, http.StatusMethodNotAllowed)
+			return
+		}
+		if !checkAgentAuth(r, token) {
+			http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
+			return
+		}
+		var req struct {
+			Name string `json:"name"`
+		}
+		if err := json.NewDecoder(io.LimitReader(r.Body, 4096)).Decode(&req); err != nil {
+			writeJSONReply(w, http.StatusBadRequest, map[string]any{"ok": false, "error": "name required"})
+			return
+		}
+		code, err := edgePairingCode(confDir, req.Name)
+		if err != nil {
+			writeJSONReply(w, http.StatusUnprocessableEntity, map[string]any{"ok": false, "error": err.Error()})
+			return
+		}
+		writeJSONReply(w, http.StatusOK, map[string]any{"ok": true, "code": code})
+	})
+
+	// POST /api/update and /api/release: updating PortBridge (see update.go).
+	mux.HandleFunc("/api/update", updateHandler(token, allowUpdates, updateWorkDir))
+	mux.HandleFunc("/api/update/part", updatePartHandler(token, allowUpdates, updateWorkDir))
+	mux.HandleFunc("/api/release", releaseHandler(token))
 
 	// POST /api/tunnel/join and /api/tunnel/update take the same pairing code. One
 	// makes a tunnel that does not exist yet; the other changes the ports and
@@ -1013,12 +1100,13 @@ func CmdAgent(args []string) error {
 	// A panel this agent should call, if one was set up. It is in addition to
 	// the agent's own port, not instead of it: the Iran server's menu still
 	// reaches the agent there.
+	allow := updatesAllowedByConfig(*confPath)
 	if ac, err := readAgentConfig(*confPath); err == nil && ac.PanelURL != "" {
 		go callHome(context.Background(), ac.PanelURL, ac.PanelFingerprint, *token,
-			newAgentHandler(*token, defaultTunnelsDir))
+			newAgentHandler(*token, defaultTunnelsDir, allow))
 	}
 
-	return runAgentServer(*listen, *token, *cert, *key, defaultTunnelsDir)
+	return runAgentServer(*listen, *token, *cert, *key, defaultTunnelsDir, allow)
 }
 
 // cmdJoin handles pairing code application locally or against a remote agent.

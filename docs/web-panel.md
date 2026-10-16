@@ -3,9 +3,8 @@
 The web panel shows every server and every tunnel in one place, in a browser.
 Set it up on **one** of your servers; from the panel you add the others.
 
-This first version shows servers and tunnels and adds servers. Creating and
-deleting tunnels from the panel comes next; until then use the menu on the
-servers.
+From the panel you add servers, make and delete tunnels between them, start,
+stop and restart them, and update PortBridge on every server with one click.
 
 ## Setting it up
 
@@ -56,6 +55,50 @@ agent's own token, encrypted.
 
 Removing a server from the panel only makes the panel forget it. PortBridge and
 its tunnels stay on that server and keep working.
+
+## Making a tunnel
+
+**New tunnel** (or drag a relay server's card onto a foreign server's card) asks
+the same questions as the menu's "Create a tunnel", as one form: the two servers,
+a name, direct or reverse, how the link looks (plain, a normal website, through a
+CDN, a website with a CDN standing by, HTTP/2, KCP, or over GRE), IPv6 when both
+servers have it, shared connections, the ports, and whether your service is told
+your users' real addresses. Only the questions that apply are shown.
+
+**Check these ports on both servers** asks both servers whether the ports are free,
+and whether your service is listening on the foreign one, before anything is made.
+
+The panel then makes the Iran half on the relay server and the foreign half on the
+foreign server. The tunnel is exactly the one the menu would have made, so the menu
+can still show, edit and delete it. If the foreign half cannot be made, the Iran
+half is taken away again, so nothing is left half-made, and the reason is shown.
+
+Each tunnel has **Restart**, **Stop** or **Start**, **Show its code** (for pasting on
+a foreign server by hand) and **Delete**, which removes it from both servers. If a
+server cannot be reached, the panel says what to do on that server by hand.
+
+## Updating
+
+When a newer release is out, or a server has an older PortBridge than the panel,
+**Update everything** appears. It updates the panel's own server first, if it is
+behind: the panel restarts on the new version, you log in again, and it carries on
+with the other servers by itself. Then each other server, one at a time, so only one
+server's tunnels restart (for a few seconds) at any moment.
+
+A server downloads the release from GitHub itself and checks it against the
+published checksum. A server that cannot reach GitHub, which is common in Iran, is
+sent the release by the panel; when the panel's own server cannot reach GitHub
+either, a foreign server downloads it for the panel.
+
+A server with a PortBridge from before one-click updates (0.14 and older) has to be
+updated once with its SSH login. Its card offers **Update it with its SSH login**;
+the login is used for that alone and not kept. From then on it updates with one
+click.
+
+Being able to update a server means the panel can install software on it. That is
+allowed on the servers you add to the panel (it is the `allow_updates = on` line in
+`/etc/portbridge/agent.conf` on each), so keep the panel's password strong. To stop
+the panel updating one server, set that line to `off` there.
 
 ## The tunnels page
 

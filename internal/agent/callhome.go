@@ -50,11 +50,17 @@ type HubReply struct {
 
 // The panel holds each poll open for up to this long when it has nothing to ask.
 const (
-	HubPollWait   = 25 * time.Second
-	hubPollLimit  = HubPollWait + 20*time.Second
+	HubPollWait = 25 * time.Second
+	// hubAnswerWait is how long a poll waits for the panel to start answering:
+	// a connection that has gone silently dead, as they do in a shutdown, is
+	// given up on after this. Once the answer has started it may take far
+	// longer (transferTime), since it can carry a whole release.
+	hubAnswerWait = HubPollWait + 20*time.Second
 	hubBackoffMin = 2 * time.Second
 	hubBackoffMax = time.Minute
-	hubBodyLimit  = 1 << 20
+	// HubBodyLimit is the most one request or answer through the hub may be:
+	// room for a release, base64-encoded, and a little more.
+	HubBodyLimit = MaxReleaseSize*4/3 + 1<<20
 )
 
 // NewPinnedClient is an HTTPS client that trusts exactly one certificate, by its
@@ -138,7 +144,12 @@ func CallHome(ctx context.Context, panelURL, fingerprint, token string, h http.H
 // callHome keeps asking the panel for work until ctx ends.
 func callHome(ctx context.Context, panelURL, fingerprint, token string, h http.Handler) {
 	panelURL = strings.TrimRight(panelURL, "/")
-	client := panelClient(fingerprint, panelURL, hubPollLimit)
+	// No overall limit on the client: each poll and answer sets its own, and
+	// the transport gives up on a panel that does not start answering.
+	client := panelClient(fingerprint, panelURL, 0)
+	if tr, ok := client.Transport.(*http.Transport); ok {
+		tr.ResponseHeaderTimeout = hubAnswerWait
+	}
 	logs := newCallHomeLog()
 	backoff := time.Duration(0)
 	log.Printf("[agent] calling the panel at %s", panelURL)
@@ -176,6 +187,8 @@ func callHome(ctx context.Context, panelURL, fingerprint, token string, h http.H
 
 // hubPoll asks once. It returns nil, nil when the panel had nothing to ask.
 func hubPoll(ctx context.Context, client *http.Client, panelURL, token string) (*HubRequest, error) {
+	ctx, cancel := context.WithTimeout(ctx, transferTime)
+	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, panelURL+"/hub/poll", nil)
 	if err != nil {
 		return nil, err
@@ -192,7 +205,7 @@ func hubPoll(ctx context.Context, client *http.Client, panelURL, token string) (
 		return nil, nil
 	case http.StatusOK:
 		var r HubRequest
-		if err := json.NewDecoder(io.LimitReader(resp.Body, hubBodyLimit)).Decode(&r); err != nil {
+		if err := json.NewDecoder(io.LimitReader(resp.Body, HubBodyLimit)).Decode(&r); err != nil {
 			return nil, fmt.Errorf("the panel sent something that is not a request: %w", err)
 		}
 		return &r, nil
@@ -224,7 +237,8 @@ func runHubRequest(r HubRequest, token string, h http.Handler) HubReply {
 
 func hubReply(ctx context.Context, client *http.Client, panelURL, token string, rep HubReply) error {
 	body, _ := json.Marshal(rep)
-	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	// An answer can carry a release downloaded for the panel.
+	ctx, cancel := context.WithTimeout(ctx, transferTime)
 	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, panelURL+"/hub/reply", bytes.NewReader(body))
 	if err != nil {

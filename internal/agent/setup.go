@@ -43,6 +43,8 @@ type agentConfig struct {
 	KeyFile          string
 	PanelURL         string
 	PanelFingerprint string
+	// AllowUpdates is "on" when the panel may update PortBridge here.
+	AllowUpdates string
 }
 
 func readAgentConfig(path string) (agentConfig, error) {
@@ -74,6 +76,8 @@ func readAgentConfig(path string) (agentConfig, error) {
 			ac.PanelURL = v
 		case "panel_fingerprint":
 			ac.PanelFingerprint = v
+		case "allow_updates":
+			ac.AllowUpdates = v
 		}
 	}
 	return ac, nil
@@ -95,6 +99,10 @@ func writeAgentConfig(path string, ac agentConfig) error {
 		if ac.PanelFingerprint != "" {
 			fmt.Fprintf(&b, "panel_fingerprint = %s\n", ac.PanelFingerprint)
 		}
+	}
+	if ac.AllowUpdates != "" {
+		b.WriteString("\n# on = the web panel may update PortBridge on this server.\n")
+		fmt.Fprintf(&b, "allow_updates = %s\n", ac.AllowUpdates)
 	}
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return err
@@ -118,7 +126,9 @@ type AgentSetupResult struct {
 	Fingerprint string `json:"fingerprint"`
 	Version     string `json:"version"`
 	CallsPanel  bool   `json:"calls_panel"`
-	Error       string `json:"error,omitempty"`
+	// AllowsUpdates says the panel may update PortBridge on this server.
+	AllowsUpdates bool   `json:"allows_updates"`
+	Error         string `json:"error,omitempty"`
 }
 
 // portFreeTCP reports whether nothing listens on the port.
@@ -137,11 +147,17 @@ func cmdAgentSetup(args []string) error {
 	port := fs.Int("port", 0, "port for the agent to listen on (default: keep its port, or pick a free one)")
 	panelURL := fs.String("panel-url", "", "a panel for the agent to call (\"off\" stops calling one)")
 	panelFP := fs.String("panel-fingerprint", "", "fingerprint of that panel's certificate, when it is self-made")
+	allowUpdates := fs.String("allow-updates", "", "on lets the web panel update PortBridge here; off stops it (default: keep)")
 	asJSON := fs.Bool("json", false, "print the result as JSON")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	res, err := agentSetup(*confPath, *port, *panelURL, *panelFP)
+	switch *allowUpdates {
+	case "", "on", "off":
+	default:
+		return errors.New("-allow-updates must be on or off")
+	}
+	res, err := agentSetup(*confPath, *port, *panelURL, *panelFP, *allowUpdates)
 	if *asJSON {
 		if err != nil {
 			res.Error = err.Error()
@@ -159,7 +175,7 @@ func cmdAgentSetup(args []string) error {
 	return nil
 }
 
-func agentSetup(confPath string, port int, panelURL, panelFP string) (AgentSetupResult, error) {
+func agentSetup(confPath string, port int, panelURL, panelFP, allowUpdates string) (AgentSetupResult, error) {
 	res := AgentSetupResult{Version: engine.Version}
 	if err := needRoot(); err != nil {
 		return res, err
@@ -213,6 +229,9 @@ func agentSetup(confPath string, port int, panelURL, panelFP string) (AgentSetup
 	default:
 		ac.PanelURL, ac.PanelFingerprint = panelURL, panelFP
 	}
+	if allowUpdates != "" {
+		ac.AllowUpdates = allowUpdates
+	}
 
 	certFile, keyFile := ac.CertFile, ac.KeyFile
 	if certFile == "" || keyFile == "" {
@@ -251,5 +270,6 @@ func agentSetup(confPath string, port int, panelURL, panelFP string) (AgentSetup
 	res.Port = port
 	res.Fingerprint = certFingerprint(cert)
 	res.CallsPanel = ac.PanelURL != ""
+	res.AllowsUpdates = ac.AllowUpdates == "on"
 	return res, nil
 }

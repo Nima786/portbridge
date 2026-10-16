@@ -60,6 +60,11 @@ func newFleet(p *Panel) *fleet { return &fleet{p: p, by: map[string]*heard{}} }
 
 // call sends one request to a server's agent and returns its answer.
 func (f *fleet) call(ctx context.Context, srv Server, method, path string, body []byte) (int, []byte, error) {
+	return f.callLimit(ctx, srv, method, path, body, overviewLimit)
+}
+
+// callLimit is call for an answer that may be larger, such as a release.
+func (f *fleet) callLimit(ctx context.Context, srv Server, method, path string, body []byte, limit int64) (int, []byte, error) {
 	token, err := f.p.store.open(srv.TokenEnc)
 	if err != nil {
 		return 0, nil, err
@@ -75,12 +80,14 @@ func (f *fleet) call(ctx context.Context, srv Server, method, path string, body 
 	if len(body) > 0 {
 		req.Header.Set("Content-Type", "application/json")
 	}
-	resp, err := agent.NewPinnedClient(srv.Fingerprint, srv.AgentURL, agentTimeout).Do(req)
+	// The context sets how long this may take; the client's own limit is only
+	// a backstop, long enough for a release to cross a slow link.
+	resp, err := agent.NewPinnedClient(srv.Fingerprint, srv.AgentURL, 10*time.Minute).Do(req)
 	if err != nil {
 		return 0, nil, err
 	}
 	defer resp.Body.Close()
-	b, err := io.ReadAll(io.LimitReader(resp.Body, overviewLimit))
+	b, err := io.ReadAll(io.LimitReader(resp.Body, limit))
 	return resp.StatusCode, b, err
 }
 

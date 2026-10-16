@@ -93,6 +93,10 @@ func (h *hub) handlePoll(w http.ResponseWriter, r *http.Request) {
 		h.mu.Lock()
 		h.waiting[call.req.ID] = call
 		h.mu.Unlock()
+		// A request can carry a whole release, which takes a while to send.
+		if len(call.req.Body) > 1<<20 {
+			agent.ExtendDeadlines(w, 15*time.Minute)
+		}
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(call.req)
 	case <-timer.C:
@@ -113,8 +117,10 @@ func (h *hub) handleReply(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
 		return
 	}
+	// An answer can carry a release a server downloaded for the panel.
+	agent.ExtendDeadlines(w, 15*time.Minute)
 	var rep agent.HubReply
-	if err := json.NewDecoder(io.LimitReader(r.Body, 4<<20)).Decode(&rep); err != nil {
+	if err := json.NewDecoder(io.LimitReader(r.Body, agent.HubBodyLimit)).Decode(&rep); err != nil {
 		http.Error(w, `{"error":"bad reply"}`, http.StatusBadRequest)
 		return
 	}

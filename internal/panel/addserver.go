@@ -14,14 +14,11 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net"
-	"net/http"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -297,8 +294,15 @@ func (p *Panel) addServer(j *job, r addRequest) (string, error) {
 
 	// It starts out not calling any panel. Whether it needs to is found out
 	// next, and it is switched to calling this one only if so.
+	// Updates from the panel are allowed on a server added to it, so it can be
+	// kept up to date with one click. A PortBridge from before one-click updates
+	// does not know the setting, and could not use it anyway.
+	setupArgs := "-panel-url off"
+	if now := installedAfter(installed, r.AllowUpdate); compareVersions(now, firstOneClickVersion) >= 0 {
+		setupArgs += " -allow-updates on"
+	}
 	j.say("Switching its management agent on...")
-	res, err := remoteAgentSetup(rm, "-panel-url off")
+	res, err := remoteAgentSetup(rm, setupArgs)
 	if err != nil {
 		return "", err
 	}
@@ -362,6 +366,16 @@ func (p *Panel) addServer(j *job, r addRequest) (string, error) {
 	return srv.ID, nil
 }
 
+// installedAfter is the version a server has once adding it has done its part:
+// the panel's own if it was installed or updated, otherwise the one it had.
+func installedAfter(installed string, allowUpdate bool) string {
+	c := compareVersions(installed, engine.Version)
+	if installed == "" || (c < 0 && allowUpdate) {
+		return engine.Version
+	}
+	return installed
+}
+
 func (p *Panel) tryDirect(srv Server) (*agent.Overview, error) {
 	var last error
 	for i := 0; i < 3; i++ {
@@ -412,29 +426,44 @@ func remoteAgentSetup(rm *remote, extra string) (agent.AgentSetupResult, error) 
 	return res, nil
 }
 
-// install carries PortBridge across and runs its installer there.
-func (p *Panel) install(j *job, rm *remote, arch string) error {
-	files, err := p.packageFor(arch)
-	if err != nil {
-		return err
-	}
+// packArchive turns a release's files into a release archive.
+func packArchive(files []pkgFile) ([]byte, error) {
 	var buf bytes.Buffer
 	gz := gzip.NewWriter(&buf)
 	tw := tar.NewWriter(gz)
 	for _, f := range files {
-		if err := tw.WriteHeader(&tar.Header{Name: f.name, Mode: f.mode, Size: int64(len(f.data))}); err != nil {
-			return err
+		if err := tw.WriteHeader(&tar.Header{Name: "./" + f.name, Mode: f.mode, Size: int64(len(f.data)), Typeflag: tar.TypeReg}); err != nil {
+			return nil, err
 		}
 		if _, err := tw.Write(f.data); err != nil {
-			return err
+			return nil, err
 		}
 	}
 	if err := tw.Close(); err != nil {
-		return err
+		return nil, err
 	}
 	if err := gz.Close(); err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
+}
+
+// archiveFor is this panel's own release, as an archive, for a processor type.
+func (p *Panel) archiveFor(arch string) ([]byte, error) {
+	files, err := p.packageFor(arch)
+	if err != nil {
+		return nil, err
+	}
+	return packArchive(files)
+}
+
+// install carries PortBridge across and runs its installer there.
+func (p *Panel) install(j *job, rm *remote, arch string) error {
+	archive, err := p.archiveFor(arch)
+	if err != nil {
 		return err
 	}
+	buf := bytes.NewBuffer(archive)
 	dir := "/tmp/portbridge-install-" + strings.ToLower(newID(6))
 	dir = strings.Map(func(r rune) rune {
 		if r == '-' || r == '/' || (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') {
@@ -505,43 +534,18 @@ func (p *Panel) packageFor(arch string) ([]pkgFile, error) {
 // downloadRelease fetches a release archive from GitHub and checks it against the
 // checksums published with it before anything in it is used.
 func downloadRelease(version, arch string) ([]pkgFile, error) {
-	if !strings.HasPrefix(version, "v") || strings.Contains(version, "-") {
+	if !agent.IsReleaseVersion(version) {
 		return nil, fmt.Errorf("this panel (%s) is not a release, so it cannot fetch a copy for a %s server", version, arch)
 	}
-	name := fmt.Sprintf("portbridge_%s_linux_%s.tar.gz", strings.TrimPrefix(version, "v"), arch)
-	base := "https://github.com/Nima786/portbridge/releases/download/" + version + "/"
-	client := &http.Client{Timeout: 2 * time.Minute}
-	get := func(u string) ([]byte, error) {
-		resp, err := client.Get(u)
-		if err != nil {
-			return nil, err
-		}
-		defer resp.Body.Close()
-		if resp.StatusCode != http.StatusOK {
-			return nil, fmt.Errorf("HTTP %d", resp.StatusCode)
-		}
-		return io.ReadAll(io.LimitReader(resp.Body, 64<<20))
-	}
-	archive, err := get(base + name)
+	archive, err := agent.FetchRelease(version, arch)
 	if err != nil {
-		return nil, fmt.Errorf("could not download PortBridge for a %s server from GitHub (%v); "+
-			"this server may not reach GitHub", arch, err)
+		return nil, fmt.Errorf("%v; this server may not reach GitHub", err)
 	}
-	sums, err := get(base + "checksums.txt")
-	if err != nil {
-		return nil, fmt.Errorf("could not download the release's checksums: %v", err)
-	}
-	sum := sha256.Sum256(archive)
-	want := ""
-	for _, l := range strings.Split(string(sums), "\n") {
-		f := strings.Fields(l)
-		if len(f) == 2 && strings.TrimPrefix(f[1], "./") == name {
-			want = f[0]
-		}
-	}
-	if want == "" || want != hex.EncodeToString(sum[:]) {
-		return nil, errors.New("the download does not match its published checksum; not using it")
-	}
+	return unpackArchive(archive)
+}
+
+// unpackArchive reads a release archive into its files.
+func unpackArchive(archive []byte) ([]pkgFile, error) {
 	gz, err := gzip.NewReader(bytes.NewReader(archive))
 	if err != nil {
 		return nil, err

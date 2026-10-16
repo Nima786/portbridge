@@ -107,7 +107,7 @@ func TestAgentServerAPI(t *testing.T) {
 	_ = l.Close()
 
 	go func() {
-		_ = runAgentServer(listenAddr, token, certFile, keyFile, tmpDir)
+		_ = runAgentServer(listenAddr, token, certFile, keyFile, tmpDir, nil)
 	}()
 
 	client := &http.Client{

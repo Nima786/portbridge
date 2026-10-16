@@ -1,0 +1,214 @@
+package panel
+
+import (
+	"encoding/base64"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/Nima786/portbridge/internal/agent"
+)
+
+// twoServers is a panel whose own server is a relay, managing one foreign server
+// whose agent runs here on a folder of its own.
+func twoServers(t *testing.T) (p *Panel, foreignID, foreignDir string) {
+	t.Helper()
+	p = newTestPanel(t)
+	_ = p.store.update(func(s *State) error { s.ThisGroup = GroupRelay; return nil })
+	const token = "pba_foreign"
+	foreignDir = t.TempDir()
+	srv := httptest.NewTLSServer(agent.NewHandler(token, foreignDir, nil))
+	t.Cleanup(srv.Close)
+	f := addTestServer(t, p, Server{ID: "far", Name: "Aeza", Group: GroupForeign, Address: "203.0.113.20",
+		AgentURL: srv.URL, Fingerprint: fingerprintOf(srv.Certificate().Raw)}, token)
+	p.fleet.refresh(f)
+	return p, f.ID, foreignDir
+}
+
+func waitJob(t *testing.T, p *Panel, id string) jobView {
+	t.Helper()
+	deadline := time.Now().Add(30 * time.Second)
+	for time.Now().Before(deadline) {
+		p.jobsMu.Lock()
+		j := p.jobs[id]
+		p.jobsMu.Unlock()
+		if v := j.view(); v.Done {
+			return v
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("job %s never finished", id)
+	return jobView{}
+}
+
+func newTunnel(name string) createRequest {
+	return createRequest{Name: name, Relay: "this", Foreign: "far", Mode: "reverse", Link: "website",
+		ServerName: "www.bing.com", ServicePorts: "39001", UserPorts: "29311", LinkPort: 2217, RelayIP: "198.51.100.1"}
+}
+
+func confs(dir string) []string {
+	m, _ := filepath.Glob(filepath.Join(dir, "*.conf"))
+	for i := range m {
+		m[i] = filepath.Base(m[i])
+	}
+	return m
+}
+
+func TestATunnelIsMadeOnBothServersFromThePanel(t *testing.T) {
+	p, foreignID, foreignDir := twoServers(t)
+	id, err := p.startCreate(newTunnel("shop"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if v := waitJob(t, p, id); v.Error != "" {
+		t.Fatalf("not made: %s\n%s", v.Error, strings.Join(v.Lines, "\n"))
+	}
+	edge, origin := agent.TunnelsReport(p.tunnelsDir), agent.TunnelsReport(foreignDir)
+	if len(edge) != 1 || len(origin) != 1 || edge[0].PairID == "" || edge[0].PairID != origin[0].PairID {
+		t.Fatalf("the two halves are not one tunnel: %+v %+v", edge, origin)
+	}
+	if edge[0].Role != "edge" || origin[0].Role != "origin" || edge[0].Mode != "reverse" || origin[0].Transport != "tls" {
+		t.Fatalf("wrong halves: %+v %+v", edge[0], origin[0])
+	}
+
+	// It is shown as one tunnel with both ends.
+	var found bool
+	for _, tv := range pairTunnels(p.fleet.views()) {
+		if tv.Name == "shop" && tv.Edge != nil && tv.Origin != nil && tv.Edge.ServerID == "this" && tv.Origin.ServerID == foreignID {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("the tunnels page does not show it with both ends")
+	}
+
+	// Its code, for pasting by hand, is the one the foreign half was made from.
+	code, err := p.tunnelCode("this", "shop")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if raw, err := base64.StdEncoding.DecodeString(code); err != nil || !strings.Contains(string(raw), "name=shop\n") {
+		t.Fatalf("not the tunnel's code: %v", err)
+	}
+
+	for _, action := range []string{"stop", "start", "restart"} {
+		for _, o := range p.serviceTunnel(tunnelTarget{Name: "shop", Edge: "this", Origin: foreignID}, action) {
+			if !o.OK {
+				t.Fatalf("%s on %s: %s", action, o.Server, o.Error)
+			}
+		}
+	}
+
+	results := p.deleteTunnel(tunnelTarget{Name: "shop", Edge: "this", Origin: foreignID})
+	if len(results) != 2 || !results[0].OK || !results[1].OK {
+		t.Fatalf("not deleted from both: %+v", results)
+	}
+	if len(confs(p.tunnelsDir)) != 0 || len(confs(foreignDir)) != 0 {
+		t.Fatalf("files were left behind: %v %v", confs(p.tunnelsDir), confs(foreignDir))
+	}
+}
+
+func TestIfTheForeignHalfFailsNothingIsLeftBehind(t *testing.T) {
+	p, _, foreignDir := twoServers(t)
+	// The foreign server already has a tunnel of that name, so it refuses.
+	_ = os.WriteFile(filepath.Join(foreignDir, "taken.conf"), []byte("name = taken\n"), 0o600)
+	id, err := p.startCreate(newTunnel("taken"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	v := waitJob(t, p, id)
+	if v.Error == "" || !strings.Contains(v.Error, "Nothing was left behind") {
+		t.Fatalf("the failure was not reported plainly: %q", v.Error)
+	}
+	if len(confs(p.tunnelsDir)) != 0 {
+		t.Fatalf("the Iran half was left behind: %v", confs(p.tunnelsDir))
+	}
+}
+
+func TestAPortClashOnTheForeignServerIsCaughtFirst(t *testing.T) {
+	p, foreignID, foreignDir := twoServers(t)
+	// A tunnel already there uses port 39001 for its own link.
+	first := newTunnel("first")
+	first.Mode, first.LinkPort, first.ServicePorts, first.UserPorts = "direct", 39001, "443", "443"
+	if v := waitJob(t, p, mustCreate(t, p, first)); v.Error != "" {
+		t.Fatalf("setting up: %s", v.Error)
+	}
+	clash := newTunnel("second")
+	clash.ServicePorts, clash.UserPorts = "39001", "29312"
+	v := waitJob(t, p, mustCreate(t, p, clash))
+	if v.Error == "" || !strings.Contains(v.Error, "39001") {
+		t.Fatalf("the clash was not caught: %q", v.Error)
+	}
+	if got := confs(p.tunnelsDir); len(got) != 1 {
+		t.Fatalf("the Iran half was made despite the clash: %v", got)
+	}
+	_ = foreignID
+	_ = foreignDir
+}
+
+func mustCreate(t *testing.T, p *Panel, r createRequest) string {
+	t.Helper()
+	id, err := p.startCreate(r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return id
+}
+
+func TestTheNewTunnelFormIsChecked(t *testing.T) {
+	p, _, _ := twoServers(t)
+	for name, change := range map[string]func(*createRequest){
+		"no relay":                 func(r *createRequest) { r.Relay = "" },
+		"the same server twice":    func(r *createRequest) { r.Foreign = "this" },
+		"relay in the wrong group": func(r *createRequest) { r.Relay, r.Foreign = "far", "this" },
+		"no link type":             func(r *createRequest) { r.Link = "" },
+		"CDN with no domain":       func(r *createRequest) { r.Link = "cdn" },
+		"CDN backup in reverse":    func(r *createRequest) { r.Link, r.Domain = "website-cdn-backup", "x.example.com" },
+	} {
+		r := newTunnel("x")
+		change(&r)
+		if _, err := p.startCreate(r); err == nil {
+			t.Fatalf("%s: accepted", name)
+		}
+	}
+	// IPv6 between the servers needs both to have an IPv6 address. Whether this
+	// machine has one depends on where the test runs, so the foreign server is
+	// told to have none.
+	p.fleet.mu.Lock()
+	p.fleet.by["far"].overview = &agent.Overview{OK: true, Version: "v0.15.0", IPv4: []string{"203.0.113.20"}}
+	p.fleet.mu.Unlock()
+	r6 := newTunnel("x")
+	r6.IPv6 = true
+	if _, err := p.startCreate(r6); err == nil || !strings.Contains(err.Error(), "IPv6") {
+		t.Fatalf("IPv6 without a foreign IPv6 address: %v", err)
+	}
+	// The users' ports default to the service ports.
+	r := newTunnel("x")
+	r.UserPorts = ""
+	s, err := p.toSpec(r)
+	if err != nil || s.UserPorts != "39001" {
+		t.Fatalf("users' ports did not default to the service ports: %q %v", s.UserPorts, err)
+	}
+}
+
+func TestDeletingSaysWhatToDoByHand(t *testing.T) {
+	p, foreignID, _ := twoServers(t)
+	// The foreign server's agent goes away.
+	_ = p.store.update(func(s *State) error {
+		s.Servers[0].AgentURL = "https://127.0.0.1:1"
+		return nil
+	})
+	results := p.deleteTunnel(tunnelTarget{Name: "gone", Edge: "this", Origin: foreignID})
+	var foreign halfOutcome
+	for _, r := range results {
+		if r.Server == "Aeza" {
+			foreign = r
+		}
+	}
+	if foreign.OK || !strings.Contains(foreign.Manual, "Delete a tunnel") || !strings.Contains(foreign.Manual, "gone") {
+		t.Fatalf("no plain instructions for the server that could not be reached: %+v", foreign)
+	}
+}

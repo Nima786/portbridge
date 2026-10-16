@@ -95,7 +95,7 @@ func TestTunnelsReportShowsAFreshStatusOnly(t *testing.T) {
 }
 
 func TestOverviewEndpointNeedsTheToken(t *testing.T) {
-	h := newAgentHandler("pba_right", t.TempDir())
+	h := newAgentHandler("pba_right", t.TempDir(), nil)
 	for _, tc := range []struct {
 		token string
 		want  int
@@ -146,7 +146,7 @@ func TestAgentConfigKeepsEverySetting(t *testing.T) {
 }
 
 func TestHubRequestsAreOnlyForTheAPI(t *testing.T) {
-	h := newAgentHandler("pba_t", t.TempDir())
+	h := newAgentHandler("pba_t", t.TempDir(), nil)
 	rep := runHubRequest(HubRequest{ID: "1", Method: http.MethodGet, Path: "/debug/pprof"}, "pba_t", h)
 	if rep.Status != http.StatusNotFound || rep.ID != "1" {
 		t.Fatalf("a path outside the API was run: %+v", rep)
@@ -191,7 +191,7 @@ func TestCallHomeAnswersThePanelsRequests(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	go callHome(ctx, panel.URL, fp, token, newAgentHandler(token, t.TempDir()))
+	go callHome(ctx, panel.URL, fp, token, newAgentHandler(token, t.TempDir(), nil))
 	select {
 	case rep := <-replies:
 		if rep.ID != "r1" || rep.Status != http.StatusOK {
