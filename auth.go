@@ -70,6 +70,13 @@ const (
 	msgParkPing     = 0x07 // periodic heartbeat for parked spares (keeps UDP NAT alive)
 	msgParkPong     = 0x08 // heartbeat reply
 
+	// msgActivateFrom is msgActivatePort with the user's address after the port
+	// (see userAddrs.appendTo), then the opening bytes. Sent instead of the other
+	// two only when proxy_protocol is on, so a tunnel without it sends exactly
+	// what it always did, and an older server is never sent a byte it does not
+	// know unless both were set up for it.
+	msgActivateFrom = 0x09
+
 	// Sent before closing, but only once the MAC has already verified, so these
 	// never leak information to a peer that does not hold the secret.
 	rejClockSkew = 0x11

@@ -68,6 +68,7 @@ type origin struct {
 	logDial     *throttled
 	logConnect  *throttled
 	logRelay    *throttled
+	logProxy    *throttled
 
 	cancel       context.CancelFunc
 	teardownOnce sync.Once
@@ -90,6 +91,7 @@ func runOrigin(ctx context.Context, cfg *Config, st *status) error {
 		logDial:     newThrottled(),
 		logConnect:  newThrottled(),
 		logRelay:    newThrottled(),
+		logProxy:    newThrottled(),
 	}
 
 	ctrl, err := startOriginControlServer(ctx, cfg, o)
@@ -127,17 +129,17 @@ func (o *origin) serveStream(tunnel net.Conn) {
 	o.wg.Add(1)
 	defer o.wg.Done()
 
-	port, err := o.awaitActivation(tunnel, muxActivateWait)
+	a, err := o.awaitActivation(tunnel, muxActivateWait)
 	if err != nil {
 		_ = tunnel.Close()
 		return
 	}
-	if port == 0 {
+	if a.port == 0 {
 		if pt, ok := tunnel.(interface{ TargetPort() uint16 }); ok {
-			port = pt.TargetPort()
+			a.port = pt.TargetPort()
 		}
 	}
-	o.handleActivated(tunnel, port)
+	o.handleActivated(tunnel, a)
 }
 
 // runDirect accepts tunnel connections from the edge.
@@ -247,13 +249,13 @@ func (o *origin) runDirect(ctx context.Context) error {
 					return
 				}
 				atomic.AddInt64(&o.st.parkedSpares, 1)
-				targetPort, err := o.parkUntilActivated(ctx, c, o.cfg.ParkTimeout)
+				a, err := o.parkUntilActivated(ctx, c, o.cfg.ParkTimeout)
 				atomic.AddInt64(&o.st.parkedSpares, -1)
 				if err != nil {
 					_ = c.Close()
 					return
 				}
-				o.handleActivated(c, targetPort)
+				o.handleActivated(c, a)
 			}(c)
 		default:
 			o.logCapacity.printf("too many unestablished tunnel connections (%d); dropping one", o.cfg.MaxPending)
@@ -361,7 +363,7 @@ func (o *origin) reverseWorker(ctx context.Context, n int) {
 		// that a firewall may quietly have forgotten about.
 		atomic.AddInt64(&o.st.parkedSpares, 1)
 		o.trackParked(c, true)
-		targetPort, err := o.parkUntilActivated(ctx, c, o.cfg.SpareTTL)
+		a, err := o.parkUntilActivated(ctx, c, o.cfg.SpareTTL)
 		o.trackParked(c, false)
 		atomic.AddInt64(&o.st.parkedSpares, -1)
 
@@ -380,10 +382,10 @@ func (o *origin) reverseWorker(ctx context.Context, n int) {
 
 		// Hand the session off and immediately rebuild this spare.
 		o.wg.Add(1)
-		go func(c net.Conn, targetPort uint16) {
+		go func(c net.Conn, a arrival) {
 			defer o.wg.Done()
-			o.handleActivated(c, targetPort)
-		}(c, targetPort)
+			o.handleActivated(c, a)
+		}(c, a)
 	}
 }
 
@@ -453,7 +455,7 @@ func (o *origin) routeChanged() {
 // Cancelling a context does not interrupt a blocked socket read, so without this
 // the process would appear to hang on shutdown until that deadline expired.
 // Moving the deadline to "now" makes the read return immediately.
-func (o *origin) parkUntilActivated(ctx context.Context, c net.Conn, timeout time.Duration) (uint16, error) {
+func (o *origin) parkUntilActivated(ctx context.Context, c net.Conn, timeout time.Duration) (arrival, error) {
 	unpark := make(chan struct{})
 	go func() {
 		select {
@@ -467,9 +469,17 @@ func (o *origin) parkUntilActivated(ctx context.Context, c net.Conn, timeout tim
 	return o.awaitActivation(c, timeout)
 }
 
+// arrival is what the edge says when it wakes a connection for a user: which of
+// the published services they want (0 for the first), and, when proxy_protocol
+// is on there, where they came from.
+type arrival struct {
+	port uint16
+	from *userAddrs
+}
+
 // awaitActivation blocks until the edge says a user has arrived. Anything other
 // than the activation byte means the connection is finished with.
-func (o *origin) awaitActivation(c net.Conn, timeout time.Duration) (uint16, error) {
+func (o *origin) awaitActivation(c net.Conn, timeout time.Duration) (arrival, error) {
 	seenPing := false
 	for {
 		readTimeout := timeout
@@ -484,69 +494,108 @@ func (o *origin) awaitActivation(c net.Conn, timeout time.Duration) (uint16, err
 			readTimeout = parkedSilenceLimit
 		}
 		if err := c.SetReadDeadline(time.Now().Add(readTimeout)); err != nil {
-			return 0, err
+			return arrival{}, err
 		}
 		var sig [1]byte
 		if _, err := io.ReadFull(c, sig[:]); err != nil {
-			return 0, err
+			return arrival{}, err
 		}
 		switch sig[0] {
 		case msgParkPing:
 			seenPing = true
 			_ = c.SetWriteDeadline(time.Now().Add(activateWriteTimeout))
 			if _, err := c.Write([]byte{msgParkPong}); err != nil {
-				return 0, err
+				return arrival{}, err
 			}
 			_ = c.SetWriteDeadline(time.Time{})
 			continue
 		case msgActivate:
 			if err := c.SetReadDeadline(time.Time{}); err != nil {
-				return 0, err
+				return arrival{}, err
 			}
-			return 0, nil
-		case msgActivatePort:
+			return arrival{}, nil
+		case msgActivatePort, msgActivateFrom:
 			if err := c.SetReadDeadline(time.Time{}); err != nil {
-				return 0, err
+				return arrival{}, err
 			}
 			var portBuf [2]byte
 			if _, err := io.ReadFull(c, portBuf[:]); err != nil {
-				return 0, err
+				return arrival{}, err
 			}
-			return binary.BigEndian.Uint16(portBuf[:]), nil
+			a := arrival{port: binary.BigEndian.Uint16(portBuf[:])}
+			if sig[0] == msgActivateFrom {
+				// The address arrives in the same write as the signal, so a
+				// short limit only guards against a broken peer, never a slow
+				// route.
+				_ = c.SetReadDeadline(time.Now().Add(ackWaitTimeout))
+				from, err := readUserAddrs(c)
+				_ = c.SetReadDeadline(time.Time{})
+				if err != nil {
+					o.logAuth.printf("%v", err)
+					return arrival{}, err
+				}
+				a.from = from
+			}
+			return a, nil
 		case msgTeardown:
 			if err := c.SetReadDeadline(time.Time{}); err != nil {
-				return 0, err
+				return arrival{}, err
 			}
 			_ = c.SetWriteDeadline(time.Now().Add(activateWriteTimeout))
 			_, _ = c.Write([]byte{msgTeardownAck})
 			o.triggerTeardown()
-			return 0, errTeardownRequested
+			return arrival{}, errTeardownRequested
 		case msgSpeedtest:
 			if err := c.SetReadDeadline(time.Time{}); err != nil {
-				return 0, err
+				return arrival{}, err
 			}
 			runSpeedtestServer(c)
-			return 0, errSpeedtestFinished
+			return arrival{}, errSpeedtestFinished
 		default:
 			_ = c.SetReadDeadline(time.Time{})
 			switch {
 			case isRejection(sig[0]):
 				err := describeRejection(sig[0])
 				o.logAuth.printf("the other server refused this connection: %v", err)
-				return 0, err
+				return arrival{}, err
 			case sig[0] >= muxOpen && sig[0] <= muxTeardownAck:
 				// Shared-connection frames arriving where single sessions are
 				// expected: the other server has mux on and this one has not.
 				o.logAuth.printf("%v", errMuxOnlyThere)
-				return 0, errMuxOnlyThere
+				return arrival{}, errMuxOnlyThere
 			}
-			return 0, errBadAck
+			return arrival{}, errBadAck
 		}
 	}
 }
 
+// tellService gives the service the user's address, in the PROXY protocol
+// header, before anything else reaches it. It does nothing when proxy_protocol
+// is off here. When the two servers disagree the tunnel still works, and the
+// log says which one to change.
+func (o *origin) tellService(svc net.Conn, a arrival) error {
+	if o.cfg.ProxyProtocol == proxyProtocolOff {
+		if a.from != nil {
+			o.logProxy.printf("the other server is sending users' real addresses, but proxy_protocol " +
+				"is off here, so the service is not told them; turn it on here too, or off there")
+		}
+		return nil
+	}
+	if a.from == nil {
+		o.logProxy.printf("proxy_protocol is on here, but the other server is not sending users' " +
+			"real addresses, so the service is told they are unknown; turn proxy_protocol on there too")
+	}
+	if err := svc.SetWriteDeadline(time.Now().Add(activateWriteTimeout)); err != nil {
+		return err
+	}
+	_, err := svc.Write(proxyHeader(o.cfg.ProxyProtocol, a.from))
+	_ = svc.SetWriteDeadline(time.Time{})
+	return err
+}
+
 // handleActivated is reached only once a real user is waiting on the other side.
-func (o *origin) handleActivated(tunnel net.Conn, targetPort uint16) {
+func (o *origin) handleActivated(tunnel net.Conn, a arrival) {
+	targetPort := a.port
 	select {
 	case o.active <- struct{}{}:
 	default:
@@ -573,6 +622,15 @@ func (o *origin) handleActivated(tunnel net.Conn, targetPort uint16) {
 		atomic.AddInt64(&o.st.failedSessions, 1)
 		o.logDial.printf("cannot reach the local service at %s: %v", inboundAddr, err)
 		_ = tunnel.Close()
+		return
+	}
+	// Before the confirmation: if the service cannot be told, the edge is still
+	// free to try this user again on another connection.
+	if err := o.tellService(svc, a); err != nil {
+		atomic.AddInt64(&o.st.failedSessions, 1)
+		o.logDial.printf("could not give the local service at %s the user's address: %v", inboundAddr, err)
+		_ = tunnel.Close()
+		_ = svc.Close()
 		return
 	}
 

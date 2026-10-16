@@ -193,6 +193,13 @@ type Config struct {
 	RealSite  bool
 	CoverSite string
 
+	// ProxyProtocol passes each user's real address to the service in the
+	// standard PROXY protocol header: proxyProtocolOff, or the version written
+	// (1 or 2). On the edge any version means "send users' addresses across"; on
+	// the origin it is the header the service is given. Both ends need it on.
+	// Works with every link, mode and kind of sharing. See proxyproto.go.
+	ProxyProtocol int
+
 	fragmentSet bool
 	resendSet   bool // kcp_resend was written down, so 0 means off rather than unset
 	utlsSet     bool
@@ -530,6 +537,12 @@ func (c *Config) set(key, val string) error {
 		}
 	case "cover_site":
 		c.CoverSite = strings.TrimSpace(val)
+	case "proxy_protocol":
+		v, err := parseProxyProtocol(strings.ToLower(strings.TrimSpace(val)))
+		if err != nil {
+			return err
+		}
+		c.ProxyProtocol = v
 	case "firewall":
 		// Read by the firewall helper, not by the engine. Accepted here so the
 		// engine does not refuse a config that contains it.
@@ -966,6 +979,14 @@ func (c *Config) Summary() string {
 		}
 	}
 	fmt.Fprintf(&b, "Link is %s. ", describeTransport(c))
+	if c.ProxyProtocol != proxyProtocolOff {
+		if c.Role == RoleEdge {
+			b.WriteString("Each user's real address is sent to the other server. ")
+		} else {
+			fmt.Fprintf(&b, "The service is told each user's real address (PROXY protocol %s). ",
+				proxyProtocolName(c.ProxyProtocol))
+		}
+	}
 	if c.Mux {
 		fmt.Fprintf(&b, "All sessions share %d long-lived connections, capacity %d, drain %s",
 			c.MuxLinks, c.MaxConn, c.Drain)

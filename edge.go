@@ -418,6 +418,13 @@ func (e *edge) serve(ctx context.Context, user net.Conn, targetPort uint16) erro
 		tries = 1
 	}
 
+	// Read from the connection the user really made, never from anything they
+	// sent, so nobody can claim someone else's address.
+	var from *userAddrs
+	if e.cfg.ProxyProtocol != proxyProtocolOff {
+		from = addrsOf(user)
+	}
+
 	var lastErr error
 	for attempt := 1; attempt <= tries; attempt++ {
 		if ctx.Err() != nil {
@@ -432,7 +439,7 @@ func (e *edge) serve(ctx context.Context, user net.Conn, targetPort uint16) erro
 			}
 			continue
 		}
-		if err := activate(tunnel, head, targetPort); err != nil {
+		if err := activate(tunnel, head, targetPort, from); err != nil {
 			// A shared link that produced this failure is suspect: it may be
 			// dead without having noticed yet, and picking it again would just
 			// repeat the wait.
@@ -480,11 +487,18 @@ func (e *edge) takeTunnel(ctx context.Context, targetPort uint16) (net.Conn, err
 // acknowledgement rides along inside that wait. And because those bytes are
 // still held locally, the connection stays safe to throw away if no
 // acknowledgement arrives.
-func activate(tunnel net.Conn, head []byte, targetPort uint16) error {
-	opening := make([]byte, 0, 3+len(head))
-	if targetPort > 0 {
+//
+// from is the user's address when proxy_protocol is on, and nil when it is off;
+// only then does the opening differ from what it has always been.
+func activate(tunnel net.Conn, head []byte, targetPort uint16, from *userAddrs) error {
+	opening := make([]byte, 0, 3+1+2*net.IPv6len+4+len(head))
+	switch {
+	case from != nil:
+		opening = append(opening, msgActivateFrom, byte(targetPort>>8), byte(targetPort))
+		opening = from.appendTo(opening)
+	case targetPort > 0:
 		opening = append(opening, msgActivatePort, byte(targetPort>>8), byte(targetPort))
-	} else {
+	default:
 		opening = append(opening, msgActivate)
 	}
 	opening = append(opening, head...)

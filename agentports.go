@@ -125,6 +125,10 @@ func buildOriginConf(p *PairingData, secretFile, certFile, keyFile string) strin
 		fmt.Fprintf(&b, "alt_target = %s\n", net.JoinHostPort(p.AltHost, p.TunnelPort))
 		fmt.Fprintf(&b, "alt_server_name = %s\n", p.AltHost)
 	}
+	if p.ProxyProtocol == "v1" || p.ProxyProtocol == "v2" {
+		fmt.Fprintf(&b, "\n# Tell the service each user's real address; it must be set to expect it.\n")
+		fmt.Fprintf(&b, "proxy_protocol = %s\n", p.ProxyProtocol)
+	}
 	fmt.Fprintf(&b, "\nmux = %s\n", p.Mux)
 	if p.Mux == "on" {
 		fmt.Fprintf(&b, "mux_links = %s\n", p.MuxLinks)

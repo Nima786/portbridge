@@ -66,10 +66,15 @@ type PairingData struct {
 	// website instead of presenting our own certificate.
 	RealSite  string
 	CoverSite string
+
+	// Added in version 10, and only sent when used: the service is told each
+	// user's real address (off, v1 or v2). See proxyproto.go.
+	ProxyProtocol string
 }
 
-// pairingVersionMax is the newest code this build understands.
-const pairingVersionMax = 9
+// pairingVersionMax is the newest code this build understands. The menu keeps
+// the same number in PAIRING_VERSION_MAX, and a test holds the two together.
+const pairingVersionMax = 10
 
 // decodePairingCode parses a base64 encoded pairing code into structured data.
 func decodePairingCode(code string) (*PairingData, error) {
@@ -121,6 +126,8 @@ func decodePairingCode(code string) (*PairingData, error) {
 		HTTPHost:    kv["http_host"],
 		RealSite:    kv["real_site"],
 		CoverSite:   kv["cover_site"],
+
+		ProxyProtocol: kv["proxy_protocol"],
 	}
 
 	if v, err := strconv.Atoi(p.Version); err == nil && v > pairingVersionMax {

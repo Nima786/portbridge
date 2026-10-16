@@ -802,7 +802,7 @@ func checkFirstFrame(typ byte) error {
 		return nil
 	case isRejection(typ):
 		return describeRejection(typ)
-	case typ == msgActivate || typ == msgActivatePort || typ == msgParkPing:
+	case typ == msgActivate || typ == msgActivatePort || typ == msgActivateFrom || typ == msgParkPing:
 		return errMuxOnlyHere
 	default:
 		return fmt.Errorf("the other server sent something that is not shared-connection data (0x%02x); "+

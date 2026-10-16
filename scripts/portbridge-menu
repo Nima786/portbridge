@@ -35,7 +35,7 @@ DEFAULT_TUNNEL_PORT=443
 # every code the menu writes to it, so a new kind of code cannot be made without
 # also being accepted. Version 9 once was made here and refused here, which went
 # unnoticed because the agent's automatic setup reads codes in the engine.
-PAIRING_VERSION_MAX=9
+PAIRING_VERSION_MAX=10
 
 # Ports strongly associated with proxy and VPN software. Using one of these for
 # the link between the two servers is an easy giveaway, so the menu warns.
@@ -1403,48 +1403,89 @@ describe_sharing() {
     fi
 }
 
+# ------------------------------------------------------- users' real addresses
+
+# describe_proxy <off|v1|v2> - whether the service is told users' real addresses
+describe_proxy() {
+    case "$1" in
+        v1 | v2) printf 'passed to the service (PROXY protocol %s)' "$1" ;;
+        *) printf 'not passed on' ;;
+    esac
+}
+
+# explain_proxy_service <service ports> - what the service on the foreign server
+# must be set to do. Said every time it matters, because getting it wrong breaks
+# every connection through the tunnel, not just the addresses.
+explain_proxy_service() {
+    warn "The service on port(s) $1 of the foreign server must be set to expect"
+    warn "each user's address (PROXY protocol), or connections through this tunnel"
+    warn "will fail. Set the service up first:"
+    say "${DIM}  Xray / 3x-ui    turn on Proxy Protocol on that inbound${R}"
+    say "${DIM}  LiteSpeed       Server, Tuning, PROXY Protocol: 127.0.0.1, ::1${R}"
+    say "${DIM}  nginx           add proxy_protocol to that listen line${R}"
+}
+
 # -------------------------------------------------------------- pairing code
 
 # The code carries everything the foreign server needs, so it asks nothing.
+#
+# It is one list of lines. The settings every tunnel has always come first, in
+# the same order. Each optional setting then adds its own lines, only when it is
+# on, so any of them can travel together in one code. Both readers (Join a
+# tunnel here, and the agent's join in the engine) read the lines by name, never
+# by position or by version, and both already understand every line written here.
+#
+# The version is what keeps an older server from quietly dropping a setting it
+# does not know. Each optional setting names the version that introduced it, and
+# a code says the highest version among the settings it carries: a server that
+# accepts that version knows all of them, and an older one refuses the code and
+# says to update. A code carrying nothing optional stays at 6, so every server
+# from 6 up keeps working with every tunnel that needs no more.
+#
+#   6  every tunnel: the browser hello, the split hello and the clean addresses
+#   7  http_header, http_host: the web header of a plain link
+#   8  gre: the private GRE link
+#   9  real_site, cover_site: strangers are passed to the real website
+#  10  proxy_protocol: the service is told each user's real address
+#
+# A new setting gets a block below, with the next number, and that number goes
+# into PAIRING_VERSION_MAX at the top of this file and pairingVersionMax in the
+# engine. The tests check all three agree, and that existing codes are unchanged.
 make_pairing_code() {
     local name=$1 mode=$2 tport=$3 relay_ip=$4 server_ip=$5 inbound_port=$6 pool=$7 secret=$8
     local transport=$9 servername=${10} wspath=${11} cdn=${12} mux=${13} muxlinks=${14}
     local althost=${15-} utls=${16-} fragment=${17-} cleanips=${18-}
-    local httpheader=${19-} httphost=${20-} gre=${21-} realsite=${22-}
-    # Version 6 adds the browser hello, the split hello and the clean addresses,
-    # which a CDN tunnel needs on the foreign side as well. Version 7 adds the web
-    # header of a plain link. A code says 7 only when it uses it, so a server that
-    # knows up to 6 keeps working with every tunnel that does not. Version 8 adds
-    # the private GRE link, and is sent only for a tunnel that uses one. Version 9
-    # passes strangers to the real website instead of presenting our own cert.
-    if [ "$realsite" = on ]; then
-        printf 'v=9\nname=%s\nmode=%s\ntunnel_port=%s\nrelay_ip=%s\nserver_ip=%s\ninbound_port=%s\npool=%s\ntransport=%s\nserver_name=%s\nws_path=%s\ncdn=%s\nalt_host=%s\nmux=%s\nmux_links=%s\nutls=%s\ntls_fragment=%s\nclean_ips=%s\nreal_site=%s\nsecret=%s\n' \
-            "$name" "$mode" "$tport" "$relay_ip" "$server_ip" "$inbound_port" "$pool" \
-            "$transport" "$servername" "$wspath" "$cdn" "$althost" "${mux:-off}" "${muxlinks:-4}" \
-            "$utls" "$fragment" "$cleanips" "on" "$secret" |
-            base64 | tr -d '\n'
-        return 0
+    local httpheader=${19-} httphost=${20-} gre=${21-} realsite=${22-} coversite=${23-}
+    local proxyproto=${24-}
+    local v=6 extra=""
+
+    if [ "$httpheader" = on ]; then
+        extra+="http_header=on"$'\n'"http_host=${httphost:-www.bing.com}"$'\n'
+        [ "$v" -ge 7 ] || v=7
     fi
     if [ "$gre" = on ]; then
-        printf 'v=8\nname=%s\nmode=%s\ntunnel_port=%s\nrelay_ip=%s\nserver_ip=%s\ninbound_port=%s\npool=%s\ntransport=%s\nserver_name=%s\nws_path=%s\ncdn=%s\nalt_host=%s\nmux=%s\nmux_links=%s\nutls=%s\ntls_fragment=%s\nclean_ips=%s\ngre=%s\nsecret=%s\n' \
-            "$name" "$mode" "$tport" "$relay_ip" "$server_ip" "$inbound_port" "$pool" \
-            "$transport" "$servername" "$wspath" "$cdn" "$althost" "${mux:-off}" "${muxlinks:-4}" \
-            "$utls" "$fragment" "$cleanips" "on" "$secret" |
-            base64 | tr -d '\n'
-        return 0
+        extra+="gre=on"$'\n'
+        [ "$v" -ge 8 ] || v=8
     fi
-    if [ "$httpheader" = on ]; then
-        printf 'v=7\nname=%s\nmode=%s\ntunnel_port=%s\nrelay_ip=%s\nserver_ip=%s\ninbound_port=%s\npool=%s\ntransport=%s\nserver_name=%s\nws_path=%s\ncdn=%s\nalt_host=%s\nmux=%s\nmux_links=%s\nutls=%s\ntls_fragment=%s\nclean_ips=%s\nhttp_header=%s\nhttp_host=%s\nsecret=%s\n' \
-            "$name" "$mode" "$tport" "$relay_ip" "$server_ip" "$inbound_port" "$pool" \
-            "$transport" "$servername" "$wspath" "$cdn" "$althost" "${mux:-off}" "${muxlinks:-4}" \
-            "$utls" "$fragment" "$cleanips" "on" "${httphost:-www.bing.com}" "$secret" |
-            base64 | tr -d '\n'
-        return 0
+    if [ "$realsite" = on ]; then
+        extra+="real_site=on"$'\n'
+        # Only written when the tunnel names one; otherwise the other side uses
+        # the name the link claims, as it always has.
+        [ -n "$coversite" ] && extra+="cover_site=$coversite"$'\n'
+        [ "$v" -ge 9 ] || v=9
     fi
-    printf 'v=6\nname=%s\nmode=%s\ntunnel_port=%s\nrelay_ip=%s\nserver_ip=%s\ninbound_port=%s\npool=%s\ntransport=%s\nserver_name=%s\nws_path=%s\ncdn=%s\nalt_host=%s\nmux=%s\nmux_links=%s\nutls=%s\ntls_fragment=%s\nclean_ips=%s\nsecret=%s\n' \
-        "$name" "$mode" "$tport" "$relay_ip" "$server_ip" "$inbound_port" "$pool" \
+    case "$proxyproto" in
+        v1 | v2)
+            extra+="proxy_protocol=$proxyproto"$'\n'
+            [ "$v" -ge 10 ] || v=10
+            ;;
+    esac
+
+    # The optional lines go just before the password, where they always were.
+    printf 'v=%s\nname=%s\nmode=%s\ntunnel_port=%s\nrelay_ip=%s\nserver_ip=%s\ninbound_port=%s\npool=%s\ntransport=%s\nserver_name=%s\nws_path=%s\ncdn=%s\nalt_host=%s\nmux=%s\nmux_links=%s\nutls=%s\ntls_fragment=%s\nclean_ips=%s\n%ssecret=%s\n' \
+        "$v" "$name" "$mode" "$tport" "$relay_ip" "$server_ip" "$inbound_port" "$pool" \
         "$transport" "$servername" "$wspath" "$cdn" "$althost" "${mux:-off}" "${muxlinks:-4}" \
-        "$utls" "$fragment" "$cleanips" "$secret" |
+        "$utls" "$fragment" "$cleanips" "$extra" "$secret" |
         base64 | tr -d '\n'
 }
 get_tunnel_pairing_code() {
@@ -1481,7 +1522,8 @@ get_tunnel_pairing_code() {
     make_pairing_code "$name" "$mode" "$tport" "$relay_ip" "$server_ip" "$inbound_port" \
         "$pool" "$secret" "$transport" "$servername" "$wspath" "$cdn" "$mux" "$muxlinks" "$althost" \
         "$utls" "$fragment" "$cleanips" "$(read_conf "$name" http_header)" "$(read_conf "$name" http_host)" \
-        "$(read_conf "$name" gre)" "$(read_conf "$name" real_site)"
+        "$(read_conf "$name" gre)" "$(read_conf "$name" real_site)" "$(read_conf "$name" cover_site)" \
+        "$(read_conf "$name" proxy_protocol)"
 }
 
 show_pairing_code() {
@@ -1629,6 +1671,12 @@ write_tunnel() {
                 printf 'cover_site = %s\n' "$DG_COVER_SITE"
             fi
         fi
+        case "${DG_PROXY:-off}" in
+            v1 | v2)
+                printf "\n# Pass each user's real address on; the service must be set to expect it.\n"
+                printf 'proxy_protocol = %s\n' "$DG_PROXY"
+                ;;
+        esac
 
         printf '\n# on = every user session shares a few long-lived connections.\n'
         printf 'mux = %s\n' "${MX_MUX:-off}"
@@ -1819,6 +1867,9 @@ looks_like_foreign_server() {
 create_tunnel() {
     local name mode tport taddr ulisten peer localip secret inport uport
     local pool=25 target_agent="" agent_url="" agent_token="" peer_conf=""
+    # Not asked here: it is turned on later, from Edit a tunnel, once the service
+    # is ready for it. Reset so nothing is left over from a join in this session.
+    DG_PROXY=off
 
     hr
     say "${B}Create a tunnel${R}"
@@ -2286,6 +2337,8 @@ join_tunnel() {
     # Version 9: passes strangers to the real website instead of presenting our cert.
     DG_REAL_SITE=$(get real_site); [ -n "$DG_REAL_SITE" ] || DG_REAL_SITE=off
     DG_COVER_SITE=$(get cover_site)
+    # Version 10: the service is told each user's real address.
+    DG_PROXY=$(get proxy_protocol); [ -n "$DG_PROXY" ] || DG_PROXY=off
 
     # So does whether connections are shared: it must match on both ends or
     # neither side would understand the other.
@@ -2307,11 +2360,15 @@ join_tunnel() {
     case "$DG_HTTPHEADER" in on | off) ;; *) err "That code has a bad web header setting."; return 1 ;; esac
     case "$DG_GRE" in on | off) ;; *) err "That code has a bad link setting."; return 1 ;; esac
     case "$DG_REAL_SITE" in on | off) ;; *) err "That code has a bad setting."; return 1 ;; esac
+    case "$DG_PROXY" in off | v1 | v2) ;; *) err "That code has a bad setting for users' addresses."; return 1 ;; esac
     if [ "$DG_GRE" = on ] && { [ "$DG_TRANSPORT" != plain ] || [ "$DG_CDN" = on ] || [ -n "$DG_ALTHOST" ]; }; then
         err "That code puts a GRE link together with a disguise or a CDN, which cannot work."
         return 1
     fi
     if [ -n "$DG_HTTPHOST" ] && ! valid_hostname "$DG_HTTPHOST"; then err "That code has a bad web header name."; return 1; fi
+    # A name, or a name and port, as the engine accepts. It goes into a settings
+    # file, so nothing else is let through.
+    if [ -n "$DG_COVER_SITE" ] && ! valid_host "$DG_COVER_SITE"; then err "That code has a bad cover site."; return 1; fi
     if [ "$DG_HTTPHEADER" = on ] && [ "$DG_TRANSPORT" != plain ]; then err "That code puts a web header on a link that is not plain."; return 1; fi
     case "$DG_UTLS" in '' | on | off) ;; *) err "That code has a bad setting."; return 1 ;; esac
     case "$DG_FRAGMENT" in '' | on | off) ;; *) err "That code has a bad setting."; return 1 ;; esac
@@ -2350,10 +2407,14 @@ join_tunnel() {
         say "${B}'$name' already exists here. This code changes it to:${R}"
         say "  link port          $tport"
         say "  service port(s)    $inport"
+        say "  users' addresses   $(describe_proxy "$DG_PROXY")"
         hr
+        if [ "$DG_PROXY" != off ] && [ "$(read_conf "$name" proxy_protocol)" != "$DG_PROXY" ]; then
+            explain_proxy_service "$inport"
+        fi
         confirm "Change it?" || { say "Cancelled. Nothing was changed."; return 1; }
         if printf '%s' "$code" | tr -d '[:space:]' | "$BIN" join -update -code-file -; then
-            ok "Done. '$name' is running on the new ports."
+            ok "Done. '$name' is running with the new settings."
             return 0
         fi
         err "It was not changed. The tunnel is still running on its old settings."
@@ -2445,7 +2506,9 @@ join_tunnel() {
     say "  link appearance    $(describe_disguise "$DG_TRANSPORT" "$DG_CDN" "$DG_ALTHOST" "${DG_HTTPHOST-}")"
     [ -n "$DG_SERVERNAME" ] && say "  claims to be       $DG_SERVERNAME$DG_WSPATH"
     say "  connections        $(describe_sharing "$MX_MUX" "$MX_LINKS")"
+    [ "$DG_PROXY" != off ] && say "  users' addresses   $(describe_proxy "$DG_PROXY")"
     hr
+    [ "$DG_PROXY" != off ] && explain_proxy_service "$inport"
 
     # Nothing to ask, but two things are worth checking before going ahead.
     inbound=$(echo "$inport" | awk -F',' '{for(i=1;i<=NF;i++){gsub(/^[ \t]+|[ \t]+$/,"",$i); printf (i==1?"":", ") "127.0.0.1:" $i}}')
@@ -2989,17 +3052,111 @@ edit_tunnel() {
     if [ "$role" = edge ]; then
         say "  ${NUM}1${R}) Change ports ${DIM}(users, service and link ports; the foreign server follows)${R}"
         say "  ${NUM}2${R}) Change other settings ${DIM}(limits, timing, the other server's IP)${R}"
+        say "  ${NUM}3${R}) Users' real address ${DIM}(now $(describe_proxy "$(read_conf "$name" proxy_protocol)"))${R}"
     else
         say "  ${NUM}1${R}) Change ports ${DIM}(done from the Iran server)${R}"
         say "  ${NUM}2${R}) Change other settings ${DIM}(limits, timing, your service address)${R}"
+        say "  ${NUM}3${R}) Users' real address ${DIM}(done from the Iran server)${R}"
     fi
     say "  ${NUM}0${R}) Back"
     hr
     case "$(ask "Choose" "1")" in
         1) edit_tunnel_ports "$name" ;;
         2) edit_tunnel_settings "$name" ;;
+        3) edit_tunnel_proxy "$name" ;;
         *) return 0 ;;
     esac
+}
+
+# edit_tunnel_proxy <name> - turns passing users' real addresses to the service
+# on or off. Done from the Iran server, like ports: the foreign server is changed
+# to match first, and if it refuses, nothing is changed on either server.
+edit_tunnel_proxy() {
+    local name=$1 role cur new backup rc inport
+    role=$(read_conf "$name" role)
+    if [ "$role" != edge ]; then
+        info "This is turned on or off from the Iran server, which then updates this one."
+        info "Open this menu on the Iran server and choose Edit a tunnel."
+        return 1
+    fi
+    cur=$(read_conf "$name" proxy_protocol); [ -n "$cur" ] || cur=off
+    inport=$(read_conf "$name" server_inbound_port)
+
+    hr
+    say "${B}Users' real address for '$name'${R}"
+    hr
+    say "Without this, your service sees every user arrive from this tunnel, so its logs,"
+    say "per-user limits and login protection treat all of them as the same person."
+    say "With it on, PortBridge tells the service each user's real address, in the"
+    say "standard PROXY protocol format that Xray, LiteSpeed, nginx and others read."
+    say ""
+    say "  now: $(describe_proxy "$cur")"
+    hr
+    if [ "$cur" = off ]; then
+        explain_proxy_service "${inport:-?}"
+        say ""
+        confirm "Is the service ready for it? Turn it on now?" || { say "Nothing was changed."; return 0; }
+        new=v1
+    else
+        info "If you set the service to require it, change that back there afterwards."
+        confirm "Turn it off?" || { say "Nothing was changed."; return 0; }
+        new=off
+    fi
+
+    backup=$(mktemp)
+    cp "$(conf_of "$name")" "$backup"
+    write_conf "$name" proxy_protocol "$new"
+    if ! "$BIN" check -config "$(conf_of "$name")" >/dev/null 2>&1; then
+        "$BIN" check -config "$(conf_of "$name")" >&2
+        cp "$backup" "$(conf_of "$name")"
+        rm -f "$backup"
+        err "That was refused here, so nothing has been changed."
+        return 1
+    fi
+
+    # The foreign server first: it is the one that talks to the service, and an
+    # older PortBridge there would not understand what this side starts sending.
+    push_tunnel_to_foreign "$name" update
+    rc=$?
+    if [ "$rc" -eq 1 ]; then
+        cp "$backup" "$(conf_of "$name")"
+        rm -f "$backup"
+        err "Nothing was changed on either server."
+        info "A foreign server on an older PortBridge refuses this; update PortBridge there first."
+        return 1
+    fi
+    if [ "$rc" -eq 2 ]; then
+        say ""
+        warn "No linked foreign server is recorded for this tunnel, so change it there first."
+        say "On the foreign server, choose 'Join a tunnel' and paste this code. Because the"
+        say "tunnel already exists there, it offers to change it to match."
+        say ""
+        get_tunnel_pairing_code "$name"
+        say ""
+        say ""
+        if ! confirm "Done on the foreign server? Restart this half now to finish?"; then
+            cp "$backup" "$(conf_of "$name")"
+            rm -f "$backup"
+            say "Nothing was changed here. Choose this again once the foreign server has the code."
+            return 0
+        fi
+    fi
+    rm -f "$backup"
+
+    "$FIREWALL" apply "$name" >/dev/null 2>&1
+    systemctl restart "$(unit_of "$name")"
+    sleep 2
+    if [ "$(systemctl is-active "$(unit_of "$name")")" != active ]; then
+        err "This half did not come back up. Recent log:"
+        journalctl -u "$(unit_of "$name")" -n 20 --no-pager
+        return 1
+    fi
+    if [ "$new" = off ]; then
+        ok "Turned off. The service is no longer told users' addresses."
+    else
+        ok "Turned on. This server is sending users' real addresses."
+    fi
+    return 0
 }
 edit_tunnel_settings() {
     local name=$1 cur new changed=0 backup
@@ -3351,6 +3508,17 @@ test_tunnel() {
     alt=$(read_conf "$name" alt_target)
     result "link appearance" note "$(describe_disguise "$transport" "$cdn" "$alt" "$(http_header_host "$name")")"
     result "connections" note "$(describe_sharing "$mux" "$(read_conf "$name" mux_links)")"
+
+    local pp
+    pp=$(read_conf "$name" proxy_protocol); [ -n "$pp" ] || pp=off
+    result "users' addresses" note "$(describe_proxy "$pp")"
+    # The two servers disagreeing does not stop the tunnel, so it is easy to miss.
+    # The foreign server is the one that notices, and says so in its log.
+    if journalctl -u "$(unit_of "$name")" --since "-10 min" --no-pager 2>/dev/null |
+        grep -qE "sending users' real addresses, but proxy_protocol|proxy_protocol is on here, but"; then
+        result "users' addresses agree" bad "no, only one of the two servers has it on"
+        note "Turn it on or off from the Iran server, in Edit a tunnel, so both match."
+    fi
 
     # Only Cloudflare limits the ports, so this is a reminder and never a failure.
     if cdn_involved "$cdn" "$alt" && ! cdn_port_ok "${taddr##*:}"; then

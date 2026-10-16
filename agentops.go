@@ -284,6 +284,19 @@ func portOK(s string) (int, bool) {
 	return n, err == nil && n >= 1 && n <= 65535
 }
 
+// validCoverSite accepts what coverTarget can use: a host name or address, with
+// or without a port.
+func validCoverSite(s string) bool {
+	host := s
+	if h, port, err := net.SplitHostPort(s); err == nil {
+		if _, ok := portOK(port); !ok {
+			return false
+		}
+		host = h
+	}
+	return hostnameRe.MatchString(host) || net.ParseIP(host) != nil
+}
+
 // validatePairing refuses a code that would write something the tunnel cannot
 // use, or something that does not belong in a settings file.
 func validatePairing(p *PairingData) error {
@@ -332,7 +345,7 @@ func validatePairing(p *PairingData) error {
 	}
 	for _, f := range []struct{ name, val string }{
 		{"cdn", p.CDN}, {"mux", p.Mux}, {"utls", p.UTLS}, {"tls_fragment", p.TLSFragment},
-		{"ech", p.ECH}, {"http_header", p.HTTPHeader}, {"gre", p.GRE},
+		{"ech", p.ECH}, {"http_header", p.HTTPHeader}, {"gre", p.GRE}, {"real_site", p.RealSite},
 	} {
 		if f.val != "" && f.val != "on" && f.val != "off" {
 			return fmt.Errorf("%s must be on or off, got %q", f.name, f.val)
@@ -357,6 +370,14 @@ func validatePairing(p *PairingData) error {
 	}
 	if p.HTTPHost != "" && !hostnameRe.MatchString(p.HTTPHost) {
 		return fmt.Errorf("web header name %q is not a hostname", p.HTTPHost)
+	}
+	if p.CoverSite != "" && !validCoverSite(p.CoverSite) {
+		return fmt.Errorf("cover site %q is not a host name, or a host name and port", p.CoverSite)
+	}
+	switch p.ProxyProtocol {
+	case "", "off", "v1", "v2":
+	default:
+		return fmt.Errorf("proxy_protocol must be off, v1 or v2, got %q", p.ProxyProtocol)
 	}
 	if p.ServerName != "" && !hostnameRe.MatchString(p.ServerName) {
 		return fmt.Errorf("server name %q is not a hostname", p.ServerName)

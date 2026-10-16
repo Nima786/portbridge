@@ -233,7 +233,7 @@ func encodeCode(fields string) string {
 }
 
 func TestNewerPairingCodeIsRefusedByName(t *testing.T) {
-	_, err := decodePairingCode(encodeCode("v=10\nname=x\nmode=direct\ntunnel_port=1\nsecret=0123456789abcdef\n"))
+	_, err := decodePairingCode(encodeCode(fmt.Sprintf("v=%d\nname=x\nmode=direct\ntunnel_port=1\nsecret=0123456789abcdef\n", pairingVersionMax+1)))
 	if err == nil || !strings.Contains(err.Error(), "newer") {
 		t.Fatalf("got %v", err)
 	}
