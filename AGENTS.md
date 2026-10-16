@@ -1,5 +1,24 @@
 # Repository Guidelines for PortBridge
 
+## Layout
+
+- `cmd/portbridge/` – the program's starting point only: picks a command and
+  hands it to the right part. The release number is stamped here
+  (`-X main.version=...`) and passed to the engine.
+- `internal/engine/` – the tunnel itself: settings, both halves (edge and
+  origin), link disguises, shared connections, routes and health checks, status,
+  speed test, and the `run`, `check`, `teardown` and `speedtest` commands.
+- `internal/agent/` – the management agent, pairing codes, port checks, and the
+  `agent`, `join`, `ports` and `addresses` commands. It uses the engine; the
+  engine never uses it.
+- `internal/proxyproto/` – the PROXY protocol header (users' real addresses).
+- `scripts/` – the menu, the firewall helper and the tuning helper.
+- `packaging/` – the systemd units.
+- `docs/` – the long explanations; the README links to them.
+
+Build the program with `go build ./cmd/portbridge`. Tests that check the shell
+scripts read them from `../../scripts/`.
+
 ## Mandatory Pre-Push CI Verification Rule
 All commits pushed to GitHub MUST pass the GitHub Actions CI checks (`.github/workflows/ci.yml`).
 Before pushing ANY commit to `origin/main` or any remote branch, you MUST verify:
@@ -29,4 +48,4 @@ changes firewall rules, and although it only does that for the real settings
 directory (`/etc/portbridge/tunnels`), running as root on a machine that has real
 tunnels is never worth the risk. Use an unprivileged account, or a throwaway
 container. Any new test that needs the machine (services, firewall, ports below
-1024) must go through the replaceable host in `agentops.go` instead.
+1024) must go through the replaceable host in `internal/agent/agentops.go` instead.

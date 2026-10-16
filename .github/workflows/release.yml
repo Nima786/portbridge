@@ -83,7 +83,7 @@ jobs:
             mkdir -p "$stage/scripts" "$stage/packaging"
 
             CGO_ENABLED=0 GOOS=linux GOARCH="$arch" \
-              go build -trimpath -ldflags="-s -w -X main.version=$TAG" -o "$stage/portbridge" .
+              go build -trimpath -ldflags="-s -w -X main.version=$TAG" -o "$stage/portbridge" ./cmd/portbridge
 
             cp scripts/portbridge-menu scripts/portbridge-firewall scripts/portbridge-tune "$stage/scripts/"
             cp packaging/*.service "$stage/packaging/"

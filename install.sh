@@ -179,7 +179,11 @@ build_from_source() {
     dir=$(find "$TMP/src" -maxdepth 1 -mindepth 1 -type d | head -1)
     [ -n "$dir" ] || return 1
     mkdir -p "$TMP/rel"
-    ( cd "$dir" && CGO_ENABLED=0 go build -trimpath -ldflags="-s -w -X main.version=$tag" -o "$TMP/rel/portbridge" . ) || return 1
+    # From 0.13.1 the program starts in cmd/portbridge; older releases asked for
+    # with --version still have it at the top, so build whichever this one has.
+    local pkg=.
+    [ -d "$dir/cmd/portbridge" ] && pkg=./cmd/portbridge
+    ( cd "$dir" && CGO_ENABLED=0 go build -trimpath -ldflags="-s -w -X main.version=$tag" -o "$TMP/rel/portbridge" "$pkg" ) || return 1
     # The scripts and service files come from the same source.
     mkdir -p "$TMP/rel/scripts" "$TMP/rel/packaging"
     cp "$dir"/scripts/* "$TMP/rel/scripts/" || return 1
