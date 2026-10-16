@@ -243,24 +243,36 @@ func (p *Panel) addServer(j *job, r addRequest) (string, error) {
 	rm := &remote{c: client}
 	j.say("Connected (host key %s).", hostKey)
 
-	facts, err := rm.run("id -u; uname -m; test -d /run/systemd/system && echo systemd; /usr/local/bin/portbridge version 2>/dev/null || true", nil, 30*time.Second)
+	// What the server is, asked in one go. Each answer is labelled and on its
+	// own line, so a login banner, or a stray warning that some servers print
+	// on the connection, cannot be read as one of the answers. A real root
+	// login whose first line of output was such a line was once reported as
+	// "not root"; now anything that is not a labelled answer is ignored.
+	const lookCmd = "echo pb_uid=$(id -u); echo pb_arch=$(uname -m); " +
+		"echo pb_systemd=$(test -d /run/systemd/system && echo yes); " +
+		"echo pb_version=$(/usr/local/bin/portbridge version 2>/dev/null)"
+	facts, err := rm.run(lookCmd, nil, 30*time.Second)
 	if err != nil {
-		return "", fmt.Errorf("could not look at the server: %v %s", err, facts)
+		return "", fmt.Errorf("could not look at the server: %v %s", err, lastLines(facts, 5))
 	}
-	lines := strings.Split(facts, "\n")
-	if len(lines) < 2 || strings.TrimSpace(lines[0]) != "0" {
+	f := parseFacts(facts)
+	uid, answered := f["pb_uid"]
+	if !answered {
+		return "", fmt.Errorf("the panel could not read the server when it looked at it; its answer was: %s", lastLines(facts, 5))
+	}
+	if uid != "0" {
 		return "", errors.New("the account given is not root; PortBridge needs root to manage services and the firewall")
 	}
-	arch := archName(strings.TrimSpace(lines[1]))
+	arch := archName(f["pb_arch"])
 	if arch == "" {
-		return "", fmt.Errorf("its processor type (%s) is not one PortBridge is built for", strings.TrimSpace(lines[1]))
+		return "", fmt.Errorf("its processor type (%s) is not one PortBridge is built for", f["pb_arch"])
 	}
-	if !strings.Contains(facts, "systemd") {
+	if f["pb_systemd"] != "yes" {
 		return "", errors.New("it does not use systemd, which PortBridge needs")
 	}
 	installed := ""
-	if len(lines) >= 3 && strings.HasPrefix(strings.TrimSpace(lines[len(lines)-1]), "v") {
-		installed = strings.TrimSpace(lines[len(lines)-1])
+	if strings.HasPrefix(f["pb_version"], "v") {
+		installed = f["pb_version"]
 	}
 
 	switch c := compareVersions(installed, engine.Version); {
@@ -558,6 +570,21 @@ func downloadRelease(version, arch string) ([]pkgFile, error) {
 		files = append(files, pkgFile{n, 0o755, b})
 	}
 	return files, nil
+}
+
+// parseFacts reads the "pb_key=value" lines the look-at-the-server command
+// prints, and ignores every other line, so anything the server says on the
+// connection of its own accord (a login banner, a warning) is never mistaken
+// for an answer.
+func parseFacts(out string) map[string]string {
+	f := map[string]string{}
+	for _, line := range strings.Split(out, "\n") {
+		k, v, ok := strings.Cut(strings.TrimSpace(line), "=")
+		if ok && strings.HasPrefix(k, "pb_") {
+			f[k] = strings.TrimSpace(v)
+		}
+	}
+	return f
 }
 
 func archName(uname string) string {

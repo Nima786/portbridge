@@ -32,6 +32,32 @@ func TestVersionsCompare(t *testing.T) {
 	}
 }
 
+func TestLookingAtAServerIgnoresNoise(t *testing.T) {
+	// A real root login whose output has a banner and a stray warning, before
+	// and among the answers, must still be read as root. This is the case that
+	// was wrongly reported as "not root".
+	out := "Welcome to Ubuntu 24.04 LTS\n" +
+		"mesg: ttyname failed: Inappropriate ioctl for device\n" +
+		"pb_uid=0\npb_arch=x86_64\npb_systemd=yes\npb_version=v0.14.0\n"
+	f := parseFacts(out)
+	if f["pb_uid"] != "0" || f["pb_arch"] != "x86_64" || f["pb_systemd"] != "yes" || f["pb_version"] != "v0.14.0" {
+		t.Fatalf("the answers were misread past the noise: %v", f)
+	}
+	// A genuine non-root login is still caught.
+	if parseFacts("pb_uid=1000\npb_arch=x86_64\npb_systemd=yes\n")["pb_uid"] == "0" {
+		t.Fatalf("a non-root account was read as root")
+	}
+	// A server with no PortBridge yet reports an empty version, not a missing one.
+	f = parseFacts("pb_uid=0\npb_arch=aarch64\npb_systemd=yes\npb_version=\n")
+	if v, ok := f["pb_version"]; !ok || v != "" {
+		t.Fatalf("an empty version was not read as empty: %q %v", v, ok)
+	}
+	// Only noise, no answers at all: no uid, so the panel says it could not read it.
+	if _, ok := parseFacts("some error\nand another\n")["pb_uid"]; ok {
+		t.Fatalf("noise produced a user id")
+	}
+}
+
 func TestProcessorNames(t *testing.T) {
 	for in, want := range map[string]string{"x86_64": "amd64", "aarch64": "arm64", "arm64": "arm64", "armv7l": "", "i686": ""} {
 		if got := archName(in); got != want {
