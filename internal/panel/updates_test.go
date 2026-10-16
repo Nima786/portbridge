@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -125,6 +126,20 @@ func (f *fakeAgent) handler(token string) http.Handler {
 	})
 }
 
+// fakeState is what a fake agent went through, read safely while its handler
+// may still run.
+type fakeState struct {
+	version, lastAsked string
+	gotSent, gotPulled bool
+	partsSeen          int
+}
+
+func (f *fakeAgent) state() fakeState {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return fakeState{version: f.version, lastAsked: f.lastAsked, gotSent: f.gotSent, gotPulled: f.gotPulled, partsSeen: f.partsSeen}
+}
+
 func withFakeAgent(t *testing.T, p *Panel, id, group string, f *fakeAgent) Server {
 	t.Helper()
 	token := "pba_" + id
@@ -157,8 +172,8 @@ func TestAServerDownloadsTheReleaseFromThePanel(t *testing.T) {
 	t.Cleanup(func() { fetchRelease = oldFetch })
 
 	v := waitJob(t, p, p.startJob(func(j *job) (string, error) { return "", p.updates.updateServers(j, "v0.16.0") }))
-	if v.Error != "" || !iran.gotPulled || iran.gotSent || iran.version != "v0.16.0" {
-		t.Fatalf("it should have downloaded it from the panel: %q %+v\n%s", v.Error, iran, strings.Join(v.Lines, "\n"))
+	if st := iran.state(); v.Error != "" || !st.gotPulled || st.gotSent || st.version != "v0.16.0" {
+		t.Fatalf("it should have downloaded it from the panel: %q %+v\n%s", v.Error, st, strings.Join(v.Lines, "\n"))
 	}
 	p.updates.mu.Lock()
 	left := len(p.updates.offers)
@@ -209,11 +224,12 @@ func TestAReleaseIsSentInPartsThroughACuttingNetwork(t *testing.T) {
 	t.Cleanup(func() { fetchRelease = oldFetch })
 
 	v := waitJob(t, p, p.startJob(func(j *job) (string, error) { return "", p.updates.updateServers(j, "v0.16.0") }))
-	if v.Error != "" || !iran.gotSent || iran.version != "v0.16.0" {
-		t.Fatalf("the release did not get through: %q %+v\n%s", v.Error, iran.version, strings.Join(v.Lines, "\n"))
+	st := iran.state()
+	if v.Error != "" || !st.gotSent || st.version != "v0.16.0" {
+		t.Fatalf("the release did not get through: %q %+v\n%s", v.Error, st, strings.Join(v.Lines, "\n"))
 	}
-	if iran.partsSeen <= 6 {
-		t.Fatalf("no part was cut, so the test proves nothing (%d parts seen)", iran.partsSeen)
+	if st.partsSeen <= 6 {
+		t.Fatalf("no part was cut, so the test proves nothing (%d parts seen)", st.partsSeen)
 	}
 }
 
@@ -227,13 +243,13 @@ func TestAReleaseIsFetchedInPartsThroughAServer(t *testing.T) {
 		big[i] = byte(i)
 	}
 	const token = "pba_parts"
-	corrupt := false
+	var corrupt atomic.Bool
 	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var req agent.ReleaseRequest
 		_ = json.NewDecoder(r.Body).Decode(&req)
 		parts := (len(big) + req.PartSize - 1) / req.PartSize
 		data := append([]byte(nil), big[req.Part*req.PartSize:min((req.Part+1)*req.PartSize, len(big))]...)
-		if corrupt && req.Part == 1 {
+		if corrupt.Load() && req.Part == 1 {
 			data[0] ^= 0xff
 		}
 		_ = json.NewEncoder(w).Encode(agent.ReleaseReply{OK: true, Version: req.Version, Archive: data,
@@ -246,7 +262,7 @@ func TestAReleaseIsFetchedInPartsThroughAServer(t *testing.T) {
 	if err != nil || !bytes.Equal(got, big) {
 		t.Fatalf("not fetched whole: %v", err)
 	}
-	corrupt = true
+	corrupt.Store(true)
 	if _, err := p.updates.fetchInParts(s, "v0.16.0", "amd64"); err == nil {
 		t.Fatalf("a damaged release was accepted")
 	}
@@ -274,16 +290,16 @@ func TestServersAreBroughtUpToThePanelsVersion(t *testing.T) {
 	v := waitJob(t, p, id)
 	log := strings.Join(v.Lines, "\n")
 
-	if direct.version != "v0.16.0" || direct.gotSent {
-		t.Fatalf("a server that can reach GitHub should download it itself: %+v", direct)
+	if st := direct.state(); st.version != "v0.16.0" || st.gotSent {
+		t.Fatalf("a server that can reach GitHub should download it itself: %+v", st)
 	}
-	if iran.version != "v0.16.0" || !iran.gotSent {
-		t.Fatalf("a server that cannot reach GitHub should be sent the release: %+v", iran)
+	if st := iran.state(); st.version != "v0.16.0" || !st.gotSent {
+		t.Fatalf("a server that cannot reach GitHub should be sent the release: %+v", st)
 	}
-	if old.version != "v0.14.1" || !strings.Contains(log, "SSH login") {
+	if st := old.state(); st.version != "v0.14.1" || !strings.Contains(log, "SSH login") {
 		t.Fatalf("a server too old for one-click updates should be pointed at the SSH update:\n%s", log)
 	}
-	if current.lastAsked != "" {
+	if current.state().lastAsked != "" {
 		t.Fatalf("a server already up to date was updated")
 	}
 	if v.Error == "" || !strings.Contains(v.Error, "2 of 3") {
@@ -348,7 +364,7 @@ func TestThePanelUpdatesItselfFirstThenCarriesOn(t *testing.T) {
 	if v.Error != "" || installed.Version != "v0.16.0" || string(installed.Archive) != "release v0.16.0" {
 		t.Fatalf("the panel's own server was not updated first: %q %+v", v.Error, installed)
 	}
-	if far.lastAsked != "" {
+	if far.state().lastAsked != "" {
 		t.Fatalf("other servers were updated before the panel came back on the new version")
 	}
 	if _, err := os.Stat(filepath.Join(p.dir, pendingFile)); err != nil {
@@ -362,8 +378,8 @@ func TestThePanelUpdatesItselfFirstThenCarriesOn(t *testing.T) {
 		t.Fatalf("the note to carry on was not cleared")
 	}
 	v = waitJob(t, p, p.updates.status().Job)
-	if v.Error != "" || far.version != "v0.16.0" {
-		t.Fatalf("the other servers were not updated after the restart: %q %+v\n%s", v.Error, far, strings.Join(v.Lines, "\n"))
+	if st := far.state(); v.Error != "" || st.version != "v0.16.0" {
+		t.Fatalf("the other servers were not updated after the restart: %q %+v\n%s", v.Error, st, strings.Join(v.Lines, "\n"))
 	}
 }
 

@@ -371,6 +371,16 @@ var startInstaller = func(dir string) error {
 
 func shQuote(s string) string { return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'" }
 
+// updateWorkDirFor is where updates are unpacked for a tunnels folder: the
+// system's own place for the real one, and inside the folder itself for any
+// other, so an agent run on a scratch folder (in tests) never touches the system.
+func updateWorkDirFor(confDir string) string {
+	if filepath.ToSlash(filepath.Clean(confDir)) == defaultTunnelsDir {
+		return updateWorkDir
+	}
+	return filepath.Join(confDir, ".update")
+}
+
 // releaseVersionOf asks an unpacked program which version it is.
 var releaseVersionOf = func(bin string) (string, error) {
 	out, err := exec.Command(bin, "version").Output()

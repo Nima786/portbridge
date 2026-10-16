@@ -576,8 +576,9 @@ func newAgentHandler(token, confDir string, allowUpdates func() bool) *http.Serv
 	})
 
 	// POST /api/update and /api/release: updating PortBridge (see update.go).
-	mux.HandleFunc("/api/update", updateHandler(token, allowUpdates, updateWorkDir))
-	mux.HandleFunc("/api/update/part", updatePartHandler(token, allowUpdates, updateWorkDir))
+	work := updateWorkDirFor(confDir)
+	mux.HandleFunc("/api/update", updateHandler(token, allowUpdates, work))
+	mux.HandleFunc("/api/update/part", updatePartHandler(token, allowUpdates, work))
 	mux.HandleFunc("/api/release", releaseHandler(token))
 
 	// POST /api/tunnel/join and /api/tunnel/update take the same pairing code. One

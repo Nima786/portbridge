@@ -167,6 +167,9 @@ func TestUpdatesOnlyWhereAllowed(t *testing.T) {
 	if code, res := ask(); code != http.StatusForbidden || res.OK {
 		t.Fatalf("an update was allowed on a server that did not allow them: %d %+v", code, res)
 	}
+	if updateWorkDirFor(defaultTunnelsDir) != updateWorkDir || updateWorkDirFor(t.TempDir()) == updateWorkDir {
+		t.Fatalf("only the real tunnels folder may unpack updates in the system's own place")
+	}
 	_ = writeAgentConfig(confPath, agentConfig{Listen: "0.0.0.0:2083", Token: "pba_x", AllowUpdates: "on"})
 	if code, res := ask(); code != http.StatusOK || !res.OK {
 		t.Fatalf("an allowed update was refused: %d %+v", code, res)
