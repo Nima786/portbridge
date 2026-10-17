@@ -202,9 +202,11 @@
           <p class="muted small">Use a scoped Cloudflare API Token so the panel can list your domains and manage DNS records without needing your account password or Global API Key.</p>
         </div>
         <ol class="cf-steps">
-          <li>Open your Cloudflare dashboard → <strong>My Profile</strong> → <strong>API Tokens</strong> → <strong>Create Token</strong>.</li>
-          <li>Click <strong>Use template</strong> next to <strong>Edit zone DNS</strong>.</li>
-          <li>Under <strong>Permissions</strong>, ensure <code>Zone → DNS → Edit</code> and <code>Zone → Zone → Read</code> are included, select <strong>All zones</strong> (or specific domains), and copy the generated token.</li>
+          <li>In your Cloudflare dashboard, click the <strong>Profile icon</strong> (top-right) → <strong>My Profile</strong> → <strong>API Tokens</strong> → <strong>Create Token</strong>.</li>
+          <li>Next to the <strong>Edit zone DNS</strong> template, click <strong>Use template</strong>.</li>
+          <li>Under <strong>Permissions</strong>: the first row is already set to <code>Zone</code> → <code>DNS</code> → <code>Edit</code>. Click <strong>+ Add more</strong> right below it and set the new row to <code>Zone</code> → <code>Zone</code> → <code>Read</code>.</li>
+          <li>Under <strong>Zone Resources</strong>: change the second dropdown from <em>Specific zone</em> to <strong>All zones</strong> (or keep <em>Specific zone</em> and select the domain you want to use).</li>
+          <li>Click <strong>Continue to summary</strong> → <strong>Create Token</strong>, then copy the token shown and paste it below.</li>
         </ol>
         <form id="cf-inline-token-form" class="cf-inline-form" novalidate>
           <div class="row2">
@@ -1163,10 +1165,16 @@
     <div class="dialog-header">
       <div>
         <h2 id="cf-token-title">Add Cloudflare API Token</h2>
-        <p class="muted small">Create a scoped API Token in Cloudflare with <code>Zone → DNS → Edit</code> and <code>Zone → Zone → Read</code> permissions. Your token is encrypted with AES-256-GCM and never shown again.</p>
+        <p class="muted small">Your token is encrypted at rest with AES-256-GCM and never shown again.</p>
       </div>
     </div>
     <div class="dialog-body">
+      <ol class="cf-steps">
+        <li>In Cloudflare, click your <strong>Profile icon</strong> (top-right) → <strong>My Profile</strong> → <strong>API Tokens</strong> → <strong>Create Token</strong>.</li>
+        <li>Click <strong>Use template</strong> next to <strong>Edit zone DNS</strong>.</li>
+        <li>Under <strong>Permissions</strong>: keep <code>Zone</code> → <code>DNS</code> → <code>Edit</code>, click <strong>+ Add more</strong>, and add <code>Zone</code> → <code>Zone</code> → <code>Read</code>.</li>
+        <li>Under <strong>Zone Resources</strong>: select <code>Include</code> → <strong>All zones</strong> (or choose a specific domain), then click <strong>Continue to summary</strong> → <strong>Create Token</strong>.</li>
+      </ol>
       <label for="cf-token-name">Account Label <span class="muted">(optional)</span></label>
       <input id="cf-token-name" maxlength="64" placeholder="e.g. Main Cloudflare">
       <label for="cf-token-val">Scoped Bearer API Token</label>
