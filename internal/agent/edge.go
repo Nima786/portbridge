@@ -1278,11 +1278,13 @@ func CheckTunnel(confDir, name string) (TunnelCheckReport, error) {
 		}
 	}
 
-	fwDetail := "Disabled / Open"
-	if ti.Firewall {
-		fwDetail = fmt.Sprintf("Enabled (bridge port locked to %s)", ti.PeerIP)
+	if !cfg.Dials() {
+		if ti.Firewall {
+			add("Bridge port firewall", "ok", fmt.Sprintf("Enabled (bridge port locked to %s)", ti.PeerIP), "")
+		} else {
+			add("Bridge port firewall", "note", "Disabled (bridge port open to any IP)", "")
+		}
 	}
-	add("Bridge port firewall", "note", fwDetail, "")
 
 	return rep, nil
 }

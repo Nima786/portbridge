@@ -1303,12 +1303,20 @@
               h('span', { class: 'state bad' }, 'Error')),
             h('p', { class: 'error' }, sentence(rep.error)));
         }
-        const checks = rep.checks || [];
+        const rawChecks = rep.checks || [];
+        const dialsOut = rawChecks.some((c) => c.label === 'Peer bridge port');
+        const checks = rawChecks.filter((c) => !(dialsOut && c.label === 'Bridge port firewall'));
         const hasBad = checks.some((c) => c.status === 'bad');
         const hasWarn = checks.some((c) => c.status === 'warn');
         const headState = hasBad ? ['bad', 'Needs Attention'] : (hasWarn ? ['warn', 'Warning'] : ['ok', 'Healthy']);
         const items = checks.map((c) => {
-          const st = c.status === 'ok' ? ['ok', 'OK'] : (c.status === 'warn' ? ['warn', 'Warning'] : ['bad', 'Problem']);
+          const isFwLocked = c.label === 'Bridge port firewall' && /^Enabled/i.test(c.detail || '');
+          const effStatus = isFwLocked ? 'ok' : c.status;
+          const st = effStatus === 'ok'
+            ? ['ok', 'OK']
+            : (effStatus === 'warn'
+              ? ['warn', 'Warning']
+              : (effStatus === 'note' ? ['note', 'Info'] : ['bad', 'Problem']));
           return h('li', { class: 'check-item ' + st[0] },
             h('div', { class: 'check-item-top' },
               h('span', null, c.label),
