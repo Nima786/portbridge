@@ -20,9 +20,11 @@ import (
 	"net/http/httptest"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/Nima786/portbridge/internal/agent"
+	"github.com/Nima786/portbridge/internal/engine"
 )
 
 const tunnelOpTimeout = 2 * time.Minute
@@ -1061,4 +1063,142 @@ func (p *Panel) setServerFirewall(parent context.Context, id, action string) (ag
 		return agent.FirewallInfo{}, errors.New(rep.Error)
 	}
 	return rep.FirewallInfo, nil
+}
+
+func serverAddresses(v serverView) (v4, v6 string) {
+	if v.Overview != nil {
+		if len(v.Overview.IPv4) > 0 {
+			v4 = v.Overview.IPv4[0]
+		}
+		if len(v.Overview.IPv6) > 0 {
+			v6 = v.Overview.IPv6[0]
+		}
+	}
+	if v4 == "" && v.Address != "" {
+		if ip := net.ParseIP(v.Address); ip != nil && ip.To4() == nil {
+			if v6 == "" {
+				v6 = v.Address
+			}
+		} else {
+			v4 = v.Address
+		}
+	}
+	return v4, v6
+}
+
+func (p *Panel) probeBetweenServers(parent context.Context, relayID, foreignID, cdnDomain string) (*engine.ProbeBenchmarkReport, error) {
+	rv, rok := p.viewOf(relayID)
+	fv, fok := p.viewOf(foreignID)
+	if !rok || !fok {
+		return nil, errors.New("both the Relay and Foreign servers must be added to the panel first")
+	}
+	if !rv.Online {
+		return nil, fmt.Errorf("Relay server %s is currently offline", rv.Name)
+	}
+	if !fv.Online {
+		return nil, fmt.Errorf("Foreign server %s is currently offline", fv.Name)
+	}
+
+	relayV4, relayV6 := serverAddresses(rv)
+	foreignV4, foreignV6 := serverAddresses(fv)
+	bothV6 := relayV6 != "" && foreignV6 != ""
+
+	type probeListenReply struct {
+		OK     bool   `json:"ok"`
+		ID     string `json:"id"`
+		Port   int    `json:"port"`
+		Secret string `json:"secret"`
+		Error  string `json:"error"`
+	}
+	type probeDialReply struct {
+		OK      bool                          `json:"ok"`
+		Results []engine.ProbeCandidateResult `json:"results"`
+		Error   string                        `json:"error"`
+	}
+
+	runDirection := func(mode, listenerID, dialerID, targetV4, targetV6 string, prefPort int, cdn string) ([]engine.ProbeCandidateResult, error) {
+		lctx, lcancel := context.WithTimeout(parent, 15*time.Second)
+		defer lcancel()
+		var lrep probeListenReply
+		_, err := p.callJSON(lctx, listenerID, "/api/probe/listen", map[string]int{"preferred_port": prefPort}, &lrep)
+		if err != nil {
+			if errors.Is(err, errTooOld) {
+				return nil, fmt.Errorf("%s is running an older PortBridge release; update it first to use Smart Benchmark", p.serverName(listenerID))
+			}
+			return nil, fmt.Errorf("%s listener: %s", p.serverName(listenerID), plainAgentError(err))
+		}
+		if !lrep.OK {
+			return nil, fmt.Errorf("%s listener: %s", p.serverName(listenerID), lrep.Error)
+		}
+		defer func() {
+			sctx, scancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer scancel()
+			var dummy map[string]any
+			_, _ = p.callJSON(sctx, listenerID, "/api/probe/stop", map[string]string{"id": lrep.ID}, &dummy)
+		}()
+
+		specs := engine.BuildProbeCandidates(mode, targetV4, targetV6, lrep.Port, cdn)
+		if len(specs) == 0 {
+			return nil, nil
+		}
+
+		dctx, dcancel := context.WithTimeout(parent, 70*time.Second)
+		defer dcancel()
+		var drep probeDialReply
+		_, err = p.callJSON(dctx, dialerID, "/api/probe/dial", map[string]any{
+			"specs":       specs,
+			"secret":      lrep.Secret,
+			"burst_bytes": 384 * 1024,
+		}, &drep)
+		if err != nil {
+			if errors.Is(err, errTooOld) {
+				return nil, fmt.Errorf("%s is running an older PortBridge release; update it first to use Smart Benchmark", p.serverName(dialerID))
+			}
+			return nil, fmt.Errorf("%s dialer: %s", p.serverName(dialerID), plainAgentError(err))
+		}
+		if !drep.OK {
+			return nil, fmt.Errorf("%s dialer: %s", p.serverName(dialerID), drep.Error)
+		}
+		return drep.Results, nil
+	}
+
+	var (
+		wg         sync.WaitGroup
+		directRes  []engine.ProbeCandidateResult
+		reverseRes []engine.ProbeCandidateResult
+		directErr  error
+		reverseErr error
+	)
+
+	fv6 := ""
+	rv6 := ""
+	if bothV6 {
+		fv6 = foreignV6
+		rv6 = relayV6
+	}
+
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		directRes, directErr = runDirection("direct", foreignID, relayID, foreignV4, fv6, 2053, cdnDomain)
+	}()
+	go func() {
+		defer wg.Done()
+		reverseRes, reverseErr = runDirection("reverse", relayID, foreignID, relayV4, rv6, 2083, "")
+	}()
+	wg.Wait()
+
+	if directErr != nil && reverseErr != nil && len(directRes) == 0 && len(reverseRes) == 0 {
+		return nil, directErr
+	}
+
+	all := append(directRes, reverseRes...)
+	rep := engine.FinalizeProbeReport(all, cdnDomain)
+	if directErr != nil {
+		rep.Notes = append(rep.Notes, "Direct benchmark note: "+directErr.Error())
+	}
+	if reverseErr != nil {
+		rep.Notes = append(rep.Notes, "Reverse benchmark note: "+reverseErr.Error())
+	}
+	return rep, nil
 }

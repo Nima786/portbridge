@@ -54,6 +54,8 @@ func main() {
 		engine.CmdTeardown(os.Args[2:])
 	case "speedtest":
 		engine.CmdSpeedtest(os.Args[2:])
+	case "probe":
+		engine.CmdProbe(os.Args[2:])
 	case "agent":
 		if err := agent.CmdAgent(os.Args[2:]); err != nil {
 			fmt.Fprintf(os.Stderr, "agent error: %v\n", err)
@@ -95,6 +97,7 @@ Usage:
   portbridge check     -config <file>               Check a config file and print what it means
   portbridge teardown  -config <file>               Teardown remote tunnel and delete local files
   portbridge speedtest [name|-config <file>]        Run an in-tunnel latency and throughput test
+  portbridge probe     [listen|<code...>]           Benchmark all transport modes between two servers
   portbridge agent     [-config <file>]             Run the management agent daemon
   portbridge join      <code>                       Join and configure tunnel from pairing code
   portbridge ports     [port,port,...]              Which ports can this server give a tunnel?

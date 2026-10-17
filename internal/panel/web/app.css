@@ -1783,6 +1783,121 @@ select.cf-server-pick {
   white-space: nowrap;
 }
 
+/* ------------------------------------------- Smart Route & Transport Probe */
+
+.probe-box {
+  margin-top: .85rem;
+  padding: .85rem 1rem;
+  background: var(--panel);
+  border: 1px solid var(--accent-border);
+  border-radius: var(--radius-sm);
+}
+.probe-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: .85rem;
+  flex-wrap: wrap;
+}
+.probe-head strong {
+  font-size: .95rem;
+}
+.probe-head p {
+  margin: .15rem 0 0;
+}
+.probe-cdn-row {
+  display: grid;
+  grid-template-columns: 1.4fr 1fr;
+  gap: .65rem;
+  margin-top: .65rem;
+  align-items: end;
+}
+.probe-cdn-row label {
+  margin-top: 0;
+}
+.probe-results {
+  margin-top: .85rem;
+  display: grid;
+  gap: .65rem;
+}
+.probe-rec-card {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: .85rem;
+  flex-wrap: wrap;
+  padding: .75rem .95rem;
+  border-radius: var(--radius-sm);
+  background: var(--ok-soft);
+  border: 1px solid var(--ok-border);
+}
+.probe-rec-main {
+  flex: 1;
+  min-width: 200px;
+}
+.probe-rec-top {
+  display: flex;
+  align-items: center;
+  gap: .5rem;
+  flex-wrap: wrap;
+}
+.probe-score-pill {
+  display: inline-flex;
+  align-items: center;
+  padding: .16rem .5rem;
+  border-radius: 999px;
+  font-size: .76rem;
+  font-weight: 750;
+  background: var(--ok);
+  color: #fff;
+}
+.probe-score-pill.warn {
+  background: var(--warn);
+}
+.probe-score-pill.bad {
+  background: var(--muted);
+}
+.probe-rec-summary {
+  margin: .22rem 0 0;
+  font-size: .83rem;
+  color: var(--text);
+}
+
+.probe-list {
+  display: grid;
+  gap: .38rem;
+}
+.probe-row {
+  display: grid;
+  grid-template-columns: minmax(170px, 1.6fr) 5.5rem 4.8rem 6.2rem 4.6rem auto;
+  align-items: center;
+  gap: .6rem;
+  padding: .5rem .75rem;
+  border-radius: 6px;
+  background: var(--well);
+  border: 1px solid var(--line);
+  font-size: .84rem;
+}
+.probe-row-label {
+  font-weight: 600;
+  min-width: 0;
+}
+.probe-row-sub {
+  display: block;
+  font-size: .74rem;
+  font-weight: 400;
+  color: var(--muted);
+}
+.probe-metric {
+  font-family: ui-monospace, "Cascadia Code", Consolas, monospace;
+  font-size: .8rem;
+  white-space: nowrap;
+}
+.probe-row button.probe-use-btn {
+  padding: .24rem .58rem;
+  font-size: .76rem;
+}
+
 /* ---------------------------------------------------- Responsive Layouts */
 
 @media (max-width: 960px) {
@@ -1797,6 +1912,10 @@ select.cf-server-pick {
   }
   .cf-rec-target { grid-column: 1 / -1; }
   .cf-rec-actions { grid-column: 1 / -1; justify-content: flex-start; }
+  .probe-row {
+    grid-template-columns: 1fr auto auto;
+    gap: .35rem .6rem;
+  }
 }
 
 @media (max-width: 760px) {
@@ -1804,6 +1923,7 @@ select.cf-server-pick {
   .row, .row2 { grid-template-columns: 1fr; }
   .choice-grid.cols-2, .choice-grid.cols-3 { grid-template-columns: 1fr; }
   .cf-filter-bar { grid-template-columns: 1fr; }
+  .probe-cdn-row { grid-template-columns: 1fr; }
   .top-inner { padding: .55rem .85rem; gap: .5rem; }
   .brand { gap: .45rem; font-size: 1.05rem; }
   .top-right { gap: .38rem; margin-left: auto; }

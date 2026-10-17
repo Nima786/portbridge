@@ -2331,6 +2331,168 @@
     el.addEventListener('change', () => { sharingTouched = true; showTunnelOptions(); });
   }
 
+  // ----------------------------------------- smart route & transport probe
+
+  async function populateProbeCFPick() {
+    const wrap = $('tn-probe-cf-wrap');
+    const pick = $('tn-probe-cf-pick');
+    if (!wrap || !pick) return;
+    if (!cfZones.length) {
+      try {
+        const acctData = await api('GET', '/api/cf/accounts');
+        cfAccounts = acctData.accounts || [];
+        if (cfAccounts.length) {
+          const zdata = await api('GET', '/api/cf/zones');
+          cfZones = zdata.zones || [];
+        }
+      } catch (e) {
+        // Ignore if Cloudflare is not configured.
+      }
+    }
+    if (!cfZones.length) {
+      wrap.hidden = true;
+      return;
+    }
+    try {
+      const z = cfZones[0];
+      const data = await api('GET', `/api/cf/zones/${encodeURIComponent(z.id)}/records?account_id=${encodeURIComponent(z.account_id)}`);
+      const recs = (data.records || []).filter((r) => ['A', 'AAAA', 'CNAME'].includes(r.type));
+      if (!recs.length) {
+        wrap.hidden = true;
+        return;
+      }
+      wrap.hidden = false;
+      pick.replaceChildren(
+        h('option', { value: '' }, `— Pick from ${z.name} —`),
+        ...recs.map((r) => h('option', { value: r.name }, `${r.name} → ${r.content}${r.proxied ? ' (Proxied)' : ''}`))
+      );
+    } catch (e) {
+      wrap.hidden = true;
+    }
+  }
+
+  if ($('tn-probe-cf-pick')) {
+    $('tn-probe-cf-pick').addEventListener('change', (ev) => {
+      if (ev.target.value && $('tn-probe-cdn')) {
+        $('tn-probe-cdn').value = ev.target.value;
+      }
+    });
+  }
+
+  function applyProbeCandidate(cand) {
+    if (!cand) return;
+    $('tn-gre').checked = false;
+    setRadio('tn-mode', cand.mode === 'reverse' ? 'reverse' : 'direct');
+    setRadio('tn-link', cand.link || 'website');
+    $('tn-stealth').checked = !!cand.stealth;
+    $('tn-webheader').checked = !!cand.web_header;
+    $('tn-ipv6').checked = !!cand.ipv6;
+    if (cand.server_name && ['website', 'website-cdn-backup', 'grpc'].includes(cand.link)) {
+      $('tn-claim').value = cand.server_name;
+    }
+    if (cand.domain) {
+      $('tn-domain').value = cand.domain;
+    }
+    sharingTouched = true;
+    setRadio('tn-shared', cand.shared ? 'shared' : 'one');
+    if (cand.port && ['cdn', 'website-cdn-backup', 'grpc-cdn'].includes(cand.link)) {
+      $('tn-linkport').value = String(cand.port);
+    }
+    showTunnelOptions();
+    setStatus(`Applied "${cand.label}" (Score ${cand.score}/100). Enter your Inbound Port(s) in Step 5 and click Create Tunnel.`);
+    $('tn-service').focus();
+  }
+
+  function renderProbeResults(rep) {
+    const box = $('tn-probe-results');
+    if (!box) return;
+    box.hidden = false;
+
+    const kids = [];
+    if (rep.recommended) {
+      const rec = rep.recommended;
+      kids.push(h('div', { class: 'probe-rec-card' },
+        h('div', { class: 'probe-rec-main' },
+          h('div', { class: 'probe-rec-top' },
+            h('span', { class: 'probe-score-pill' }, `★ Recommended · ${rec.score}/100`),
+            h('strong', null, rec.label)),
+          h('p', { class: 'probe-rec-summary' }, rec.summary || '')),
+        h('button', {
+          type: 'button',
+          class: 'primary',
+          onclick: () => applyProbeCandidate(rec)
+        }, 'Apply Recommended')));
+    }
+
+    const rows = (rep.results || []).map((r) => {
+      const stMap = {
+        ok: ['ok', 'Healthy'],
+        throttled: ['warn', 'Throttled'],
+        degraded: ['warn', 'Degraded'],
+        blocked: ['bad', 'Blocked'],
+      };
+      const st = stMap[r.status] || ['bad', r.status || 'Blocked'];
+      const scoreCls = r.score >= 75 ? '' : (r.score >= 45 ? ' warn' : ' bad');
+      const canUse = r.status === 'ok' || r.status === 'degraded';
+      return h('div', { class: 'probe-row' },
+        h('div', { class: 'probe-row-label' },
+          r.label,
+          r.error && r.status !== 'ok' ? h('span', { class: 'probe-row-sub' }, r.error) : null),
+        h('span', { class: 'state ' + st[0] }, st[1]),
+        h('span', { class: 'probe-metric' }, r.successes > 0 ? `${Math.round(r.rtt_ms)} ms` : '—'),
+        h('span', { class: 'probe-metric' }, r.successes > 0 ? `${r.avg_mbps.toFixed(1)} Mbps` : '—'),
+        h('span', { class: 'probe-score-pill' + scoreCls }, `${r.score}/100`),
+        canUse
+          ? h('button', {
+              type: 'button',
+              class: 'probe-use-btn',
+              onclick: () => applyProbeCandidate(r)
+            }, 'Use')
+          : h('span', { class: 'muted small' }, '—'));
+    });
+
+    if (rows.length) {
+      kids.push(h('div', { class: 'probe-list' }, ...rows));
+    }
+    for (const note of rep.notes || []) {
+      kids.push(h('p', { class: 'muted small' }, note));
+    }
+    box.replaceChildren(...kids);
+  }
+
+  if ($('tn-probe-btn')) {
+    $('tn-probe-btn').addEventListener('click', async () => {
+      const btn = $('tn-probe-btn');
+      const st = $('tn-probe-status');
+      const err = $('tn-probe-error');
+      const resBox = $('tn-probe-results');
+      const relay = $('tn-relay').value;
+      const foreign = $('tn-foreign').value;
+      const cdn = ($('tn-probe-cdn') && $('tn-probe-cdn').value.trim()) || ($('tn-domain') && $('tn-domain').value.trim()) || '';
+
+      err.textContent = '';
+      resBox.hidden = true;
+      resBox.replaceChildren();
+      st.hidden = false;
+      st.textContent = 'Running parallel Direct & Reverse transport benchmarks (Fake TLS, Stealth, gRPC, KCP, TCP' + (cdn ? ', Cloudflare CDN' : '') + ')... Please wait ~15–25 seconds...';
+      btn.disabled = true;
+      try {
+        const rep = await api('POST', '/api/tunnels/probe', {
+          relay,
+          foreign,
+          cdn_domain: cdn,
+        });
+        st.hidden = true;
+        renderProbeResults(rep);
+      } catch (e) {
+        st.hidden = true;
+        err.textContent = e.message;
+      } finally {
+        btn.disabled = false;
+      }
+    });
+  }
+
   async function openNewTunnel(relayID, foreignID) {
     if (!serversCache.length) {
       try { serversCache = (await api('GET', '/api/servers')).servers || []; } catch (e) { setStatus(e.message, true); return; }
@@ -2347,6 +2509,13 @@
     if (foreignID) $('tn-foreign').value = foreignID;
     $('tn-error').textContent = '';
     $('tn-ports-result').replaceChildren();
+    if ($('tn-probe-error')) $('tn-probe-error').textContent = '';
+    if ($('tn-probe-status')) $('tn-probe-status').hidden = true;
+    if ($('tn-probe-results')) {
+      $('tn-probe-results').hidden = true;
+      $('tn-probe-results').replaceChildren();
+    }
+    populateProbeCFPick();
     $('tunnel-form').hidden = false;
     $('tn-progress').hidden = true;
     sharingTouched = false;

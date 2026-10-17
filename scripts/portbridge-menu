@@ -4638,14 +4638,15 @@ main_menu() {
         item 9 "View a tunnel's log"
         item 10 "Speed test a tunnel"
         item 11 "Show free ports on both servers" "which ones a CDN forwards"
+        item 12 "Benchmark & recommend best tunnel" "test all modes between two servers"
         group "Settings"
-        item 12 "Management Agent" "automate foreign setup from Iran"
-        item 13 "Speed tuning" "run on both servers"
-        item 14 "Firewall"
-        item 15 "Web panel" "all your servers in a browser"
+        item 13 "Management Agent" "automate foreign setup from Iran"
+        item 14 "Speed tuning" "run on both servers"
+        item 15 "Firewall"
+        item 16 "Web panel" "all your servers in a browser"
         group "Remove"
-        item 16 "Delete a tunnel" "" "$RED"
-        item 17 "Uninstall PortBridge" "" "$RED"
+        item 17 "Delete a tunnel" "" "$RED"
+        item 18 "Uninstall PortBridge" "" "$RED"
         say ""
         item 0 "Quit"
         hr
@@ -4663,16 +4664,48 @@ main_menu() {
             9) name=$(pick_tunnel) && show_logs "$name"; pause ;;
             10) name=$(pick_tunnel) && speedtest_tunnel "$name"; pause ;;
             11) ports_overview; pause ;;
-            12) agent_menu ;;
-            13) tuning_menu; pause ;;
-            14) firewall_menu ;;
-            15) panel_menu ;;
-            16) name=$(pick_tunnel) && delete_tunnel "$name"; pause ;;
-            17) uninstall_all ;;
+            12) probe_menu; pause ;;
+            13) agent_menu ;;
+            14) tuning_menu; pause ;;
+            15) firewall_menu ;;
+            16) panel_menu ;;
+            17) name=$(pick_tunnel) && delete_tunnel "$name"; pause ;;
+            18) uninstall_all ;;
             0 | q | Q) say "Bye."; exit 0 ;;
             *) err "Not a valid choice."; sleep 1 ;;
         esac
     done
+}
+
+probe_menu() {
+    local choice code cdn
+    hr
+    say "${B}Benchmark & Recommend Best Tunnel${R}"
+    say "${DIM}Tests Fake TLS, Stealth (uTLS + Fragmentation), gRPC, KCP, Plain TCP, IPv6,${R}"
+    say "${DIM}and optional Cloudflare CDN between your two servers, scores them (0-100),${R}"
+    say "${DIM}and recommends the fastest and most DPI-resistant mode.${R}"
+    hr
+    say "  ${NUM}1${R}) Start benchmark listener on this server ${DIM}(run first on Foreign or Relay)${R}"
+    say "  ${NUM}2${R}) Run benchmark from this server using a PBPROBE1 code"
+    say "  ${NUM}0${R}) Back"
+    hr
+    choice=$(ask "Choose" "0")
+    case "$choice" in
+        1)
+            "$BIN" probe listen
+            ;;
+        2)
+            code=$(ask "Paste the PBPROBE1:... code from the other server" "")
+            [ -n "$code" ] || return 0
+            cdn=$(ask "Optional Cloudflare/CDN subdomain pointed at the other server (Enter to skip)" "")
+            if [ -n "$cdn" ]; then
+                "$BIN" probe -cdn "$cdn" "$code"
+            else
+                "$BIN" probe "$code"
+            fi
+            ;;
+        *) return 0 ;;
+    esac
 }
 # set_firewall <name> <on|off> - records the choice and applies it at once
 set_firewall() {

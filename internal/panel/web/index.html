@@ -502,6 +502,32 @@
           <label for="tn-name">Tunnel Name <span class="muted">(letters, numbers, dash or underscore)</span></label>
           <input id="tn-name" maxlength="40" autocapitalize="none" spellcheck="false" pattern="[A-Za-z0-9_-]+" required placeholder="e.g. de-vless or main-tunnel">
         </div>
+
+        <!-- Smart Route & Transport Benchmark -->
+        <div id="tn-probe-box" class="probe-box">
+          <div class="probe-head">
+            <div>
+              <strong>Smart Route &amp; Transport Benchmark</strong>
+              <p class="muted small">Not sure which mode works best between these two servers? Test Direct, Reverse, Fake TLS, Stealth, gRPC, KCP, and Cloudflare CDN simultaneously to score speed, ping, and DPI resistance.</p>
+            </div>
+            <button type="button" id="tn-probe-btn" class="primary">Find Best Tunnel Mode</button>
+          </div>
+          <div class="probe-cdn-row">
+            <div class="probe-cdn-input">
+              <label for="tn-probe-cdn">Optional CDN Subdomain to include in benchmark <span class="muted">(pointed at Foreign server with Cloudflare Proxy ON)</span></label>
+              <input id="tn-probe-cdn" placeholder="e.g. edge1.example.com (leave empty to test direct/reverse only)" autocapitalize="none" spellcheck="false">
+            </div>
+            <div id="tn-probe-cf-wrap" class="probe-cdn-pick" hidden>
+              <label for="tn-probe-cf-pick">Or pick from Cloudflare DNS</label>
+              <select id="tn-probe-cf-pick">
+                <option value="">— Select Cloudflare record —</option>
+              </select>
+            </div>
+          </div>
+          <p id="tn-probe-status" class="muted small" hidden role="status" aria-live="polite"></p>
+          <p id="tn-probe-error" class="error" role="alert"></p>
+          <div id="tn-probe-results" class="probe-results" hidden></div>
+        </div>
       </section>
 
       <!-- STEP 2: Direction -->

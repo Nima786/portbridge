@@ -23,6 +23,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/Nima786/portbridge/internal/engine"
@@ -876,6 +877,80 @@ func newAgentHandler(token, confDir string, allowUpdates func() bool) *http.Serv
 		writeJSONReply(w, http.StatusOK, info)
 	})
 
+	// POST /api/probe/listen: open an ephemeral multi-transport probe listener.
+	mux.HandleFunc("/api/probe/listen", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, `{"error":"method not allowed"}`, http.StatusMethodNotAllowed)
+			return
+		}
+		if !checkAgentAuth(r, token) {
+			http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
+			return
+		}
+		var req struct {
+			PreferredPort int `json:"preferred_port"`
+		}
+		_ = json.NewDecoder(io.LimitReader(r.Body, 4096)).Decode(&req)
+		pl, err := engine.StartProbeListener("0.0.0.0", req.PreferredPort, nil, 75*time.Second)
+		if err != nil {
+			writeJSONReply(w, http.StatusUnprocessableEntity, map[string]any{"ok": false, "error": err.Error()})
+			return
+		}
+		id := registerProbeListener(pl)
+		writeJSONReply(w, http.StatusOK, map[string]any{
+			"ok":     true,
+			"id":     id,
+			"port":   pl.Port,
+			"secret": base64.StdEncoding.EncodeToString(pl.Secret),
+		})
+	})
+
+	// POST /api/probe/stop: close an ephemeral probe listener early.
+	mux.HandleFunc("/api/probe/stop", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, `{"error":"method not allowed"}`, http.StatusMethodNotAllowed)
+			return
+		}
+		if !checkAgentAuth(r, token) {
+			http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
+			return
+		}
+		var req struct {
+			ID string `json:"id"`
+		}
+		_ = json.NewDecoder(io.LimitReader(r.Body, 4096)).Decode(&req)
+		stopProbeListener(req.ID)
+		writeJSONReply(w, http.StatusOK, map[string]any{"ok": true})
+	})
+
+	// POST /api/probe/dial: benchmark a batch of transport candidates against a peer probe listener.
+	mux.HandleFunc("/api/probe/dial", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, `{"error":"method not allowed"}`, http.StatusMethodNotAllowed)
+			return
+		}
+		if !checkAgentAuth(r, token) {
+			http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
+			return
+		}
+		var req struct {
+			Specs      []engine.ProbeCandidateSpec `json:"specs"`
+			Secret     string                      `json:"secret"`
+			BurstBytes int                         `json:"burst_bytes"`
+		}
+		if err := json.NewDecoder(io.LimitReader(r.Body, 64*1024)).Decode(&req); err != nil {
+			writeJSONReply(w, http.StatusBadRequest, map[string]any{"ok": false, "error": "invalid probe request"})
+			return
+		}
+		sec, err := base64.StdEncoding.DecodeString(req.Secret)
+		if err != nil || len(sec) < 16 {
+			writeJSONReply(w, http.StatusBadRequest, map[string]any{"ok": false, "error": "invalid probe secret"})
+			return
+		}
+		results := engine.RunProbeDialer(r.Context(), req.Specs, sec, req.BurstBytes)
+		writeJSONReply(w, http.StatusOK, map[string]any{"ok": true, "results": results})
+	})
+
 	return mux
 }
 
@@ -1466,4 +1541,35 @@ func CmdJoin(args []string) error {
 	}
 	fmt.Printf("Successfully joined and activated tunnel %q (role: origin, mode: %s)\n", p.Name, p.Mode)
 	return nil
+}
+
+var (
+	probeMu      sync.Mutex
+	activeProbes = map[string]*engine.ProbeListener{}
+)
+
+func registerProbeListener(pl *engine.ProbeListener) string {
+	var b [8]byte
+	_, _ = rand.Read(b[:])
+	id := hex.EncodeToString(b[:])
+	probeMu.Lock()
+	activeProbes[id] = pl
+	probeMu.Unlock()
+	time.AfterFunc(80*time.Second, func() {
+		stopProbeListener(id)
+	})
+	return id
+}
+
+func stopProbeListener(id string) {
+	if id == "" {
+		return
+	}
+	probeMu.Lock()
+	pl := activeProbes[id]
+	delete(activeProbes, id)
+	probeMu.Unlock()
+	if pl != nil {
+		pl.Close()
+	}
 }

@@ -126,13 +126,15 @@ func buildAuthFrame(secret []byte) ([]byte, error) {
 
 // buildAuthFrameV2 builds an obfuscated, variable-length auth frame for purpose.
 func buildAuthFrameV2(secret []byte, purpose byte) ([]byte, error) {
-	// Generate random nonce where nonce[0] != protoVersion (1) to guarantee zero clash with v1
+	// Generate random nonce where nonce[0] != protoVersion (1) to guarantee zero
+	// clash with v1, and != 0x16 / 'G' / 'P' so a multi-transport probe listener
+	// can distinguish raw v2 auth frames from TLS ClientHello, HTTP GET, and HTTP/2 PRI.
 	var nonce [authNonceLen]byte
 	for {
 		if _, err := rand.Read(nonce[:]); err != nil {
 			return nil, err
 		}
-		if nonce[0] != protoVersion {
+		if nonce[0] != protoVersion && nonce[0] != 0x16 && nonce[0] != 'G' && nonce[0] != 'P' {
 			break
 		}
 	}

@@ -66,6 +66,7 @@ func (p *Panel) routes() http.Handler {
 	mux.HandleFunc("POST /api/tunnels/logs", p.withAuth(p.handleTunnelLogs))
 	mux.HandleFunc("POST /api/tunnels/check", p.withAuth(p.handleCheckTunnel))
 	mux.HandleFunc("POST /api/tunnels/speedtest", p.withAuth(p.handleSpeedtestTunnel))
+	mux.HandleFunc("POST /api/tunnels/probe", p.withAuth(p.handleProbeTunnel))
 	mux.HandleFunc("POST /api/ports", p.withAuth(p.handlePorts))
 	mux.HandleFunc("GET /api/servers/{id}/tune", p.withAuth(p.handleGetServerTune))
 	mux.HandleFunc("POST /api/servers/{id}/tune", p.withAuth(p.handleSetServerTune))
@@ -717,6 +718,23 @@ func (p *Panel) handleSpeedtestTunnel(w http.ResponseWriter, r *http.Request, _ 
 		"server": srvName,
 		"output": out,
 	})
+}
+
+func (p *Panel) handleProbeTunnel(w http.ResponseWriter, r *http.Request, _ authed) {
+	var req struct {
+		Relay     string `json:"relay"`
+		Foreign   string `json:"foreign"`
+		CDNDomain string `json:"cdn_domain"`
+	}
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	rep, err := p.probeBetweenServers(r.Context(), strings.TrimSpace(req.Relay), strings.TrimSpace(req.Foreign), strings.TrimSpace(req.CDNDomain))
+	if err != nil {
+		writeErr(w, http.StatusUnprocessableEntity, capitalise(plainAgentError(err))+".")
+		return
+	}
+	writeJSON(w, http.StatusOK, rep)
 }
 
 func (p *Panel) handleGetServerTune(w http.ResponseWriter, r *http.Request, _ authed) {
