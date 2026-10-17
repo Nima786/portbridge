@@ -175,6 +175,24 @@ func sshAuth(r addRequest) ([]ssh.AuthMethod, error) {
 	return methods, nil
 }
 
+// syncBuffer is a goroutine-safe bytes.Buffer for concurrent stdout/stderr writes.
+type syncBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *syncBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *syncBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
 // remote is an SSH connection to a server being added.
 type remote struct {
 	c *ssh.Client
@@ -186,14 +204,47 @@ func (rm *remote) run(cmd string, stdin []byte, timeout time.Duration) (string, 
 		return "", err
 	}
 	defer sess.Close()
-	var out bytes.Buffer
-	sess.Stdout = &out
-	sess.Stderr = &out
-	if stdin != nil {
-		sess.Stdin = bytes.NewReader(stdin)
+	stdoutPipe, err := sess.StdoutPipe()
+	if err != nil {
+		return "", err
 	}
+	stderrPipe, err := sess.StderrPipe()
+	if err != nil {
+		return "", err
+	}
+	inPipe, err := sess.StdinPipe()
+	if err != nil {
+		return "", err
+	}
+	defer inPipe.Close()
+
+	var out syncBuffer
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		_, _ = io.Copy(&out, stdoutPipe)
+	}()
+	go func() {
+		defer wg.Done()
+		_, _ = io.Copy(&out, stderrPipe)
+	}()
+
+	if err := sess.Start(cmd); err != nil {
+		return "", err
+	}
+	if stdin != nil {
+		go func() {
+			_, _ = inPipe.Write(stdin)
+			_ = inPipe.Close()
+		}()
+	}
+
 	done := make(chan error, 1)
-	go func() { done <- sess.Run(cmd) }()
+	go func() {
+		wg.Wait()
+		done <- sess.Wait()
+	}()
 	select {
 	case err := <-done:
 		return strings.TrimSpace(out.String()), err
@@ -238,12 +289,27 @@ func (p *Panel) addServer(j *job, r addRequest) (string, error) {
 	const lookCmd = "echo pb_uid=$(id -u); echo pb_arch=$(uname -m); " +
 		"echo pb_systemd=$(test -d /run/systemd/system && echo yes); " +
 		"echo pb_version=$(/usr/local/bin/portbridge version 2>/dev/null)"
-	facts, err := rm.run(lookCmd, nil, 30*time.Second)
-	if err != nil {
+	var facts string
+	var f map[string]string
+	var uid string
+	var answered bool
+	for attempt := 0; attempt < 3; attempt++ {
+		if attempt > 0 {
+			time.Sleep(500 * time.Millisecond)
+		}
+		facts, err = rm.run(lookCmd, nil, 30*time.Second)
+		if err != nil {
+			continue
+		}
+		f = parseFacts(facts)
+		uid, answered = f["pb_uid"]
+		if answered {
+			break
+		}
+	}
+	if err != nil && !answered {
 		return "", fmt.Errorf("could not look at the server: %v %s", err, lastLines(facts, 5))
 	}
-	f := parseFacts(facts)
-	uid, answered := f["pb_uid"]
 	if !answered {
 		return "", fmt.Errorf("the panel could not read the server when it looked at it; its answer was: %s", lastLines(facts, 5))
 	}

@@ -835,6 +835,7 @@
       $('add-note').hidden = true;
       const updating = addMode.kind === 'ssh-update';
       if (job.error) {
+        if (/older than the panel/i.test(job.error)) $('add-update').checked = true;
         $('add-result').textContent = (updating ? 'Upgrade failed. ' : 'Could not add server. ') + sentence(job.error);
         $('add-result').className = 'bad';
         $('add-back').hidden = false;

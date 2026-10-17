@@ -3,7 +3,10 @@ package panel
 import (
 	"crypto/ed25519"
 	"crypto/rand"
+	"crypto/rsa"
+	"crypto/x509"
 	"encoding/pem"
+	"math/big"
 	"strings"
 	"testing"
 
@@ -185,6 +188,61 @@ func TestPuTTYPPKKeysV2AndV3(t *testing.T) {
 	}
 	if m, err := sshAuth(addRequest{PrivateKey: ppkV3Enc, Passphrase: "my-secret-pass"}); err != nil || len(m) != 1 {
 		t.Fatalf("encrypted PPK v3 with right passphrase failed: %v", err)
+	}
+
+	// PuTTY-User-Key-File-2 RSA key (such as PuTTYgen keys with small exponent E=37)
+	// must produce the exact same *rsa.PrivateKey as the corresponding PKCS#1 PEM key.
+	rsaPriv, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mpint := func(n *big.Int) []byte {
+		b := n.Bytes()
+		if len(b) > 0 && b[0]&0x80 != 0 {
+			b = append([]byte{0}, b...)
+		}
+		return encodeSSHBytes(b)
+	}
+	rsaPubRaw := append(encodeSSHBytes([]byte("ssh-rsa")), mpint(big.NewInt(int64(rsaPriv.E)))...)
+	rsaPubRaw = append(rsaPubRaw, mpint(rsaPriv.N)...)
+	qinv := new(big.Int).ModInverse(rsaPriv.Primes[1], rsaPriv.Primes[0])
+	rsaPrivRaw := append(mpint(rsaPriv.D), mpint(rsaPriv.Primes[0])...)
+	rsaPrivRaw = append(rsaPrivRaw, mpint(rsaPriv.Primes[1])...)
+	rsaPrivRaw = append(rsaPrivRaw, mpint(qinv)...)
+	ppkV2RSA := "PuTTY-User-Key-File-2: ssh-rsa\r\n" +
+		"Encryption: none\r\n" +
+		"Comment: rsa-key\r\n" +
+		"Public-Lines: 1\r\n" +
+		encodeBase64Std(rsaPubRaw) + "\r\n" +
+		"Private-Lines: 1\r\n" +
+		encodeBase64Std(rsaPrivRaw) + "\r\n"
+	pemRSA := string(pem.EncodeToMemory(&pem.Block{
+		Type:  "RSA PRIVATE KEY",
+		Bytes: x509.MarshalPKCS1PrivateKey(rsaPriv),
+	}))
+	k1, err := parsePPK(ppkV2RSA, "")
+	if err != nil {
+		t.Fatalf("parsePPK v2 RSA failed: %v", err)
+	}
+	k2, err := parseAnyPrivateKey(pemRSA, "")
+	if err != nil {
+		t.Fatalf("parseAnyPrivateKey PEM RSA failed: %v", err)
+	}
+	if string(k1.PublicKey().Marshal()) != string(k2.PublicKey().Marshal()) {
+		t.Fatalf("PPK v2 RSA public key did not match PEM RSA public key")
+	}
+	sig, err := k1.Sign(rand.Reader, []byte("hello-ssh"))
+	if err != nil {
+		t.Fatalf("k1.Sign failed: %v", err)
+	}
+	if err := k2.PublicKey().Verify([]byte("hello-ssh"), sig); err != nil {
+		t.Fatalf("k2.PublicKey().Verify failed: %v", err)
+	}
+	if m1, err := sshAuth(addRequest{PrivateKey: ppkV2RSA}); err != nil || len(m1) != 1 {
+		t.Fatalf("sshAuth with PPK v2 RSA failed: %v", err)
+	}
+	if m2, err := sshAuth(addRequest{PrivateKey: pemRSA}); err != nil || len(m2) != 1 {
+		t.Fatalf("sshAuth with PEM RSA failed: %v", err)
 	}
 }
 
