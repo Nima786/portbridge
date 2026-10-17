@@ -332,12 +332,19 @@
     const totalTunnels = tunnelsCache.length;
     let runningTunnels = 0;
     let activeUsers = 0;
+    let activeConns = 0;
     for (const t of tunnelsCache) {
       const e = t.edge, o = t.origin;
       const halves = [e, o].filter(Boolean);
       if (halves.length && halves.every((x) => x.info && x.info.running)) runningTunnels++;
-      const live = (e && e.info && e.info.live) || (o && o.info && o.info.live) || null;
-      if (live && live.active_sessions) activeUsers += Number(live.active_sessions) || 0;
+      const edgeLive = e && e.info && e.info.live ? e.info.live : null;
+      const live = edgeLive || (o && o.info && o.info.live) || null;
+      if (edgeLive && typeof edgeLive.active_users === 'number') {
+        activeUsers += Number(edgeLive.active_users) || 0;
+      } else if (live && typeof live.active_users === 'number') {
+        activeUsers += Number(live.active_users) || 0;
+      }
+      if (live && live.active_sessions) activeConns += Number(live.active_sessions) || 0;
     }
 
     if ($('sum-tunnels')) {
@@ -346,7 +353,7 @@
     }
     if ($('sum-users')) {
       $('sum-users').textContent = String(activeUsers);
-      $('sum-users-sub').textContent = activeUsers === 1 ? '1 active session' : `${activeUsers} active sessions`;
+      $('sum-users-sub').textContent = `${activeUsers === 1 ? '1 unique IP' : activeUsers + ' unique IPs'} · ${activeConns} TCP ${activeConns === 1 ? 'conn' : 'conns'}`;
     }
 
     const ct = $('count-tunnels');
@@ -652,9 +659,15 @@
     $('auth-key').hidden = kind !== 'key';
     $('auth-file').hidden = kind !== 'file';
     $('auth-passphrase').hidden = kind === 'password';
+    if (kind === 'password') $('add-passphrase').value = '';
     syncChoiceCards($('add-dialog'));
   }
-  for (const r of document.querySelectorAll('input[name="auth"]')) r.addEventListener('change', showAuth);
+  for (const r of document.querySelectorAll('input[name="auth"]')) {
+    r.addEventListener('change', () => {
+      $('add-passphrase').value = '';
+      showAuth();
+    });
+  }
 
   function clearSecrets() {
     $('add-password').value = '';
@@ -716,11 +729,14 @@
     clearSecrets();
     $('add-dialog').close();
   });
-  $('add-close').addEventListener('click', () => $('add-dialog').close());
+  $('add-close').addEventListener('click', () => {
+    clearSecrets();
+    $('add-dialog').close();
+  });
   $('add-back').addEventListener('click', () => {
     $('add-progress').hidden = true;
     $('add-form').hidden = false;
-    $('add-error').textContent = 'Please enter the SSH password or key again (it is never stored).';
+    $('add-error').textContent = '';
     (addMode.kind === 'add' ? $('add-address') : $('add-user')).focus();
   });
 
@@ -732,6 +748,21 @@
     const address = $('add-address').value.trim();
     const port = Number($('add-port').value || 22);
     const kind = authKind();
+    if (kind === 'file' && !keyFromFile.trim()) {
+      const f = $('add-file').files && $('add-file').files[0];
+      if (f) {
+        if (f.size > 64 * 1024) {
+          err.textContent = 'That file is too large to be an SSH private key.';
+          return;
+        }
+        try {
+          keyFromFile = await f.text();
+        } catch (_) {
+          err.textContent = 'Could not read that file.';
+          return;
+        }
+      }
+    }
     const body = {
       name: $('add-name').value.trim(),
       group: group ? group.value : '',
@@ -755,15 +786,14 @@
     if (!updating && !address) { err.textContent = 'Enter the server IP address or hostname.'; $('add-address').focus(); return; }
     if (!Number.isInteger(port) || port < 1 || port > 65535) { err.textContent = 'SSH port must be between 1 and 65535.'; return; }
     if (kind === 'password' && !body.password) { err.textContent = 'Enter the SSH password.'; $('add-password').focus(); return; }
-    if (kind === 'key' && !body.private_key.trim()) { err.textContent = 'Paste the SSH private key.'; $('add-key').focus(); return; }
-    if (kind === 'file' && !body.private_key.trim()) { err.textContent = 'Select the SSH private key file.'; $('add-file').focus(); return; }
+    if (kind === 'key' && !body.private_key.trim()) { err.textContent = 'Paste the SSH private key (OpenSSH, PEM, or PuTTY .ppk).'; $('add-key').focus(); return; }
+    if (kind === 'file' && !body.private_key.trim()) { err.textContent = 'Select the SSH private key file (OpenSSH, PEM, or PuTTY .ppk).'; $('add-file').focus(); return; }
 
     const btn = ev.target.querySelector('button[type=submit]');
     btn.disabled = true;
     try {
       const path = updating ? `/api/servers/${encodeURIComponent(addMode.server.id)}/ssh-update` : '/api/servers';
       const res = await api('POST', path, body);
-      clearSecrets();
       startJob(res.job);
     } catch (e) {
       err.textContent = e.message;
@@ -809,6 +839,7 @@
         $('add-result').className = 'bad';
         $('add-back').hidden = false;
       } else {
+        clearSecrets();
         $('add-result').textContent = updating ? 'Success: server is updated and supports one-click updates from now on.'
           : 'Success: server has been added to the panel.';
         $('add-result').className = 'good';
@@ -957,7 +988,12 @@
     const relayName = e ? (e.server_name || e.address) : (oi && oi.peer_ip ? oi.peer_ip : 'Not in panel');
     const foreignName = o ? (o.server_name || o.address) : (ei && ei.peer_ip ? ei.peer_ip : 'Not in panel');
     const mainPort = ports(userPorts || servicePorts);
-    const activeCount = live ? (Number(live.active_sessions) || 0) : 0;
+    const edgeLive = ei && ei.live ? ei.live : null;
+    const uniqueUsers = (edgeLive && typeof edgeLive.active_users === 'number')
+      ? (Number(edgeLive.active_users) || 0)
+      : (live && typeof live.active_users === 'number' ? (Number(live.active_users) || 0) : 0);
+    const activeConns = live ? (Number(live.active_sessions) || 0) : 0;
+    const userBadgeText = `${uniqueUsers} ${uniqueUsers === 1 ? 'user' : 'users'} · ${activeConns} ${activeConns === 1 ? 'conn' : 'conns'}`;
 
     const tunKey = `${t.name}:${e ? e.server_id : ''}:${o ? o.server_id : ''}`;
     const headingId = 'tun-' + t.name + (e ? e.server_id : '') + (o ? o.server_id : '');
@@ -982,7 +1018,7 @@
     if (live) {
       const pw = PATH_WORDS[live.path_state] || PATH_WORDS.unknown;
       healthParts.push(pw[1]);
-      healthParts.push(`${activeCount} active ${activeCount === 1 ? 'user' : 'users'}`);
+      healthParts.push(`${uniqueUsers} online ${uniqueUsers === 1 ? 'user' : 'users'} (${activeConns} TCP ${activeConns === 1 ? 'conn' : 'conns'})`);
       if (any.mux) {
         healthParts.push(`${live.links || 0}/${live.link_target || any.mux_links || 1} mux links`);
       } else {
@@ -1043,7 +1079,7 @@
           mainPort ? h('span', { class: 'tunnel-summary-port mono' }, `:${mainPort}`) : null)),
       h('div', { class: 'tunnel-summary-right' },
         h('span', { class: 'badge badge-transport' }, `${reverse ? 'Reverse' : 'Direct'}${isIPv6 ? ' (IPv6)' : ''} · ${shortLink}`),
-        live ? h('span', { class: 'badge badge-users' }, `${activeCount} active`) : null,
+        live ? h('span', { class: 'badge badge-users', title: 'Unique connected client IPs · Active TCP connections' }, userBadgeText) : null,
         h('span', { class: 'tunnel-chevron', 'aria-hidden': 'true' }, '▾')));
 
     const card = h('article', { class: 'card tunnel' + (isOpen ? ' is-open' : ''), 'aria-labelledby': headingId },

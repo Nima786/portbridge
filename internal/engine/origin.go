@@ -72,6 +72,10 @@ type origin struct {
 	logRelay    *throttled
 	logProxy    *throttled
 
+	proxyStateMu sync.Mutex
+	proxyBypass  map[string]time.Time
+	proxyWorks   map[string]time.Time
+
 	cancel       context.CancelFunc
 	teardownOnce sync.Once
 }
@@ -595,6 +599,152 @@ func (o *origin) tellService(svc net.Conn, a arrival) error {
 	return err
 }
 
+func (o *origin) isProxyBypassed(addr string) (bypassed, knownWorking bool) {
+	now := time.Now()
+	o.proxyStateMu.Lock()
+	defer o.proxyStateMu.Unlock()
+	if until, ok := o.proxyBypass[addr]; ok && now.Before(until) {
+		return true, false
+	}
+	if until, ok := o.proxyWorks[addr]; ok && now.Before(until) {
+		return false, true
+	}
+	return false, false
+}
+
+func (o *origin) markProxyBypass(addr string, ttl time.Duration) {
+	o.proxyStateMu.Lock()
+	if o.proxyBypass == nil {
+		o.proxyBypass = make(map[string]time.Time)
+	}
+	delete(o.proxyWorks, addr)
+	o.proxyBypass[addr] = time.Now().Add(ttl)
+	o.proxyStateMu.Unlock()
+}
+
+func (o *origin) markProxyWorks(addr string, ttl time.Duration) {
+	o.proxyStateMu.Lock()
+	if o.proxyWorks == nil {
+		o.proxyWorks = make(map[string]time.Time)
+	}
+	delete(o.proxyBypass, addr)
+	o.proxyWorks[addr] = time.Now().Add(ttl)
+	o.proxyStateMu.Unlock()
+}
+
+// isProxyHeaderRejection reports whether the first bytes sent back by a local
+// service immediately after receiving ONLY a PROXY protocol header indicate
+// that the service does not have "Accept Proxy Protocol" enabled (for example,
+// a TLS fatal alert 0x15 0x03 or an HTTP 400 Bad Request).
+func isProxyHeaderRejection(b []byte) bool {
+	if len(b) == 0 {
+		return false
+	}
+	if b[0] == 0x15 { // TLS Alert record (e.g. alert 70 protocol_version)
+		return true
+	}
+	s := string(b)
+	return strings.HasPrefix(s, "HTTP/") || strings.HasPrefix(s, "<!DOC") || strings.HasPrefix(s, "<html")
+}
+
+type prefixedServiceConn struct {
+	net.Conn
+	prefix []byte
+}
+
+func (p *prefixedServiceConn) Read(b []byte) (int, error) {
+	if len(p.prefix) > 0 {
+		n := copy(b, p.prefix)
+		p.prefix = p.prefix[n:]
+		return n, nil
+	}
+	return p.Conn.Read(b)
+}
+
+func (p *prefixedServiceConn) CloseWrite() error {
+	if cw, ok := p.Conn.(closeWriter); ok {
+		return cw.CloseWrite()
+	}
+	return p.Conn.Close()
+}
+
+type proxyReplyWatchConn struct {
+	net.Conn
+	o         *origin
+	addr      string
+	firstRead bool
+}
+
+func (w *proxyReplyWatchConn) Read(b []byte) (int, error) {
+	n, err := w.Conn.Read(b)
+	if !w.firstRead {
+		w.firstRead = true
+		if (n == 0 && err != nil) || (n > 0 && n <= 32 && isProxyHeaderRejection(b[:n])) {
+			w.o.markProxyBypass(w.addr, 60*time.Second)
+			w.o.logProxy.printf("local service at %s rejected the PROXY protocol header (Accept Proxy Protocol is not enabled on that service); "+
+				"automatically bypassing PROXY header so the tunnel keeps working", w.addr)
+		}
+	}
+	return n, err
+}
+
+func (w *proxyReplyWatchConn) CloseWrite() error {
+	if cw, ok := w.Conn.(closeWriter); ok {
+		return cw.CloseWrite()
+	}
+	return w.Conn.Close()
+}
+
+func (o *origin) dialAndTellService(inboundAddr string, a arrival) (net.Conn, error) {
+	if o.cfg.ProxyProtocol == proxyproto.Off {
+		svc, err := net.DialTimeout("tcp", inboundAddr, inboundDialTimeout)
+		if err != nil {
+			return nil, err
+		}
+		_ = o.tellService(svc, a)
+		return svc, nil
+	}
+
+	bypassed, knownWorking := o.isProxyBypassed(inboundAddr)
+	if bypassed {
+		return net.DialTimeout("tcp", inboundAddr, inboundDialTimeout)
+	}
+
+	svc, err := net.DialTimeout("tcp", inboundAddr, inboundDialTimeout)
+	if err != nil {
+		return nil, err
+	}
+	if err := o.tellService(svc, a); err != nil {
+		_ = svc.Close()
+		return nil, err
+	}
+	if knownWorking {
+		return &proxyReplyWatchConn{Conn: svc, o: o, addr: inboundAddr}, nil
+	}
+
+	// Probe briefly before any user bytes are sent: a local service without
+	// "Accept Proxy Protocol" enabled immediately closes or replies with a
+	// TLS alert / HTTP 400 upon seeing the PROXY header.
+	var peek [8]byte
+	_ = svc.SetReadDeadline(time.Now().Add(45 * time.Millisecond))
+	n, rerr := svc.Read(peek[:])
+	_ = svc.SetReadDeadline(time.Time{})
+
+	if (rerr != nil && !isTimeout(rerr)) || (n > 0 && isProxyHeaderRejection(peek[:n])) {
+		_ = svc.Close()
+		o.markProxyBypass(inboundAddr, 60*time.Second)
+		o.logProxy.printf("local service at %s rejected the PROXY protocol header (Accept Proxy Protocol is not enabled on that service); "+
+			"automatically bypassing PROXY header so the tunnel keeps working", inboundAddr)
+		return net.DialTimeout("tcp", inboundAddr, inboundDialTimeout)
+	}
+
+	o.markProxyWorks(inboundAddr, 60*time.Second)
+	if n > 0 {
+		return &prefixedServiceConn{Conn: svc, prefix: append([]byte(nil), peek[:n]...)}, nil
+	}
+	return &proxyReplyWatchConn{Conn: svc, o: o, addr: inboundAddr}, nil
+}
+
 // handleActivated is reached only once a real user is waiting on the other side.
 func (o *origin) handleActivated(tunnel net.Conn, a arrival) {
 	targetPort := a.port
@@ -619,20 +769,11 @@ func (o *origin) handleActivated(tunnel net.Conn, a arrival) {
 		_ = tunnel.Close()
 		return
 	}
-	svc, err := net.DialTimeout("tcp", inboundAddr, inboundDialTimeout)
+	svc, err := o.dialAndTellService(inboundAddr, a)
 	if err != nil {
 		atomic.AddInt64(&o.st.failedSessions, 1)
 		o.logDial.printf("cannot reach the local service at %s: %v", inboundAddr, err)
 		_ = tunnel.Close()
-		return
-	}
-	// Before the confirmation: if the service cannot be told, the edge is still
-	// free to try this user again on another connection.
-	if err := o.tellService(svc, a); err != nil {
-		atomic.AddInt64(&o.st.failedSessions, 1)
-		o.logDial.printf("could not give the local service at %s the user's address: %v", inboundAddr, err)
-		_ = tunnel.Close()
-		_ = svc.Close()
 		return
 	}
 

@@ -108,9 +108,9 @@
         <span id="sum-tunnels-sub" class="stat-sub">Configured bridges</span>
       </div>
       <div class="stat-pill stat-users">
-        <span class="stat-label">Online Connections</span>
+        <span class="stat-label">Online Users</span>
         <strong id="sum-users" class="stat-val">—</strong>
-        <span id="sum-users-sub" class="stat-sub">Active user sessions</span>
+        <span id="sum-users-sub" class="stat-sub">Unique IPs · TCP conns</span>
       </div>
     </section>
 
@@ -379,26 +379,26 @@
           </label>
           <label class="choice-card compact">
             <input type="radio" name="auth" value="file">
-            <div class="choice-body"><div class="choice-top"><strong>Key File</strong></div></div>
+            <div class="choice-body"><div class="choice-top"><strong>Key File (.ppk / OpenSSH)</strong></div></div>
           </label>
         </div>
       </fieldset>
 
       <div id="auth-password">
         <label for="add-password">SSH Password</label>
-        <input id="add-password" type="password" autocomplete="off">
+        <input id="add-password" type="password" autocomplete="new-password">
       </div>
       <div id="auth-key" hidden>
-        <label for="add-key">Private Key</label>
-        <textarea id="add-key" rows="5" spellcheck="false" autocomplete="off" placeholder="-----BEGIN OPENSSH PRIVATE KEY-----"></textarea>
+        <label for="add-key">Private Key <span class="muted">(OpenSSH, PEM, or PuTTY .ppk)</span></label>
+        <textarea id="add-key" rows="5" spellcheck="false" autocomplete="off" placeholder="-----BEGIN OPENSSH PRIVATE KEY----- or PuTTY-User-Key-File-3: ..."></textarea>
       </div>
       <div id="auth-file" hidden>
-        <label for="add-file">Private Key File</label>
+        <label for="add-file">Private Key File <span class="muted">(OpenSSH id_ed25519 / id_rsa, .pem, or PuTTY .ppk)</span></label>
         <input id="add-file" type="file">
       </div>
       <div id="auth-passphrase" hidden>
-        <label for="add-passphrase">Key Passphrase <span class="muted">(if encrypted)</span></label>
-        <input id="add-passphrase" type="password" autocomplete="off">
+        <label for="add-passphrase">Key Passphrase <span class="muted">(leave empty unless your key is encrypted)</span></label>
+        <input id="add-passphrase" type="password" autocomplete="new-password" placeholder="Leave empty for unencrypted keys">
       </div>
 
       <label class="check-card" id="add-update-row">
@@ -811,7 +811,7 @@
           <span class="step-num">6</span>
           <span>
             <span class="step-title">Forward Real User IP (PROXY Protocol)</span>
-            <span class="step-sub">Only enable this if your X-UI / Nginx / inbound service has "Accept Proxy Protocol" enabled.</span>
+            <span class="step-sub">Passes each visitor's IP to X-UI / Nginx when "Accept Proxy Protocol" is enabled on that inbound (auto-bypasses if the inbound rejects it).</span>
           </span>
         </legend>
         <div class="choice-grid cols-3">
@@ -1005,7 +1005,7 @@
           <span class="step-num">3</span>
           <span>
             <span class="step-title">Forward Real User IP (PROXY Protocol)</span>
-            <span class="step-sub">Only enable this if your X-UI / Nginx / inbound service has "Accept Proxy Protocol" enabled.</span>
+            <span class="step-sub">Passes each visitor's IP to X-UI / Nginx when "Accept Proxy Protocol" is enabled on that inbound (auto-bypasses if the inbound rejects it).</span>
           </span>
         </legend>
         <div class="choice-grid cols-3">

@@ -358,9 +358,11 @@ func (e *edge) acceptUsers(ctx context.Context, ln net.Listener, st *status) {
 		case e.active <- struct{}{}:
 			e.wg.Add(1)
 			atomic.AddInt64(&st.activeSessions, 1)
-			go func(user net.Conn) {
+			clientIP := st.addClient(c.RemoteAddr())
+			go func(user net.Conn, ip string) {
 				defer e.wg.Done()
 				defer func() {
+					st.removeClient(ip)
 					atomic.AddInt64(&st.activeSessions, -1)
 					<-e.active
 				}()
@@ -374,7 +376,7 @@ func (e *edge) acceptUsers(ctx context.Context, ln net.Listener, st *status) {
 					atomic.AddInt64(&st.failedSessions, 1)
 					e.logSession.printf("could not put a user on the tunnel: %v", err)
 				}
-			}(c)
+			}(c, clientIP)
 		default:
 			atomic.AddInt64(&st.droppedSessions, 1)
 			e.logCapacity.printf("at capacity (%d sessions); dropping a user", e.cfg.MaxConn)

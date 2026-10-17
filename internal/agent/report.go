@@ -26,6 +26,7 @@ import (
 type TunnelLive struct {
 	UptimeSeconds  int64  `json:"uptime_seconds"`
 	ActiveSessions int64  `json:"active_sessions"`
+	ActiveUsers    int    `json:"active_users"`
 	ParkedSpares   int64  `json:"parked_spares"`
 	PoolTarget     int    `json:"pool_target"`
 	Links          int    `json:"links"`

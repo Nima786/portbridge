@@ -5,6 +5,7 @@ import (
 	"io"
 	"net"
 	"sync"
+	"time"
 )
 
 // closeWriter is anything that can finish sending without closing the whole
@@ -12,6 +13,11 @@ import (
 type closeWriter interface {
 	CloseWrite() error
 }
+
+// halfCloseGrace bounds how long the remaining direction of a session may sit
+// after the other side has finished and half-closed. Without this, a client
+// whose socket stays in FIN-WAIT-2 across NAT holds its session slot forever.
+const halfCloseGrace = 20 * time.Second
 
 // copyChunk is how much a single copy step moves. Large enough that the
 // per-step cost disappears against the work of actually sending the bytes.
@@ -72,6 +78,7 @@ func relay(local, tunnel net.Conn) error {
 		// whole thing would truncate the other direction.
 		if cw, ok := dst.(closeWriter); ok {
 			_ = cw.CloseWrite()
+			_ = dst.SetReadDeadline(time.Now().Add(halfCloseGrace))
 		} else {
 			_ = dst.Close()
 		}

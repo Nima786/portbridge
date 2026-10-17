@@ -3,8 +3,10 @@ package engine
 import (
 	"context"
 	"encoding/json"
+	"net"
 	"os"
 	"path/filepath"
+	"sync"
 	"sync/atomic"
 	"time"
 )
@@ -25,6 +27,9 @@ type status struct {
 	parkedSpares     int64
 	retries          int64
 	emptyConnections int64
+
+	clientMu  sync.Mutex
+	clientIPs map[string]int
 }
 
 type statusFile struct {
@@ -39,6 +44,7 @@ type statusFile struct {
 	StartedAt      string `json:"started_at"`
 	UptimeSeconds  int64  `json:"uptime_seconds"`
 	ActiveSessions int64  `json:"active_sessions"`
+	ActiveUsers    int    `json:"active_users"`
 	ParkedSpares   int64  `json:"parked_spares"`
 	PoolTarget     int    `json:"pool_target"`
 	// Mux and the two counts below replace the spare pool when sessions share a
@@ -148,6 +154,7 @@ func (s *status) writeOnce() {
 		StartedAt:        s.started.UTC().Format(time.RFC3339),
 		UptimeSeconds:    int64(time.Since(s.started).Seconds()),
 		ActiveSessions:   atomic.LoadInt64(&s.activeSessions),
+		ActiveUsers:      s.uniqueClients(),
 		ParkedSpares:     parked,
 		PoolTarget:       s.cfg.PoolSize,
 		Mux:              s.cfg.Mux,
@@ -179,4 +186,62 @@ func (s *status) writeOnce() {
 		return
 	}
 	_ = os.Rename(tmp, s.cfg.StatusFile)
+}
+
+func normalizeClientIP(addr net.Addr) string {
+	if addr == nil {
+		return ""
+	}
+	if tcp, ok := addr.(*net.TCPAddr); ok && tcp.IP != nil {
+		if v4 := tcp.IP.To4(); v4 != nil {
+			return v4.String()
+		}
+		return tcp.IP.String()
+	}
+	host, _, err := net.SplitHostPort(addr.String())
+	if err != nil {
+		host = addr.String()
+	}
+	if ip := net.ParseIP(host); ip != nil {
+		if v4 := ip.To4(); v4 != nil {
+			return v4.String()
+		}
+		return ip.String()
+	}
+	return host
+}
+
+func (s *status) addClient(addr net.Addr) string {
+	ip := normalizeClientIP(addr)
+	if ip == "" {
+		return ""
+	}
+	s.clientMu.Lock()
+	if s.clientIPs == nil {
+		s.clientIPs = make(map[string]int)
+	}
+	s.clientIPs[ip]++
+	s.clientMu.Unlock()
+	return ip
+}
+
+func (s *status) removeClient(ip string) {
+	if ip == "" {
+		return
+	}
+	s.clientMu.Lock()
+	if s.clientIPs != nil {
+		s.clientIPs[ip]--
+		if s.clientIPs[ip] <= 0 {
+			delete(s.clientIPs, ip)
+		}
+	}
+	s.clientMu.Unlock()
+}
+
+func (s *status) uniqueClients() int {
+	s.clientMu.Lock()
+	n := len(s.clientIPs)
+	s.clientMu.Unlock()
+	return n
 }

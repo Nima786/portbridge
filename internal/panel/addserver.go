@@ -155,19 +155,9 @@ func (p *Panel) startAdd(r addRequest) (string, error) {
 func sshAuth(r addRequest) ([]ssh.AuthMethod, error) {
 	var methods []ssh.AuthMethod
 	if key := strings.TrimSpace(r.PrivateKey); key != "" {
-		var signer ssh.Signer
-		var err error
-		if r.Passphrase != "" {
-			signer, err = ssh.ParsePrivateKeyWithPassphrase([]byte(key+"\n"), []byte(r.Passphrase))
-		} else {
-			signer, err = ssh.ParsePrivateKey([]byte(key + "\n"))
-		}
-		var missing *ssh.PassphraseMissingError
-		switch {
-		case errors.As(err, &missing):
-			return nil, errors.New("that private key is protected by a passphrase; give it too")
-		case err != nil:
-			return nil, fmt.Errorf("that private key could not be read: %v", err)
+		signer, err := parseAnyPrivateKey(key, r.Passphrase)
+		if err != nil {
+			return nil, err
 		}
 		methods = append(methods, ssh.PublicKeys(signer))
 	}

@@ -439,3 +439,103 @@ func TestSummarySaysUsersAddressesArePassedOn(t *testing.T) {
 		}
 	}
 }
+
+// When the user enables proxy_protocol (v1 or v2) on the tunnel, but the
+// destination service (e.g. Xray REALITY without acceptProxyProtocol) rejects
+// the PROXY header with a TLS fatal alert or immediate close, origin
+// automatically falls back to a clean connection without breaking the tunnel.
+func TestServiceRejectingProxyHeaderAutoFallsBack(t *testing.T) {
+	startStrictTLSService := func(t *testing.T) string {
+		t.Helper()
+		ln, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		var wg sync.WaitGroup
+		go func() {
+			for {
+				c, err := ln.Accept()
+				if err != nil {
+					return
+				}
+				wg.Add(1)
+				go func() {
+					defer wg.Done()
+					defer c.Close()
+					_ = c.SetDeadline(time.Now().Add(10 * time.Second))
+					r := bufio.NewReader(c)
+					b6, _ := r.Peek(6)
+					b12, _ := r.Peek(12)
+					if string(b6) == "PROXY " || bytes.Equal(b12, proxyproto.V2Signature) {
+						// Reply with TLS fatal alert 70 (protocol_version) and close,
+						// matching Xray REALITY when acceptProxyProtocol is off.
+						_, _ = c.Write([]byte{0x15, 0x03, 0x01, 0x00, 0x02, 0x02, 0x46})
+						return
+					}
+					buf := make([]byte, 8192)
+					for {
+						n, err := r.Read(buf)
+						if n > 0 {
+							if _, werr := c.Write(bytes.ToUpper(buf[:n])); werr != nil {
+								return
+							}
+						}
+						if err != nil {
+							return
+						}
+					}
+				}()
+			}
+		}()
+		t.Cleanup(func() { _ = ln.Close(); wg.Wait() })
+		return ln.Addr().String()
+	}
+
+	for _, version := range []int{proxyproto.V1, proxyproto.V2} {
+		t.Run(proxyproto.SettingName(version), func(t *testing.T) {
+			logs := captureLog(t)
+			svcAddr := startStrictTLSService(t)
+			users := startPPTunnel(t, ppTunnelOpts{
+				mode:      ModeReverse,
+				transport: TransportTLS,
+				edgePP:    version,
+				originPP:  version,
+				services:  []string{svcAddr},
+			})
+			// Both the first connection (which triggers auto-detection & retry)
+			// and subsequent connections (which use the cached bypass) must succeed.
+			for i := 0; i < 3; i++ {
+				visit(t, users[0], fmt.Sprintf("still-works-without-accept-pp-%d", i))
+			}
+			if !strings.Contains(logs.String(), "rejected the PROXY protocol") {
+				t.Fatalf("expected auto-fallback log message, got:\n%s", logs.String())
+			}
+		})
+	}
+}
+
+func TestUniqueClientsTracked(t *testing.T) {
+	st := newStatus(DefaultConfig())
+	a1 := tcpAddr(t, "198.51.100.10:40001")
+	a2 := tcpAddr(t, "198.51.100.10:40002")
+	b1 := tcpAddr(t, "203.0.113.25:50001")
+
+	ipA1 := st.addClient(a1)
+	ipA2 := st.addClient(a2)
+	ipB1 := st.addClient(b1)
+	if got := st.uniqueClients(); got != 2 {
+		t.Fatalf("uniqueClients = %d, want 2 (two connections from 198.51.100.10 + one from 203.0.113.25)", got)
+	}
+	st.removeClient(ipA1)
+	if got := st.uniqueClients(); got != 2 {
+		t.Fatalf("uniqueClients after closing one of A's connections = %d, want 2", got)
+	}
+	st.removeClient(ipA2)
+	if got := st.uniqueClients(); got != 1 {
+		t.Fatalf("uniqueClients after closing both of A's connections = %d, want 1", got)
+	}
+	st.removeClient(ipB1)
+	if got := st.uniqueClients(); got != 0 {
+		t.Fatalf("uniqueClients after closing all connections = %d, want 0", got)
+	}
+}

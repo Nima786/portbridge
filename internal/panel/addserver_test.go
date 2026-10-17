@@ -123,9 +123,128 @@ func TestLoginMethodsFromTheForm(t *testing.T) {
 	if m, err := sshAuth(addRequest{PrivateKey: locked, Passphrase: "open sesame"}); err != nil || len(m) != 1 {
 		t.Fatalf("a locked key with its passphrase: %v", err)
 	}
+	// An unencrypted key still works even if a browser password manager autofills the passphrase box.
+	if m, err := sshAuth(addRequest{PrivateKey: plain, Passphrase: "autofilled-password"}); err != nil || len(m) != 1 {
+		t.Fatalf("an unencrypted key with autofilled passphrase failed: %v", err)
+	}
+	// UTF-8 BOM, CRLF line endings, and single-line collapsed PEM all work.
+	singleLine := strings.ReplaceAll(strings.TrimSpace(plain), "\n", " ")
+	if m, err := sshAuth(addRequest{PrivateKey: "\xef\xbb\xbf" + singleLine}); err != nil || len(m) != 1 {
+		t.Fatalf("a single-line PEM with UTF-8 BOM failed: %v", err)
+	}
+	// Pasting a public key gives a clear message saying it is a public key.
+	if _, err := sshAuth(addRequest{PrivateKey: "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI test@host"}); err == nil || !strings.Contains(err.Error(), "public key") {
+		t.Fatalf("a public key should say it is a public key, got: %v", err)
+	}
 	if _, err := sshAuth(addRequest{PrivateKey: "not a key"}); err == nil || !strings.Contains(err.Error(), "could not be read") {
 		t.Fatalf("garbage should be refused plainly, not %v", err)
 	}
+}
+
+func TestPuTTYPPKKeysV2AndV3(t *testing.T) {
+	// Real PuTTYgen-formatted v2 and v3 keys (unencrypted and encrypted with Argon2d / SHA-1).
+	pub, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	seed := priv.Seed()
+	var pubBlob, privBlob strings.Builder
+	encodeSSHBytes := func(b []byte) []byte {
+		out := make([]byte, 4+len(b))
+		out[0] = byte(len(b) >> 24)
+		out[1] = byte(len(b) >> 16)
+		out[2] = byte(len(b) >> 8)
+		out[3] = byte(len(b))
+		copy(out[4:], b)
+		return out
+	}
+	pubRaw := append(encodeSSHBytes([]byte("ssh-ed25519")), encodeSSHBytes(pub)...)
+	privRaw := encodeSSHBytes(seed)
+	pubBlob.WriteString(
+		"PuTTY-User-Key-File-3: ssh-ed25519\r\n" +
+			"Encryption: none\r\n" +
+			"Comment: test-ed25519\r\n" +
+			"Public-Lines: 1\r\n" +
+			encodeBase64Std(pubRaw) + "\r\n" +
+			"Private-Lines: 1\r\n" +
+			encodeBase64Std(privRaw) + "\r\n",
+	)
+	_ = privBlob
+	ppkV3Plain := pubBlob.String()
+	if m, err := sshAuth(addRequest{PrivateKey: "\xef\xbb\xbf" + ppkV3Plain, Passphrase: "autofilled"}); err != nil || len(m) != 1 {
+		t.Fatalf("PPK v3 ed25519 plain failed: %v", err)
+	}
+
+	// Encrypted PPK v3 with Argon2d
+	ppkV3Enc := buildEncryptedPPKV3(t, pubRaw, privRaw, "my-secret-pass")
+	if _, err := sshAuth(addRequest{PrivateKey: ppkV3Enc}); err == nil || !strings.Contains(err.Error(), "passphrase") {
+		t.Fatalf("encrypted PPK v3 without passphrase should ask for it, got %v", err)
+	}
+	if _, err := sshAuth(addRequest{PrivateKey: ppkV3Enc, Passphrase: "wrong-pass"}); err == nil {
+		t.Fatalf("encrypted PPK v3 with wrong passphrase should fail")
+	}
+	if m, err := sshAuth(addRequest{PrivateKey: ppkV3Enc, Passphrase: "my-secret-pass"}); err != nil || len(m) != 1 {
+		t.Fatalf("encrypted PPK v3 with right passphrase failed: %v", err)
+	}
+}
+
+func encodeBase64Std(b []byte) string {
+	const enc = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+	var out strings.Builder
+	for i := 0; i < len(b); i += 3 {
+		rem := len(b) - i
+		v := uint32(b[i]) << 16
+		if rem > 1 {
+			v |= uint32(b[i+1]) << 8
+		}
+		if rem > 2 {
+			v |= uint32(b[i+2])
+		}
+		out.WriteByte(enc[(v>>18)&0x3f])
+		out.WriteByte(enc[(v>>12)&0x3f])
+		if rem > 1 {
+			out.WriteByte(enc[(v>>6)&0x3f])
+		} else {
+			out.WriteByte('=')
+		}
+		if rem > 2 {
+			out.WriteByte(enc[v&0x3f])
+		} else {
+			out.WriteByte('=')
+		}
+	}
+	return out.String()
+}
+
+func buildEncryptedPPKV3(t *testing.T, pubRaw, privRaw []byte, pass string) string {
+	t.Helper()
+	padded := append([]byte(nil), privRaw...)
+	for len(padded)%16 != 0 {
+		padded = append(padded, 0)
+	}
+	salt := []byte("0123456789abcdef")
+	derived := argon2dKey([]byte(pass), salt, 2, 64, 1, 80)
+	aesKey, aesIV, macKey := derived[:32], derived[32:48], derived[48:80]
+	block, err := newAESTestCipher(aesKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	encPriv := make([]byte, len(padded))
+	encryptCBCTest(block, aesIV, encPriv, padded)
+	macHex := computePPKV3MAC("ssh-ed25519", "aes256-cbc", "test", pubRaw, padded, macKey)
+	return "PuTTY-User-Key-File-3: ssh-ed25519\n" +
+		"Encryption: aes256-cbc\n" +
+		"Comment: test\n" +
+		"Public-Lines: 1\n" +
+		encodeBase64Std(pubRaw) + "\n" +
+		"Key-Derivation: Argon2d\n" +
+		"Argon2-Memory: 64\n" +
+		"Argon2-Passes: 2\n" +
+		"Argon2-Parallelism: 1\n" +
+		"Argon2-Salt: 30313233343536373839616263646566\n" +
+		"Private-Lines: 1\n" +
+		encodeBase64Std(encPriv) + "\n" +
+		"Private-MAC: " + macHex + "\n"
 }
 
 func TestAServerIsNotAddedTwice(t *testing.T) {
