@@ -52,6 +52,8 @@ type TunnelInfo struct {
 	Mux           bool        `json:"mux"`
 	MuxLinks      int         `json:"mux_links,omitempty"`
 	PoolSize      int         `json:"pool_size,omitempty"`
+	MaxConn       int         `json:"max_conn,omitempty"`
+	Firewall      bool        `json:"firewall"`
 	CDN           bool        `json:"cdn"`
 	GRE           bool        `json:"gre"`
 	RealSite      bool        `json:"real_site"`
@@ -65,13 +67,16 @@ type TunnelInfo struct {
 
 // Overview is everything the panel shows about one server.
 type Overview struct {
-	OK       bool         `json:"ok"`
-	Version  string       `json:"version"`
-	Hostname string       `json:"hostname"`
-	Arch     string       `json:"arch"`
-	IPv4     []string     `json:"ipv4"`
-	IPv6     []string     `json:"ipv6"`
-	Tunnels  []TunnelInfo `json:"tunnels"`
+	OK                bool         `json:"ok"`
+	Version           string       `json:"version"`
+	Hostname          string       `json:"hostname"`
+	Arch              string       `json:"arch"`
+	IPv4              []string     `json:"ipv4"`
+	IPv6              []string     `json:"ipv6"`
+	BBRActive         bool         `json:"bbr_active"`
+	TunedByPB         bool         `json:"tuned_by_pb"`
+	CongestionControl string       `json:"congestion_control,omitempty"`
+	Tunnels           []TunnelInfo `json:"tunnels"`
 }
 
 // statusStaleAfter is how old a status file may be before the tunnel is taken to
@@ -125,6 +130,8 @@ func tunnelInfo(path string, host agentHost) TunnelInfo {
 	ti.CDN = cfg.CDN
 	ti.GRE = cfg.GRE
 	ti.RealSite = cfg.RealSite
+	ti.MaxConn = cfg.MaxConn
+	ti.Firewall = cfg.Firewall != "off"
 	ti.ProxyProtocol = "off"
 	if cfg.ProxyProtocol != 0 {
 		ti.ProxyProtocol = "v" + strconv.Itoa(cfg.ProxyProtocol)
@@ -186,13 +193,17 @@ func TunnelsReport(confDir string) []TunnelInfo {
 func LocalOverview(confDir string) Overview {
 	v4, v6 := localPublicAddresses()
 	host, _ := os.Hostname()
+	tune := readTuneStatus(confDir)
 	return Overview{
-		OK:       true,
-		Version:  engine.Version,
-		Hostname: host,
-		Arch:     runtime.GOARCH,
-		IPv4:     v4,
-		IPv6:     v6,
-		Tunnels:  TunnelsReport(confDir),
+		OK:                true,
+		Version:           engine.Version,
+		Hostname:          host,
+		Arch:              runtime.GOARCH,
+		IPv4:              v4,
+		IPv6:              v6,
+		BBRActive:         tune.BBRActive,
+		TunedByPB:         tune.TunedByPB,
+		CongestionControl: tune.CongestionControl,
+		Tunnels:           TunnelsReport(confDir),
 	}
 }

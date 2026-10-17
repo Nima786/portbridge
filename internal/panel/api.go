@@ -59,10 +59,16 @@ func (p *Panel) routes() http.Handler {
 	mux.HandleFunc("GET /api/jobs/{id}", p.withAuth(p.handleJob))
 	mux.HandleFunc("GET /api/tunnels", p.withAuth(p.handleTunnels))
 	mux.HandleFunc("POST /api/tunnels", p.withAuth(p.handleCreateTunnel))
+	mux.HandleFunc("POST /api/tunnels/edit", p.withAuth(p.handleEditTunnel))
 	mux.HandleFunc("POST /api/tunnels/delete", p.withAuth(p.handleDeleteTunnel))
 	mux.HandleFunc("POST /api/tunnels/service", p.withAuth(p.handleServiceTunnel))
 	mux.HandleFunc("POST /api/tunnels/code", p.withAuth(p.handleTunnelCode))
+	mux.HandleFunc("POST /api/tunnels/logs", p.withAuth(p.handleTunnelLogs))
+	mux.HandleFunc("POST /api/tunnels/check", p.withAuth(p.handleCheckTunnel))
+	mux.HandleFunc("POST /api/tunnels/speedtest", p.withAuth(p.handleSpeedtestTunnel))
 	mux.HandleFunc("POST /api/ports", p.withAuth(p.handlePorts))
+	mux.HandleFunc("GET /api/servers/{id}/tune", p.withAuth(p.handleGetServerTune))
+	mux.HandleFunc("POST /api/servers/{id}/tune", p.withAuth(p.handleSetServerTune))
 	mux.HandleFunc("GET /api/updates", p.withAuth(p.handleUpdates))
 	mux.HandleFunc("POST /api/updates", p.withAuth(p.handleStartUpdate))
 	mux.HandleFunc("POST /api/updates/check", p.withAuth(p.handleCheckUpdates))
@@ -636,6 +642,104 @@ func (p *Panel) handleSSHUpdate(w http.ResponseWriter, r *http.Request, _ authed
 	}
 	id := p.startJob(func(j *job) (string, error) { return srv.ID, p.sshUpdate(j, srv, req) })
 	writeJSON(w, http.StatusAccepted, map[string]string{"job": id})
+}
+
+func (p *Panel) handleEditTunnel(w http.ResponseWriter, r *http.Request, _ authed) {
+	var req editTunnelRequest
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	id, err := p.startEditTunnel(req)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, capitalise(err.Error())+".")
+		return
+	}
+	writeJSON(w, http.StatusAccepted, map[string]string{"job": id})
+}
+
+func (p *Panel) handleTunnelLogs(w http.ResponseWriter, r *http.Request, _ authed) {
+	var t tunnelTarget
+	if !decodeJSON(w, r, &t) {
+		return
+	}
+	if err := p.knownTarget(t); err != nil {
+		writeErr(w, http.StatusBadRequest, capitalise(err.Error())+".")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"results": p.tunnelLogs(r.Context(), t)})
+}
+
+func (p *Panel) handleCheckTunnel(w http.ResponseWriter, r *http.Request, _ authed) {
+	var t tunnelTarget
+	if !decodeJSON(w, r, &t) {
+		return
+	}
+	if err := p.knownTarget(t); err != nil {
+		writeErr(w, http.StatusBadRequest, capitalise(err.Error())+".")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"results": p.checkTunnel(r.Context(), t)})
+}
+
+func (p *Panel) handleSpeedtestTunnel(w http.ResponseWriter, r *http.Request, _ authed) {
+	var t tunnelTarget
+	if !decodeJSON(w, r, &t) {
+		return
+	}
+	if err := p.knownTarget(t); err != nil {
+		writeErr(w, http.StatusBadRequest, capitalise(err.Error())+".")
+		return
+	}
+	srvName, out, err := p.speedtestTunnel(r.Context(), t)
+	if err != nil {
+		writeJSON(w, http.StatusUnprocessableEntity, map[string]any{
+			"ok":     false,
+			"server": srvName,
+			"output": out,
+			"error":  capitalise(plainAgentError(err)) + ".",
+		})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":     true,
+		"server": srvName,
+		"output": out,
+	})
+}
+
+func (p *Panel) handleGetServerTune(w http.ResponseWriter, r *http.Request, _ authed) {
+	id := r.PathValue("id")
+	if _, ok := p.viewOf(id); !ok {
+		writeErr(w, http.StatusNotFound, "That server is not in the panel.")
+		return
+	}
+	info, err := p.getServerTune(r.Context(), id)
+	if err != nil {
+		writeErr(w, http.StatusBadGateway, capitalise(plainAgentError(err))+".")
+		return
+	}
+	writeJSON(w, http.StatusOK, info)
+}
+
+func (p *Panel) handleSetServerTune(w http.ResponseWriter, r *http.Request, _ authed) {
+	id := r.PathValue("id")
+	if _, ok := p.viewOf(id); !ok {
+		writeErr(w, http.StatusNotFound, "That server is not in the panel.")
+		return
+	}
+	var req struct {
+		Enable bool `json:"enable"`
+	}
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	info, err := p.setServerTune(r.Context(), id, req.Enable)
+	if err != nil {
+		writeErr(w, http.StatusBadGateway, capitalise(plainAgentError(err))+".")
+		return
+	}
+	p.refreshOne(id)
+	writeJSON(w, http.StatusOK, info)
 }
 
 // capitalise starts a message with a capital letter, for showing on its own.

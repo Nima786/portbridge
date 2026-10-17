@@ -329,7 +329,22 @@ func CmdSpeedtest(args []string) {
 		os.Exit(2)
 	}
 
-	// If given a short tunnel name (e.g. ir-nl), locate its file in /etc/portbridge/tunnels/
+	output, err := RunSpeedtest(path, *sizeMB)
+	if output != "" {
+		fmt.Print(output)
+		if !strings.HasSuffix(output, "\n") {
+			fmt.Println()
+		}
+	}
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "%v\n", err)
+		os.Exit(1)
+	}
+}
+
+// RunSpeedtest runs an in-tunnel latency, download, and upload test for the
+// tunnel described by confPath and returns the human-readable report.
+func RunSpeedtest(path string, sizeMB float64) (string, error) {
 	if !strings.HasSuffix(path, ".conf") && !strings.Contains(path, "/") && !strings.Contains(path, "\\") {
 		stdPath := filepath.Join("/etc/portbridge/tunnels", path+".conf")
 		if _, err := os.Stat(stdPath); err == nil {
@@ -341,26 +356,24 @@ func CmdSpeedtest(args []string) {
 
 	cfg, err := LoadConfig(path)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "config error: %v\n", err)
-		os.Exit(1)
+		return "", fmt.Errorf("config error: %w", err)
 	}
 	if err := cfg.Validate(); err != nil {
-		fmt.Fprintf(os.Stderr, "config %s: %v\n", path, err)
-		os.Exit(1)
+		return "", fmt.Errorf("config %s: %w", path, err)
 	}
 	if err := cfg.LoadSecret(); err != nil {
-		fmt.Fprintf(os.Stderr, "config %s: %v\n", path, err)
-		os.Exit(1)
+		return "", fmt.Errorf("config %s: %w", path, err)
 	}
+
+	var buf strings.Builder
 
 	// 1. If this server dials, dial the peer and run the speedtest directly
 	if cfg.Dials() {
 		routes := newRouter(cfg)
-		fmt.Printf("Connecting to %s (%s)...\n", cfg.Name, routes.describe())
+		fmt.Fprintf(&buf, "Connecting to %s (%s)...\n", cfg.Name, routes.describe())
 		raw, claim, err := routes.dial(10 * time.Second)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "dial error: %v\n", err)
-			os.Exit(1)
+			return buf.String(), fmt.Errorf("dial error: %w", err)
 		}
 		defer raw.Close()
 		tuneSocket(raw)
@@ -369,38 +382,41 @@ func CmdSpeedtest(args []string) {
 		// upgrade request, and a speed test announced as a tunnel never works.
 		c, err := wrapDialPurpose(raw, cfg.withClaimedName(claim), authPurposeSpeedtest)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "securing link: %v\n", err)
-			os.Exit(1)
+			return buf.String(), fmt.Errorf("securing link: %w", err)
 		}
 		defer c.Close()
 
 		if err := sendAuthPurpose(c, cfg.secret, authPurposeSpeedtest); err != nil {
-			fmt.Fprintf(os.Stderr, "auth error: %v\n", err)
-			os.Exit(1)
+			return buf.String(), fmt.Errorf("auth error: %w", err)
 		}
 
-		if err := runSpeedtestClient(c, cfg, os.Stdout, *sizeMB); err != nil {
-			fmt.Fprintf(os.Stderr, "speedtest error: %v\n", err)
-			os.Exit(1)
+		if err := runSpeedtestClient(c, cfg, &buf, sizeMB); err != nil {
+			return buf.String(), fmt.Errorf("speedtest error: %w", err)
 		}
-		return
+		return buf.String(), nil
 	}
 
 	// 2. If this server accepts, check if the running daemon can run a speedtest via control socket
 	sockPath := cfg.ControlSocketPath()
 	if c, err := net.DialTimeout("unix", sockPath, 2*time.Second); err == nil {
 		defer c.Close()
-		_ = c.SetDeadline(time.Now().Add(60 * time.Second))
+		_ = c.SetDeadline(time.Now().Add(120 * time.Second))
 		if _, err := fmt.Fprintln(c, "speedtest"); err == nil {
 			sc := bufio.NewScanner(c)
 			for sc.Scan() {
-				fmt.Println(sc.Text())
+				fmt.Fprintln(&buf, sc.Text())
 			}
-			return
+			out := buf.String()
+			if !strings.Contains(out, "RTT:") {
+				msg := strings.TrimSpace(out)
+				if msg == "" {
+					msg = "speedtest did not complete"
+				}
+				return out, fmt.Errorf("%s", msg)
+			}
+			return out, nil
 		}
 	}
 
-	fmt.Fprintf(os.Stderr, "Tunnel %q waits for incoming connections on this server.\nPlease run 'portbridge speedtest %s' on the other server (%s).\n",
-		cfg.Name, cfg.Name, cfg.PeerIP)
-	os.Exit(1)
+	return "", fmt.Errorf("Tunnel %q is not running on this server, or cannot initiate a speedtest right now.", cfg.Name)
 }

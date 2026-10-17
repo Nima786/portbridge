@@ -58,11 +58,12 @@ type EdgeSpec struct {
 	ServicePorts string `json:"service_ports"` // the service on the foreign server: "443,8443"
 }
 
-// EdgeResult is what making the Iran half gives back.
+// EdgeResult is what making or editing the Iran half gives back.
 type EdgeResult struct {
 	OK       bool     `json:"ok"`
 	Name     string   `json:"name"`
-	Code     string   `json:"code"` // the pairing code for the foreign server
+	Code     string   `json:"code"`               // the pairing code for the foreign server
+	OldConf  string   `json:"old_conf,omitempty"` // previous config text when staging an edit
 	Warnings []string `json:"warnings,omitempty"`
 	Error    string   `json:"error,omitempty"`
 }
@@ -760,4 +761,671 @@ func tunnelService(confDir, name, action string) error {
 		return fmt.Errorf("%s: %s", action, out)
 	}
 	return nil
+}
+
+// ---------------------------------------------------------------------------
+// Editing a tunnel, viewing logs, diagnostics, speed test, and BBR tuning
+// ---------------------------------------------------------------------------
+
+// EditSpec describes changes to an existing tunnel, matching the CLI menu's
+// "Edit a tunnel" options (ports, real user IP, pool/mux links, max_conn, firewall).
+type EditSpec struct {
+	Name          string `json:"name"`
+	UserPorts     string `json:"user_ports,omitempty"`
+	ServicePorts  string `json:"service_ports,omitempty"`
+	LinkPort      int    `json:"link_port,omitempty"`
+	ProxyProtocol string `json:"proxy_protocol,omitempty"` // "off", "v1" or "v2"
+	Pool          int    `json:"pool,omitempty"`
+	MuxLinks      int    `json:"mux_links,omitempty"`
+	MaxConn       int    `json:"max_conn,omitempty"`
+	Firewall      string `json:"firewall,omitempty"` // "on" or "off"
+	Stage         string `json:"stage,omitempty"`    // "", "prepare", "commit", "rollback"
+	OldConf       string `json:"old_conf,omitempty"`
+}
+
+func setConfKey(text, key, val string) string {
+	lines := strings.Split(text, "\n")
+	replaced := false
+	for i, l := range lines {
+		t := strings.TrimSpace(l)
+		if t == "" || strings.HasPrefix(t, "#") {
+			continue
+		}
+		k, _, ok := strings.Cut(t, "=")
+		if ok && strings.TrimSpace(k) == key {
+			lines[i] = key + " = " + val
+			replaced = true
+		}
+	}
+	if !replaced {
+		if len(lines) > 0 && lines[len(lines)-1] == "" {
+			lines[len(lines)-1] = key + " = " + val
+			lines = append(lines, "")
+		} else {
+			lines = append(lines, key+" = "+val)
+		}
+	}
+	return strings.Join(lines, "\n")
+}
+
+func replaceAddrPort(addr string, port int) string {
+	p := strconv.Itoa(port)
+	if h, _, err := net.SplitHostPort(addr); err == nil {
+		return net.JoinHostPort(h, p)
+	}
+	if i := strings.LastIndex(addr, ":"); i >= 0 {
+		return addr[:i+1] + p
+	}
+	return "0.0.0.0:" + p
+}
+
+func intInSlice(n int, list []int) bool {
+	for _, x := range list {
+		if x == n {
+			return true
+		}
+	}
+	return false
+}
+
+// EditEdge changes the ports and settings of a tunnel on its Relay (edge) server
+// and returns the updated pairing code for the Foreign server.
+func EditEdge(spec EditSpec, confDir string) (EdgeResult, error) {
+	if confDir == "" {
+		confDir = defaultTunnelsDir
+	}
+	res := EdgeResult{Name: spec.Name}
+	if err := validTunnelName(spec.Name); err != nil {
+		return res, err
+	}
+
+	agentOpMu.Lock()
+	defer agentOpMu.Unlock()
+	host := hostFor(confDir)
+
+	confFile := filepath.Join(confDir, spec.Name+".conf")
+	oldBytes, err := os.ReadFile(confFile)
+	if err != nil {
+		return res, fmt.Errorf("there is no tunnel %q on this server", spec.Name)
+	}
+	oldConf := string(oldBytes)
+
+	switch spec.Stage {
+	case "rollback":
+		if spec.OldConf != "" {
+			_ = writeFileAtomic(confFile, []byte(spec.OldConf), 0o600)
+		}
+		res.OK = true
+		return res, nil
+
+	case "commit":
+		restore := func() {
+			if spec.OldConf != "" {
+				_ = writeFileAtomic(confFile, []byte(spec.OldConf), 0o600)
+				_ = host.FirewallApply(spec.Name)
+				_ = host.Restart(spec.Name)
+			}
+		}
+		cfg, err := engine.LoadConfig(confFile)
+		if err != nil {
+			restore()
+			return res, err
+		}
+		if err := host.FirewallApply(spec.Name); err != nil {
+			if cfg.GRE {
+				restore()
+				return res, fmt.Errorf("this server could not make the private GRE link: %w", err)
+			}
+			res.Warnings = append(res.Warnings, err.Error())
+		}
+		if err := host.Restart(spec.Name); err != nil && !errors.Is(err, errNoSystemd) {
+			restore()
+			return res, err
+		}
+		if err := confirmRunning(host, spec.Name); err != nil {
+			restore()
+			return res, err
+		}
+		code, _ := edgePairingCode(confDir, spec.Name)
+		res.OK = true
+		res.Code = code
+		return res, nil
+
+	case "", "prepare":
+	default:
+		return res, fmt.Errorf("unknown edit stage %q", spec.Stage)
+	}
+
+	curCfg, err := engine.LoadConfig(confFile)
+	if err != nil {
+		return res, fmt.Errorf("reading current settings: %w", err)
+	}
+	kv, err := readConfKeys(confFile)
+	if err != nil {
+		return res, err
+	}
+
+	text := oldConf
+
+	if curCfg.Role == engine.RoleEdge {
+		curUsers := portsIn(curCfg.UserListen)
+		curServices := portsIn(curCfg.ServerInboundPort)
+		if len(curServices) == 0 {
+			curServices = curUsers
+		}
+		curLink := 0
+		if ps := portsIn(curCfg.TunnelAddr); len(ps) > 0 {
+			curLink = ps[0]
+		}
+
+		uPorts := joinPorts(spec.UserPorts, ", ")
+		sPorts := joinPorts(spec.ServicePorts, ",")
+		if uPorts == "" && sPorts != "" {
+			uPorts = joinPorts(sPorts, ", ")
+		}
+		if uPorts == "" {
+			uPorts = joinPorts(curCfg.UserListen, ", ")
+		}
+		if sPorts == "" {
+			sPorts = joinPorts(curCfg.ServerInboundPort, ",")
+			if sPorts == "" {
+				sPorts = joinPorts(uPorts, ",")
+			}
+		}
+		linkPort := spec.LinkPort
+		if linkPort == 0 {
+			linkPort = curLink
+		}
+		if linkPort < 1 || linkPort > 65535 {
+			return res, errors.New("the port between the servers must be from 1 to 65535")
+		}
+
+		users, services := portsIn(uPorts), portsIn(sPorts)
+		if len(users) == 0 || len(users) != len(strings.Split(uPorts, ",")) {
+			return res, errors.New("give the port or ports your users connect to, as numbers from 1 to 65535")
+		}
+		if len(services) == 0 || len(services) != len(strings.Split(sPorts, ",")) {
+			return res, errors.New("give the inbound port or ports on the foreign server, as numbers from 1 to 65535")
+		}
+		if len(users) != len(services) {
+			return res, errors.New("each user listen port leads to one inbound port, in order, so give the same number of each")
+		}
+		for _, u := range users {
+			if curCfg.Mode == engine.ModeReverse && u == linkPort {
+				return res, fmt.Errorf("the port between the servers cannot also be a user listen port (%d)", u)
+			}
+		}
+		if curCfg.Mode == engine.ModeDirect {
+			for _, sv := range services {
+				if sv == linkPort {
+					return res, fmt.Errorf("the port between the servers cannot also be an inbound port on the foreign server (%d)", sv)
+				}
+			}
+		}
+
+		// Check port clashes on this Relay server, ignoring ports already held by this tunnel itself.
+		var problems []string
+		claimed := portsClaimedByOthers(confDir, spec.Name)
+		owner := func(p int) string {
+			for _, c := range claimed {
+				if c.port == p {
+					return fmt.Sprintf("tunnel %q (%s)", c.tunnel, c.what)
+				}
+			}
+			return ""
+		}
+		for _, u := range users {
+			if o := owner(u); o != "" {
+				problems = append(problems, fmt.Sprintf("user listen port %d is already used on this server by %s", u, o))
+			} else if !intInSlice(u, curUsers) && !(curCfg.Mode == engine.ModeReverse && u == curLink) {
+				if err := host.PortFree(engine.TransportPlain, u); err != nil {
+					problems = append(problems, fmt.Sprintf("user listen port %d is already in use on this server by another program", u))
+				}
+			}
+		}
+		if curCfg.Mode == engine.ModeReverse {
+			t := engine.TransportPlain
+			if curCfg.Transport == engine.TransportKCP {
+				t = engine.TransportKCP
+			}
+			if o := owner(linkPort); o != "" {
+				problems = append(problems, fmt.Sprintf("the port between the servers, %d, is already used on this server by %s", linkPort, o))
+			} else if linkPort != curLink && !intInSlice(linkPort, curUsers) {
+				if err := host.PortFree(t, linkPort); err != nil {
+					problems = append(problems, fmt.Sprintf("the port between the servers, %d, is already in use on this server", linkPort))
+				}
+			}
+		}
+		if len(problems) > 0 {
+			return res, fmt.Errorf("this server cannot use those ports:\n  - %s\nChange them and try again", strings.Join(problems, "\n  - "))
+		}
+
+		text = setConfKey(text, "user_listen", uPorts)
+		text = setConfKey(text, "server_inbound_port", sPorts)
+		text = setConfKey(text, "tunnel_addr", replaceAddrPort(kv["tunnel_addr"], linkPort))
+		if kv["alt_target"] != "" {
+			text = setConfKey(text, "alt_target", replaceAddrPort(kv["alt_target"], linkPort))
+		}
+	}
+
+	if spec.ProxyProtocol != "" {
+		switch spec.ProxyProtocol {
+		case "off", "v1", "v2":
+			text = setConfKey(text, "proxy_protocol", spec.ProxyProtocol)
+		default:
+			return res, fmt.Errorf("real user IP (proxy_protocol) must be off, v1 or v2, got %q", spec.ProxyProtocol)
+		}
+	}
+	if spec.MuxLinks > 0 && curCfg.Mux {
+		if spec.MuxLinks < 1 || spec.MuxLinks > 16 {
+			return res, errors.New("the number of shared connections must be from 1 to 16")
+		}
+		text = setConfKey(text, "mux_links", strconv.Itoa(spec.MuxLinks))
+	}
+	if spec.Pool > 0 && !curCfg.Mux {
+		if spec.Pool < 1 || spec.Pool > 10000 {
+			return res, errors.New("connection pool size must be from 1 to 10000")
+		}
+		text = setConfKey(text, "pool_size", strconv.Itoa(spec.Pool))
+	}
+	if spec.MaxConn > 0 {
+		if spec.MaxConn < 1 || spec.MaxConn > 100000 {
+			return res, errors.New("max_conn must be from 1 to 100000")
+		}
+		text = setConfKey(text, "max_conn", strconv.Itoa(spec.MaxConn))
+	}
+	if spec.Firewall != "" {
+		switch spec.Firewall {
+		case "on":
+			if curCfg.CDN || curCfg.AltTarget != "" || curCfg.GRE {
+				res.Warnings = append(res.Warnings, "firewall stays off for CDN and GRE tunnels")
+			} else {
+				text = setConfKey(text, "firewall", "on")
+			}
+		case "off":
+			text = setConfKey(text, "firewall", "off")
+		default:
+			return res, fmt.Errorf("firewall must be on or off, got %q", spec.Firewall)
+		}
+	}
+
+	if err := writeFileAtomic(confFile, []byte(text), 0o600); err != nil {
+		return res, fmt.Errorf("writing updated settings: %w", err)
+	}
+	newCfg, err := engine.LoadConfig(confFile)
+	if err == nil {
+		err = newCfg.Validate()
+	}
+	if err == nil {
+		err = newCfg.LoadSecret()
+	}
+	if err != nil {
+		_ = writeFileAtomic(confFile, []byte(oldConf), 0o600)
+		return res, fmt.Errorf("those settings were refused: %w", err)
+	}
+
+	var code string
+	if newCfg.Role == engine.RoleEdge {
+		code, err = edgePairingCode(confDir, spec.Name)
+		if err != nil {
+			_ = writeFileAtomic(confFile, []byte(oldConf), 0o600)
+			return res, err
+		}
+	}
+
+	if spec.Stage == "prepare" {
+		res.OK = true
+		res.Code = code
+		res.OldConf = oldConf
+		return res, nil
+	}
+
+	// Single-step commit (when no remote server needs to be updated first).
+	restore := func() {
+		_ = writeFileAtomic(confFile, []byte(oldConf), 0o600)
+		_ = host.FirewallApply(spec.Name)
+		_ = host.Restart(spec.Name)
+	}
+	if err := host.FirewallApply(spec.Name); err != nil {
+		if newCfg.GRE {
+			restore()
+			return res, fmt.Errorf("this server could not make the private GRE link: %w", err)
+		}
+		res.Warnings = append(res.Warnings, err.Error())
+	}
+	if err := host.Restart(spec.Name); err != nil && !errors.Is(err, errNoSystemd) {
+		restore()
+		return res, err
+	}
+	if err := confirmRunning(host, spec.Name); err != nil {
+		restore()
+		return res, err
+	}
+
+	res.OK = true
+	res.Code = code
+	return res, nil
+}
+
+// tunnelLogs returns the recent systemd journal lines for one tunnel.
+func tunnelLogs(confDir, name string, lines int) (string, error) {
+	if err := validTunnelName(name); err != nil {
+		return "", err
+	}
+	if _, err := os.Stat(filepath.Join(confDir, name+".conf")); err != nil {
+		return "", fmt.Errorf("there is no tunnel %q on this server", name)
+	}
+	if lines <= 0 || lines > 500 {
+		lines = 60
+	}
+	if _, ok := hostFor(confDir).(systemHost); !ok {
+		return fmt.Sprintf("(test environment: no systemd journal for portbridge@%s)", name), nil
+	}
+	out, err := hostRun("journalctl", "-u", "portbridge@"+name, "-n", strconv.Itoa(lines), "--no-pager")
+	if err != nil && out == "" {
+		return "", fmt.Errorf("reading journal: %w", err)
+	}
+	if strings.TrimSpace(out) == "" {
+		return "(no log entries yet)", nil
+	}
+	return out, nil
+}
+
+// CheckItem is one diagnostic check line, matching the CLI menu's "Check a tunnel".
+type CheckItem struct {
+	Label  string `json:"label"`
+	Status string `json:"status"` // "ok", "warn", "bad", "note"
+	Detail string `json:"detail"`
+	Note   string `json:"note,omitempty"`
+}
+
+// TunnelCheckReport is the diagnostic report for one half of a tunnel.
+type TunnelCheckReport struct {
+	OK     bool        `json:"ok"`
+	Name   string      `json:"name"`
+	Role   string      `json:"role"`
+	Checks []CheckItem `json:"checks"`
+}
+
+// CheckTunnel inspects one half of a tunnel on this server, mirroring the CLI
+// menu's test_tunnel (Option 8).
+func CheckTunnel(confDir, name string) (TunnelCheckReport, error) {
+	if confDir == "" {
+		confDir = defaultTunnelsDir
+	}
+	if err := validTunnelName(name); err != nil {
+		return TunnelCheckReport{}, err
+	}
+	confPath := filepath.Join(confDir, name+".conf")
+	if _, err := os.Stat(confPath); err != nil {
+		return TunnelCheckReport{}, fmt.Errorf("there is no tunnel %q on this server", name)
+	}
+	host := hostFor(confDir)
+	ti := tunnelInfo(confPath, host)
+	cfg, cfgErr := engine.LoadConfig(confPath)
+
+	rep := TunnelCheckReport{OK: true, Name: name, Role: ti.Role}
+	add := func(label, status, detail, note string) {
+		rep.Checks = append(rep.Checks, CheckItem{Label: label, Status: status, Detail: detail, Note: note})
+	}
+
+	if ti.Running {
+		add("Tunnel service", "ok", "Active and running", "")
+	} else {
+		add("Tunnel service", "bad", "Stopped", ti.ServiceNote)
+	}
+
+	if cfgErr != nil {
+		add("Configuration", "bad", cfgErr.Error(), "")
+		return rep, nil
+	}
+
+	if cfg.GRE {
+		if _, isSys := host.(systemHost); isSys {
+			if out, err := hostRun(firewallHelper, "gre-test", name); err == nil {
+				add("Private GRE link", "ok", out, "")
+			} else {
+				add("Private GRE link", "bad", out, "GRE (IP protocol 47) may be filtered between these servers.")
+			}
+		} else {
+			add("Private GRE link", "ok", "Configured", "")
+		}
+	}
+
+	if cfg.Role == engine.RoleEdge {
+		for _, p := range ti.UserPorts {
+			if host.Listening(p) {
+				add(fmt.Sprintf("User listen port %d", p), "ok", "Listening for user connections", "")
+			} else {
+				add(fmt.Sprintf("User listen port %d", p), "bad", fmt.Sprintf("Nothing listening on port %d", p), "Start the tunnel service to accept user connections.")
+			}
+		}
+	} else {
+		for _, p := range ti.ServicePorts {
+			if host.Listening(p) {
+				add(fmt.Sprintf("Inbound service port %d", p), "ok", fmt.Sprintf("Local service answering at 127.0.0.1:%d", p), "")
+			} else {
+				add(fmt.Sprintf("Inbound service port %d", p), "bad", fmt.Sprintf("Nothing answering at 127.0.0.1:%d", p), "Make sure your X-UI / Xray / inbound service is running on this port.")
+			}
+		}
+	}
+
+	if cfg.Dials() {
+		if cfg.Transport == engine.TransportKCP {
+			add("Peer bridge port", "note", fmt.Sprintf("UDP (%s) — verified by link state below", cfg.TunnelAddr), "")
+		} else if _, isSys := host.(systemHost); isSys {
+			c, err := net.DialTimeout("tcp", cfg.TunnelAddr, 3*time.Second)
+			if err == nil {
+				_ = c.Close()
+				add("Peer bridge port", "ok", fmt.Sprintf("Reachable (%s)", cfg.TunnelAddr), "")
+			} else {
+				add("Peer bridge port", "bad", fmt.Sprintf("Cannot reach %s", cfg.TunnelAddr), "Check that the other server's tunnel half is running and its firewall allows this server.")
+			}
+		} else {
+			add("Peer bridge port", "ok", fmt.Sprintf("Configured (%s)", cfg.TunnelAddr), "")
+		}
+	} else {
+		busy := host.PortFree(cfg.Transport, ti.LinkPort) != nil
+		if _, isNo := host.(noHost); isNo {
+			busy = ti.Running
+		}
+		if busy {
+			add("Bridge listener", "ok", fmt.Sprintf("Waiting for peer on port %d", ti.LinkPort), "")
+		} else {
+			add("Bridge listener", "bad", fmt.Sprintf("Not listening on bridge port %d", ti.LinkPort), "")
+		}
+	}
+
+	if ti.Live != nil {
+		if cfg.Mux {
+			if ti.Live.Links > 0 {
+				add("Inter-server link", "ok", fmt.Sprintf("Connected (%d / %d shared Mux links open)", ti.Live.Links, max(1, ti.Live.LinkTarget)), "")
+			} else {
+				add("Inter-server link", "bad", "0 shared links open — servers are not connected", "Check that both halves are running and have matching pairing codes and system clocks.")
+			}
+		} else {
+			if ti.Live.ParkedSpares > 0 {
+				add("Inter-server link", "ok", fmt.Sprintf("Connected (%d / %d spare connections ready)", ti.Live.ParkedSpares, max(1, ti.Live.PoolTarget)), "")
+			} else {
+				add("Inter-server link", "bad", "0 spare connections ready — servers are not talking", "Check that both halves are running and have matching pairing codes and system clocks.")
+			}
+		}
+		switch ti.Live.PathState {
+		case "ok":
+			add("End-to-end data flow", "ok", "Healthy — verified by active tunnel probe", "")
+		case "degraded":
+			add("End-to-end data flow", "warn", "Degraded", ti.Live.PathNote)
+		case "blocked":
+			add("End-to-end data flow", "bad", "Blocked — connections open but data is dropped", ti.Live.PathNote)
+		default:
+			add("End-to-end data flow", "note", "Measuring...", "")
+		}
+	} else if ti.Running {
+		add("Inter-server link", "warn", "Waiting for live telemetry from service", "")
+	}
+
+	if cfg.AltTarget != "" {
+		if _, isSys := host.(systemHost); isSys {
+			c, err := net.DialTimeout("tcp", cfg.AltTarget, 3*time.Second)
+			if err == nil {
+				_ = c.Close()
+				add("CDN backup route", "ok", fmt.Sprintf("Ready (%s)", cfg.AltTarget), "")
+			} else {
+				add("CDN backup route", "bad", fmt.Sprintf("Cannot reach %s", cfg.AltTarget), "Check that the domain points to your CDN with proxy enabled.")
+			}
+		} else {
+			add("CDN backup route", "ok", fmt.Sprintf("Configured (%s)", cfg.AltTarget), "")
+		}
+	}
+
+	fwDetail := "Disabled / Open"
+	if ti.Firewall {
+		fwDetail = fmt.Sprintf("Enabled (bridge port locked to %s)", ti.PeerIP)
+	}
+	add("Bridge port firewall", "note", fwDetail, "")
+
+	return rep, nil
+}
+
+// tunnelSpeedtest runs an in-tunnel latency and throughput test.
+func tunnelSpeedtest(confDir, name string, sizeMB float64) (string, error) {
+	if confDir == "" {
+		confDir = defaultTunnelsDir
+	}
+	if err := validTunnelName(name); err != nil {
+		return "", err
+	}
+	confPath := filepath.Join(confDir, name+".conf")
+	if _, err := os.Stat(confPath); err != nil {
+		return "", fmt.Errorf("there is no tunnel %q on this server", name)
+	}
+	if sizeMB <= 0 || sizeMB > 16 {
+		sizeMB = 1.0
+	}
+	if _, isSys := hostFor(confDir).(systemHost); !isSys {
+		return fmt.Sprintf("🚀 PortBridge Speed Test: %s\n   RTT: 18.40 ms | Jitter: 1.20 ms\n   Download: 12.50 MB/s (100.0 Mbps) in 0.08s\n   Upload: 11.80 MB/s (94.4 Mbps) in 0.08s\n", name), nil
+	}
+	return engine.RunSpeedtest(confPath, sizeMB)
+}
+
+// TuneInfo describes a server's Linux kernel network & BBR tuning state.
+type TuneInfo struct {
+	OK                bool   `json:"ok"`
+	BBRActive         bool   `json:"bbr_active"`
+	TunedByPB         bool   `json:"tuned_by_pb"`
+	CongestionControl string `json:"congestion_control"`
+	Qdisc             string `json:"qdisc"`
+	WmemMax           string `json:"wmem_max"`
+	RmemMax           string `json:"rmem_max"`
+	FileMax           string `json:"file_max"`
+	FastOpen          string `json:"fast_open"`
+	Output            string `json:"output,omitempty"`
+}
+
+const tuneHelper = "/usr/local/bin/portbridge-tune"
+const tuneConfPath = "/etc/sysctl.d/99-portbridge-tuning.conf"
+
+func readProcSys(rel string) string {
+	b, err := os.ReadFile("/proc/sys/" + rel)
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(b))
+}
+
+func readTuneStatus(confDir string) TuneInfo {
+	if _, isSys := hostFor(confDir).(systemHost); !isSys {
+		return TuneInfo{
+			OK:                true,
+			BBRActive:         false,
+			TunedByPB:         false,
+			CongestionControl: "cubic",
+			Qdisc:             "fq_codel",
+		}
+	}
+	cc := readProcSys("net/ipv4/tcp_congestion_control")
+	_, err := os.Stat(tuneConfPath)
+	return TuneInfo{
+		OK:                true,
+		BBRActive:         cc == "bbr",
+		TunedByPB:         err == nil,
+		CongestionControl: cc,
+		Qdisc:             readProcSys("net/core/default_qdisc"),
+		WmemMax:           readProcSys("net/core/wmem_max"),
+		RmemMax:           readProcSys("net/core/rmem_max"),
+		FileMax:           readProcSys("fs/file-max"),
+		FastOpen:          readProcSys("net/ipv4/tcp_fastopen"),
+	}
+}
+
+const builtinSysctlConf = `# written by portbridge-tune
+# Remove this file and reboot (or run: portbridge-tune undo) to go back.
+
+net.ipv4.tcp_congestion_control = bbr
+net.core.default_qdisc = fq
+
+net.core.rmem_max = 16777216
+net.core.wmem_max = 16777216
+net.ipv4.tcp_rmem = 4096 87380 16777216
+net.ipv4.tcp_wmem = 4096 65536 16777216
+
+net.core.somaxconn = 8192
+net.ipv4.tcp_max_syn_backlog = 8192
+net.core.netdev_max_backlog = 16384
+
+net.ipv4.tcp_fin_timeout = 15
+net.ipv4.tcp_tw_reuse = 1
+net.ipv4.ip_local_port_range = 10240 65535
+
+net.ipv4.tcp_fastopen = 3
+net.ipv4.tcp_slow_start_after_idle = 0
+fs.file-max = 2097152
+`
+
+func applyTune(confDir string, enable bool) (TuneInfo, error) {
+	if _, isSys := hostFor(confDir).(systemHost); !isSys {
+		return TuneInfo{
+			OK:                true,
+			BBRActive:         enable,
+			TunedByPB:         enable,
+			CongestionControl: map[bool]string{true: "bbr", false: "cubic"}[enable],
+			Qdisc:             map[bool]string{true: "fq", false: "fq_codel"}[enable],
+		}, nil
+	}
+	if err := needRoot(); err != nil {
+		return TuneInfo{}, err
+	}
+	action := "undo"
+	if enable {
+		action = "apply"
+	}
+	var out string
+	if _, err := os.Stat(tuneHelper); err == nil {
+		var runErr error
+		out, runErr = hostRun(tuneHelper, action)
+		if runErr != nil {
+			return TuneInfo{}, fmt.Errorf("tuning (%s): %s", action, out)
+		}
+	} else {
+		// Fallback if only the portbridge binary was installed on this server.
+		if enable {
+			_, _ = hostRun("modprobe", "tcp_bbr")
+			if err := os.WriteFile(tuneConfPath, []byte(builtinSysctlConf), 0o644); err != nil {
+				return TuneInfo{}, err
+			}
+			if _, err := os.Stat("/etc/modules-load.d"); err == nil {
+				_ = os.WriteFile("/etc/modules-load.d/portbridge-bbr.conf", []byte("tcp_bbr\n"), 0o644)
+			}
+			_, _ = hostRun("sysctl", "-p", tuneConfPath)
+			out = "BBR and high-throughput TCP buffers applied."
+		} else {
+			_ = os.Remove(tuneConfPath)
+			_ = os.Remove("/etc/modules-load.d/portbridge-bbr.conf")
+			_, _ = hostRun("sysctl", "--system")
+			out = "PortBridge network tuning removed."
+		}
+	}
+	info := readTuneStatus(confDir)
+	info.Output = out
+	return info, nil
 }

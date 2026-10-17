@@ -715,6 +715,138 @@ func newAgentHandler(token, confDir string, allowUpdates func() bool) *http.Serv
 		_ = json.NewEncoder(w).Encode(LocalOverview(confDir))
 	})
 
+	// POST /api/tunnel/edit-edge: change ports, proxy protocol, pool/mux links, or firewall.
+	mux.HandleFunc("/api/tunnel/edit-edge", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, `{"error":"method not allowed"}`, http.StatusMethodNotAllowed)
+			return
+		}
+		if !checkAgentAuth(r, token) {
+			http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
+			return
+		}
+		var spec EditSpec
+		dec := json.NewDecoder(io.LimitReader(r.Body, 64*1024))
+		dec.DisallowUnknownFields()
+		if err := dec.Decode(&spec); err != nil {
+			writeJSONReply(w, http.StatusBadRequest, EdgeResult{Error: "the tunnel's settings could not be read: " + err.Error()})
+			return
+		}
+		res, err := EditEdge(spec, confDir)
+		if err != nil {
+			res.Error = err.Error()
+			writeJSONReply(w, http.StatusUnprocessableEntity, res)
+			return
+		}
+		writeJSONReply(w, http.StatusOK, res)
+	})
+
+	// POST /api/tunnel/logs: recent journalctl lines for one tunnel.
+	mux.HandleFunc("/api/tunnel/logs", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, `{"error":"method not allowed"}`, http.StatusMethodNotAllowed)
+			return
+		}
+		if !checkAgentAuth(r, token) {
+			http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
+			return
+		}
+		var req struct {
+			Name  string `json:"name"`
+			Lines int    `json:"lines"`
+		}
+		if err := json.NewDecoder(io.LimitReader(r.Body, 4096)).Decode(&req); err != nil || req.Name == "" {
+			writeJSONReply(w, http.StatusBadRequest, map[string]any{"ok": false, "error": "name required"})
+			return
+		}
+		logs, err := tunnelLogs(confDir, req.Name, req.Lines)
+		if err != nil {
+			writeJSONReply(w, http.StatusUnprocessableEntity, map[string]any{"ok": false, "error": err.Error()})
+			return
+		}
+		writeJSONReply(w, http.StatusOK, map[string]any{"ok": true, "logs": logs})
+	})
+
+	// POST /api/tunnel/check: diagnostic checks for one tunnel half.
+	mux.HandleFunc("/api/tunnel/check", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, `{"error":"method not allowed"}`, http.StatusMethodNotAllowed)
+			return
+		}
+		if !checkAgentAuth(r, token) {
+			http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
+			return
+		}
+		var req struct {
+			Name string `json:"name"`
+		}
+		if err := json.NewDecoder(io.LimitReader(r.Body, 4096)).Decode(&req); err != nil || req.Name == "" {
+			writeJSONReply(w, http.StatusBadRequest, map[string]any{"ok": false, "error": "name required"})
+			return
+		}
+		rep, err := CheckTunnel(confDir, req.Name)
+		if err != nil {
+			writeJSONReply(w, http.StatusUnprocessableEntity, map[string]any{"ok": false, "error": err.Error()})
+			return
+		}
+		writeJSONReply(w, http.StatusOK, rep)
+	})
+
+	// POST /api/tunnel/speedtest: run in-tunnel latency & throughput test.
+	mux.HandleFunc("/api/tunnel/speedtest", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, `{"error":"method not allowed"}`, http.StatusMethodNotAllowed)
+			return
+		}
+		if !checkAgentAuth(r, token) {
+			http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
+			return
+		}
+		var req struct {
+			Name   string  `json:"name"`
+			SizeMB float64 `json:"size_mb"`
+		}
+		if err := json.NewDecoder(io.LimitReader(r.Body, 4096)).Decode(&req); err != nil || req.Name == "" {
+			writeJSONReply(w, http.StatusBadRequest, map[string]any{"ok": false, "error": "name required"})
+			return
+		}
+		out, err := tunnelSpeedtest(confDir, req.Name, req.SizeMB)
+		if err != nil {
+			writeJSONReply(w, http.StatusUnprocessableEntity, map[string]any{"ok": false, "error": err.Error(), "output": out})
+			return
+		}
+		writeJSONReply(w, http.StatusOK, map[string]any{"ok": true, "output": out})
+	})
+
+	// GET or POST /api/tune: inspect or toggle BBR speed tuning on this server.
+	mux.HandleFunc("/api/tune", func(w http.ResponseWriter, r *http.Request) {
+		if !checkAgentAuth(r, token) {
+			http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
+			return
+		}
+		if r.Method == http.MethodGet {
+			writeJSONReply(w, http.StatusOK, readTuneStatus(confDir))
+			return
+		}
+		if r.Method != http.MethodPost {
+			http.Error(w, `{"error":"method not allowed"}`, http.StatusMethodNotAllowed)
+			return
+		}
+		var req struct {
+			Enable bool `json:"enable"`
+		}
+		if err := json.NewDecoder(io.LimitReader(r.Body, 4096)).Decode(&req); err != nil {
+			writeJSONReply(w, http.StatusBadRequest, map[string]any{"ok": false, "error": "invalid request"})
+			return
+		}
+		info, err := applyTune(confDir, req.Enable)
+		if err != nil {
+			writeJSONReply(w, http.StatusUnprocessableEntity, map[string]any{"ok": false, "error": err.Error()})
+			return
+		}
+		writeJSONReply(w, http.StatusOK, info)
+	})
+
 	return mux
 }
 

@@ -698,6 +698,7 @@ func handleControlConn(c net.Conn, e *edge) {
 		}
 		_, _ = fmt.Fprintln(c, "ok")
 	case "speedtest":
+		_ = c.SetDeadline(time.Now().Add(120 * time.Second))
 		if e.cfg.Mode == ModeDirect {
 			routes := newRouter(e.cfg)
 			raw, claim, err := routes.dial(5 * time.Second)
@@ -722,7 +723,21 @@ func handleControlConn(c net.Conn, e *edge) {
 			_ = runSpeedtestClient(tc, e.cfg, c)
 			return
 		}
-		_, _ = fmt.Fprintln(c, "speedtest must be initiated from the origin in reverse mode")
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		tc, err := e.takeTunnel(ctx, 0)
+		if err != nil {
+			_, _ = fmt.Fprintf(c, "obtaining tunnel connection: %v\n", err)
+			return
+		}
+		defer tc.Close()
+		_ = tc.SetWriteDeadline(time.Now().Add(activateWriteTimeout))
+		if _, err := tc.Write([]byte{msgSpeedtest}); err != nil {
+			_, _ = fmt.Fprintf(c, "starting speedtest: %v\n", err)
+			return
+		}
+		_ = tc.SetWriteDeadline(time.Time{})
+		_ = runSpeedtestClient(tc, e.cfg, c)
 	default:
 		_, _ = fmt.Fprintln(c, "unknown command")
 	}

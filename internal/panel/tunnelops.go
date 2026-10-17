@@ -579,3 +579,411 @@ func (p *Panel) tunnelCode(edgeID, name string) (string, error) {
 	}
 	return rep.Code, nil
 }
+
+// editTunnelRequest is what the "Edit tunnel" dialog sends.
+type editTunnelRequest struct {
+	Name          string `json:"name"`
+	Edge          string `json:"edge"`
+	Origin        string `json:"origin"`
+	ServicePorts  string `json:"service_ports"`
+	UserPorts     string `json:"user_ports"`
+	LinkPort      int    `json:"link_port"`
+	ProxyProtocol string `json:"proxy_protocol"`
+	Pool          int    `json:"pool"`
+	MuxLinks      int    `json:"mux_links"`
+	MaxConn       int    `json:"max_conn"`
+	Firewall      string `json:"firewall"`
+}
+
+func (p *Panel) startEditTunnel(r editTunnelRequest) (string, error) {
+	t := tunnelTarget{Name: strings.TrimSpace(r.Name), Edge: r.Edge, Origin: r.Origin}
+	if err := p.knownTarget(t); err != nil {
+		return "", err
+	}
+	if strings.TrimSpace(r.UserPorts) == "" && strings.TrimSpace(r.ServicePorts) != "" {
+		r.UserPorts = r.ServicePorts
+	}
+	return p.startJob(func(j *job) (string, error) { return "", p.editTunnel(j, r) }), nil
+}
+
+func (p *Panel) editTunnel(j *job, r editTunnelRequest) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 3*tunnelOpTimeout)
+	defer cancel()
+
+	spec := agent.EditSpec{
+		Name:          strings.TrimSpace(r.Name),
+		UserPorts:     strings.TrimSpace(r.UserPorts),
+		ServicePorts:  strings.TrimSpace(r.ServicePorts),
+		LinkPort:      r.LinkPort,
+		ProxyProtocol: strings.TrimSpace(r.ProxyProtocol),
+		Pool:          r.Pool,
+		MuxLinks:      r.MuxLinks,
+		MaxConn:       r.MaxConn,
+		Firewall:      strings.TrimSpace(r.Firewall),
+	}
+
+	if r.Edge == "" && r.Origin != "" {
+		foreign := p.serverName(r.Origin)
+		j.say("Updating tunnel settings on %s...", foreign)
+		var res agent.EdgeResult
+		status, err := p.callJSON(ctx, r.Origin, "/api/tunnel/edit-edge", spec, &res)
+		if errors.Is(err, errTooOld) {
+			return fmt.Errorf("PortBridge on %s is too old to edit settings from the panel; update it first", foreign)
+		}
+		if err != nil {
+			return fmt.Errorf("%s could not be reached: %s", foreign, plainAgentError(err))
+		}
+		if !res.OK {
+			if res.Error == "" {
+				res.Error = fmt.Sprintf("HTTP %d", status)
+			}
+			return fmt.Errorf("%s refused the change: %s", foreign, res.Error)
+		}
+		for _, w := range res.Warnings {
+			j.say("Note from %s: %s", foreign, w)
+		}
+		j.say("Tunnel %q updated and restarted on %s.", spec.Name, foreign)
+		p.refreshOne(r.Origin)
+		return nil
+	}
+
+	relay := p.serverName(r.Edge)
+	if r.Origin == "" {
+		j.say("Updating tunnel %q on %s...", spec.Name, relay)
+		var edge agent.EdgeResult
+		status, err := p.callJSON(ctx, r.Edge, "/api/tunnel/edit-edge", spec, &edge)
+		if errors.Is(err, errTooOld) {
+			return fmt.Errorf("PortBridge on %s is too old to edit tunnels from the panel; update it first", relay)
+		}
+		if err != nil {
+			return fmt.Errorf("%s could not be reached: %s", relay, plainAgentError(err))
+		}
+		if !edge.OK {
+			if edge.Error == "" {
+				edge.Error = fmt.Sprintf("HTTP %d", status)
+			}
+			return fmt.Errorf("%s refused the change: %s", relay, edge.Error)
+		}
+		for _, w := range edge.Warnings {
+			j.say("Note from %s: %s", relay, w)
+		}
+		j.say("Tunnel %q updated and restarted on %s.", spec.Name, relay)
+		p.refreshOne(r.Edge)
+		return nil
+	}
+
+	foreign := p.serverName(r.Origin)
+	j.say("Validating and preparing new settings on %s...", relay)
+	spec.Stage = "prepare"
+	var prep agent.EdgeResult
+	status, err := p.callJSON(ctx, r.Edge, "/api/tunnel/edit-edge", spec, &prep)
+	if errors.Is(err, errTooOld) {
+		return fmt.Errorf("PortBridge on %s is too old to edit tunnels from the panel; update it first", relay)
+	}
+	if err != nil {
+		return fmt.Errorf("%s could not be reached: %s", relay, plainAgentError(err))
+	}
+	if !prep.OK {
+		if prep.Error == "" {
+			prep.Error = fmt.Sprintf("HTTP %d", status)
+		}
+		return fmt.Errorf("%s refused the change: %s", relay, prep.Error)
+	}
+	for _, w := range prep.Warnings {
+		j.say("Note from %s: %s", relay, w)
+	}
+
+	j.say("Applying updated configuration to %s...", foreign)
+	var upd struct {
+		OK       bool     `json:"ok"`
+		Error    string   `json:"error"`
+		Warnings []string `json:"warnings"`
+	}
+	_, uerr := p.callJSON(ctx, r.Origin, "/api/tunnel/update", map[string]string{"code": prep.Code}, &upd)
+	if uerr == nil && !upd.OK {
+		uerr = errors.New(upd.Error)
+	}
+	if uerr != nil {
+		reason := uerr.Error()
+		if !errors.Is(uerr, errTooOld) {
+			reason = plainAgentError(uerr)
+		}
+		j.say("%s did not accept the change: %s", foreign, reason)
+		j.say("Restoring previous settings on %s so nothing is left out of sync...", relay)
+		var rb agent.EdgeResult
+		_, _ = p.callJSON(ctx, r.Edge, "/api/tunnel/edit-edge", agent.EditSpec{
+			Name:    spec.Name,
+			Stage:   "rollback",
+			OldConf: prep.OldConf,
+		}, &rb)
+		return fmt.Errorf("%s refused the change: %s. Nothing was changed on either server", foreign, reason)
+	}
+	for _, w := range upd.Warnings {
+		j.say("Note from %s: %s", foreign, w)
+	}
+	j.say("%s updated and restarted.", foreign)
+
+	j.say(" Applying firewall rules and restarting %s...", relay)
+	var commit agent.EdgeResult
+	cstatus, cerr := p.callJSON(ctx, r.Edge, "/api/tunnel/edit-edge", agent.EditSpec{
+		Name:    spec.Name,
+		Stage:   "commit",
+		OldConf: prep.OldConf,
+	}, &commit)
+	if cerr != nil {
+		return fmt.Errorf("%s could not finish restarting: %s", relay, plainAgentError(cerr))
+	}
+	if !commit.OK {
+		if commit.Error == "" {
+			commit.Error = fmt.Sprintf("HTTP %d", cstatus)
+		}
+		return fmt.Errorf("%s could not restart on the new settings: %s", relay, commit.Error)
+	}
+	for _, w := range commit.Warnings {
+		j.say("Note from %s: %s", relay, w)
+	}
+
+	j.say("Tunnel %q is updated and running on both servers.", spec.Name)
+	p.refreshOne(r.Edge)
+	p.refreshOne(r.Origin)
+	return nil
+}
+
+type halfLogs struct {
+	Server string `json:"server"`
+	Role   string `json:"role"`
+	OK     bool   `json:"ok"`
+	Logs   string `json:"logs,omitempty"`
+	Error  string `json:"error,omitempty"`
+}
+
+func (p *Panel) tunnelLogs(parent context.Context, t tunnelTarget) []halfLogs {
+	ctx, cancel := context.WithTimeout(parent, agentTimeout)
+	defer cancel()
+	var out []halfLogs
+	for _, pair := range []struct {
+		id, role string
+	}{
+		{t.Edge, "Relay (Iran)"},
+		{t.Origin, "Foreign"},
+	} {
+		if pair.id == "" {
+			continue
+		}
+		hl := halfLogs{Server: p.serverName(pair.id), Role: pair.role}
+		var rep struct {
+			OK    bool   `json:"ok"`
+			Logs  string `json:"logs"`
+			Error string `json:"error"`
+		}
+		_, err := p.callJSON(ctx, pair.id, "/api/tunnel/logs", map[string]any{"name": t.Name, "lines": 60}, &rep)
+		switch {
+		case errors.Is(err, errTooOld):
+			hl.Error = "PortBridge on this server is from an older release; update it in Settings -> Software Updates to view logs from the panel."
+		case err != nil:
+			hl.Error = plainAgentError(err)
+		case !rep.OK:
+			hl.Error = rep.Error
+		default:
+			hl.OK = true
+			hl.Logs = rep.Logs
+		}
+		out = append(out, hl)
+	}
+	return out
+}
+
+type halfCheck struct {
+	Server string            `json:"server"`
+	Role   string            `json:"role"`
+	OK     bool              `json:"ok"`
+	Checks []agent.CheckItem `json:"checks,omitempty"`
+	Error  string            `json:"error,omitempty"`
+}
+
+func (p *Panel) checkTunnel(parent context.Context, t tunnelTarget) []halfCheck {
+	ctx, cancel := context.WithTimeout(parent, agentTimeout)
+	defer cancel()
+	var out []halfCheck
+	for _, pair := range []struct {
+		id, role string
+	}{
+		{t.Edge, "Relay (Iran) · Entry"},
+		{t.Origin, "Foreign · Exit"},
+	} {
+		if pair.id == "" {
+			continue
+		}
+		hc := halfCheck{Server: p.serverName(pair.id), Role: pair.role}
+		var rep struct {
+			OK     bool              `json:"ok"`
+			Checks []agent.CheckItem `json:"checks"`
+			Error  string            `json:"error"`
+		}
+		_, err := p.callJSON(ctx, pair.id, "/api/tunnel/check", map[string]string{"name": t.Name}, &rep)
+		switch {
+		case errors.Is(err, errTooOld):
+			// Build diagnostic checks from the cached Overview and /api/ports so
+			// even an older server gives useful answers.
+			if checks, ok := p.fallbackCheck(ctx, pair.id, t.Name); ok {
+				hc.OK = true
+				hc.Checks = checks
+			} else {
+				hc.Error = "PortBridge on this server is from an older release; update it to run deep diagnostics."
+			}
+		case err != nil:
+			hc.Error = plainAgentError(err)
+		case !rep.OK:
+			hc.Error = rep.Error
+		default:
+			hc.OK = true
+			hc.Checks = rep.Checks
+		}
+		out = append(out, hc)
+	}
+	return out
+}
+
+func (p *Panel) fallbackCheck(ctx context.Context, id, name string) ([]agent.CheckItem, bool) {
+	v, ok := p.viewOf(id)
+	if !ok || v.Overview == nil {
+		return nil, false
+	}
+	var ti *agent.TunnelInfo
+	for i := range v.Overview.Tunnels {
+		if v.Overview.Tunnels[i].Name == name {
+			ti = &v.Overview.Tunnels[i]
+			break
+		}
+	}
+	if ti == nil {
+		return nil, false
+	}
+	var checks []agent.CheckItem
+	add := func(label, status, detail, note string) {
+		checks = append(checks, agent.CheckItem{Label: label, Status: status, Detail: detail, Note: note})
+	}
+	if ti.Running {
+		add("Tunnel service", "ok", "Active and running", "")
+	} else {
+		add("Tunnel service", "bad", "Stopped", ti.ServiceNote)
+	}
+	if ti.Role == "origin" && len(ti.ServicePorts) > 0 {
+		if st, err := p.portsThere(ctx, id, ti.ServicePorts); err == nil {
+			for _, sp := range ti.ServicePorts {
+				if ps, exists := st[sp]; exists {
+					if ps.State == "free" {
+						add(fmt.Sprintf("Inbound service port %d", sp), "bad", fmt.Sprintf("Nothing listening on port %d", sp), "Make sure your X-UI / Xray / inbound service is running.")
+					} else {
+						add(fmt.Sprintf("Inbound service port %d", sp), "ok", fmt.Sprintf("Active service listening%s", byWhom(ps.By)), "")
+					}
+				}
+			}
+		}
+	}
+	if ti.Live != nil {
+		if ti.Mux {
+			if ti.Live.Links > 0 {
+				add("Inter-server link", "ok", fmt.Sprintf("Connected (%d / %d shared Mux links open)", ti.Live.Links, max(1, ti.Live.LinkTarget)), "")
+			} else {
+				add("Inter-server link", "bad", "0 shared links open", "")
+			}
+		} else {
+			if ti.Live.ParkedSpares > 0 {
+				add("Inter-server link", "ok", fmt.Sprintf("Connected (%d / %d spare connections ready)", ti.Live.ParkedSpares, max(1, ti.Live.PoolTarget)), "")
+			} else {
+				add("Inter-server link", "bad", "0 spare connections ready", "")
+			}
+		}
+		switch ti.Live.PathState {
+		case "ok":
+			add("End-to-end data flow", "ok", "Healthy", "")
+		case "degraded":
+			add("End-to-end data flow", "warn", "Degraded", ti.Live.PathNote)
+		case "blocked":
+			add("End-to-end data flow", "bad", "Blocked", ti.Live.PathNote)
+		}
+	}
+	return checks, true
+}
+
+func (p *Panel) speedtestTunnel(parent context.Context, t tunnelTarget) (string, string, error) {
+	ctx, cancel := context.WithTimeout(parent, 90*time.Second)
+	defer cancel()
+
+	// Prefer running the speedtest from the panel's own server ("this") when it is
+	// one of the tunnel's endpoints, or from the Relay server first.
+	order := []string{}
+	if t.Edge == "this" || (t.Edge != "" && t.Origin != "this") {
+		if t.Edge != "" {
+			order = append(order, t.Edge)
+		}
+		if t.Origin != "" {
+			order = append(order, t.Origin)
+		}
+	} else {
+		if t.Origin != "" {
+			order = append(order, t.Origin)
+		}
+		if t.Edge != "" {
+			order = append(order, t.Edge)
+		}
+	}
+
+	var lastErr error
+	var lastSrv, lastOut string
+	for _, id := range order {
+		srvName := p.serverName(id)
+		var rep struct {
+			OK     bool   `json:"ok"`
+			Output string `json:"output"`
+			Error  string `json:"error"`
+		}
+		_, err := p.callJSON(ctx, id, "/api/tunnel/speedtest", map[string]any{"name": t.Name, "size_mb": 1.0}, &rep)
+		if err == nil && rep.OK {
+			return srvName, rep.Output, nil
+		}
+		lastSrv = srvName
+		lastOut = rep.Output
+		if err != nil {
+			lastErr = err
+		} else {
+			lastErr = errors.New(rep.Error)
+		}
+	}
+	return lastSrv, lastOut, lastErr
+}
+
+func (p *Panel) getServerTune(parent context.Context, id string) (agent.TuneInfo, error) {
+	ctx, cancel := context.WithTimeout(parent, agentTimeout)
+	defer cancel()
+	status, rb, err := p.callServer(ctx, id, http.MethodGet, "/api/tune", nil, overviewLimit)
+	if err != nil {
+		return agent.TuneInfo{}, err
+	}
+	if status == http.StatusNotFound {
+		return agent.TuneInfo{}, errTooOld
+	}
+	var info agent.TuneInfo
+	if err := json.Unmarshal(rb, &info); err != nil {
+		return agent.TuneInfo{}, err
+	}
+	return info, nil
+}
+
+func (p *Panel) setServerTune(parent context.Context, id string, enable bool) (agent.TuneInfo, error) {
+	ctx, cancel := context.WithTimeout(parent, agentTimeout)
+	defer cancel()
+	var rep struct {
+		agent.TuneInfo
+		Error string `json:"error"`
+	}
+	_, err := p.callJSON(ctx, id, "/api/tune", map[string]bool{"enable": enable}, &rep)
+	if err != nil {
+		return agent.TuneInfo{}, err
+	}
+	if !rep.OK {
+		return agent.TuneInfo{}, errors.New(rep.Error)
+	}
+	return rep.TuneInfo, nil
+}
