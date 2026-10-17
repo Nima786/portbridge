@@ -79,8 +79,9 @@ type pathHealth struct {
 	timeouts int // activations in a row that timed out
 	closed   int // activations in a row that were refused outright
 
-	lastOK     time.Time
-	lastLogged time.Time
+	lastOK      time.Time
+	lastProbeOK time.Time
+	lastLogged  time.Time
 
 	hasBackup bool
 
@@ -184,14 +185,18 @@ func (h *pathHealth) probeResult(out probeOutcome) {
 	switch out.kind {
 	case probePassed:
 		h.timeouts = 0
-		h.lastOK = time.Now()
+		now := time.Now()
+		h.lastOK = now
+		h.lastProbeOK = now
 		h.change(pathOK, "")
 	case probeStalled:
+		h.lastProbeOK = time.Time{}
 		h.change(pathBlocked, "a test transfer over this route started and then stopped moving.")
 	case probeUnsupported:
 		// The other end hung up on the test. Most likely it is a version that
 		// predates it, so nothing is concluded from it.
 	default:
+		h.lastProbeOK = time.Time{}
 		h.change(pathDegraded, fmt.Sprintf("a test transfer over this route failed: %v", out.err))
 	}
 }
@@ -205,12 +210,12 @@ func (h *pathHealth) poke() {
 	}
 }
 
-// provenRecently reports whether data was seen flowing within the last d, by a
-// user getting through or a check passing.
+// provenRecently reports whether a transfer check proved data was flowing
+// within the last d.
 func (h *pathHealth) provenRecently(d time.Duration) bool {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	return h.state == pathOK && !h.lastOK.IsZero() && time.Since(h.lastOK) < d
+	return h.state == pathOK && !h.lastProbeOK.IsZero() && time.Since(h.lastProbeOK) < d
 }
 
 // isBlocked reports whether users should stop waiting on this route.
@@ -529,7 +534,8 @@ func (p *prober) run(ctx context.Context) {
 		p.cycle()
 
 		state, _, _ := p.health.snapshot()
-		if state == pathOK.String() || state == pathUnknown.String() {
+		cur := p.routes.currentIndex()
+		if atomic.LoadInt32(&p.stalls[cur]) == 0 && (state == pathOK.String() || state == pathUnknown.String()) {
 			// Spread the checks of many tunnels on one machine apart.
 			wait = probeEveryHealthy + time.Duration(p.rng.Int63n(int64(60*time.Second)))
 		} else {
