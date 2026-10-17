@@ -8,6 +8,8 @@ import (
 	"net/http"
 	"net/http/cookiejar"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -344,5 +346,169 @@ func TestThePageIsServedSafely(t *testing.T) {
 		if resp.StatusCode != http.StatusNotFound {
 			t.Fatalf("%s answered %d", path, resp.StatusCode)
 		}
+	}
+}
+
+func TestCloudflareDNSManager(t *testing.T) {
+	const rawToken = "cf_secret_token_9876543210abcdef"
+
+	cfMock := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "Bearer "+rawToken {
+			w.WriteHeader(http.StatusUnauthorized)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"success": false,
+				"errors":  []map[string]any{{"code": 10000, "message": "Invalid API Token"}},
+			})
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/zones":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"success": true,
+				"result": []map[string]any{
+					{"id": "zone123", "name": "example.com", "status": "active"},
+				},
+			})
+		case r.Method == http.MethodGet && r.URL.Path == "/zones/zone123/dns_records":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"success": true,
+				"result": []map[string]any{
+					{
+						"id":        "rec1",
+						"type":      "A",
+						"name":      "edge1.example.com",
+						"content":   "203.0.113.10",
+						"proxied":   true,
+						"proxiable": true,
+						"ttl":       1,
+					},
+				},
+			})
+		case r.Method == http.MethodPost && r.URL.Path == "/zones/zone123/dns_records":
+			var body map[string]any
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"success": true,
+				"result": map[string]any{
+					"id":        "rec2",
+					"type":      body["type"],
+					"name":      "edge2.example.com",
+					"content":   body["content"],
+					"proxied":   body["proxied"],
+					"proxiable": true,
+					"ttl":       1,
+				},
+			})
+		case r.Method == http.MethodPatch && r.URL.Path == "/zones/zone123/dns_records/rec2":
+			var body map[string]any
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"success": true,
+				"result": map[string]any{
+					"id":        "rec2",
+					"type":      "A",
+					"name":      "edge2.example.com",
+					"content":   "203.0.113.20",
+					"proxied":   body["proxied"],
+					"proxiable": true,
+					"ttl":       1,
+				},
+			})
+		case r.Method == http.MethodDelete && r.URL.Path == "/zones/zone123/dns_records/rec2":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"success": true,
+				"result":  map[string]any{"id": "rec2"},
+			})
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer cfMock.Close()
+
+	prevBase := cfAPIBase
+	cfAPIBase = cfMock.URL
+	defer func() { cfAPIBase = prevBase }()
+
+	p := newTestPanel(t)
+	ts := startPanel(t, p)
+	b := newBrowser(t, ts)
+	if b.login("admin", testPassword) != http.StatusOK {
+		t.Fatal("could not log in")
+	}
+
+	// 1. Add token and verify encryption at rest + write-only response
+	code, added, _ := b.do(http.MethodPost, "/api/cf/accounts", map[string]any{
+		"name":  "Main CF",
+		"token": rawToken,
+	}, nil)
+	if code != http.StatusOK {
+		t.Fatalf("adding CF account answered %d: %v", code, added)
+	}
+	acctID, _ := added["id"].(string)
+	if acctID == "" || added["hint"] != "••••cdef" || added["token"] != nil {
+		t.Fatalf("unexpected account view: %v", added)
+	}
+
+	diskBytes, err := os.ReadFile(filepath.Join(p.dir, "state.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(diskBytes), rawToken) {
+		t.Fatal("plaintext Cloudflare API token was written to state.json!")
+	}
+
+	// 2. List zones
+	code, zout, _ := b.do(http.MethodGet, "/api/cf/zones", nil, nil)
+	if code != http.StatusOK {
+		t.Fatalf("listing zones answered %d: %v", code, zout)
+	}
+	zones, _ := zout["zones"].([]any)
+	if len(zones) != 1 || zones[0].(map[string]any)["name"] != "example.com" {
+		t.Fatalf("unexpected zones: %v", zout)
+	}
+
+	// 3. List records
+	code, rout, _ := b.do(http.MethodGet, "/api/cf/zones/zone123/records", nil, nil)
+	if code != http.StatusOK {
+		t.Fatalf("listing records answered %d: %v", code, rout)
+	}
+	recs, _ := rout["records"].([]any)
+	if len(recs) != 1 || recs[0].(map[string]any)["name"] != "edge1.example.com" {
+		t.Fatalf("unexpected records: %v", rout)
+	}
+
+	// 4. Create record
+	code, created, _ := b.do(http.MethodPost, "/api/cf/zones/zone123/records", map[string]any{
+		"account_id": acctID,
+		"type":       "A",
+		"name":       "edge2",
+		"content":    "203.0.113.20",
+		"ttl":        1,
+		"proxied":    true,
+	}, nil)
+	if code != http.StatusOK || created["id"] != "rec2" || created["proxied"] != true {
+		t.Fatalf("creating record answered %d: %v", code, created)
+	}
+
+	// 5. Toggle proxy off via PATCH
+	code, patched, _ := b.do(http.MethodPatch, "/api/cf/zones/zone123/records/rec2", map[string]any{
+		"account_id": acctID,
+		"proxied":    false,
+	}, nil)
+	if code != http.StatusOK || patched["proxied"] != false {
+		t.Fatalf("patching record answered %d: %v", code, patched)
+	}
+
+	// 6. Delete record
+	code, delOut, _ := b.do(http.MethodDelete, "/api/cf/zones/zone123/records/rec2?account_id="+acctID, nil, nil)
+	if code != http.StatusOK {
+		t.Fatalf("deleting record answered %d: %v", code, delOut)
+	}
+
+	// 7. Delete account
+	code, _, _ = b.do(http.MethodDelete, "/api/cf/accounts/"+acctID, nil, nil)
+	if code != http.StatusOK {
+		t.Fatalf("deleting account answered %d", code)
 	}
 }

@@ -1535,18 +1535,275 @@ li.bad { color: var(--bad); border-color: var(--bad-border); background: var(--b
   font-size: .82rem;
 }
 
+/* ----------------------------------------------------- Cloudflare DNS Tab */
+
+.cf-accounts-bar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: .55rem;
+  margin-bottom: 1rem;
+}
+.cf-account-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: .45rem;
+  padding: .35rem .45rem .35rem .75rem;
+  border-radius: 999px;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  font-size: .83rem;
+  box-shadow: var(--shadow-sm);
+}
+.cf-account-pill .cf-dot {
+  width: .5rem;
+  height: .5rem;
+  border-radius: 50%;
+  background: #f6821f;
+  flex: none;
+}
+.cf-account-pill .cf-hint {
+  font-family: ui-monospace, "Cascadia Code", Consolas, monospace;
+  font-size: .78rem;
+  color: var(--muted);
+}
+.cf-account-pill button.cf-del-acct {
+  padding: .12rem .42rem;
+  font-size: .74rem;
+  border-radius: 999px;
+  min-height: 0;
+  line-height: 1.3;
+}
+
+.cf-setup-card {
+  max-width: 760px;
+}
+.cf-steps {
+  margin: .6rem 0 1.1rem;
+  padding-left: 1.35rem;
+  display: grid;
+  gap: .4rem;
+  font-size: .9rem;
+  color: var(--text);
+}
+.cf-inline-form {
+  border-top: 1px solid var(--line);
+  padding-top: .85rem;
+}
+
+.cf-filter-card {
+  margin-bottom: 1rem;
+  padding: .85rem 1.05rem;
+}
+.cf-filter-bar {
+  display: grid;
+  grid-template-columns: 1.3fr .8fr 1.4fr;
+  gap: .75rem;
+  align-items: end;
+}
+.cf-filter-bar label {
+  margin-top: 0;
+}
+
+.cf-records-wrap {
+  display: grid;
+  gap: .55rem;
+}
+.cf-record-row {
+  display: grid;
+  grid-template-columns: 4.5rem minmax(160px, 1.4fr) minmax(160px, 1.5fr) 8.5rem 5.5rem auto;
+  align-items: center;
+  gap: .75rem;
+  padding: .75rem 1rem;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  box-shadow: var(--shadow-sm);
+  transition: border-color .15s ease;
+}
+.cf-record-row:hover {
+  border-color: var(--line-strong);
+}
+
+.cf-type-badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-family: ui-monospace, "Cascadia Code", Consolas, monospace;
+  font-size: .76rem;
+  font-weight: 700;
+  padding: .22rem .5rem;
+  border-radius: 6px;
+  background: var(--accent-soft);
+  color: var(--accent);
+  border: 1px solid var(--accent-border);
+}
+.cf-type-AAAA {
+  background: var(--foreign-soft);
+  color: var(--foreign);
+  border-color: var(--foreign-border);
+}
+.cf-type-CNAME {
+  background: var(--warn-soft);
+  color: var(--warn);
+  border-color: var(--warn-border);
+}
+.cf-type-TXT, .cf-type-MX, .cf-type-NS, .cf-type-CAA {
+  background: var(--well);
+  color: var(--muted);
+  border-color: var(--line);
+}
+
+.cf-rec-main {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: .15rem;
+}
+.cf-rec-fqdn {
+  font-weight: 650;
+  font-size: .92rem;
+  word-break: break-all;
+}
+.cf-rec-note {
+  font-size: .78rem;
+  color: var(--muted);
+}
+
+.cf-rec-target {
+  min-width: 0;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: .4rem;
+}
+.cf-rec-ip {
+  font-family: ui-monospace, "Cascadia Code", Consolas, monospace;
+  font-size: .86rem;
+  word-break: break-all;
+}
+.cf-srv-match {
+  font-size: .72rem;
+  padding: .1rem .42rem;
+  border-radius: 999px;
+  background: var(--ok-soft);
+  color: var(--ok);
+  border: 1px solid var(--ok-border);
+  font-weight: 600;
+}
+
+button.cf-proxy-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: .4rem;
+  padding: .3rem .65rem;
+  font-size: .78rem;
+  font-weight: 650;
+  border-radius: 999px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+button.cf-proxy-btn.is-proxied {
+  background: rgba(246, 130, 31, 0.14);
+  color: #d96506;
+  border-color: rgba(246, 130, 31, 0.45);
+}
+:root[data-theme="dark"] button.cf-proxy-btn.is-proxied {
+  background: rgba(246, 130, 31, 0.18);
+  color: #fb923c;
+  border-color: rgba(246, 130, 31, 0.48);
+}
+button.cf-proxy-btn.is-dns-only {
+  background: var(--well);
+  color: var(--muted);
+  border-color: var(--line);
+}
+.cf-proxy-cloud {
+  width: 15px;
+  height: 15px;
+  flex: none;
+}
+
+.cf-rec-ttl-cell {
+  font-size: .82rem;
+  color: var(--muted);
+}
+.cf-rec-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: .38rem;
+  flex-wrap: wrap;
+}
+.cf-rec-actions button {
+  padding: .32rem .62rem;
+  font-size: .8rem;
+}
+
+.cf-target-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: .5rem;
+  flex-wrap: wrap;
+  margin-top: .75rem;
+  margin-bottom: .3rem;
+}
+.cf-target-head label {
+  margin: 0;
+}
+select.cf-server-pick {
+  width: auto;
+  max-width: 240px;
+  padding: .24rem .55rem;
+  font-size: .79rem;
+}
+
+.cf-tunnel-helper {
+  margin-top: .65rem;
+  padding: .75rem .85rem;
+  background: var(--panel);
+  border: 1px dashed var(--accent-border);
+  border-radius: var(--radius-sm);
+}
+.cf-quick-create {
+  margin-top: .6rem;
+}
+.cf-quick-row {
+  display: flex;
+  gap: .5rem;
+  align-items: center;
+}
+.cf-quick-row input {
+  flex: 1;
+}
+.cf-quick-row button {
+  flex: none;
+  white-space: nowrap;
+}
+
 /* ---------------------------------------------------- Responsive Layouts */
 
 @media (max-width: 960px) {
   .summary-strip { grid-template-columns: repeat(2, 1fr); }
   .tunnel-details-grid { grid-template-columns: repeat(2, 1fr); }
   .ports-grid { grid-template-columns: 1fr; }
+  .cf-filter-bar { grid-template-columns: 1fr 1fr; }
+  .cf-filter-search { grid-column: 1 / -1; }
+  .cf-record-row {
+    grid-template-columns: auto 1fr auto;
+    gap: .5rem .75rem;
+  }
+  .cf-rec-target { grid-column: 1 / -1; }
+  .cf-rec-actions { grid-column: 1 / -1; justify-content: flex-start; }
 }
 
 @media (max-width: 760px) {
   .columns { grid-template-columns: 1fr; }
   .row, .row2 { grid-template-columns: 1fr; }
   .choice-grid.cols-2, .choice-grid.cols-3 { grid-template-columns: 1fr; }
+  .cf-filter-bar { grid-template-columns: 1fr; }
   .top-inner { padding: .55rem .85rem; gap: .5rem; }
   .brand { gap: .45rem; font-size: 1.05rem; }
   .top-right { gap: .38rem; margin-left: auto; }
@@ -1579,6 +1836,7 @@ li.bad { color: var(--bad); border-color: var(--bad-border); background: var(--b
   .toolbar .actions { justify-content: stretch; }
   .toolbar .actions button { flex: 1; }
   .badge-users { display: none; }
+  .cf-quick-row { flex-direction: column; align-items: stretch; }
 }
 
 @media (prefers-reduced-motion: reduce) {

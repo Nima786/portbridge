@@ -77,6 +77,16 @@ func (p *Panel) routes() http.Handler {
 	mux.HandleFunc("POST /api/servers/{id}/ssh-update", p.withAuth(p.handleSSHUpdate))
 	mux.HandleFunc("GET /api/panel", p.withAuth(p.handlePanelInfo))
 
+	mux.HandleFunc("GET /api/cf/accounts", p.withAuth(p.handleGetCFAccounts))
+	mux.HandleFunc("POST /api/cf/accounts", p.withAuth(p.handleAddCFAccount))
+	mux.HandleFunc("DELETE /api/cf/accounts/{id}", p.withAuth(p.handleDeleteCFAccount))
+	mux.HandleFunc("GET /api/cf/zones", p.withAuth(p.handleGetCFZones))
+	mux.HandleFunc("GET /api/cf/zones/{zoneID}/records", p.withAuth(p.handleGetCFRecords))
+	mux.HandleFunc("POST /api/cf/zones/{zoneID}/records", p.withAuth(p.handleCreateCFRecord))
+	mux.HandleFunc("PUT /api/cf/zones/{zoneID}/records/{recordID}", p.withAuth(p.handleUpdateCFRecord))
+	mux.HandleFunc("PATCH /api/cf/zones/{zoneID}/records/{recordID}", p.withAuth(p.handlePatchCFRecord))
+	mux.HandleFunc("DELETE /api/cf/zones/{zoneID}/records/{recordID}", p.withAuth(p.handleDeleteCFRecord))
+
 	return secureHeaders(mux)
 }
 

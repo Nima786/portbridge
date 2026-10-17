@@ -63,6 +63,10 @@
           <span>Tunnels</span>
           <span id="count-tunnels" class="tab-count" hidden>0</span>
         </button>
+        <button type="button" role="tab" id="tab-dns" aria-controls="view-dns" aria-selected="false" tabindex="-1">
+          <span>DNS</span>
+          <span id="count-zones" class="tab-count" hidden>0</span>
+        </button>
         <button type="button" role="tab" id="tab-settings" aria-controls="view-settings" aria-selected="false" tabindex="-1">
           <span>Settings</span>
         </button>
@@ -172,6 +176,83 @@
         </div>
       </div>
       <div id="tunnel-list" class="tunnels"></div>
+    </section>
+
+    <!-- DNS (CLOUDFLARE) TAB -->
+    <section id="view-dns" role="tabpanel" aria-labelledby="tab-dns" hidden>
+      <div class="toolbar">
+        <div>
+          <h2>Cloudflare DNS Manager</h2>
+          <p class="muted small">Manage domains, subdomains, target IPs, and Cloudflare proxy (orange cloud) for your CDN tunnels. API tokens are encrypted at rest with AES-256-GCM.</p>
+        </div>
+        <div class="actions">
+          <button type="button" id="cf-refresh" hidden>Refresh</button>
+          <button type="button" id="cf-open-tokens">+ API Token</button>
+          <button type="button" id="cf-add-record" class="primary" hidden>+ Add Record</button>
+        </div>
+      </div>
+
+      <!-- Saved token pills bar -->
+      <div id="cf-accounts-bar" class="cf-accounts-bar" hidden></div>
+
+      <!-- Empty state when no token is saved -->
+      <div id="cf-empty" class="card cf-setup-card" hidden>
+        <div class="card-head">
+          <h3>Connect Your Cloudflare Account</h3>
+          <p class="muted small">Use a scoped Cloudflare API Token so the panel can list your domains and manage DNS records without needing your account password or Global API Key.</p>
+        </div>
+        <ol class="cf-steps">
+          <li>Open your Cloudflare dashboard → <strong>My Profile</strong> → <strong>API Tokens</strong> → <strong>Create Token</strong>.</li>
+          <li>Click <strong>Use template</strong> next to <strong>Edit zone DNS</strong>.</li>
+          <li>Under <strong>Permissions</strong>, ensure <code>Zone → DNS → Edit</code> and <code>Zone → Zone → Read</code> are included, select <strong>All zones</strong> (or specific domains), and copy the generated token.</li>
+        </ol>
+        <form id="cf-inline-token-form" class="cf-inline-form" novalidate>
+          <div class="row2">
+            <div>
+              <label for="cf-inline-name">Account Label <span class="muted">(optional)</span></label>
+              <input id="cf-inline-name" maxlength="64" placeholder="e.g. Main Cloudflare">
+            </div>
+            <div>
+              <label for="cf-inline-token">Scoped API Token</label>
+              <input id="cf-inline-token" type="password" autocomplete="off" spellcheck="false" required placeholder="Paste Cloudflare Bearer API Token">
+            </div>
+          </div>
+          <p id="cf-inline-error" class="error" role="alert"></p>
+          <div class="actions">
+            <button type="submit" id="cf-inline-submit" class="primary">Verify &amp; Save Encrypted Token</button>
+          </div>
+        </form>
+      </div>
+
+      <!-- Active DNS workspace -->
+      <div id="cf-workspace" hidden>
+        <div class="card cf-filter-card">
+          <div class="cf-filter-bar">
+            <div class="cf-filter-zone">
+              <label for="cf-zone-select">Domain (Zone)</label>
+              <select id="cf-zone-select"></select>
+            </div>
+            <div class="cf-filter-type">
+              <label for="cf-type-filter">Record Type</label>
+              <select id="cf-type-filter">
+                <option value="">All Types</option>
+                <option value="A">A (IPv4)</option>
+                <option value="AAAA">AAAA (IPv6)</option>
+                <option value="CNAME">CNAME</option>
+                <option value="TXT">TXT</option>
+                <option value="MX">MX</option>
+              </select>
+            </div>
+            <div class="cf-filter-search">
+              <label for="cf-search">Search Subdomain or IP</label>
+              <input id="cf-search" type="search" placeholder="Filter by name or target IP..." autocapitalize="none" spellcheck="false">
+            </div>
+          </div>
+        </div>
+
+        <p id="cf-error" class="error" role="alert"></p>
+        <div id="cf-records-wrap" class="cf-records-wrap"></div>
+      </div>
     </section>
 
     <!-- SETTINGS TAB -->
@@ -569,6 +650,28 @@
         <div id="tn-opt-domain" class="sub-panel" hidden>
           <label for="tn-domain">Your CDN Domain <span class="muted">(pointed at the Foreign server with CDN proxy enabled)</span></label>
           <input id="tn-domain" placeholder="link.example.com" autocapitalize="none" spellcheck="false">
+          <div id="tn-cf-helper" class="cf-tunnel-helper" hidden>
+            <div class="row2">
+              <div>
+                <label for="tn-cf-zone">Cloudflare Domain (Zone)</label>
+                <select id="tn-cf-zone"></select>
+              </div>
+              <div>
+                <label for="tn-cf-pick">Pick Existing Cloudflare Record</label>
+                <select id="tn-cf-pick">
+                  <option value="">— Select a subdomain —</option>
+                </select>
+              </div>
+            </div>
+            <div class="cf-quick-create">
+              <label for="tn-cf-sub">Or Quick-Create New Subdomain <span class="muted">(points to selected Foreign server IP with Proxy ON)</span></label>
+              <div class="cf-quick-row">
+                <input id="tn-cf-sub" placeholder="e.g. edge1" autocapitalize="none" spellcheck="false">
+                <button type="button" id="tn-cf-create-btn">Create &amp; Use</button>
+              </div>
+              <p id="tn-cf-msg" class="small" role="status"></p>
+            </div>
+          </div>
           <p class="muted small hint-box">Set Cloudflare SSL/TLS mode to <strong>Full</strong> (not Flexible, not Full Strict). Supported Cloudflare HTTPS ports: <code>443, 2053, 2083, 2087, 2096, 8443</code>.</p>
         </div>
 
@@ -1052,6 +1155,97 @@
       <button type="button" id="fw-close">Close</button>
     </div>
   </div>
+</dialog>
+
+<!-- Cloudflare API Token Dialog -->
+<dialog id="cf-token-dialog" aria-labelledby="cf-token-title">
+  <form id="cf-token-form" novalidate>
+    <div class="dialog-header">
+      <div>
+        <h2 id="cf-token-title">Add Cloudflare API Token</h2>
+        <p class="muted small">Create a scoped API Token in Cloudflare with <code>Zone → DNS → Edit</code> and <code>Zone → Zone → Read</code> permissions. Your token is encrypted with AES-256-GCM and never shown again.</p>
+      </div>
+    </div>
+    <div class="dialog-body">
+      <label for="cf-token-name">Account Label <span class="muted">(optional)</span></label>
+      <input id="cf-token-name" maxlength="64" placeholder="e.g. Main Cloudflare">
+      <label for="cf-token-val">Scoped Bearer API Token</label>
+      <input id="cf-token-val" type="password" autocomplete="off" spellcheck="false" required placeholder="Paste Cloudflare API Token">
+      <p id="cf-token-error" class="error" role="alert"></p>
+    </div>
+    <div class="dialog-footer actions">
+      <button type="button" id="cf-token-cancel">Cancel</button>
+      <button type="submit" id="cf-token-submit" class="primary">Verify &amp; Save Token</button>
+    </div>
+  </form>
+</dialog>
+
+<!-- Cloudflare DNS Record Add/Edit Dialog -->
+<dialog id="cf-record-dialog" aria-labelledby="cf-rec-title">
+  <form id="cf-record-form" novalidate>
+    <div class="dialog-header">
+      <div>
+        <h2 id="cf-rec-title">Add DNS Record</h2>
+        <p id="cf-rec-sub" class="muted small">Create or update a DNS record in your Cloudflare domain.</p>
+      </div>
+    </div>
+    <div class="dialog-body">
+      <div class="row2">
+        <div>
+          <label for="cf-rec-type">Record Type</label>
+          <select id="cf-rec-type">
+            <option value="A">A (IPv4 Address)</option>
+            <option value="AAAA">AAAA (IPv6 Address)</option>
+            <option value="CNAME">CNAME (Alias)</option>
+            <option value="TXT">TXT (Text)</option>
+            <option value="MX">MX (Mail)</option>
+            <option value="NS">NS (Nameserver)</option>
+            <option value="CAA">CAA</option>
+          </select>
+        </div>
+        <div>
+          <label for="cf-rec-ttl">TTL</label>
+          <select id="cf-rec-ttl">
+            <option value="1">Auto</option>
+            <option value="60">1 min</option>
+            <option value="120">2 min</option>
+            <option value="300">5 min</option>
+            <option value="900">15 min</option>
+            <option value="3600">1 hour</option>
+            <option value="86400">1 day</option>
+          </select>
+        </div>
+      </div>
+
+      <label for="cf-rec-name">Name <span id="cf-rec-zone-hint" class="muted">(use @ for root, or subdomain like edge1)</span></label>
+      <input id="cf-rec-name" required autocapitalize="none" spellcheck="false" placeholder="e.g. edge1 or @">
+
+      <div class="cf-target-head">
+        <label for="cf-rec-content" id="cf-rec-content-label">IPv4 Address</label>
+        <select id="cf-rec-server-pick" class="cf-server-pick" aria-label="Fill IP from a panel server">
+          <option value="">Fill IP from Foreign / Relay server…</option>
+        </select>
+      </div>
+      <input id="cf-rec-content" required autocapitalize="none" spellcheck="false" placeholder="e.g. 203.0.113.5">
+
+      <label class="check-card" id="cf-rec-proxy-row">
+        <input type="checkbox" id="cf-rec-proxied" checked>
+        <span>
+          <strong>Cloudflare Proxy (Orange Cloud)</strong>
+          <span class="muted"> — Routes traffic through Cloudflare CDN edge IPs and hides your Foreign server's IP. Required for CDN WebSocket and CDN gRPC tunnels.</span>
+        </span>
+      </label>
+
+      <label for="cf-rec-comment">Comment <span class="muted">(optional)</span></label>
+      <input id="cf-rec-comment" maxlength="100" placeholder="e.g. PortBridge CDN tunnel for Germany">
+
+      <p id="cf-rec-error" class="error" role="alert"></p>
+    </div>
+    <div class="dialog-footer actions">
+      <button type="button" id="cf-rec-cancel">Cancel</button>
+      <button type="submit" id="cf-rec-submit" class="primary">Save Record</button>
+    </div>
+  </form>
 </dialog>
 </body>
 </html>

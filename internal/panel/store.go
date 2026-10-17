@@ -122,12 +122,22 @@ type Admin struct {
 	Hash string `json:"hash"`
 }
 
+// CFAccount is one Cloudflare API token the panel keeps, encrypted.
+type CFAccount struct {
+	ID       string    `json:"id"`
+	Name     string    `json:"name"`
+	TokenEnc string    `json:"token"` // encrypted with secret.key
+	Hint     string    `json:"hint"`  // last 4 characters, safe to display
+	Added    time.Time `json:"added"`
+}
+
 // State is state.json.
 type State struct {
-	Admin     Admin    `json:"admin"`
-	ThisGroup string   `json:"this_group"` // the group the panel's own server is in, if any
-	ThisName  string   `json:"this_name"`
-	Servers   []Server `json:"servers"`
+	Admin      Admin       `json:"admin"`
+	ThisGroup  string      `json:"this_group"` // the group the panel's own server is in, if any
+	ThisName   string      `json:"this_name"`
+	Servers    []Server    `json:"servers"`
+	CFAccounts []CFAccount `json:"cf_accounts,omitempty"`
 }
 
 // store guards the state and saves every change at once.
@@ -164,6 +174,7 @@ func (s *store) get() State {
 	defer s.mu.Unlock()
 	st := s.st
 	st.Servers = append([]Server(nil), s.st.Servers...)
+	st.CFAccounts = append([]CFAccount(nil), s.st.CFAccounts...)
 	return st
 }
 
@@ -173,6 +184,7 @@ func (s *store) update(change func(*State) error) error {
 	defer s.mu.Unlock()
 	next := s.st
 	next.Servers = append([]Server(nil), s.st.Servers...)
+	next.CFAccounts = append([]CFAccount(nil), s.st.CFAccounts...)
 	if err := change(&next); err != nil {
 		return err
 	}

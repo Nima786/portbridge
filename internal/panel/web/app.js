@@ -259,23 +259,28 @@
 
   // ------------------------------------------------------------------- tabs
 
-  const TABS = ['servers', 'tunnels', 'settings'];
+  const TABS = ['servers', 'tunnels', 'dns', 'settings'];
+  let cfLoadedOnce = false;
 
   function selectTab(name, focus) {
     currentTab = name;
+    if (name === 'dns') cfLoadedOnce = false;
     for (const t of TABS) {
       const on = t === name;
       const tab = $('tab-' + t);
+      if (!tab) continue;
       tab.setAttribute('aria-selected', String(on));
       tab.tabIndex = on ? 0 : -1;
-      $('view-' + t).hidden = !on;
+      const view = $('view-' + t);
+      if (view) view.hidden = !on;
     }
-    if (focus) $('tab-' + name).focus();
+    if (focus && $('tab-' + name)) $('tab-' + name).focus();
     refresh();
   }
 
   for (const t of TABS) {
     const tab = $('tab-' + t);
+    if (!tab) continue;
     tab.addEventListener('click', () => selectTab(t, false));
     tab.addEventListener('keydown', (ev) => {
       let i = TABS.indexOf(t);
@@ -351,6 +356,8 @@
         await Promise.all([loadServers(), loadTunnels()]);
       } else if (currentTab === 'tunnels') {
         await Promise.all([loadTunnels(), loadServers()]);
+      } else if (currentTab === 'dns') {
+        await Promise.all([loadServers(), loadCloudflare(false)]);
       } else {
         await loadSettings();
       }
@@ -1736,6 +1743,560 @@
     return !!(ov && ov.ipv6 && ov.ipv6.length);
   }
 
+  // ------------------------------------------------------- cloudflare dns
+
+  let cfAccounts = [];
+  let cfZones = [];
+  let cfRecords = [];
+  let editingCFRecord = null;
+
+  function makeCloudIcon() {
+    const svgNS = 'http://www.w3.org/2000/svg';
+    const svg = document.createElementNS(svgNS, 'svg');
+    svg.setAttribute('class', 'cf-proxy-cloud');
+    svg.setAttribute('viewBox', '0 0 24 24');
+    svg.setAttribute('fill', 'currentColor');
+    svg.setAttribute('aria-hidden', 'true');
+    const path = document.createElementNS(svgNS, 'path');
+    path.setAttribute('d', 'M18.42 9.22A7 7 0 0 0 5.06 11a4.5 4.5 0 0 0 .44 8.98h12.5a4.5 4.5 0 0 0 .42-8.98z');
+    svg.append(path);
+    return svg;
+  }
+
+  function currentCFZone() {
+    const sel = $('cf-zone-select');
+    const id = sel ? sel.value : '';
+    return cfZones.find((z) => z.id === id) || cfZones[0] || null;
+  }
+
+  function serverMatchingIP(ip) {
+    if (!ip) return null;
+    const clean = String(ip).trim().toLowerCase();
+    for (const s of serversCache) {
+      if (s.address && s.address.toLowerCase() === clean) return s;
+      const ov = s.overview;
+      if (ov) {
+        if ((ov.ipv4 || []).some((v) => String(v).toLowerCase() === clean)) return s;
+        if ((ov.ipv6 || []).some((v) => String(v).toLowerCase() === clean)) return s;
+      }
+    }
+    return null;
+  }
+
+  function renderCFAccountsBar() {
+    const bar = $('cf-accounts-bar');
+    if (!bar) return;
+    if (!cfAccounts.length) {
+      bar.hidden = true;
+      bar.replaceChildren();
+      return;
+    }
+    bar.hidden = false;
+    const pills = cfAccounts.map((a) => h('div', { class: 'cf-account-pill' },
+      h('span', { class: 'cf-dot', 'aria-hidden': 'true' }),
+      h('strong', null, a.name || 'Cloudflare'),
+      h('span', { class: 'cf-hint' }, a.hint || '••••'),
+      h('button', {
+        type: 'button',
+        class: 'cf-del-acct danger-text',
+        title: 'Remove this Cloudflare API token',
+        onclick: () => openConfirm(
+          `Remove "${a.name || 'Cloudflare'}" API token?`,
+          'This removes the encrypted Cloudflare API token from the panel. Your DNS records on Cloudflare are not touched.',
+          'Remove Token',
+          async () => {
+            await api('DELETE', '/api/cf/accounts/' + encodeURIComponent(a.id));
+            cfLoadedOnce = false;
+            await loadCloudflare(true);
+            setStatus('Cloudflare API token removed.');
+          }
+        )
+      }, 'Remove')));
+    bar.replaceChildren(...pills);
+  }
+
+  async function loadCloudflare(force) {
+    if (!force && cfLoadedOnce) return;
+    if ($('cf-error')) $('cf-error').textContent = '';
+    const acctData = await api('GET', '/api/cf/accounts');
+    cfAccounts = acctData.accounts || [];
+    renderCFAccountsBar();
+
+    const cz = $('count-zones');
+    if (!cfAccounts.length) {
+      cfZones = [];
+      cfRecords = [];
+      if (cz) cz.hidden = true;
+      if ($('cf-empty')) $('cf-empty').hidden = false;
+      if ($('cf-workspace')) $('cf-workspace').hidden = true;
+      if ($('cf-refresh')) $('cf-refresh').hidden = true;
+      if ($('cf-add-record')) $('cf-add-record').hidden = true;
+      cfLoadedOnce = true;
+      return;
+    }
+
+    if ($('cf-empty')) $('cf-empty').hidden = true;
+    if ($('cf-workspace')) $('cf-workspace').hidden = false;
+    if ($('cf-refresh')) $('cf-refresh').hidden = false;
+    if ($('cf-add-record')) $('cf-add-record').hidden = false;
+
+    try {
+      const zdata = await api('GET', '/api/cf/zones');
+      cfZones = zdata.zones || [];
+    } catch (e) {
+      cfZones = [];
+      if ($('cf-error')) $('cf-error').textContent = e.message;
+    }
+
+    if (cz) {
+      cz.textContent = String(cfZones.length);
+      cz.hidden = cfZones.length === 0;
+    }
+
+    const sel = $('cf-zone-select');
+    const prev = sel ? sel.value : '';
+    if (sel) {
+      sel.replaceChildren(...cfZones.map((z) => h('option', { value: z.id },
+        `${z.name}${z.status && z.status !== 'active' ? ' (' + z.status + ')' : ''}${cfAccounts.length > 1 ? ' — ' + z.account_name : ''}`)));
+      if (prev && cfZones.some((z) => z.id === prev)) sel.value = prev;
+    }
+
+    await loadCFRecordsForCurrentZone();
+    cfLoadedOnce = true;
+  }
+
+  async function loadCFRecordsForCurrentZone() {
+    const wrap = $('cf-records-wrap');
+    if (!wrap) return;
+    const z = currentCFZone();
+    if (!z) {
+      cfRecords = [];
+      wrap.replaceChildren(h('p', { class: 'empty' }, 'No domains (zones) found under your Cloudflare API token. Ensure your token has Zone:Read permission.'));
+      return;
+    }
+    if ($('cf-error')) $('cf-error').textContent = '';
+    wrap.replaceChildren(h('p', { class: 'muted' }, `Loading DNS records for ${z.name}...`));
+    try {
+      const data = await api('GET', `/api/cf/zones/${encodeURIComponent(z.id)}/records?account_id=${encodeURIComponent(z.account_id)}`);
+      cfRecords = data.records || [];
+      renderCFRecords();
+    } catch (e) {
+      wrap.replaceChildren();
+      if ($('cf-error')) $('cf-error').textContent = e.message;
+    }
+  }
+
+  function formatTTL(ttl, proxied) {
+    if (proxied || !ttl || ttl === 1) return 'Auto';
+    if (ttl < 60) return `${ttl}s`;
+    if (ttl < 3600) return `${Math.round(ttl / 60)} min`;
+    if (ttl < 86400) return `${Math.round(ttl / 3600)} hr`;
+    return `${Math.round(ttl / 86400)} d`;
+  }
+
+  function renderCFRecords() {
+    const wrap = $('cf-records-wrap');
+    if (!wrap) return;
+    const z = currentCFZone();
+    if (!z) return;
+    const typeFilter = ($('cf-type-filter') && $('cf-type-filter').value) || '';
+    const q = (($('cf-search') && $('cf-search').value) || '').trim().toLowerCase();
+
+    const list = cfRecords.filter((r) => {
+      if (typeFilter && r.type !== typeFilter) return false;
+      if (q) {
+        const hay = `${r.name || ''} ${r.content || ''} ${r.comment || ''}`.toLowerCase();
+        if (!hay.includes(q)) return false;
+      }
+      return true;
+    });
+
+    if (!list.length) {
+      wrap.replaceChildren(h('p', { class: 'empty' },
+        cfRecords.length
+          ? 'No DNS records match your current filter.'
+          : `No DNS records found in ${z.name}. Click "+ Add Record" to create a subdomain.`));
+      return;
+    }
+
+    const rows = list.map((r) => {
+      const canProxy = r.proxiable || ['A', 'AAAA', 'CNAME'].includes(r.type);
+      const matchedSrv = serverMatchingIP(r.content);
+      const proxyCell = canProxy
+        ? h('button', {
+            type: 'button',
+            class: 'cf-proxy-btn ' + (r.proxied ? 'is-proxied' : 'is-dns-only'),
+            title: r.proxied
+              ? 'Proxied through Cloudflare CDN (Orange Cloud) — click to switch to DNS Only'
+              : 'DNS Only (Grey Cloud) — click to enable Cloudflare Proxy',
+            onclick: async (ev) => {
+              const btn = ev.currentTarget;
+              btn.disabled = true;
+              try {
+                const updated = await api('PATCH', `/api/cf/zones/${encodeURIComponent(z.id)}/records/${encodeURIComponent(r.id)}`, {
+                  account_id: z.account_id,
+                  proxied: !r.proxied,
+                });
+                r.proxied = updated.proxied;
+                r.ttl = updated.ttl || r.ttl;
+                renderCFRecords();
+                setStatus(`${r.name}: Cloudflare Proxy ${r.proxied ? 'enabled (Proxied)' : 'disabled (DNS Only)'}.`);
+              } catch (e) {
+                setStatus(e.message, true);
+                btn.disabled = false;
+              }
+            }
+          }, makeCloudIcon(), r.proxied ? 'Proxied' : 'DNS Only')
+        : h('span', { class: 'muted small' }, 'DNS Only');
+
+      const useInTunnelBtn = ['A', 'AAAA', 'CNAME'].includes(r.type)
+        ? h('button', {
+            type: 'button',
+            title: 'Create a CDN tunnel with this subdomain',
+            onclick: async () => {
+              const foreignID = matchedSrv && matchedSrv.group === 'foreign' ? matchedSrv.id : '';
+              await openNewTunnel('', foreignID);
+              setRadio('tn-link', 'cdn');
+              $('tn-domain').value = r.name;
+              showTunnelOptions();
+              $('tn-name').focus();
+            }
+          }, '+ Tunnel')
+        : null;
+
+      return h('div', { class: 'cf-record-row' },
+        h('span', { class: 'cf-type-badge cf-type-' + r.type }, r.type),
+        h('div', { class: 'cf-rec-main' },
+          h('span', { class: 'cf-rec-fqdn' }, r.name),
+          r.comment ? h('span', { class: 'cf-rec-note' }, r.comment) : null),
+        h('div', { class: 'cf-rec-target' },
+          h('span', { class: 'cf-rec-ip' }, r.content),
+          matchedSrv
+            ? h('span', { class: 'cf-srv-match' }, `${matchedSrv.name || matchedSrv.address} (${matchedSrv.group === 'foreign' ? 'Foreign' : 'Relay'})`)
+            : null),
+        h('div', null, proxyCell),
+        h('div', { class: 'cf-rec-ttl-cell' }, formatTTL(r.ttl, r.proxied)),
+        h('div', { class: 'cf-rec-actions' },
+          useInTunnelBtn,
+          h('button', { type: 'button', onclick: () => openCFRecordModal(r) }, 'Edit'),
+          h('button', {
+            type: 'button',
+            class: 'danger-text',
+            onclick: () => openConfirm(
+              `Delete DNS record "${r.name}"?`,
+              `This permanently deletes the ${r.type} record "${r.name}" → "${r.content}" from ${z.name} in Cloudflare.`,
+              'Delete Record',
+              async () => {
+                await api('DELETE', `/api/cf/zones/${encodeURIComponent(z.id)}/records/${encodeURIComponent(r.id)}?account_id=${encodeURIComponent(z.account_id)}`);
+                await loadCFRecordsForCurrentZone();
+                setStatus(`Deleted DNS record ${r.name}.`);
+              }
+            )
+          }, 'Delete')));
+    });
+
+    wrap.replaceChildren(...rows);
+  }
+
+  async function saveCFToken(name, token, errEl, btnEl, closeDlg) {
+    if (!token) {
+      if (errEl) errEl.textContent = 'Paste your Cloudflare API token.';
+      return;
+    }
+    if (errEl) errEl.textContent = '';
+    if (btnEl) btnEl.disabled = true;
+    try {
+      await api('POST', '/api/cf/accounts', { name, token });
+      if (closeDlg) closeDlg.close();
+      cfLoadedOnce = false;
+      await loadCloudflare(true);
+      setStatus('Cloudflare API token verified and encrypted.');
+    } catch (e) {
+      if (errEl) errEl.textContent = e.message;
+    } finally {
+      if (btnEl) btnEl.disabled = false;
+    }
+  }
+
+  if ($('cf-inline-token-form')) {
+    $('cf-inline-token-form').addEventListener('submit', async (ev) => {
+      ev.preventDefault();
+      await saveCFToken(
+        $('cf-inline-name').value.trim(),
+        $('cf-inline-token').value.trim(),
+        $('cf-inline-error'),
+        $('cf-inline-submit'),
+        null
+      );
+      $('cf-inline-token').value = '';
+    });
+  }
+
+  if ($('cf-open-tokens')) {
+    $('cf-open-tokens').addEventListener('click', () => {
+      $('cf-token-name').value = '';
+      $('cf-token-val').value = '';
+      $('cf-token-error').textContent = '';
+      openDialog($('cf-token-dialog'));
+      $('cf-token-val').focus();
+    });
+  }
+  if ($('cf-token-cancel')) $('cf-token-cancel').addEventListener('click', () => $('cf-token-dialog').close());
+  if ($('cf-token-form')) {
+    $('cf-token-form').addEventListener('submit', async (ev) => {
+      ev.preventDefault();
+      await saveCFToken(
+        $('cf-token-name').value.trim(),
+        $('cf-token-val').value.trim(),
+        $('cf-token-error'),
+        $('cf-token-submit'),
+        $('cf-token-dialog')
+      );
+    });
+  }
+
+  if ($('cf-refresh')) {
+    $('cf-refresh').addEventListener('click', () => {
+      cfLoadedOnce = false;
+      loadCloudflare(true);
+    });
+  }
+  if ($('cf-zone-select')) {
+    $('cf-zone-select').addEventListener('change', () => loadCFRecordsForCurrentZone());
+  }
+  if ($('cf-type-filter')) {
+    $('cf-type-filter').addEventListener('change', renderCFRecords);
+  }
+  if ($('cf-search')) {
+    $('cf-search').addEventListener('input', renderCFRecords);
+  }
+
+  function syncCFRecordFormType() {
+    const t = $('cf-rec-type').value;
+    const canProxy = ['A', 'AAAA', 'CNAME'].includes(t);
+    $('cf-rec-proxy-row').hidden = !canProxy;
+    const lbl = $('cf-rec-content-label');
+    const inp = $('cf-rec-content');
+    if (t === 'A') {
+      lbl.textContent = 'IPv4 Address';
+      inp.placeholder = 'e.g. 203.0.113.5';
+    } else if (t === 'AAAA') {
+      lbl.textContent = 'IPv6 Address';
+      inp.placeholder = 'e.g. 2001:db8::1';
+    } else if (t === 'CNAME') {
+      lbl.textContent = 'Target Domain';
+      inp.placeholder = 'e.g. target.example.com';
+    } else {
+      lbl.textContent = 'Record Content';
+      inp.placeholder = 'Enter record value';
+    }
+    syncChoiceCards($('cf-record-dialog'));
+  }
+
+  function populateCFServerPick() {
+    const pick = $('cf-rec-server-pick');
+    if (!pick) return;
+    const opts = [h('option', { value: '' }, 'Fill IP from Foreign / Relay server…')];
+    const sorted = [...serversCache].sort((a, b) => (a.group === 'foreign' ? -1 : 1) - (b.group === 'foreign' ? -1 : 1));
+    for (const s of sorted) {
+      const role = s.group === 'foreign' ? 'Foreign' : 'Relay';
+      const v4 = (s.overview && s.overview.ipv4 && s.overview.ipv4[0]) || s.address || '';
+      if (v4) {
+        opts.push(h('option', { value: `A:${v4}` }, `${s.name || v4} (${role} IPv4: ${v4})`));
+      }
+      const v6 = s.overview && s.overview.ipv6 && s.overview.ipv6[0];
+      if (v6) {
+        opts.push(h('option', { value: `AAAA:${v6}` }, `${s.name || v6} (${role} IPv6: ${v6})`));
+      }
+    }
+    pick.replaceChildren(...opts);
+    pick.value = '';
+  }
+
+  if ($('cf-rec-type')) {
+    $('cf-rec-type').addEventListener('change', syncCFRecordFormType);
+  }
+  if ($('cf-rec-server-pick')) {
+    $('cf-rec-server-pick').addEventListener('change', (ev) => {
+      const val = ev.target.value;
+      if (!val) return;
+      const idx = val.indexOf(':');
+      const rtype = val.slice(0, idx);
+      const ip = val.slice(idx + 1);
+      $('cf-rec-type').value = rtype;
+      $('cf-rec-content').value = ip;
+      syncCFRecordFormType();
+      ev.target.value = '';
+    });
+  }
+
+  function openCFRecordModal(rec) {
+    const z = currentCFZone();
+    if (!z) return;
+    editingCFRecord = rec || null;
+    $('cf-rec-title').textContent = rec ? `Edit DNS Record (${z.name})` : `Add DNS Record (${z.name})`;
+    $('cf-rec-zone-hint').textContent = `(use @ for ${z.name}, or a subdomain like edge1)`;
+    populateCFServerPick();
+
+    $('cf-rec-type').value = (rec && rec.type) || 'A';
+    $('cf-rec-ttl').value = String((rec && rec.ttl) || 1);
+    $('cf-rec-name').value = (rec && rec.name) || '';
+    $('cf-rec-content').value = (rec && rec.content) || '';
+    $('cf-rec-proxied').checked = rec ? !!rec.proxied : true;
+    $('cf-rec-comment').value = (rec && rec.comment) || '';
+    $('cf-rec-error').textContent = '';
+
+    syncCFRecordFormType();
+    openDialog($('cf-record-dialog'));
+    $('cf-rec-name').focus();
+  }
+
+  if ($('cf-add-record')) {
+    $('cf-add-record').addEventListener('click', () => openCFRecordModal(null));
+  }
+  if ($('cf-rec-cancel')) {
+    $('cf-rec-cancel').addEventListener('click', () => $('cf-record-dialog').close());
+  }
+  if ($('cf-record-form')) {
+    $('cf-record-form').addEventListener('submit', async (ev) => {
+      ev.preventDefault();
+      const z = currentCFZone();
+      if (!z) return;
+      const btn = $('cf-rec-submit');
+      const err = $('cf-rec-error');
+      err.textContent = '';
+      btn.disabled = true;
+      const body = {
+        account_id: z.account_id,
+        type: $('cf-rec-type').value,
+        name: $('cf-rec-name').value.trim(),
+        content: $('cf-rec-content').value.trim(),
+        ttl: Number($('cf-rec-ttl').value || 1),
+        proxied: $('cf-rec-proxied').checked,
+        comment: $('cf-rec-comment').value.trim(),
+      };
+      try {
+        if (editingCFRecord) {
+          await api('PUT', `/api/cf/zones/${encodeURIComponent(z.id)}/records/${encodeURIComponent(editingCFRecord.id)}`, body);
+          setStatus(`Updated DNS record ${body.name}.`);
+        } else {
+          await api('POST', `/api/cf/zones/${encodeURIComponent(z.id)}/records`, body);
+          setStatus(`Created DNS record ${body.name}.`);
+        }
+        $('cf-record-dialog').close();
+        await loadCFRecordsForCurrentZone();
+      } catch (e) {
+        err.textContent = e.message;
+      } finally {
+        btn.disabled = false;
+      }
+    });
+  }
+
+  // Cloudflare helper inside + New Tunnel modal
+  async function ensureTunnelCFHelper() {
+    const box = $('tn-cf-helper');
+    if (!box) return;
+    if (!cfZones.length) {
+      try {
+        const acctData = await api('GET', '/api/cf/accounts');
+        cfAccounts = acctData.accounts || [];
+        if (cfAccounts.length) {
+          const zdata = await api('GET', '/api/cf/zones');
+          cfZones = zdata.zones || [];
+        }
+      } catch (e) {
+        // Ignore if Cloudflare is not configured.
+      }
+    }
+    if (!cfZones.length) {
+      box.hidden = true;
+      return;
+    }
+    box.hidden = false;
+    const zSel = $('tn-cf-zone');
+    const prev = zSel.value;
+    zSel.replaceChildren(...cfZones.map((z) => h('option', { value: z.id }, z.name)));
+    if (prev && cfZones.some((z) => z.id === prev)) zSel.value = prev;
+    await loadTunnelCFRecords();
+  }
+
+  async function loadTunnelCFRecords() {
+    const zSel = $('tn-cf-zone');
+    const pick = $('tn-cf-pick');
+    if (!zSel || !pick) return;
+    const z = cfZones.find((x) => x.id === zSel.value) || cfZones[0];
+    if (!z) return;
+    try {
+      const data = await api('GET', `/api/cf/zones/${encodeURIComponent(z.id)}/records?account_id=${encodeURIComponent(z.account_id)}`);
+      const recs = (data.records || []).filter((r) => ['A', 'AAAA', 'CNAME'].includes(r.type));
+      pick.replaceChildren(
+        h('option', { value: '' }, `— Pick from ${z.name} (${recs.length}) —`),
+        ...recs.map((r) => h('option', { value: r.name }, `${r.name} → ${r.content} (${r.proxied ? 'Proxied' : 'DNS Only'})`))
+      );
+    } catch (e) {
+      pick.replaceChildren(h('option', { value: '' }, '— Could not load records —'));
+    }
+  }
+
+  if ($('tn-cf-zone')) {
+    $('tn-cf-zone').addEventListener('change', loadTunnelCFRecords);
+  }
+  if ($('tn-cf-pick')) {
+    $('tn-cf-pick').addEventListener('change', (ev) => {
+      if (ev.target.value) {
+        $('tn-domain').value = ev.target.value;
+      }
+    });
+  }
+  if ($('tn-cf-create-btn')) {
+    $('tn-cf-create-btn').addEventListener('click', async () => {
+      const msg = $('tn-cf-msg');
+      const sub = $('tn-cf-sub').value.trim();
+      const z = cfZones.find((x) => x.id === $('tn-cf-zone').value) || cfZones[0];
+      if (!z) return;
+      if (!sub) {
+        msg.className = 'small error';
+        msg.textContent = 'Enter a subdomain name (e.g. edge1).';
+        $('tn-cf-sub').focus();
+        return;
+      }
+      const fSrv = serverById($('tn-foreign').value);
+      const ip = (fSrv && fSrv.overview && fSrv.overview.ipv4 && fSrv.overview.ipv4[0]) || (fSrv && fSrv.address) || '';
+      if (!ip) {
+        msg.className = 'small error';
+        msg.textContent = 'Select a Foreign server with a valid IPv4 address first.';
+        return;
+      }
+      const btn = $('tn-cf-create-btn');
+      btn.disabled = true;
+      msg.className = 'small muted';
+      msg.textContent = 'Creating Cloudflare A record with Proxy enabled...';
+      try {
+        const created = await api('POST', `/api/cf/zones/${encodeURIComponent(z.id)}/records`, {
+          account_id: z.account_id,
+          type: 'A',
+          name: sub,
+          content: ip,
+          ttl: 1,
+          proxied: true,
+          comment: 'PortBridge CDN tunnel',
+        });
+        $('tn-domain').value = created.name;
+        $('tn-cf-sub').value = '';
+        msg.className = 'small okay';
+        msg.textContent = `Created ${created.name} → ${ip} (Proxied ON) and filled above.`;
+        cfLoadedOnce = false;
+        await loadTunnelCFRecords();
+      } catch (e) {
+        msg.className = 'small error';
+        msg.textContent = e.message;
+      } finally {
+        btn.disabled = false;
+      }
+    });
+  }
+
   function showTunnelOptions() {
     const mode = radio('tn-mode');
     const gre = $('tn-gre').checked;
@@ -1747,7 +2308,9 @@
     $('tn-opt-webheader').hidden = gre || link !== 'plain';
     $('tn-webhost').disabled = !$('tn-webheader').checked;
     $('tn-opt-claim').hidden = !['website', 'website-cdn-backup', 'grpc'].includes(link);
-    $('tn-opt-domain').hidden = !['cdn', 'website-cdn-backup', 'grpc-cdn'].includes(link);
+    const needDomain = ['cdn', 'website-cdn-backup', 'grpc-cdn'].includes(link);
+    $('tn-opt-domain').hidden = !needDomain;
+    if (needDomain) ensureTunnelCFHelper();
     $('tn-opt-clean').hidden = !['cdn', 'grpc-cdn'].includes(link);
     $('tn-opt-stealth').hidden = !['website', 'grpc'].includes(link);
     if (link === 'grpc' && $('tn-claim').value === 'www.bing.com') $('tn-claim').value = 'www.google.com';
