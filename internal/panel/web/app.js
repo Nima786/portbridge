@@ -207,7 +207,14 @@
     $('login-user').focus();
   }
 
+  let loadedVersion = '';
+
   function enter(me) {
+    if ((loadedVersion && me.version && loadedVersion !== me.version) || !$('tn-probe-live')) {
+      window.location.reload();
+      return;
+    }
+    loadedVersion = me.version || loadedVersion;
     csrf = me.csrf;
     currentUser = me.user;
     $('version').textContent = me.version || '';
@@ -2432,15 +2439,19 @@
     const st = stMap[r.status] || ['bad', r.status || 'Blocked'];
     const scoreCls = r.score >= 75 ? '' : (r.score >= 45 ? ' warn' : ' bad');
     const canUse = !isLive && (r.status === 'ok' || r.status === 'degraded');
+    let speedText = '—';
+    if (r.successes > 0) {
+      speedText = (r.status === 'throttled' && !(r.avg_mbps > 0)) ? 'Frozen' : `${r.avg_mbps.toFixed(1)} Mbps`;
+    }
     return h('div', { class: 'probe-row' },
       h('div', { class: 'probe-row-label' },
         r.label,
         r.error && r.status !== 'ok' ? h('span', { class: 'probe-row-sub' }, r.error) : null),
       h('span', { class: 'state ' + st[0] }, st[1]),
       h('span', { class: 'probe-metric' }, r.successes > 0 ? `${Math.round(r.rtt_ms)} ms` : '—'),
-      h('span', { class: 'probe-metric' }, r.successes > 0 ? `${r.avg_mbps.toFixed(1)} Mbps` : '—'),
+      h('span', { class: 'probe-metric' }, speedText),
       isLive
-        ? h('span', { class: 'muted small' }, r.status === 'ok' ? 'Done' : '—')
+        ? h('span', { class: 'muted small' }, r.status === 'ok' ? 'Done' : (r.status === 'throttled' ? 'Capped' : '—'))
         : h('span', { class: 'probe-score-pill' + scoreCls }, `${r.score}/100`),
       canUse
         ? h('button', {
@@ -2510,6 +2521,9 @@
       btn.disabled = true;
       btn.textContent = 'Starting…';
       setProbeProgress('Preparing temporary benchmark listeners on both servers…', 4);
+      if (live && live.scrollIntoView) {
+        live.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+      }
 
       let sess = null;
       const doneResults = [];
@@ -2532,7 +2546,7 @@
           const spec = cands[i];
           const pct = Math.round(((i + 0.2) / cands.length) * 92) + 4;
           btn.textContent = `Testing (${i + 1}/${cands.length})…`;
-          setProbeProgress(`Testing ${i + 1} of ${cands.length}: ${spec.label}…`, pct);
+          setProbeProgress(`Step ${i + 1} of ${cands.length}: ${spec.label}…`, pct);
           renderProbeResults({ results: liveState, notes: sess.notes }, true, i);
 
           const isTCPDirect = !spec.cdn && spec.transport !== 'kcp' && spec.target_addr;
@@ -2541,7 +2555,7 @@
               status: 'blocked',
               attempts: 1,
               successes: 0,
-              error: 'connection timed out',
+              error: 'TCP port unreachable (connection timed out)',
               summary: 'Blocked / Unreachable — TCP port unreachable',
             });
             liveState[i] = skipped;
@@ -2557,7 +2571,7 @@
             secret,
             spec,
           });
-          if (isTCPDirect && stepRes.successes === 0 && (stepRes.error === 'connection timed out' || stepRes.error === 'connection refused')) {
+          if (isTCPDirect && stepRes.successes === 0 && (stepRes.error === 'TCP port unreachable (connection timed out)' || stepRes.error === 'connection refused')) {
             deadTCP[spec.target_addr] = (deadTCP[spec.target_addr] || 0) + 1;
           }
           liveState[i] = stepRes;

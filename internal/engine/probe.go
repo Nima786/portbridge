@@ -371,6 +371,7 @@ func BuildProbeCandidates(mode, ipv4, ipv6 string, port int, cdnDomain string) [
 	if mode == "reverse" {
 		dirLabel = "Reverse"
 	}
+	v4Label := dirLabel + " (IPv4)"
 
 	var specs []ProbeCandidateSpec
 	if ipv4 != "" && port > 0 {
@@ -378,7 +379,7 @@ func BuildProbeCandidates(mode, ipv4, ipv6 string, port int, cdnDomain string) [
 		specs = append(specs,
 			ProbeCandidateSpec{
 				ID:         mode + "-tls-stealth",
-				Label:      dirLabel + " · Fake TLS + Stealth (uTLS + Frag)",
+				Label:      v4Label + " · Fake TLS + Stealth (uTLS + Frag)",
 				Mode:       mode,
 				Link:       "website",
 				Transport:  string(TransportTLS),
@@ -390,7 +391,7 @@ func BuildProbeCandidates(mode, ipv4, ipv6 string, port int, cdnDomain string) [
 			},
 			ProbeCandidateSpec{
 				ID:         mode + "-tls",
-				Label:      dirLabel + " · Fake TLS Website (SNI)",
+				Label:      v4Label + " · Fake TLS Website (SNI)",
 				Mode:       mode,
 				Link:       "website",
 				Transport:  string(TransportTLS),
@@ -402,7 +403,7 @@ func BuildProbeCandidates(mode, ipv4, ipv6 string, port int, cdnDomain string) [
 			},
 			ProbeCandidateSpec{
 				ID:         mode + "-grpc",
-				Label:      dirLabel + " · gRPC Stream (HTTP/2)",
+				Label:      v4Label + " · gRPC Stream (HTTP/2)",
 				Mode:       mode,
 				Link:       "grpc",
 				Transport:  string(TransportGRPC),
@@ -414,7 +415,7 @@ func BuildProbeCandidates(mode, ipv4, ipv6 string, port int, cdnDomain string) [
 			},
 			ProbeCandidateSpec{
 				ID:         mode + "-kcp",
-				Label:      dirLabel + " · KCP over UDP (FEC)",
+				Label:      v4Label + " · KCP over UDP (FEC)",
 				Mode:       mode,
 				Link:       "kcp",
 				Transport:  string(TransportKCP),
@@ -425,7 +426,7 @@ func BuildProbeCandidates(mode, ipv4, ipv6 string, port int, cdnDomain string) [
 			},
 			ProbeCandidateSpec{
 				ID:         mode + "-http-tcp",
-				Label:      dirLabel + " · TCP + HTTP Header",
+				Label:      v4Label + " · TCP + HTTP Header",
 				Mode:       mode,
 				Link:       "plain",
 				Transport:  string(TransportPlain),
@@ -437,7 +438,7 @@ func BuildProbeCandidates(mode, ipv4, ipv6 string, port int, cdnDomain string) [
 			},
 			ProbeCandidateSpec{
 				ID:         mode + "-plain",
-				Label:      dirLabel + " · Plain TCP (Raw)",
+				Label:      v4Label + " · Plain TCP (Raw)",
 				Mode:       mode,
 				Link:       "plain",
 				Transport:  string(TransportPlain),
@@ -451,18 +452,34 @@ func BuildProbeCandidates(mode, ipv4, ipv6 string, port int, cdnDomain string) [
 
 	if ipv6 != "" && port > 0 {
 		addr6 := net.JoinHostPort(ipv6, strconv.Itoa(port))
-		specs = append(specs, ProbeCandidateSpec{
-			ID:         mode + "-ipv6-tls",
-			Label:      dirLabel + " (IPv6) · Fake TLS Website",
-			Mode:       mode,
-			Link:       "website",
-			Transport:  string(TransportTLS),
-			IPv6:       true,
-			Shared:     false,
-			ServerName: "www.bing.com",
-			TargetAddr: addr6,
-			Port:       port,
-		})
+		specs = append(specs,
+			ProbeCandidateSpec{
+				ID:         mode + "-ipv6-tls-stealth",
+				Label:      dirLabel + " (IPv6) · Fake TLS + Stealth (uTLS + Frag)",
+				Mode:       mode,
+				Link:       "website",
+				Transport:  string(TransportTLS),
+				Stealth:    true,
+				IPv6:       true,
+				Shared:     false,
+				ServerName: "www.bing.com",
+				TargetAddr: addr6,
+				Port:       port,
+			},
+			ProbeCandidateSpec{
+				ID:         mode + "-ipv6-tls",
+				Label:      dirLabel + " (IPv6) · Fake TLS Website (SNI)",
+				Mode:       mode,
+				Link:       "website",
+				Transport:  string(TransportTLS),
+				Stealth:    false,
+				IPv6:       true,
+				Shared:     false,
+				ServerName: "www.bing.com",
+				TargetAddr: addr6,
+				Port:       port,
+			},
+		)
 	}
 
 	cdnDomain = strings.TrimSpace(cdnDomain)
@@ -507,7 +524,7 @@ func BuildProbeCandidates(mode, ipv4, ipv6 string, port int, cdnDomain string) [
 // ProbeListener using the shared ephemeral secret.
 func RunProbeDialer(ctx context.Context, specs []ProbeCandidateSpec, secret []byte, burstBytes int) []ProbeCandidateResult {
 	if burstBytes <= 0 {
-		burstBytes = 256 * 1024 // 256 KB down + 256 KB up per main test (~512 KB sustained burst)
+		burstBytes = 128 * 1024 // 128 KB down + 128 KB up per main test (~256 KB sustained burst)
 	}
 	results := make([]ProbeCandidateResult, 0, len(specs))
 	deadTCP := map[string]int{}
@@ -522,13 +539,13 @@ func RunProbeDialer(ctx context.Context, specs []ProbeCandidateSpec, secret []by
 				ProbeCandidateSpec: spec,
 				Status:             "blocked",
 				Attempts:           1,
-				Error:              "connection timed out",
+				Error:              "TCP port unreachable (connection timed out)",
 				Summary:            "Blocked / Unreachable — TCP port unreachable",
 			})
 			continue
 		}
 		res := probeOneSpec(ctx, spec, secret, burstBytes)
-		if isTCPDirect && res.Successes == 0 && (res.Error == "connection timed out" || res.Error == "connection refused") {
+		if isTCPDirect && res.Successes == 0 && (res.Error == "TCP port unreachable (connection timed out)" || res.Error == "connection refused") {
 			deadTCP[spec.TargetAddr]++
 		}
 		results = append(results, res)
@@ -574,8 +591,8 @@ func probeOneSpec(parentCtx context.Context, spec ProbeCandidateSpec, secret []b
 
 	routes := newRouter(cfg)
 
-	// Attempt 1: Full handshake + 3 ping samples + sustained download/upload burst
-	hs1, rtts, dlMbps, ulMbps, partial1, err1 := runSingleProbeAttempt(parentCtx, cfg, routes, secret, 3, uint32(burstBytes))
+	// Attempt 1: Full handshake + 1 ping sample + sustained download/upload burst
+	hs1, rtts, dlMbps, ulMbps, partial1, err1 := runSingleProbeAttempt(parentCtx, cfg, routes, secret, 1, uint32(burstBytes))
 	if err1 != nil {
 		res.Error = simplifyProbeErr(err1)
 		res.Summary = "Blocked / Unreachable — " + res.Error
@@ -583,15 +600,28 @@ func probeOneSpec(parentCtx context.Context, spec ProbeCandidateSpec, secret []b
 	}
 	res.Successes++
 
-	// Attempt 2: Repeat connection check + 1 ping + 32 KB burst to confirm stability
-	hs2, rtts2, _, _, partial2, err2 := runSingleProbeAttempt(parentCtx, cfg, routes, secret, 1, 32*1024)
-	if err2 == nil {
-		res.Successes++
-		rtts = append(rtts, rtts2...)
-		res.HandshakeMS = round2((hs1 + hs2) / 2.0)
-	} else {
+	var partial2 bool
+	if partial1 {
+		// Handshake and initial ping succeeded, but the sustained burst was cut off
+		// mid-stream by a DPI packet-count filter. Skip Attempt 2 to save time.
+		res.Attempts = 1
 		res.HandshakeMS = round2(hs1)
-		res.Error = simplifyProbeErr(err2)
+		res.Error = "connected, then frozen mid-stream by ISP/DPI filter"
+	} else {
+		// Attempt 2: Repeat connection check + 2 pings + 32 KB burst to confirm stability & jitter
+		hs2, rtts2, _, _, p2, err2 := runSingleProbeAttempt(parentCtx, cfg, routes, secret, 2, 32*1024)
+		partial2 = p2
+		if err2 == nil {
+			res.Successes++
+			rtts = append(rtts, rtts2...)
+			res.HandshakeMS = round2((hs1 + hs2) / 2.0)
+			if partial2 {
+				res.Error = "connected, then frozen mid-stream by ISP/DPI filter"
+			}
+		} else {
+			res.HandshakeMS = round2(hs1)
+			res.Error = simplifyProbeErr(err2)
+		}
 	}
 
 	var sumRTT float64
@@ -616,7 +646,11 @@ func probeOneSpec(parentCtx context.Context, spec ProbeCandidateSpec, secret []b
 	switch {
 	case partial1 || partial2:
 		res.Status = "throttled"
-		res.Summary = fmt.Sprintf("DPI freeze / interrupted mid-stream (%.1f Mbps, %.0f ms)", res.AvgMbps, res.RTTMS)
+		if res.AvgMbps > 0 {
+			res.Summary = fmt.Sprintf("Throttled — DPI freeze mid-stream (%.1f Mbps, %.0f ms ping)", res.AvgMbps, res.RTTMS)
+		} else {
+			res.Summary = fmt.Sprintf("Throttled — connected (%.0f ms ping), then frozen mid-stream by DPI filter", res.RTTMS)
+		}
 	case res.Successes < res.Attempts:
 		res.Status = "degraded"
 		res.Summary = fmt.Sprintf("Unstable (%d/%d connections succeeded, %.1f Mbps, %.0f ms)", res.Successes, res.Attempts, res.AvgMbps, res.RTTMS)
@@ -628,44 +662,55 @@ func probeOneSpec(parentCtx context.Context, spec ProbeCandidateSpec, secret []b
 }
 
 func runSingleProbeAttempt(parentCtx context.Context, cfg *Config, routes *router, secret []byte, pings int, burstBytes uint32) (hsMS float64, rtts []float64, dlMbps, ulMbps float64, partial bool, err error) {
-	ctx, cancel := context.WithTimeout(parentCtx, 5500*time.Millisecond)
+	ctx, cancel := context.WithTimeout(parentCtx, 4500*time.Millisecond)
 	defer cancel()
 
 	t0 := time.Now()
-	raw, claim, err := routes.dial(2500 * time.Millisecond)
+	raw, claim, err := routes.dial(2200 * time.Millisecond)
 	if err != nil {
-		return 0, nil, 0, 0, false, err
+		return 0, nil, 0, 0, false, fmt.Errorf("tcp dial: %w", err)
 	}
 	defer raw.Close()
 	tuneSocket(raw)
 
-	_ = raw.SetDeadline(time.Now().Add(3 * time.Second))
+	// Ensure that if ctx expires, raw is immediately interrupted even if wrapDialTLSOnce
+	// sets a longer internal deadline during the TLS handshake.
+	stop := context.AfterFunc(ctx, func() {
+		_ = raw.SetDeadline(time.Now())
+	})
+	defer stop()
+
+	_ = raw.SetDeadline(time.Now().Add(2500 * time.Millisecond))
 
 	c, err := wrapDialPurpose(raw, cfg.withClaimedName(claim), authPurposeSpeedtest)
 	if err != nil {
-		return 0, nil, 0, 0, false, err
+		return 0, nil, 0, 0, false, fmt.Errorf("handshake: %w", err)
 	}
 	defer c.Close()
 
 	if err := sendAuthPurpose(c, secret, authPurposeSpeedtest); err != nil {
-		return 0, nil, 0, 0, false, err
+		return 0, nil, 0, 0, false, fmt.Errorf("auth: %w", err)
 	}
 	hsMS = float64(time.Since(t0)) / float64(time.Millisecond)
 
-	// Ping samples (use 2.5s deadline on first ping so dead UDP/KCP ports fail fast)
+	// Ping samples (use 2.0s deadline on first ping so dead UDP/KCP or DPI-dropped streams fail fast)
 	for i := 0; i < pings; i++ {
-		if i == 0 {
-			_ = c.SetDeadline(time.Now().Add(2500 * time.Millisecond))
-		}
+		_ = c.SetDeadline(time.Now().Add(2000 * time.Millisecond))
 		pStart := time.Now()
 		var req [9]byte
 		req[0] = 0x01
 		binary.BigEndian.PutUint64(req[1:], uint64(pStart.UnixNano()))
 		if _, err := c.Write(req[:]); err != nil {
+			if len(rtts) > 0 {
+				return hsMS, rtts, 0, 0, true, nil
+			}
 			return hsMS, rtts, 0, 0, false, fmt.Errorf("ping write: %w", err)
 		}
 		var echo [8]byte
 		if _, err := io.ReadFull(c, echo[:]); err != nil {
+			if len(rtts) > 0 {
+				return hsMS, rtts, 0, 0, true, nil
+			}
 			return hsMS, rtts, 0, 0, false, fmt.Errorf("ping read: %w", err)
 		}
 		rtts = append(rtts, float64(time.Since(pStart))/float64(time.Millisecond))
@@ -675,16 +720,18 @@ func runSingleProbeAttempt(parentCtx context.Context, cfg *Config, routes *route
 		_ = c.SetDeadline(dl)
 	}
 
-	// Download burst
+	// Download burst: once at least 1 ping has succeeded, any failure during the
+	// bulk transfer indicates a mid-stream DPI packet-cap or throttle rather than
+	// an unreachable endpoint.
 	var dlHdr [5]byte
 	dlHdr[0] = 0x02
 	binary.BigEndian.PutUint32(dlHdr[1:], burstBytes)
 	if _, err := c.Write(dlHdr[:]); err != nil {
-		return hsMS, rtts, 0, 0, true, fmt.Errorf("download start: %w", err)
+		return hsMS, rtts, 0, 0, true, nil
 	}
 	var ack [1]byte
 	if _, err := io.ReadFull(c, ack[:]); err != nil {
-		return hsMS, rtts, 0, 0, true, fmt.Errorf("download ack: %w", err)
+		return hsMS, rtts, 0, 0, true, nil
 	}
 	dlStart := time.Now()
 	dlRead, dlErr := io.CopyN(io.Discard, c, int64(burstBytes))
@@ -923,14 +970,18 @@ func simplifyProbeErr(err error) string {
 	}
 	s := err.Error()
 	switch {
-	case strings.Contains(s, "i/o timeout") || strings.Contains(s, "deadline exceeded"):
-		return "connection timed out"
 	case strings.Contains(s, "connection refused"):
 		return "connection refused"
 	case strings.Contains(s, "connection reset"):
 		return "connection reset by firewall (RST)"
 	case strings.Contains(s, "did not agree to HTTP/2"):
 		return "HTTP/2 (gRPC) not enabled on CDN/peer"
+	case strings.HasPrefix(s, "tcp dial:") && (strings.Contains(s, "i/o timeout") || strings.Contains(s, "deadline exceeded")):
+		return "TCP port unreachable (connection timed out)"
+	case strings.HasPrefix(s, "handshake:") && (strings.Contains(s, "i/o timeout") || strings.Contains(s, "deadline exceeded")):
+		return "TLS/stream handshake blocked by DPI"
+	case strings.Contains(s, "i/o timeout") || strings.Contains(s, "deadline exceeded"):
+		return "connection timed out (dropped by firewall)"
 	default:
 		return s
 	}

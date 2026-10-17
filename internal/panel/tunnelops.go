@@ -1196,13 +1196,13 @@ func (p *Panel) startProbeSession(parent context.Context, relayID, foreignID, cd
 }
 
 func (p *Panel) runProbeStep(parent context.Context, dialerID, secret string, spec engine.ProbeCandidateSpec) (engine.ProbeCandidateResult, error) {
-	dctx, dcancel := context.WithTimeout(parent, 15*time.Second)
+	dctx, dcancel := context.WithTimeout(parent, 12*time.Second)
 	defer dcancel()
 	var drep probeDialReply
 	_, err := p.callJSON(dctx, dialerID, "/api/probe/dial", map[string]any{
 		"specs":       []engine.ProbeCandidateSpec{spec},
 		"secret":      secret,
-		"burst_bytes": 256 * 1024,
+		"burst_bytes": 128 * 1024,
 	}, &drep)
 	if err != nil {
 		return engine.ProbeCandidateResult{
@@ -1263,19 +1263,52 @@ func (p *Panel) probeBetweenServers(parent context.Context, relayID, foreignID, 
 	if err != nil {
 		return nil, err
 	}
-	var results []engine.ProbeCandidateResult
+	var directSpecs, reverseSpecs []engine.ProbeCandidateSpec
 	for _, spec := range sess.Candidates {
-		if parent.Err() != nil {
-			break
-		}
-		dialerID := sess.RelayID
-		secret := sess.DirectSecret
 		if spec.Mode == "reverse" {
-			dialerID = sess.ForeignID
-			secret = sess.ReverseSecret
+			reverseSpecs = append(reverseSpecs, spec)
+		} else {
+			directSpecs = append(directSpecs, spec)
 		}
-		res, _ := p.runProbeStep(parent, dialerID, secret, spec)
-		results = append(results, res)
 	}
+
+	var (
+		wg         sync.WaitGroup
+		directRes  []engine.ProbeCandidateResult
+		reverseRes []engine.ProbeCandidateResult
+	)
+	if len(directSpecs) > 0 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			var drep probeDialReply
+			_, err := p.callJSON(parent, sess.RelayID, "/api/probe/dial", map[string]any{
+				"specs":       directSpecs,
+				"secret":      sess.DirectSecret,
+				"burst_bytes": 128 * 1024,
+			}, &drep)
+			if err == nil && drep.OK {
+				directRes = drep.Results
+			}
+		}()
+	}
+	if len(reverseSpecs) > 0 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			var rrep probeDialReply
+			_, err := p.callJSON(parent, sess.ForeignID, "/api/probe/dial", map[string]any{
+				"specs":       reverseSpecs,
+				"secret":      sess.ReverseSecret,
+				"burst_bytes": 128 * 1024,
+			}, &rrep)
+			if err == nil && rrep.OK {
+				reverseRes = rrep.Results
+			}
+		}()
+	}
+	wg.Wait()
+
+	results := append(directRes, reverseRes...)
 	return p.finishProbeSession(*sess, results), nil
 }

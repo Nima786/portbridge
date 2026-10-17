@@ -135,9 +135,16 @@ func staticHandler() http.Handler {
 			http.NotFound(w, r)
 			return
 		}
+		if name == "index.html" && engine.Version != "" {
+			ver := url.QueryEscape(engine.Version)
+			html := string(data)
+			html = strings.Replace(html, `href="app.css"`, `href="app.css?v=`+ver+`"`, 1)
+			html = strings.Replace(html, `src="app.js"`, `src="app.js?v=`+ver+`"`, 1)
+			data = []byte(html)
+		}
 		w.Header().Set("Content-Type", types[path.Ext(name)])
 		// Always checked again, so an update shows at once.
-		w.Header().Set("Cache-Control", "no-cache")
+		w.Header().Set("Cache-Control", "no-store, no-cache, must-revalidate")
 		_, _ = w.Write(data)
 	})
 }
