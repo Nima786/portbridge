@@ -460,7 +460,9 @@
 
     const mini = tunnels.length ? h('ul', { class: 'mini', 'aria-label': `Tunnels on ${name}` },
       tunnels.map((t) => {
-        const detail = [t.mode === 'reverse' ? 'Reverse' : 'Direct', shortLinkLabel(t)].filter(Boolean).join(' · ');
+        const isV6 = String(t.peer_ip || '').includes(':') || String(t.local_ip || '').includes(':');
+        const modeTag = (t.mode === 'reverse' ? 'Reverse' : 'Direct') + (isV6 ? ' (IPv6)' : '');
+        const detail = [modeTag, shortLinkLabel(t)].filter(Boolean).join(' · ');
         return h('li', null,
           h('div', { class: 'mini-left' },
             h('span', { class: 'state ' + (t.running ? 'ok' : 'bad') }, t.running ? 'Running' : 'Stopped'),
@@ -939,6 +941,11 @@
     const servicePorts = (oi && oi.service_ports && oi.service_ports.length) ? oi.service_ports : (ei ? ei.service_ports : null);
     const live = (ei && ei.live) || (oi && oi.live) || null;
 
+    const relayBridgeIP = (ei && ei.local_ip) || (oi && oi.peer_ip) || '';
+    const foreignBridgeIP = (ei && ei.peer_ip) || (oi && oi.local_ip) || '';
+    const isIPv6 = relayBridgeIP.includes(':') || foreignBridgeIP.includes(':');
+    const protoTag = isIPv6 ? 'IPv6' : 'IPv4';
+
     let overall = ['ok', 'Running'];
     const halves = [e, o].filter(Boolean);
     if (halves.some((x) => !x.info.running)) overall = ['bad', 'Stopped'];
@@ -959,8 +966,13 @@
     // Essential details inside expanded view
     const relayAddr = e && e.address ? e.address : (oi && oi.peer_ip ? oi.peer_ip : '—');
     const foreignAddr = o && o.address ? o.address : (ei && ei.peer_ip ? ei.peer_ip : '—');
-    const modeLabel = reverse ? 'Reverse (Foreign → Relay)' : 'Direct (Relay → Foreign)';
+    const modeLabel = reverse
+      ? `Reverse · ${protoTag} (Foreign → Relay)`
+      : `Direct · ${protoTag} (Relay → Foreign)`;
+    const combinedLinkDesc = `${(ei && ei.link) || ''} ${(oi && oi.link) || ''}`;
     const extraTags = [];
+    if (/fragmented/i.test(combinedLinkDesc)) extraTags.push('Stealth (uTLS + Frag)');
+    else if (/browser TLS/i.test(combinedLinkDesc)) extraTags.push('uTLS');
     if (any.real_site) extraTags.push('Real-Site Cover');
     if (any.cdn && !/CDN/i.test(shortLink)) extraTags.push('CDN Ready');
     if (any.proxy_protocol && any.proxy_protocol !== 'off') extraTags.push(`PROXY ${any.proxy_protocol}`);
@@ -983,18 +995,25 @@
       healthParts.push('Service stopped');
     }
 
+    const relaySub = isIPv6 && relayBridgeIP
+      ? `${relayAddr} · IPv6 [${relayBridgeIP}] · Listen :${ports(userPorts) || '—'}`
+      : `${relayAddr} · Listen :${ports(userPorts) || '—'}`;
+    const foreignSub = isIPv6 && foreignBridgeIP
+      ? `${foreignAddr} · IPv6 [${foreignBridgeIP}] · Inbound :${ports(servicePorts) || '—'}`
+      : `${foreignAddr} · Inbound :${ports(servicePorts) || '—'}`;
+
     const detailsGrid = h('div', { class: 'tunnel-details-grid' },
       h('div', { class: 'detail-item detail-relay' },
         h('span', { class: 'detail-label' }, 'Relay (Iran) · Entry'),
         h('span', { class: 'detail-primary' }, relayName),
-        h('span', { class: 'detail-sub mono' }, `${relayAddr} · Listen :${ports(userPorts) || '—'}`)),
+        h('span', { class: 'detail-sub mono' }, relaySub)),
       h('div', { class: 'detail-item detail-foreign' },
         h('span', { class: 'detail-label' }, 'Foreign · Exit'),
         h('span', { class: 'detail-primary' }, foreignName),
-        h('span', { class: 'detail-sub mono' }, `${foreignAddr} · Inbound :${ports(servicePorts) || '—'}`)),
+        h('span', { class: 'detail-sub mono' }, foreignSub)),
       h('div', { class: 'detail-item' },
         h('span', { class: 'detail-label' }, 'Bridge & Transport'),
-        h('span', { class: 'detail-primary' }, `${shortLink}${linkPort ? ' · :' + linkPort : ''}`),
+        h('span', { class: 'detail-primary' }, `${shortLink}${linkPort ? ' · :' + linkPort : ''}${isIPv6 ? ' (IPv6)' : ''}`),
         h('span', { class: 'detail-sub' }, [modeLabel, ...extraTags].join(' · '))),
       h('div', { class: 'detail-item' },
         h('span', { class: 'detail-label' }, 'Health & Capacity'),
@@ -1023,7 +1042,7 @@
           `${relayName} ↔ ${foreignName}`,
           mainPort ? h('span', { class: 'tunnel-summary-port mono' }, `:${mainPort}`) : null)),
       h('div', { class: 'tunnel-summary-right' },
-        h('span', { class: 'badge badge-transport' }, `${reverse ? 'Reverse' : 'Direct'} · ${shortLink}`),
+        h('span', { class: 'badge badge-transport' }, `${reverse ? 'Reverse' : 'Direct'}${isIPv6 ? ' (IPv6)' : ''} · ${shortLink}`),
         live ? h('span', { class: 'badge badge-users' }, `${activeCount} active`) : null,
         h('span', { class: 'tunnel-chevron', 'aria-hidden': 'true' }, '▾')));
 
