@@ -250,6 +250,13 @@
     showLogin('');
   });
 
+  if ($('account-shortcut')) {
+    $('account-shortcut').addEventListener('click', () => {
+      selectTab('settings', false);
+      if ($('acc-current')) $('acc-current').focus();
+    });
+  }
+
   // ------------------------------------------------------------------- tabs
 
   const TABS = ['servers', 'tunnels', 'settings'];
@@ -471,6 +478,8 @@
           : null,
         h('button', { type: 'button', 'data-focus': `srv-${s.id}-tune`, 'aria-label': `Speed tuning (BBR) for ${name}`, onclick: () => openServerTune(s) },
           'BBR Tuning'),
+        h('button', { type: 'button', 'data-focus': `srv-${s.id}-fw`, 'aria-label': `Firewall rules for ${name}`, onclick: () => openServerFirewall(s) },
+          'Firewall'),
         h('button', { type: 'button', 'data-focus': `srv-${s.id}-edit`, 'aria-label': `Edit ${name}`, onclick: () => openEdit(s) },
           'Edit'),
         s.this ? null : h('button', { type: 'button', class: 'danger-text', 'data-focus': `srv-${s.id}-remove`, 'aria-label': `Remove ${name} from the panel`, onclick: () => confirmRemove(s) },
@@ -1089,6 +1098,13 @@
     const fw = ei && typeof ei.firewall === 'boolean' ? ei.firewall : true;
     $('et-firewall').checked = fw;
 
+    if ($('et-peer-ip')) $('et-peer-ip').value = (ei && ei.peer_ip) || (oi && oi.peer_ip) || '';
+    if ($('et-peer-wrap')) $('et-peer-wrap').hidden = !!any.gre;
+    if ($('et-spare-ttl-wrap')) $('et-spare-ttl-wrap').hidden = isMux;
+    if ($('et-spare-ttl')) $('et-spare-ttl').value = (ei && ei.spare_ttl) || (oi && oi.spare_ttl) || '1m0s';
+    if ($('et-drain')) $('et-drain').value = (ei && ei.drain) || (oi && oi.drain) || '10s';
+    if ($('et-advanced')) $('et-advanced').open = false;
+
     $('et-error').textContent = '';
     $('et-ports-result').replaceChildren();
     $('edit-tunnel-form').hidden = false;
@@ -1104,6 +1120,83 @@
     $('edit-tunnel-form').hidden = false;
     $('et-service').focus();
   });
+
+  const CDN_HTTPS_PORTS = [443, 2053, 2083, 2087, 2096, 8443];
+  const CDN_OTHER_PORTS = [80, 8080, 8880, 2052, 2082, 2086, 2095];
+  const ALL_CDN_PORTS = [...CDN_HTTPS_PORTS, ...CDN_OTHER_PORTS];
+
+  async function scanCDNPorts(relayId, foreignId, mode, ownTag, outEl, linkInput) {
+    outEl.replaceChildren(h('li', null, 'Scanning Cloudflare & CDN ports on both servers...'));
+    const portStr = ALL_CDN_PORTS.join(',');
+    const fetchMap = async (srvId) => {
+      if (!srvId) return null;
+      try {
+        const res = await api('POST', '/api/ports', { server: srvId, ports: portStr });
+        const map = {};
+        for (const p of (res.ports || [])) map[p.port] = p;
+        return map;
+      } catch (e) {
+        return null;
+      }
+    };
+    const [rMap, fMap] = await Promise.all([fetchMap(relayId), fetchMap(foreignId)]);
+    if (!rMap && !fMap) {
+      outEl.replaceChildren(h('li', { class: 'bad' }, 'Could not query ports on either server.'));
+      return;
+    }
+    const items = ALL_CDN_PORTS.map((port) => {
+      const rp = rMap ? rMap[port] : null;
+      const fp = fMap ? fMap[port] : null;
+      const rFree = rp && (rp.state === 'free' || (ownTag && rp.by === ownTag));
+      const fFree = fp && (fp.state === 'free' || (ownTag && fp.by === ownTag));
+      const isCF = CDN_HTTPS_PORTS.includes(port);
+      const cdnLabel = isCF ? 'Cloudflare HTTPS' : 'Other CDN';
+      const needFree = mode === 'direct' ? fFree : rFree;
+      const bothFree = (!rMap || rFree) && (!fMap || fFree);
+      let cls = 'bad';
+      let statusText = 'Busy';
+      if (bothFree) {
+        cls = 'good';
+        statusText = 'Free on both servers';
+      } else if (needFree) {
+        cls = 'good';
+        statusText = mode === 'direct' ? 'Usable (free on Foreign)' : 'Usable (free on Relay)';
+      } else {
+        const rDesc = rp ? rp.state : '—';
+        const fDesc = fp ? fp.state : '—';
+        statusText = `Relay: ${rDesc} · Foreign: ${fDesc}`;
+      }
+      const useBtn = (bothFree || needFree) && linkInput
+        ? h('button', {
+            type: 'button',
+            class: 'use-port-btn',
+            onclick: () => { linkInput.value = String(port); linkInput.focus(); }
+          }, `Use :${port}`)
+        : null;
+      return h('li', { class: cls },
+        h('strong', { class: 'mono' }, `Port ${port}`),
+        ` (${cdnLabel}) — ${statusText}`,
+        useBtn);
+    });
+    outEl.replaceChildren(...items);
+  }
+
+  if ($('et-scan-cdn')) {
+    $('et-scan-cdn').addEventListener('click', () => {
+      if (!editingTunnel) return;
+      const t = editingTunnel;
+      const e = t.edge, o = t.origin;
+      const any = (e && e.info) || (o && o.info) || {};
+      scanCDNPorts(
+        e ? e.server_id : '',
+        o ? o.server_id : '',
+        any.mode || 'reverse',
+        `PortBridge tunnel "${t.name}"`,
+        $('et-ports-result'),
+        $('et-linkport')
+      );
+    });
+  }
 
   $('et-check').addEventListener('click', async () => {
     if (!editingTunnel) return;
@@ -1172,6 +1265,9 @@
     const maxConn = Number($('et-max-conn').value || 0);
     const proxyProto = radio('et-proxy') || 'off';
     const firewall = $('et-firewall').checked ? 'on' : 'off';
+    const peerIP = $('et-peer-ip') ? $('et-peer-ip').value.trim() : '';
+    const spareTTL = ($('et-spare-ttl') && !$('et-spare-ttl-wrap').hidden) ? $('et-spare-ttl').value.trim() : '';
+    const drain = $('et-drain') ? $('et-drain').value.trim() : '';
 
     if (!portList.test(servicePorts)) return fail('Enter the Foreign Inbound Port(s), separated by commas.', $('et-service'));
     if (userPorts && !portList.test(userPorts)) return fail('Enter the Relay User Listen Port(s) separated by commas, or leave empty to match Inbound Port(s).', $('et-users'));
@@ -1190,6 +1286,9 @@
       pool: !$('et-pool-wrap').hidden ? poolSize : 0,
       mux_links: !$('et-mux-wrap').hidden ? muxLinks : 0,
       max_conn: maxConn,
+      spare_ttl: spareTTL,
+      drain,
+      peer_ip: peerIP,
       proxy_protocol: proxyProto,
       firewall,
     };
@@ -1453,6 +1552,64 @@
   $('tune-disable').addEventListener('click', () => applyServerTune(false));
   $('tune-close').addEventListener('click', () => $('tune-dialog').close());
 
+  // ------------------------------------------------ server firewall manager
+
+  let firewallServer = null;
+
+  function renderFirewallDialog(info) {
+    if ($('fw-status')) {
+      $('fw-status').textContent = (info && info.status) || 'No firewall rules reported.';
+    }
+    if ($('fw-msg')) {
+      if (info && info.output) {
+        $('fw-msg').hidden = false;
+        $('fw-msg').textContent = info.output;
+      } else {
+        $('fw-msg').hidden = true;
+        $('fw-msg').textContent = '';
+      }
+    }
+  }
+
+  async function openServerFirewall(s) {
+    firewallServer = s;
+    $('fw-title').textContent = `Bridge Port Firewall: ${s.name || s.address}`;
+    if ($('fw-error')) $('fw-error').textContent = '';
+    if ($('fw-msg')) { $('fw-msg').hidden = true; $('fw-msg').textContent = ''; }
+    if ($('fw-status')) $('fw-status').textContent = 'Reading firewall rules...';
+    openDialog($('fw-dialog'));
+    $('fw-close').focus();
+    try {
+      const info = await api('GET', '/api/servers/' + encodeURIComponent(s.id) + '/firewall');
+      renderFirewallDialog(info);
+    } catch (e) {
+      if ($('fw-status')) $('fw-status').textContent = '';
+      if ($('fw-error')) $('fw-error').textContent = e.message;
+    }
+  }
+
+  async function applyServerFirewall(action) {
+    if (!firewallServer) return;
+    const btns = [$('fw-sweep'), $('fw-on-all'), $('fw-off-all')].filter(Boolean);
+    for (const b of btns) b.disabled = true;
+    if ($('fw-error')) $('fw-error').textContent = '';
+    try {
+      const info = await api('POST', '/api/servers/' + encodeURIComponent(firewallServer.id) + '/firewall', { action });
+      renderFirewallDialog(info);
+      lastServers = lastTunnels = '';
+      refresh();
+    } catch (e) {
+      if ($('fw-error')) $('fw-error').textContent = e.message;
+    } finally {
+      for (const b of btns) b.disabled = false;
+    }
+  }
+
+  if ($('fw-sweep')) $('fw-sweep').addEventListener('click', () => applyServerFirewall('sweep'));
+  if ($('fw-on-all')) $('fw-on-all').addEventListener('click', () => applyServerFirewall('on-all'));
+  if ($('fw-off-all')) $('fw-off-all').addEventListener('click', () => applyServerFirewall('off-all'));
+  if ($('fw-close')) $('fw-close').addEventListener('click', () => $('fw-dialog').close());
+
   async function showCode(target) {
     try {
       const res = await api('POST', '/api/tunnels/code', target);
@@ -1673,6 +1830,13 @@
   }
 
   const portList = /^\s*\d{1,5}(\s*,\s*\d{1,5})*\s*$/;
+
+  if ($('tn-scan-cdn')) {
+    $('tn-scan-cdn').addEventListener('click', () => {
+      const r = tunnelRequest();
+      scanCDNPorts(r.relay, r.foreign, r.mode || 'reverse', '', $('tn-ports-result'), $('tn-linkport'));
+    });
+  }
 
   $('tn-check').addEventListener('click', async () => {
     const r = tunnelRequest();

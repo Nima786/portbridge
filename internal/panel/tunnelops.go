@@ -592,6 +592,9 @@ type editTunnelRequest struct {
 	Pool          int    `json:"pool"`
 	MuxLinks      int    `json:"mux_links"`
 	MaxConn       int    `json:"max_conn"`
+	SpareTTL      string `json:"spare_ttl"`
+	Drain         string `json:"drain"`
+	PeerIP        string `json:"peer_ip"`
 	Firewall      string `json:"firewall"`
 }
 
@@ -619,6 +622,9 @@ func (p *Panel) editTunnel(j *job, r editTunnelRequest) error {
 		Pool:          r.Pool,
 		MuxLinks:      r.MuxLinks,
 		MaxConn:       r.MaxConn,
+		SpareTTL:      strings.TrimSpace(r.SpareTTL),
+		Drain:         strings.TrimSpace(r.Drain),
+		PeerIP:        strings.TrimSpace(r.PeerIP),
 		Firewall:      strings.TrimSpace(r.Firewall),
 	}
 
@@ -986,4 +992,73 @@ func (p *Panel) setServerTune(parent context.Context, id string, enable bool) (a
 		return agent.TuneInfo{}, errors.New(rep.Error)
 	}
 	return rep.TuneInfo, nil
+}
+
+func (p *Panel) getServerFirewall(parent context.Context, id string) (agent.FirewallInfo, error) {
+	ctx, cancel := context.WithTimeout(parent, agentTimeout)
+	defer cancel()
+	status, rb, err := p.callServer(ctx, id, http.MethodGet, "/api/firewall", nil, overviewLimit)
+	if err != nil {
+		return agent.FirewallInfo{}, err
+	}
+	if status == http.StatusNotFound {
+		// Fallback for older agents using cached Overview.
+		if v, ok := p.viewOf(id); ok && v.Overview != nil {
+			var rules []agent.FirewallTunnelRule
+			var lines []string
+			for _, ti := range v.Overview.Tunnels {
+				dials := (ti.Mode == "direct" && ti.Role == "edge") || (ti.Mode == "reverse" && ti.Role == "origin")
+				cdnOrGRE := ti.CDN || ti.GRE
+				locked := ti.Firewall && !dials && !cdnOrGRE
+				rules = append(rules, agent.FirewallTunnelRule{
+					Name:     ti.Name,
+					Role:     ti.Role,
+					Mode:     ti.Mode,
+					DialsOut: dials,
+					LinkPort: ti.LinkPort,
+					PeerIP:   ti.PeerIP,
+					Locked:   locked,
+					CDNOrGRE: cdnOrGRE,
+				})
+				switch {
+				case dials:
+					lines = append(lines, fmt.Sprintf("%s: dials out to %s:%d", ti.Name, ti.PeerIP, ti.LinkPort))
+				case cdnOrGRE:
+					lines = append(lines, fmt.Sprintf("%s: bridge port %d open (CDN / GRE)", ti.Name, ti.LinkPort))
+				case locked:
+					lines = append(lines, fmt.Sprintf("%s: bridge port %d locked to %s", ti.Name, ti.LinkPort, ti.PeerIP))
+				default:
+					lines = append(lines, fmt.Sprintf("%s: bridge port %d open to any IP", ti.Name, ti.LinkPort))
+				}
+			}
+			st := strings.Join(lines, "\n")
+			if st == "" {
+				st = "No tunnels on this server."
+			}
+			return agent.FirewallInfo{OK: true, Status: st, Tunnels: rules}, nil
+		}
+		return agent.FirewallInfo{}, errTooOld
+	}
+	var info agent.FirewallInfo
+	if err := json.Unmarshal(rb, &info); err != nil {
+		return agent.FirewallInfo{}, err
+	}
+	return info, nil
+}
+
+func (p *Panel) setServerFirewall(parent context.Context, id, action string) (agent.FirewallInfo, error) {
+	ctx, cancel := context.WithTimeout(parent, agentTimeout)
+	defer cancel()
+	var rep struct {
+		agent.FirewallInfo
+		Error string `json:"error"`
+	}
+	_, err := p.callJSON(ctx, id, "/api/firewall", map[string]string{"action": action}, &rep)
+	if err != nil {
+		return agent.FirewallInfo{}, err
+	}
+	if !rep.OK {
+		return agent.FirewallInfo{}, errors.New(rep.Error)
+	}
+	return rep.FirewallInfo, nil
 }

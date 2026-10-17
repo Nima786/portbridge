@@ -73,6 +73,10 @@
           <svg class="icon-sun" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="5"/><line x1="12" y1="1" x2="12" y2="3"/><line x1="12" y1="21" x2="12" y2="23"/><line x1="4.22" y1="4.22" x2="5.64" y2="5.64"/><line x1="18.36" y1="18.36" x2="19.78" y2="19.78"/><line x1="1" y1="12" x2="3" y2="12"/><line x1="21" y1="12" x2="23" y2="12"/><line x1="4.22" y1="19.78" x2="5.64" y2="18.36"/><line x1="18.36" y1="5.64" x2="19.78" y2="4.22"/></svg>
           <span class="visually-hidden theme-label">Dark mode</span>
         </button>
+        <button type="button" id="account-shortcut" class="icon-btn" aria-label="Login &amp; Panel Settings" title="Change Login &amp; Panel Settings">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>
+          <span class="visually-hidden">Account &amp; Settings</span>
+        </button>
         <button type="button" id="logout" class="icon-btn" aria-label="Log out" title="Log out">
           <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" y1="12" x2="9" y2="12"/></svg>
           <span class="visually-hidden">Log out</span>
@@ -658,6 +662,7 @@
         </div>
         <div class="actions left port-check-bar">
           <button type="button" id="tn-check">Test &amp; Verify Ports on Both Servers</button>
+          <button type="button" id="tn-scan-cdn">Scan Free CDN Ports</button>
         </div>
         <ul id="tn-ports-result" class="ports-result" aria-live="polite"></ul>
       </fieldset>
@@ -828,6 +833,7 @@
         </div>
         <div class="actions left port-check-bar">
           <button type="button" id="et-check">Test &amp; Verify Ports on Both Servers</button>
+          <button type="button" id="et-scan-cdn">Scan Free CDN Ports</button>
         </div>
         <ul id="et-ports-result" class="ports-result" aria-live="polite"></ul>
       </fieldset>
@@ -905,6 +911,29 @@
           </span>
         </label>
       </fieldset>
+
+      <details id="et-advanced" class="advanced-details">
+        <summary>Advanced Settings <span class="muted">(Peer Server IP &amp; Connection Timing)</span></summary>
+        <div class="advanced-body">
+          <div class="row2">
+            <div id="et-peer-wrap">
+              <label for="et-peer-ip">Peer Server IP / Address</label>
+              <input id="et-peer-ip" autocapitalize="none" spellcheck="false" placeholder="e.g. 203.0.113.5">
+              <p class="muted small">Update if the other server's IP changed or to switch between IPv4 and IPv6.</p>
+            </div>
+            <div id="et-spare-ttl-wrap">
+              <label for="et-spare-ttl">Spare Connection Lifetime <span class="muted">(spare_ttl)</span></label>
+              <input id="et-spare-ttl" autocapitalize="none" spellcheck="false" placeholder="60s">
+              <p class="muted small">How long an idle pooled connection lives before recycling (e.g. <code>60s</code>, <code>2m</code>).</p>
+            </div>
+            <div>
+              <label for="et-drain">Restart Drain Timeout <span class="muted">(drain)</span></label>
+              <input id="et-drain" autocapitalize="none" spellcheck="false" placeholder="10s">
+              <p class="muted small">Grace period for active sessions when restarting the tunnel (e.g. <code>10s</code>).</p>
+            </div>
+          </div>
+        </div>
+      </details>
 
       <p id="et-error" class="error" role="alert"></p>
     </div>
@@ -998,6 +1027,29 @@
       <button type="button" id="tune-disable">Restore Defaults</button>
       <button type="button" id="tune-enable" class="primary">Enable BBR Tuning</button>
       <button type="button" id="tune-close">Close</button>
+    </div>
+  </div>
+</dialog>
+
+<!-- Server Bridge Port Firewall Manager -->
+<dialog id="fw-dialog" aria-labelledby="fw-title">
+  <div>
+    <div class="dialog-header">
+      <div>
+        <h2 id="fw-title">Bridge Port Firewall</h2>
+        <p id="fw-sub" class="muted small">PortBridge only ever locks the internal Tunnel Bridge Port between your servers. User listen ports, SSH, and panels are never blocked.</p>
+      </div>
+    </div>
+    <div class="dialog-body">
+      <p id="fw-msg" class="good" hidden role="status"></p>
+      <pre id="fw-status" class="log-view"></pre>
+      <p id="fw-error" class="error" role="alert"></p>
+    </div>
+    <div class="dialog-footer actions">
+      <button type="button" id="fw-sweep">Clean Up Leftovers</button>
+      <button type="button" id="fw-off-all">Unlock All Tunnels</button>
+      <button type="button" id="fw-on-all" class="primary">Lock All Tunnels</button>
+      <button type="button" id="fw-close">Close</button>
     </div>
   </div>
 </dialog>

@@ -847,6 +847,35 @@ func newAgentHandler(token, confDir string, allowUpdates func() bool) *http.Serv
 		writeJSONReply(w, http.StatusOK, info)
 	})
 
+	// GET or POST /api/firewall: inspect bridge-port firewall rules or sweep/bulk-update them.
+	mux.HandleFunc("/api/firewall", func(w http.ResponseWriter, r *http.Request) {
+		if !checkAgentAuth(r, token) {
+			http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
+			return
+		}
+		if r.Method == http.MethodGet {
+			writeJSONReply(w, http.StatusOK, readFirewallStatus(confDir))
+			return
+		}
+		if r.Method != http.MethodPost {
+			http.Error(w, `{"error":"method not allowed"}`, http.StatusMethodNotAllowed)
+			return
+		}
+		var req struct {
+			Action string `json:"action"` // "sweep", "on-all", "off-all"
+		}
+		if err := json.NewDecoder(io.LimitReader(r.Body, 4096)).Decode(&req); err != nil || req.Action == "" {
+			writeJSONReply(w, http.StatusBadRequest, map[string]any{"ok": false, "error": "action required"})
+			return
+		}
+		info, err := applyFirewallAction(confDir, req.Action)
+		if err != nil {
+			writeJSONReply(w, http.StatusUnprocessableEntity, map[string]any{"ok": false, "error": err.Error()})
+			return
+		}
+		writeJSONReply(w, http.StatusOK, info)
+	})
+
 	return mux
 }
 

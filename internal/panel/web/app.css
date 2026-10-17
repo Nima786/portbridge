@@ -1342,22 +1342,30 @@ label.check input { margin-top: .25rem; flex: none; }
 }
 .port-check-bar { margin-top: .75rem; }
 
-.advanced-box {
+.advanced-box,
+.advanced-details {
   border: 1px solid var(--line);
   border-radius: var(--radius-sm);
   background: var(--well);
   padding: .65rem .95rem;
   margin-top: .5rem;
 }
-.advanced-box summary {
+.advanced-box summary,
+.advanced-details summary {
   cursor: pointer;
   font-weight: 600;
   font-size: .92rem;
   color: var(--muted);
 }
-.advanced-box[open] summary {
+.advanced-box[open] summary,
+.advanced-details[open] summary {
   color: var(--text);
   margin-bottom: .5rem;
+}
+.use-port-btn {
+  margin-left: .55rem;
+  padding: .15rem .5rem;
+  font-size: .75rem;
 }
 
 /* Logs & Port Check Results */

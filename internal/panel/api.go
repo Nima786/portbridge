@@ -69,6 +69,8 @@ func (p *Panel) routes() http.Handler {
 	mux.HandleFunc("POST /api/ports", p.withAuth(p.handlePorts))
 	mux.HandleFunc("GET /api/servers/{id}/tune", p.withAuth(p.handleGetServerTune))
 	mux.HandleFunc("POST /api/servers/{id}/tune", p.withAuth(p.handleSetServerTune))
+	mux.HandleFunc("GET /api/servers/{id}/firewall", p.withAuth(p.handleGetServerFirewall))
+	mux.HandleFunc("POST /api/servers/{id}/firewall", p.withAuth(p.handleSetServerFirewall))
 	mux.HandleFunc("GET /api/updates", p.withAuth(p.handleUpdates))
 	mux.HandleFunc("POST /api/updates", p.withAuth(p.handleStartUpdate))
 	mux.HandleFunc("POST /api/updates/check", p.withAuth(p.handleCheckUpdates))
@@ -734,6 +736,47 @@ func (p *Panel) handleSetServerTune(w http.ResponseWriter, r *http.Request, _ au
 		return
 	}
 	info, err := p.setServerTune(r.Context(), id, req.Enable)
+	if err != nil {
+		writeErr(w, http.StatusBadGateway, capitalise(plainAgentError(err))+".")
+		return
+	}
+	p.refreshOne(id)
+	writeJSON(w, http.StatusOK, info)
+}
+
+func (p *Panel) handleGetServerFirewall(w http.ResponseWriter, r *http.Request, _ authed) {
+	id := r.PathValue("id")
+	if _, ok := p.viewOf(id); !ok {
+		writeErr(w, http.StatusNotFound, "That server is not in the panel.")
+		return
+	}
+	info, err := p.getServerFirewall(r.Context(), id)
+	if err != nil {
+		writeErr(w, http.StatusBadGateway, capitalise(plainAgentError(err))+".")
+		return
+	}
+	writeJSON(w, http.StatusOK, info)
+}
+
+func (p *Panel) handleSetServerFirewall(w http.ResponseWriter, r *http.Request, _ authed) {
+	id := r.PathValue("id")
+	if _, ok := p.viewOf(id); !ok {
+		writeErr(w, http.StatusNotFound, "That server is not in the panel.")
+		return
+	}
+	var req struct {
+		Action string `json:"action"`
+	}
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	switch req.Action {
+	case "sweep", "on-all", "off-all":
+	default:
+		writeErr(w, http.StatusBadRequest, "The firewall action must be sweep, on-all or off-all.")
+		return
+	}
+	info, err := p.setServerFirewall(r.Context(), id, req.Action)
 	if err != nil {
 		writeErr(w, http.StatusBadGateway, capitalise(plainAgentError(err))+".")
 		return

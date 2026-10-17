@@ -778,6 +778,9 @@ type EditSpec struct {
 	Pool          int    `json:"pool,omitempty"`
 	MuxLinks      int    `json:"mux_links,omitempty"`
 	MaxConn       int    `json:"max_conn,omitempty"`
+	SpareTTL      string `json:"spare_ttl,omitempty"`
+	Drain         string `json:"drain,omitempty"`
+	PeerIP        string `json:"peer_ip,omitempty"`
 	Firewall      string `json:"firewall,omitempty"` // "on" or "off"
 	Stage         string `json:"stage,omitempty"`    // "", "prepare", "commit", "rollback"
 	OldConf       string `json:"old_conf,omitempty"`
@@ -1033,6 +1036,36 @@ func EditEdge(spec EditSpec, confDir string) (EdgeResult, error) {
 			return res, errors.New("max_conn must be from 1 to 100000")
 		}
 		text = setConfKey(text, "max_conn", strconv.Itoa(spec.MaxConn))
+	}
+	if ttl := strings.TrimSpace(spec.SpareTTL); ttl != "" && !curCfg.Mux {
+		if d, err := time.ParseDuration(ttl); err != nil || d < 5*time.Second || d > 24*time.Hour {
+			return res, errors.New("spare connection lifetime (spare_ttl) must be a duration between 5s and 24h, such as 60s or 2m")
+		}
+		text = setConfKey(text, "spare_ttl", ttl)
+	}
+	if dr := strings.TrimSpace(spec.Drain); dr != "" {
+		if d, err := time.ParseDuration(dr); err != nil || d < 0 || d > 10*time.Minute {
+			return res, errors.New("restart drain timeout (drain) must be a duration between 0s and 10m, such as 10s")
+		}
+		text = setConfKey(text, "drain", dr)
+	}
+	if pip := strings.TrimSpace(spec.PeerIP); pip != "" && pip != curCfg.PeerIP {
+		if curCfg.GRE {
+			res.Warnings = append(res.Warnings, "peer_ip cannot be changed on a private GRE tunnel")
+		} else {
+			pip = strings.Trim(pip, "[]")
+			if net.ParseIP(pip) == nil && !engine.HostnameRe.MatchString(pip) {
+				return res, fmt.Errorf("peer IP %q is not a valid IP address or hostname", pip)
+			}
+			text = setConfKey(text, "peer_ip", pip)
+			curTAddr := kv["tunnel_addr"]
+			if h, p, err := net.SplitHostPort(curTAddr); err == nil && h != "0.0.0.0" && h != "::" && h != "" {
+				if spec.LinkPort > 0 {
+					p = strconv.Itoa(spec.LinkPort)
+				}
+				text = setConfKey(text, "tunnel_addr", net.JoinHostPort(pip, p))
+			}
+		}
 	}
 	if spec.Firewall != "" {
 		switch spec.Firewall {
@@ -1429,5 +1462,144 @@ func applyTune(confDir string, enable bool) (TuneInfo, error) {
 	}
 	info := readTuneStatus(confDir)
 	info.Output = out
+	return info, nil
+}
+
+// FirewallTunnelRule summarizes the bridge-port firewall state for one tunnel on this server.
+type FirewallTunnelRule struct {
+	Name     string `json:"name"`
+	Role     string `json:"role"`
+	Mode     string `json:"mode"`
+	DialsOut bool   `json:"dials_out"`
+	LinkPort int    `json:"link_port"`
+	PeerIP   string `json:"peer_ip"`
+	Locked   bool   `json:"locked"`
+	CDNOrGRE bool   `json:"cdn_or_gre"`
+}
+
+// FirewallInfo describes the PortBridge bridge-port firewall rules on a server.
+type FirewallInfo struct {
+	OK      bool                 `json:"ok"`
+	Status  string               `json:"status"`
+	Output  string               `json:"output,omitempty"`
+	Tunnels []FirewallTunnelRule `json:"tunnels"`
+}
+
+func readFirewallStatus(confDir string) FirewallInfo {
+	if confDir == "" {
+		confDir = defaultTunnelsDir
+	}
+	host := hostFor(confDir)
+	var rules []FirewallTunnelRule
+	for _, ti := range TunnelsReport(confDir) {
+		cfg, err := engine.LoadConfig(filepath.Join(confDir, ti.Name+".conf"))
+		dials := false
+		cdnOrGRE := ti.CDN || ti.GRE
+		if err == nil {
+			dials = cfg.Dials()
+			cdnOrGRE = cdnOrGRE || cfg.AltTarget != ""
+		}
+		rules = append(rules, FirewallTunnelRule{
+			Name:     ti.Name,
+			Role:     ti.Role,
+			Mode:     ti.Mode,
+			DialsOut: dials,
+			LinkPort: ti.LinkPort,
+			PeerIP:   ti.PeerIP,
+			Locked:   ti.Firewall && !dials && !cdnOrGRE,
+			CDNOrGRE: cdnOrGRE,
+		})
+	}
+	statusText := ""
+	if _, isSys := host.(systemHost); isSys {
+		if _, err := os.Stat(firewallHelper); err == nil {
+			if out, err := hostRun(firewallHelper, "status"); err == nil || out != "" {
+				statusText = out
+			}
+		}
+	}
+	if statusText == "" {
+		if len(rules) == 0 {
+			statusText = "No tunnels on this server."
+		} else {
+			var lines []string
+			for _, r := range rules {
+				switch {
+				case r.DialsOut:
+					lines = append(lines, fmt.Sprintf("%s: dials out to %s:%d (no bridge listener on this server)", r.Name, r.PeerIP, r.LinkPort))
+				case r.CDNOrGRE:
+					lines = append(lines, fmt.Sprintf("%s: bridge port %d open (CDN / GRE tunnel)", r.Name, r.LinkPort))
+				case r.Locked:
+					lines = append(lines, fmt.Sprintf("%s: bridge port %d locked to %s", r.Name, r.LinkPort, r.PeerIP))
+				default:
+					lines = append(lines, fmt.Sprintf("%s: bridge port %d open to any IP (firewall off)", r.Name, r.LinkPort))
+				}
+			}
+			statusText = strings.Join(lines, "\n")
+		}
+	}
+	return FirewallInfo{
+		OK:      true,
+		Status:  statusText,
+		Tunnels: rules,
+	}
+}
+
+func applyFirewallAction(confDir, action string) (FirewallInfo, error) {
+	if confDir == "" {
+		confDir = defaultTunnelsDir
+	}
+	agentOpMu.Lock()
+	defer agentOpMu.Unlock()
+	host := hostFor(confDir)
+
+	var outMsg string
+	switch action {
+	case "sweep":
+		if err := host.FirewallSweep(); err != nil {
+			return FirewallInfo{}, err
+		}
+		outMsg = "Cleaned up any leftover firewall rules and GRE links from removed tunnels."
+	case "on-all", "off-all":
+		val := "on"
+		if action == "off-all" {
+			val = "off"
+		}
+		entries, _ := os.ReadDir(confDir)
+		changed := 0
+		for _, e := range entries {
+			if !strings.HasSuffix(e.Name(), ".conf") {
+				continue
+			}
+			name := strings.TrimSuffix(e.Name(), ".conf")
+			confPath := filepath.Join(confDir, e.Name())
+			cfg, err := engine.LoadConfig(confPath)
+			if err != nil {
+				continue
+			}
+			if val == "on" && (cfg.CDN || cfg.AltTarget != "" || cfg.GRE) {
+				continue
+			}
+			raw, err := os.ReadFile(confPath)
+			if err != nil {
+				continue
+			}
+			updated := setConfKey(string(raw), "firewall", val)
+			if err := writeFileAtomic(confPath, []byte(updated), 0o600); err == nil {
+				_ = host.FirewallApply(name)
+				changed++
+			}
+		}
+		if val == "on" {
+			outMsg = fmt.Sprintf("Locked bridge port firewall on %d tunnel(s).", changed)
+		} else {
+			outMsg = fmt.Sprintf("Turned off bridge port firewall on %d tunnel(s).", changed)
+		}
+	default:
+		return FirewallInfo{}, fmt.Errorf("unknown firewall action %q", action)
+	}
+
+	info := readFirewallStatus(confDir)
+	info.Output = outMsg
 	return info, nil
 }

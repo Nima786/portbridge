@@ -53,6 +53,8 @@ type TunnelInfo struct {
 	MuxLinks      int         `json:"mux_links,omitempty"`
 	PoolSize      int         `json:"pool_size,omitempty"`
 	MaxConn       int         `json:"max_conn,omitempty"`
+	SpareTTL      string      `json:"spare_ttl,omitempty"`
+	Drain         string      `json:"drain,omitempty"`
 	Firewall      bool        `json:"firewall"`
 	CDN           bool        `json:"cdn"`
 	GRE           bool        `json:"gre"`
@@ -131,6 +133,12 @@ func tunnelInfo(path string, host agentHost) TunnelInfo {
 	ti.GRE = cfg.GRE
 	ti.RealSite = cfg.RealSite
 	ti.MaxConn = cfg.MaxConn
+	if cfg.SpareTTL > 0 {
+		ti.SpareTTL = cfg.SpareTTL.String()
+	}
+	if cfg.Drain > 0 {
+		ti.Drain = cfg.Drain.String()
+	}
 	ti.Firewall = cfg.Firewall != "off"
 	ti.ProxyProtocol = "off"
 	if cfg.ProxyProtocol != 0 {
