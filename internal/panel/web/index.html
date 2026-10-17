@@ -524,7 +524,14 @@
               </select>
             </div>
           </div>
-          <p id="tn-probe-status" class="muted small" hidden role="status" aria-live="polite"></p>
+          <div id="tn-probe-live" class="probe-live-box" hidden>
+            <div class="probe-live-head">
+              <span class="probe-spinner" aria-hidden="true"></span>
+              <span id="tn-probe-status" role="status" aria-live="polite">Preparing benchmark...</span>
+              <span id="tn-probe-pct" class="probe-pct">0%</span>
+            </div>
+            <progress id="tn-probe-progress" class="probe-progress" max="100" value="0"></progress>
+          </div>
           <p id="tn-probe-error" class="error" role="alert"></p>
           <div id="tn-probe-results" class="probe-results" hidden></div>
         </div>

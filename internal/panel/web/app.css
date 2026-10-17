@@ -1897,6 +1897,67 @@ select.cf-server-pick {
   padding: .24rem .58rem;
   font-size: .76rem;
 }
+.probe-row.active {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+}
+.probe-live-box {
+  margin-top: .75rem;
+  padding: .65rem .85rem;
+  border-radius: var(--radius-sm);
+  background: var(--well);
+  border: 1px solid var(--accent-border);
+}
+.probe-live-head {
+  display: flex;
+  align-items: center;
+  gap: .55rem;
+  font-size: .84rem;
+  font-weight: 600;
+  color: var(--text);
+  margin-bottom: .45rem;
+}
+.probe-pct {
+  margin-left: auto;
+  font-family: ui-monospace, "Cascadia Code", Consolas, monospace;
+  font-size: .8rem;
+  color: var(--accent);
+}
+.probe-spinner {
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  border: 2px solid var(--accent-border);
+  border-top-color: var(--accent);
+  flex-shrink: 0;
+  animation: probe-spin .75s linear infinite;
+}
+@keyframes probe-spin {
+  to { transform: rotate(360deg); }
+}
+.probe-progress {
+  width: 100%;
+  height: 8px;
+  appearance: none;
+  border: none;
+  border-radius: 999px;
+  overflow: hidden;
+  background: var(--line);
+  display: block;
+}
+.probe-progress::-webkit-progress-bar {
+  background: var(--line);
+  border-radius: 999px;
+}
+.probe-progress::-webkit-progress-value {
+  background: var(--accent);
+  border-radius: 999px;
+  transition: width .25s ease;
+}
+.probe-progress::-moz-progress-bar {
+  background: var(--accent);
+  border-radius: 999px;
+}
 
 /* ---------------------------------------------------- Responsive Layouts */
 

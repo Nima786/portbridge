@@ -891,7 +891,7 @@ func newAgentHandler(token, confDir string, allowUpdates func() bool) *http.Serv
 			PreferredPort int `json:"preferred_port"`
 		}
 		_ = json.NewDecoder(io.LimitReader(r.Body, 4096)).Decode(&req)
-		pl, err := engine.StartProbeListener("0.0.0.0", req.PreferredPort, nil, 75*time.Second)
+		pl, err := engine.StartProbeListener("0.0.0.0", req.PreferredPort, nil, 120*time.Second)
 		if err != nil {
 			writeJSONReply(w, http.StatusUnprocessableEntity, map[string]any{"ok": false, "error": err.Error()})
 			return

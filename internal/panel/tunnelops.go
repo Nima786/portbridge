@@ -1086,7 +1086,33 @@ func serverAddresses(v serverView) (v4, v6 string) {
 	return v4, v6
 }
 
-func (p *Panel) probeBetweenServers(parent context.Context, relayID, foreignID, cdnDomain string) (*engine.ProbeBenchmarkReport, error) {
+type probeSession struct {
+	RelayID         string                      `json:"relay_id"`
+	ForeignID       string                      `json:"foreign_id"`
+	CDNDomain       string                      `json:"cdn_domain"`
+	DirectListenID  string                      `json:"direct_listen_id"`
+	DirectSecret    string                      `json:"direct_secret"`
+	ReverseListenID string                      `json:"reverse_listen_id"`
+	ReverseSecret   string                      `json:"reverse_secret"`
+	Candidates      []engine.ProbeCandidateSpec `json:"candidates"`
+	Notes           []string                    `json:"notes,omitempty"`
+}
+
+type probeListenReply struct {
+	OK     bool   `json:"ok"`
+	ID     string `json:"id"`
+	Port   int    `json:"port"`
+	Secret string `json:"secret"`
+	Error  string `json:"error"`
+}
+
+type probeDialReply struct {
+	OK      bool                          `json:"ok"`
+	Results []engine.ProbeCandidateResult `json:"results"`
+	Error   string                        `json:"error"`
+}
+
+func (p *Panel) startProbeSession(parent context.Context, relayID, foreignID, cdnDomain string) (*probeSession, error) {
 	rv, rok := p.viewOf(relayID)
 	fv, fok := p.viewOf(foreignID)
 	if !rok || !fok {
@@ -1101,104 +1127,155 @@ func (p *Panel) probeBetweenServers(parent context.Context, relayID, foreignID, 
 
 	relayV4, relayV6 := serverAddresses(rv)
 	foreignV4, foreignV6 := serverAddresses(fv)
-	bothV6 := relayV6 != "" && foreignV6 != ""
-
-	type probeListenReply struct {
-		OK     bool   `json:"ok"`
-		ID     string `json:"id"`
-		Port   int    `json:"port"`
-		Secret string `json:"secret"`
-		Error  string `json:"error"`
-	}
-	type probeDialReply struct {
-		OK      bool                          `json:"ok"`
-		Results []engine.ProbeCandidateResult `json:"results"`
-		Error   string                        `json:"error"`
+	fv6 := ""
+	rv6 := ""
+	if relayV6 != "" && foreignV6 != "" {
+		fv6 = foreignV6
+		rv6 = relayV6
 	}
 
-	runDirection := func(mode, listenerID, dialerID, targetV4, targetV6 string, prefPort int, cdn string) ([]engine.ProbeCandidateResult, error) {
+	startListen := func(listenerID string, prefPort int) (probeListenReply, error) {
 		lctx, lcancel := context.WithTimeout(parent, 15*time.Second)
 		defer lcancel()
 		var lrep probeListenReply
 		_, err := p.callJSON(lctx, listenerID, "/api/probe/listen", map[string]int{"preferred_port": prefPort}, &lrep)
 		if err != nil {
 			if errors.Is(err, errTooOld) {
-				return nil, fmt.Errorf("%s is running an older PortBridge release; update it first to use Smart Benchmark", p.serverName(listenerID))
+				return probeListenReply{}, fmt.Errorf("%s is running an older PortBridge release; update it first to use Smart Benchmark", p.serverName(listenerID))
 			}
-			return nil, fmt.Errorf("%s listener: %s", p.serverName(listenerID), plainAgentError(err))
+			return probeListenReply{}, fmt.Errorf("%s listener: %s", p.serverName(listenerID), plainAgentError(err))
 		}
 		if !lrep.OK {
-			return nil, fmt.Errorf("%s listener: %s", p.serverName(listenerID), lrep.Error)
+			return probeListenReply{}, fmt.Errorf("%s listener: %s", p.serverName(listenerID), lrep.Error)
 		}
-		defer func() {
-			sctx, scancel := context.WithTimeout(context.Background(), 5*time.Second)
-			defer scancel()
-			var dummy map[string]any
-			_, _ = p.callJSON(sctx, listenerID, "/api/probe/stop", map[string]string{"id": lrep.ID}, &dummy)
-		}()
-
-		specs := engine.BuildProbeCandidates(mode, targetV4, targetV6, lrep.Port, cdn)
-		if len(specs) == 0 {
-			return nil, nil
-		}
-
-		dctx, dcancel := context.WithTimeout(parent, 70*time.Second)
-		defer dcancel()
-		var drep probeDialReply
-		_, err = p.callJSON(dctx, dialerID, "/api/probe/dial", map[string]any{
-			"specs":       specs,
-			"secret":      lrep.Secret,
-			"burst_bytes": 384 * 1024,
-		}, &drep)
-		if err != nil {
-			if errors.Is(err, errTooOld) {
-				return nil, fmt.Errorf("%s is running an older PortBridge release; update it first to use Smart Benchmark", p.serverName(dialerID))
-			}
-			return nil, fmt.Errorf("%s dialer: %s", p.serverName(dialerID), plainAgentError(err))
-		}
-		if !drep.OK {
-			return nil, fmt.Errorf("%s dialer: %s", p.serverName(dialerID), drep.Error)
-		}
-		return drep.Results, nil
+		return lrep, nil
 	}
 
 	var (
-		wg         sync.WaitGroup
-		directRes  []engine.ProbeCandidateResult
-		reverseRes []engine.ProbeCandidateResult
-		directErr  error
-		reverseErr error
+		wg      sync.WaitGroup
+		dListen probeListenReply
+		rListen probeListenReply
+		dErr    error
+		rErr    error
 	)
-
-	fv6 := ""
-	rv6 := ""
-	if bothV6 {
-		fv6 = foreignV6
-		rv6 = relayV6
-	}
-
 	wg.Add(2)
 	go func() {
 		defer wg.Done()
-		directRes, directErr = runDirection("direct", foreignID, relayID, foreignV4, fv6, 2053, cdnDomain)
+		dListen, dErr = startListen(foreignID, 2053)
 	}()
 	go func() {
 		defer wg.Done()
-		reverseRes, reverseErr = runDirection("reverse", relayID, foreignID, relayV4, rv6, 2083, "")
+		rListen, rErr = startListen(relayID, 2083)
 	}()
 	wg.Wait()
 
-	if directErr != nil && reverseErr != nil && len(directRes) == 0 && len(reverseRes) == 0 {
-		return nil, directErr
+	if dErr != nil && rErr != nil {
+		return nil, dErr
 	}
 
-	all := append(directRes, reverseRes...)
-	rep := engine.FinalizeProbeReport(all, cdnDomain)
-	if directErr != nil {
-		rep.Notes = append(rep.Notes, "Direct benchmark note: "+directErr.Error())
+	sess := &probeSession{
+		RelayID:   relayID,
+		ForeignID: foreignID,
+		CDNDomain: cdnDomain,
 	}
-	if reverseErr != nil {
-		rep.Notes = append(rep.Notes, "Reverse benchmark note: "+reverseErr.Error())
+	if dErr == nil {
+		sess.DirectListenID = dListen.ID
+		sess.DirectSecret = dListen.Secret
+		sess.Candidates = append(sess.Candidates, engine.BuildProbeCandidates("direct", foreignV4, fv6, dListen.Port, cdnDomain)...)
+	} else {
+		sess.Notes = append(sess.Notes, "Direct listener note: "+dErr.Error())
 	}
-	return rep, nil
+	if rErr == nil {
+		sess.ReverseListenID = rListen.ID
+		sess.ReverseSecret = rListen.Secret
+		sess.Candidates = append(sess.Candidates, engine.BuildProbeCandidates("reverse", relayV4, rv6, rListen.Port, "")...)
+	} else {
+		sess.Notes = append(sess.Notes, "Reverse listener note: "+rErr.Error())
+	}
+	return sess, nil
+}
+
+func (p *Panel) runProbeStep(parent context.Context, dialerID, secret string, spec engine.ProbeCandidateSpec) (engine.ProbeCandidateResult, error) {
+	dctx, dcancel := context.WithTimeout(parent, 15*time.Second)
+	defer dcancel()
+	var drep probeDialReply
+	_, err := p.callJSON(dctx, dialerID, "/api/probe/dial", map[string]any{
+		"specs":       []engine.ProbeCandidateSpec{spec},
+		"secret":      secret,
+		"burst_bytes": 256 * 1024,
+	}, &drep)
+	if err != nil {
+		return engine.ProbeCandidateResult{
+			ProbeCandidateSpec: spec,
+			Status:             "blocked",
+			Attempts:           1,
+			Error:              plainAgentError(err),
+			Summary:            "Blocked / Unreachable — " + plainAgentError(err),
+		}, nil
+	}
+	if !drep.OK || len(drep.Results) == 0 {
+		msg := drep.Error
+		if msg == "" {
+			msg = "probe failed"
+		}
+		return engine.ProbeCandidateResult{
+			ProbeCandidateSpec: spec,
+			Status:             "blocked",
+			Attempts:           1,
+			Error:              msg,
+			Summary:            "Blocked / Unreachable — " + msg,
+		}, nil
+	}
+	return drep.Results[0], nil
+}
+
+func (p *Panel) finishProbeSession(sess probeSession, results []engine.ProbeCandidateResult) *engine.ProbeBenchmarkReport {
+	var wg sync.WaitGroup
+	if sess.ForeignID != "" && sess.DirectListenID != "" {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			sctx, scancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer scancel()
+			var dummy map[string]any
+			_, _ = p.callJSON(sctx, sess.ForeignID, "/api/probe/stop", map[string]string{"id": sess.DirectListenID}, &dummy)
+		}()
+	}
+	if sess.RelayID != "" && sess.ReverseListenID != "" {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			sctx, scancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer scancel()
+			var dummy map[string]any
+			_, _ = p.callJSON(sctx, sess.RelayID, "/api/probe/stop", map[string]string{"id": sess.ReverseListenID}, &dummy)
+		}()
+	}
+	wg.Wait()
+
+	rep := engine.FinalizeProbeReport(results, sess.CDNDomain)
+	rep.Notes = append(rep.Notes, sess.Notes...)
+	return rep
+}
+
+func (p *Panel) probeBetweenServers(parent context.Context, relayID, foreignID, cdnDomain string) (*engine.ProbeBenchmarkReport, error) {
+	sess, err := p.startProbeSession(parent, relayID, foreignID, cdnDomain)
+	if err != nil {
+		return nil, err
+	}
+	var results []engine.ProbeCandidateResult
+	for _, spec := range sess.Candidates {
+		if parent.Err() != nil {
+			break
+		}
+		dialerID := sess.RelayID
+		secret := sess.DirectSecret
+		if spec.Mode == "reverse" {
+			dialerID = sess.ForeignID
+			secret = sess.ReverseSecret
+		}
+		res, _ := p.runProbeStep(parent, dialerID, secret, spec)
+		results = append(results, res)
+	}
+	return p.finishProbeSession(*sess, results), nil
 }

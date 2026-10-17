@@ -2403,13 +2403,61 @@
     $('tn-service').focus();
   }
 
-  function renderProbeResults(rep) {
+  function renderProbeRow(r, isLive, isActive) {
+    if (isActive) {
+      return h('div', { class: 'probe-row active' },
+        h('div', { class: 'probe-row-label' }, r.label,
+          h('span', { class: 'probe-row-sub' }, 'Running handshake, ping & payload burst...')),
+        h('span', { class: 'state note' }, 'Testing…'),
+        h('span', { class: 'probe-metric' }, '…'),
+        h('span', { class: 'probe-metric' }, '…'),
+        h('span', { class: 'muted small' }, '—'),
+        h('span', { class: 'muted small' }, '—'));
+    }
+    if (!r.status) {
+      return h('div', { class: 'probe-row' },
+        h('div', { class: 'probe-row-label' }, r.label),
+        h('span', { class: 'state' }, 'Queued'),
+        h('span', { class: 'probe-metric' }, '—'),
+        h('span', { class: 'probe-metric' }, '—'),
+        h('span', { class: 'muted small' }, '—'),
+        h('span', { class: 'muted small' }, '—'));
+    }
+    const stMap = {
+      ok: ['ok', 'Healthy'],
+      throttled: ['warn', 'Throttled'],
+      degraded: ['warn', 'Degraded'],
+      blocked: ['bad', 'Blocked'],
+    };
+    const st = stMap[r.status] || ['bad', r.status || 'Blocked'];
+    const scoreCls = r.score >= 75 ? '' : (r.score >= 45 ? ' warn' : ' bad');
+    const canUse = !isLive && (r.status === 'ok' || r.status === 'degraded');
+    return h('div', { class: 'probe-row' },
+      h('div', { class: 'probe-row-label' },
+        r.label,
+        r.error && r.status !== 'ok' ? h('span', { class: 'probe-row-sub' }, r.error) : null),
+      h('span', { class: 'state ' + st[0] }, st[1]),
+      h('span', { class: 'probe-metric' }, r.successes > 0 ? `${Math.round(r.rtt_ms)} ms` : '—'),
+      h('span', { class: 'probe-metric' }, r.successes > 0 ? `${r.avg_mbps.toFixed(1)} Mbps` : '—'),
+      isLive
+        ? h('span', { class: 'muted small' }, r.status === 'ok' ? 'Done' : '—')
+        : h('span', { class: 'probe-score-pill' + scoreCls }, `${r.score}/100`),
+      canUse
+        ? h('button', {
+            type: 'button',
+            class: 'probe-use-btn',
+            onclick: () => applyProbeCandidate(r)
+          }, 'Use')
+        : h('span', { class: 'muted small' }, '—'));
+  }
+
+  function renderProbeResults(rep, isLive, activeIdx) {
     const box = $('tn-probe-results');
     if (!box) return;
     box.hidden = false;
 
     const kids = [];
-    if (rep.recommended) {
+    if (!isLive && rep.recommended) {
       const rec = rep.recommended;
       kids.push(h('div', { class: 'probe-rec-card' },
         h('div', { class: 'probe-rec-main' },
@@ -2424,33 +2472,7 @@
         }, 'Apply Recommended')));
     }
 
-    const rows = (rep.results || []).map((r) => {
-      const stMap = {
-        ok: ['ok', 'Healthy'],
-        throttled: ['warn', 'Throttled'],
-        degraded: ['warn', 'Degraded'],
-        blocked: ['bad', 'Blocked'],
-      };
-      const st = stMap[r.status] || ['bad', r.status || 'Blocked'];
-      const scoreCls = r.score >= 75 ? '' : (r.score >= 45 ? ' warn' : ' bad');
-      const canUse = r.status === 'ok' || r.status === 'degraded';
-      return h('div', { class: 'probe-row' },
-        h('div', { class: 'probe-row-label' },
-          r.label,
-          r.error && r.status !== 'ok' ? h('span', { class: 'probe-row-sub' }, r.error) : null),
-        h('span', { class: 'state ' + st[0] }, st[1]),
-        h('span', { class: 'probe-metric' }, r.successes > 0 ? `${Math.round(r.rtt_ms)} ms` : '—'),
-        h('span', { class: 'probe-metric' }, r.successes > 0 ? `${r.avg_mbps.toFixed(1)} Mbps` : '—'),
-        h('span', { class: 'probe-score-pill' + scoreCls }, `${r.score}/100`),
-        canUse
-          ? h('button', {
-              type: 'button',
-              class: 'probe-use-btn',
-              onclick: () => applyProbeCandidate(r)
-            }, 'Use')
-          : h('span', { class: 'muted small' }, '—'));
-    });
-
+    const rows = (rep.results || []).map((r, idx) => renderProbeRow(r, !!isLive, isLive && idx === activeIdx));
     if (rows.length) {
       kids.push(h('div', { class: 'probe-list' }, ...rows));
     }
@@ -2460,10 +2482,22 @@
     box.replaceChildren(...kids);
   }
 
+  function setProbeProgress(text, pct) {
+    const live = $('tn-probe-live');
+    const st = $('tn-probe-status');
+    const pctEl = $('tn-probe-pct');
+    const bar = $('tn-probe-progress');
+    if (live) live.hidden = false;
+    if (st) st.textContent = text;
+    const clamped = Math.max(0, Math.min(100, Math.round(pct)));
+    if (pctEl) pctEl.textContent = `${clamped}%`;
+    if (bar) bar.value = clamped;
+  }
+
   if ($('tn-probe-btn')) {
     $('tn-probe-btn').addEventListener('click', async () => {
       const btn = $('tn-probe-btn');
-      const st = $('tn-probe-status');
+      const live = $('tn-probe-live');
       const err = $('tn-probe-error');
       const resBox = $('tn-probe-results');
       const relay = $('tn-relay').value;
@@ -2473,22 +2507,82 @@
       err.textContent = '';
       resBox.hidden = true;
       resBox.replaceChildren();
-      st.hidden = false;
-      st.textContent = 'Running parallel Direct & Reverse transport benchmarks (Fake TLS, Stealth, gRPC, KCP, TCP' + (cdn ? ', Cloudflare CDN' : '') + ')... Please wait ~15–25 seconds...';
       btn.disabled = true;
+      btn.textContent = 'Starting…';
+      setProbeProgress('Preparing temporary benchmark listeners on both servers…', 4);
+
+      let sess = null;
+      const doneResults = [];
       try {
-        const rep = await api('POST', '/api/tunnels/probe', {
+        sess = await api('POST', '/api/tunnels/probe', {
+          action: 'start',
           relay,
           foreign,
           cdn_domain: cdn,
         });
-        st.hidden = true;
-        renderProbeResults(rep);
+        const cands = sess.candidates || [];
+        if (!cands.length) {
+          throw new Error('No benchmark candidates could be prepared for these two servers.');
+        }
+
+        const liveState = cands.map((c) => Object.assign({}, c));
+        const deadTCP = {};
+
+        for (let i = 0; i < cands.length; i++) {
+          const spec = cands[i];
+          const pct = Math.round(((i + 0.2) / cands.length) * 92) + 4;
+          btn.textContent = `Testing (${i + 1}/${cands.length})…`;
+          setProbeProgress(`Testing ${i + 1} of ${cands.length}: ${spec.label}…`, pct);
+          renderProbeResults({ results: liveState, notes: sess.notes }, true, i);
+
+          const isTCPDirect = !spec.cdn && spec.transport !== 'kcp' && spec.target_addr;
+          if (isTCPDirect && (deadTCP[spec.target_addr] || 0) >= 2) {
+            const skipped = Object.assign({}, spec, {
+              status: 'blocked',
+              attempts: 1,
+              successes: 0,
+              error: 'connection timed out',
+              summary: 'Blocked / Unreachable — TCP port unreachable',
+            });
+            liveState[i] = skipped;
+            doneResults.push(skipped);
+            continue;
+          }
+
+          const dialerID = spec.mode === 'reverse' ? sess.foreign_id : sess.relay_id;
+          const secret = spec.mode === 'reverse' ? sess.reverse_secret : sess.direct_secret;
+          const stepRes = await api('POST', '/api/tunnels/probe', {
+            action: 'step',
+            dialer_id: dialerID,
+            secret,
+            spec,
+          });
+          if (isTCPDirect && stepRes.successes === 0 && (stepRes.error === 'connection timed out' || stepRes.error === 'connection refused')) {
+            deadTCP[spec.target_addr] = (deadTCP[spec.target_addr] || 0) + 1;
+          }
+          liveState[i] = stepRes;
+          doneResults.push(stepRes);
+          renderProbeResults({ results: liveState, notes: sess.notes }, true, -1);
+        }
+
+        setProbeProgress('Calculating final scores and best tunnel recommendation…', 98);
+        const finalRep = await api('POST', '/api/tunnels/probe', {
+          action: 'finish',
+          session: sess,
+          results: doneResults,
+        });
+        sess = null;
+        if (live) live.hidden = true;
+        renderProbeResults(finalRep, false, -1);
       } catch (e) {
-        st.hidden = true;
+        if (live) live.hidden = true;
         err.textContent = e.message;
       } finally {
+        if (sess) {
+          api('POST', '/api/tunnels/probe', { action: 'finish', session: sess, results: doneResults }).catch(() => {});
+        }
         btn.disabled = false;
+        btn.textContent = 'Find Best Tunnel Mode';
       }
     });
   }
@@ -2510,7 +2604,7 @@
     $('tn-error').textContent = '';
     $('tn-ports-result').replaceChildren();
     if ($('tn-probe-error')) $('tn-probe-error').textContent = '';
-    if ($('tn-probe-status')) $('tn-probe-status').hidden = true;
+    if ($('tn-probe-live')) $('tn-probe-live').hidden = true;
     if ($('tn-probe-results')) {
       $('tn-probe-results').hidden = true;
       $('tn-probe-results').replaceChildren();

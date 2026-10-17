@@ -721,20 +721,47 @@ func (p *Panel) handleSpeedtestTunnel(w http.ResponseWriter, r *http.Request, _ 
 }
 
 func (p *Panel) handleProbeTunnel(w http.ResponseWriter, r *http.Request, _ authed) {
+	agent.ExtendDeadlines(w, 3*time.Minute)
 	var req struct {
-		Relay     string `json:"relay"`
-		Foreign   string `json:"foreign"`
-		CDNDomain string `json:"cdn_domain"`
+		Action    string                        `json:"action"`
+		Relay     string                        `json:"relay"`
+		Foreign   string                        `json:"foreign"`
+		CDNDomain string                        `json:"cdn_domain"`
+		DialerID  string                        `json:"dialer_id"`
+		Secret    string                        `json:"secret"`
+		Spec      engine.ProbeCandidateSpec     `json:"spec"`
+		Session   probeSession                  `json:"session"`
+		Results   []engine.ProbeCandidateResult `json:"results"`
 	}
 	if !decodeJSON(w, r, &req) {
 		return
 	}
-	rep, err := p.probeBetweenServers(r.Context(), strings.TrimSpace(req.Relay), strings.TrimSpace(req.Foreign), strings.TrimSpace(req.CDNDomain))
-	if err != nil {
-		writeErr(w, http.StatusUnprocessableEntity, capitalise(plainAgentError(err))+".")
-		return
+	switch req.Action {
+	case "start":
+		sess, err := p.startProbeSession(r.Context(), strings.TrimSpace(req.Relay), strings.TrimSpace(req.Foreign), strings.TrimSpace(req.CDNDomain))
+		if err != nil {
+			writeErr(w, http.StatusUnprocessableEntity, capitalise(plainAgentError(err))+".")
+			return
+		}
+		writeJSON(w, http.StatusOK, sess)
+	case "step":
+		res, err := p.runProbeStep(r.Context(), strings.TrimSpace(req.DialerID), strings.TrimSpace(req.Secret), req.Spec)
+		if err != nil {
+			writeErr(w, http.StatusUnprocessableEntity, capitalise(plainAgentError(err))+".")
+			return
+		}
+		writeJSON(w, http.StatusOK, res)
+	case "finish":
+		rep := p.finishProbeSession(req.Session, req.Results)
+		writeJSON(w, http.StatusOK, rep)
+	default:
+		rep, err := p.probeBetweenServers(r.Context(), strings.TrimSpace(req.Relay), strings.TrimSpace(req.Foreign), strings.TrimSpace(req.CDNDomain))
+		if err != nil {
+			writeErr(w, http.StatusUnprocessableEntity, capitalise(plainAgentError(err))+".")
+			return
+		}
+		writeJSON(w, http.StatusOK, rep)
 	}
-	writeJSON(w, http.StatusOK, rep)
 }
 
 func (p *Panel) handleGetServerTune(w http.ResponseWriter, r *http.Request, _ authed) {

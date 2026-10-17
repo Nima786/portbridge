@@ -169,18 +169,23 @@ func StartProbeListener(bindHost string, preferredPort int, secret []byte, ttl t
 		KCPParityShards: 3,
 	}
 
+	listenHost := bindHost
+	if listenHost == "0.0.0.0" {
+		listenHost = ""
+	}
+
 	var tcpLn net.Listener
 	var kcpLn net.Listener
 	var chosenPort int
 
 	for _, port := range candidates {
-		addr := net.JoinHostPort(bindHost, strconv.Itoa(port))
+		addr := net.JoinHostPort(listenHost, strconv.Itoa(port))
 		tln, err := net.Listen("tcp", addr)
 		if err != nil {
 			continue
 		}
 		actualPort := tln.Addr().(*net.TCPAddr).Port
-		uaddr := net.JoinHostPort(bindHost, strconv.Itoa(actualPort))
+		uaddr := net.JoinHostPort(listenHost, strconv.Itoa(actualPort))
 		uln, err := kcpListen(uaddr, kcpCfg)
 		if err != nil {
 			_ = tln.Close()
@@ -502,14 +507,30 @@ func BuildProbeCandidates(mode, ipv4, ipv6 string, port int, cdnDomain string) [
 // ProbeListener using the shared ephemeral secret.
 func RunProbeDialer(ctx context.Context, specs []ProbeCandidateSpec, secret []byte, burstBytes int) []ProbeCandidateResult {
 	if burstBytes <= 0 {
-		burstBytes = 384 * 1024 // 384 KB down + 384 KB up per main test (~768 KB sustained burst)
+		burstBytes = 256 * 1024 // 256 KB down + 256 KB up per main test (~512 KB sustained burst)
 	}
 	results := make([]ProbeCandidateResult, 0, len(specs))
+	deadTCP := map[string]int{}
+
 	for _, spec := range specs {
 		if ctx.Err() != nil {
 			break
 		}
+		isTCPDirect := !spec.CDN && spec.Transport != string(TransportKCP) && spec.TargetAddr != ""
+		if isTCPDirect && deadTCP[spec.TargetAddr] >= 2 {
+			results = append(results, ProbeCandidateResult{
+				ProbeCandidateSpec: spec,
+				Status:             "blocked",
+				Attempts:           1,
+				Error:              "connection timed out",
+				Summary:            "Blocked / Unreachable — TCP port unreachable",
+			})
+			continue
+		}
 		res := probeOneSpec(ctx, spec, secret, burstBytes)
+		if isTCPDirect && res.Successes == 0 && (res.Error == "connection timed out" || res.Error == "connection refused") {
+			deadTCP[spec.TargetAddr]++
+		}
 		results = append(results, res)
 	}
 	return results
@@ -553,8 +574,8 @@ func probeOneSpec(parentCtx context.Context, spec ProbeCandidateSpec, secret []b
 
 	routes := newRouter(cfg)
 
-	// Attempt 1: Full handshake + 4 ping samples + sustained download/upload burst
-	hs1, rtts, dlMbps, ulMbps, partial1, err1 := runSingleProbeAttempt(parentCtx, cfg, routes, secret, 4, uint32(burstBytes))
+	// Attempt 1: Full handshake + 3 ping samples + sustained download/upload burst
+	hs1, rtts, dlMbps, ulMbps, partial1, err1 := runSingleProbeAttempt(parentCtx, cfg, routes, secret, 3, uint32(burstBytes))
 	if err1 != nil {
 		res.Error = simplifyProbeErr(err1)
 		res.Summary = "Blocked / Unreachable — " + res.Error
@@ -562,8 +583,8 @@ func probeOneSpec(parentCtx context.Context, spec ProbeCandidateSpec, secret []b
 	}
 	res.Successes++
 
-	// Attempt 2: Repeat connection check + 1 ping + 64 KB burst to confirm stability
-	hs2, rtts2, _, _, partial2, err2 := runSingleProbeAttempt(parentCtx, cfg, routes, secret, 1, 64*1024)
+	// Attempt 2: Repeat connection check + 1 ping + 32 KB burst to confirm stability
+	hs2, rtts2, _, _, partial2, err2 := runSingleProbeAttempt(parentCtx, cfg, routes, secret, 1, 32*1024)
 	if err2 == nil {
 		res.Successes++
 		rtts = append(rtts, rtts2...)
@@ -607,20 +628,18 @@ func probeOneSpec(parentCtx context.Context, spec ProbeCandidateSpec, secret []b
 }
 
 func runSingleProbeAttempt(parentCtx context.Context, cfg *Config, routes *router, secret []byte, pings int, burstBytes uint32) (hsMS float64, rtts []float64, dlMbps, ulMbps float64, partial bool, err error) {
-	ctx, cancel := context.WithTimeout(parentCtx, 9*time.Second)
+	ctx, cancel := context.WithTimeout(parentCtx, 5500*time.Millisecond)
 	defer cancel()
 
 	t0 := time.Now()
-	raw, claim, err := routes.dial(4 * time.Second)
+	raw, claim, err := routes.dial(2500 * time.Millisecond)
 	if err != nil {
 		return 0, nil, 0, 0, false, err
 	}
 	defer raw.Close()
 	tuneSocket(raw)
 
-	if dl, ok := ctx.Deadline(); ok {
-		_ = raw.SetDeadline(dl)
-	}
+	_ = raw.SetDeadline(time.Now().Add(3 * time.Second))
 
 	c, err := wrapDialPurpose(raw, cfg.withClaimedName(claim), authPurposeSpeedtest)
 	if err != nil {
@@ -633,12 +652,11 @@ func runSingleProbeAttempt(parentCtx context.Context, cfg *Config, routes *route
 	}
 	hsMS = float64(time.Since(t0)) / float64(time.Millisecond)
 
-	if dl, ok := ctx.Deadline(); ok {
-		_ = c.SetDeadline(dl)
-	}
-
-	// Ping samples
+	// Ping samples (use 2.5s deadline on first ping so dead UDP/KCP ports fail fast)
 	for i := 0; i < pings; i++ {
+		if i == 0 {
+			_ = c.SetDeadline(time.Now().Add(2500 * time.Millisecond))
+		}
 		pStart := time.Now()
 		var req [9]byte
 		req[0] = 0x01
@@ -651,6 +669,10 @@ func runSingleProbeAttempt(parentCtx context.Context, cfg *Config, routes *route
 			return hsMS, rtts, 0, 0, false, fmt.Errorf("ping read: %w", err)
 		}
 		rtts = append(rtts, float64(time.Since(pStart))/float64(time.Millisecond))
+	}
+
+	if dl, ok := ctx.Deadline(); ok {
+		_ = c.SetDeadline(dl)
 	}
 
 	// Download burst
