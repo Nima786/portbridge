@@ -1982,6 +1982,37 @@ select.cf-server-pick {
   }
 }
 
+.badge-autoheal.is-on {
+  background: var(--ok-soft);
+  border-color: var(--ok-border);
+  color: var(--ok);
+  font-weight: 600;
+}
+.badge-autoheal.is-healing {
+  background: var(--warn-soft);
+  border-color: var(--warn-border);
+  color: var(--warn);
+  font-weight: 650;
+}
+button.btn-autoheal.is-on {
+  border-color: var(--ok-border);
+  background: var(--ok-soft);
+  color: var(--ok);
+}
+.diag-card {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  padding: .75rem .95rem;
+}
+.diag-card-head {
+  display: flex;
+  align-items: center;
+  gap: .55rem;
+  flex-wrap: wrap;
+  margin-bottom: .25rem;
+}
+
 @media (max-width: 760px) {
   .columns { grid-template-columns: 1fr; }
   .row, .row2 { grid-template-columns: 1fr; }

@@ -27,7 +27,8 @@ type tunnelView struct {
 	Edge   *half  `json:"edge,omitempty"`   // the relay (Iran) side
 	Origin *half  `json:"origin,omitempty"` // the foreign side
 	// Stale is set when a server's picture is old because it cannot be reached.
-	Stale bool `json:"stale,omitempty"`
+	Stale    bool            `json:"stale,omitempty"`
+	AutoHeal *AutoHealConfig `json:"auto_heal,omitempty"`
 }
 
 func pairTunnels(servers []serverView) []tunnelView {

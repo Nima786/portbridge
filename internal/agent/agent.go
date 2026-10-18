@@ -2,7 +2,6 @@ package agent
 
 import (
 	"bytes"
-	"context"
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/subtle"
@@ -951,6 +950,29 @@ func newAgentHandler(token, confDir string, allowUpdates func() bool) *http.Serv
 		writeJSONReply(w, http.StatusOK, map[string]any{"ok": true, "results": results})
 	})
 
+	// POST /api/callhome: register or update the panel callback URL(s) and fingerprint
+	// so this agent calls the panel on /hub/poll in the background without needing SSH.
+	mux.HandleFunc("/api/callhome", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, `{"error":"method not allowed"}`, http.StatusMethodNotAllowed)
+			return
+		}
+		if !checkAgentAuth(r, token) {
+			http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
+			return
+		}
+		var req struct {
+			PanelURL         string `json:"panel_url"`
+			PanelFingerprint string `json:"panel_fingerprint"`
+		}
+		if err := json.NewDecoder(io.LimitReader(r.Body, 4096)).Decode(&req); err != nil {
+			writeJSONReply(w, http.StatusBadRequest, map[string]any{"ok": false, "error": "invalid request"})
+			return
+		}
+		_ = configureCallHome(req.PanelURL, req.PanelFingerprint, token, confDir, mux)
+		writeJSONReply(w, http.StatusOK, map[string]any{"ok": true})
+	})
+
 	return mux
 }
 
@@ -1339,7 +1361,7 @@ func CmdAgent(args []string) error {
 	// reaches the agent there.
 	allow := updatesAllowedByConfig(*confPath)
 	if ac, err := readAgentConfig(*confPath); err == nil && ac.PanelURL != "" {
-		go callHome(context.Background(), ac.PanelURL, ac.PanelFingerprint, *token,
+		_ = configureCallHome(ac.PanelURL, ac.PanelFingerprint, *token, defaultTunnelsDir,
 			newAgentHandler(*token, defaultTunnelsDir, allow))
 	}
 

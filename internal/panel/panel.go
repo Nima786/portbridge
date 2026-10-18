@@ -67,6 +67,7 @@ type Panel struct {
 	localToken string
 
 	updates *updater
+	healer  *autoHealer
 }
 
 func newPanel(dir string, cfg Config, st *store) *Panel {
@@ -84,6 +85,7 @@ func newPanel(dir string, cfg Config, st *store) *Panel {
 	p.fleet = newFleet(p)
 	p.setLocal(defaultTunnelsDir)
 	p.updates = newUpdater(p)
+	p.healer = newAutoHealer(p)
 	return p
 }
 
@@ -132,7 +134,7 @@ func (p *Panel) dropPending(id string) {
 func (p *Panel) hubTokens() map[string]string {
 	out := map[string]string{}
 	for _, s := range p.store.get().Servers {
-		if !s.CallsPanel {
+		if !s.CallsPanel && !s.StandbyHub {
 			continue
 		}
 		if t, err := p.store.open(s.TokenEnc); err == nil {
@@ -149,6 +151,37 @@ func (p *Panel) hubTokens() map[string]string {
 
 // publicURL is the address servers that call the panel are given.
 func (p *Panel) publicURL() string { return publicURLFor(p.cfg) }
+
+// allCallbackURLs returns comma-separated callback URLs (domain, IPv4, IPv6)
+// that remote agents can use to reach this panel on /hub/poll.
+func (p *Panel) allCallbackURLs() string {
+	var list []string
+	seen := map[string]bool{}
+	add := func(u string) {
+		u = strings.TrimRight(strings.TrimSpace(u), "/")
+		if u != "" && !seen[u] {
+			seen[u] = true
+			list = append(list, u)
+		}
+	}
+	if p.cfg.PublicURL != "" {
+		add(p.cfg.PublicURL)
+	}
+	_, port, err := net.SplitHostPort(p.cfg.Listen)
+	if err == nil && port != "" {
+		if p.cfg.Domain != "" {
+			add("https://" + net.JoinHostPort(p.cfg.Domain, port))
+		}
+		v4, v6 := agent.PublicAddresses()
+		for _, ip := range v4 {
+			add("https://" + net.JoinHostPort(ip, port))
+		}
+		for _, ip := range v6 {
+			add("https://" + net.JoinHostPort(ip, port))
+		}
+	}
+	return strings.Join(list, ",")
+}
 
 func publicURLFor(cfg Config) string {
 	if cfg.PublicURL != "" {
@@ -247,6 +280,7 @@ func Run(dir string) error {
 	defer stop()
 	go p.fleet.run(ctx)
 	go p.updates.run(ctx)
+	go p.healer.run(ctx)
 	// An update that restarted the panel carries on from where it was.
 	p.updates.resume()
 	if cfg.Domain != "" {

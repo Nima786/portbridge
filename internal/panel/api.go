@@ -67,6 +67,8 @@ func (p *Panel) routes() http.Handler {
 	mux.HandleFunc("POST /api/tunnels/check", p.withAuth(p.handleCheckTunnel))
 	mux.HandleFunc("POST /api/tunnels/speedtest", p.withAuth(p.handleSpeedtestTunnel))
 	mux.HandleFunc("POST /api/tunnels/probe", p.withAuth(p.handleProbeTunnel))
+	mux.HandleFunc("POST /api/tunnels/autoheal", p.withAuth(p.handleSetTunnelAutoHeal))
+	mux.HandleFunc("POST /api/tunnels/autoheal/trigger", p.withAuth(p.handleTriggerTunnelAutoHeal))
 	mux.HandleFunc("POST /api/ports", p.withAuth(p.handlePorts))
 	mux.HandleFunc("GET /api/servers/{id}/tune", p.withAuth(p.handleGetServerTune))
 	mux.HandleFunc("POST /api/servers/{id}/tune", p.withAuth(p.handleSetServerTune))
@@ -496,7 +498,9 @@ func (p *Panel) handleRemoveServer(w http.ResponseWriter, r *http.Request, _ aut
 }
 
 func (p *Panel) handleTunnels(w http.ResponseWriter, _ *http.Request, _ authed) {
-	writeJSON(w, http.StatusOK, map[string]any{"tunnels": pairTunnels(p.fleet.views())})
+	tunnels := pairTunnels(p.fleet.views())
+	p.healer.attachViews(tunnels)
+	writeJSON(w, http.StatusOK, map[string]any{"tunnels": tunnels})
 }
 
 func (p *Panel) handlePanelInfo(w http.ResponseWriter, _ *http.Request, _ authed) {
@@ -769,6 +773,45 @@ func (p *Panel) handleProbeTunnel(w http.ResponseWriter, r *http.Request, _ auth
 		}
 		writeJSON(w, http.StatusOK, rep)
 	}
+}
+
+func (p *Panel) handleSetTunnelAutoHeal(w http.ResponseWriter, r *http.Request, _ authed) {
+	var req struct {
+		Name      string `json:"name"`
+		Enabled   bool   `json:"enabled"`
+		CDNDomain string `json:"cdn_domain"`
+	}
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	name := strings.TrimSpace(req.Name)
+	if err := checkTunnelName(name); err != nil {
+		writeErr(w, http.StatusBadRequest, capitalise(err.Error())+".")
+		return
+	}
+	if err := p.healer.setConfig(name, req.Enabled, req.CDNDomain); err != nil {
+		writeErr(w, http.StatusBadRequest, capitalise(err.Error())+".")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+func (p *Panel) handleTriggerTunnelAutoHeal(w http.ResponseWriter, r *http.Request, _ authed) {
+	var req struct {
+		Name      string `json:"name"`
+		Edge      string `json:"edge"`
+		Origin    string `json:"origin"`
+		CDNDomain string `json:"cdn_domain"`
+	}
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	jobID, err := p.healer.startManualHeal(strings.TrimSpace(req.Name), strings.TrimSpace(req.Edge), strings.TrimSpace(req.Origin), strings.TrimSpace(req.CDNDomain))
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, capitalise(err.Error())+".")
+		return
+	}
+	writeJSON(w, http.StatusAccepted, map[string]string{"job": jobID})
 }
 
 func (p *Panel) handleGetServerTune(w http.ResponseWriter, r *http.Request, _ authed) {

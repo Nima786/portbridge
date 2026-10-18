@@ -1066,6 +1066,14 @@
       t.stale ? h('p', { class: 'muted small' }, 'One of the servers cannot be reached right now, so these stats may be cached.') : null,
       tunnelActions(t, halves));
 
+    const ah = t.auto_heal || {};
+    let ahBadge = null;
+    if (ah.state === 'probing' || ah.state === 'switching') {
+      ahBadge = h('span', { class: 'badge badge-autoheal is-healing', title: ah.last_note || 'Auto-healing tunnel...' }, 'Auto-Healing…');
+    } else if (ah.enabled) {
+      ahBadge = h('span', { class: 'badge badge-autoheal is-on', title: ah.last_note || 'Auto-Heal & Smart Failover enabled' }, 'Auto-Heal: ON');
+    }
+
     const toggleBtn = h('button', {
       type: 'button',
       class: 'tunnel-summary',
@@ -1079,6 +1087,7 @@
           `${relayName} ↔ ${foreignName}`,
           mainPort ? h('span', { class: 'tunnel-summary-port mono' }, `:${mainPort}`) : null)),
       h('div', { class: 'tunnel-summary-right' },
+        ahBadge,
         h('span', { class: 'badge badge-transport' }, `${reverse ? 'Reverse' : 'Direct'}${isIPv6 ? ' (IPv6)' : ''} · ${shortLink}`),
         live ? h('span', { class: 'badge badge-users', title: 'Unique connected client IPs · Active TCP connections' }, userBadgeText) : null,
         h('span', { class: 'tunnel-chevron', 'aria-hidden': 'true' }, '▾')));
@@ -1120,7 +1129,16 @@
         btn.disabled = false;
       }
     };
+    const ahOn = !!(t.auto_heal && t.auto_heal.enabled);
     return h('div', { class: 'actions left tunnel-actions' },
+      target.edge && target.origin
+        ? h('button', {
+            type: 'button',
+            class: ahOn ? 'btn-autoheal is-on' : 'btn-autoheal',
+            'data-focus': key + '-autoheal',
+            onclick: () => openTunnelAutoHeal(t)
+          }, ahOn ? 'Auto-Heal (ON)' : 'Auto-Heal & Failover')
+        : null,
       target.edge ? h('button', { type: 'button', 'data-focus': key + '-edit', onclick: () => openEditTunnel(t) }, 'Edit') : null,
       h('button', { type: 'button', 'data-focus': key + '-diag', onclick: () => openTunnelDiag(t, target) }, 'Diagnose & Speed Test'),
       h('button', { type: 'button', 'data-focus': key + '-logs', onclick: () => openTunnelLogs(t, target) }, 'Logs'),
@@ -2722,7 +2740,146 @@
       link_port: Number($('tn-linkport').value || 0),
       proxy_protocol: radio('tn-proxy'),
       relay_ip: $('tn-relayip').value.trim(),
+      auto_heal: $('tn-autoheal') ? $('tn-autoheal').checked : true,
     };
+  }
+
+  // ------------------------------------------------ auto-heal & smart failover
+
+  let autoHealTunnel = null;
+
+  function renderAutoHealModal(t) {
+    const ah = (t && t.auto_heal) || {};
+    $('ah-title').textContent = `Auto-Heal & Smart Failover: ${t.name}`;
+    $('ah-enabled').checked = !!ah.enabled;
+    $('ah-cdn').value = ah.cdn_domain || '';
+    $('ah-msg').textContent = '';
+    $('ah-msg').className = '';
+    $('ah-error').textContent = '';
+
+    const banner = $('ah-status-banner');
+    if (banner) {
+      let stateText = ah.enabled
+        ? 'Active — Monitoring tunnel health every 20 seconds.'
+        : 'Disabled — Enable below so PortBridge automatically benchmarks and switches modes if this tunnel gets blocked.';
+      if (ah.last_note) {
+        stateText += ` Latest status: ${ah.last_note}`;
+      }
+      if (ah.last_heal) {
+        stateText += ` (Last failover: ${ago(ah.last_heal)})`;
+      }
+      banner.textContent = stateText;
+    }
+
+    const histBox = $('ah-history');
+    const history = ah.history || [];
+    if (!history.length) {
+      histBox.replaceChildren(h('p', { class: 'muted small' }, 'No automatic or manual mode switches recorded for this tunnel yet.'));
+    } else {
+      histBox.replaceChildren(...history.map((ev) => {
+        const cls = ev.success ? 'ok' : 'bad';
+        const title = ev.success
+          ? `Switched: ${ev.from_desc || 'Previous'} → ${ev.to_desc || ev.candidate}`
+          : `Failover attempt failed (${ev.from_desc || 'Tunnel'})`;
+        const sub = ev.success
+          ? `Score ${ev.score}/100 · Reason: ${ev.reason || 'blocked'} · ${ago(ev.at)}`
+          : `${ev.error || 'Could not switch'} · Reason: ${ev.reason || 'blocked'} · ${ago(ev.at)}`;
+        return h('div', { class: 'diag-card' },
+          h('div', { class: 'diag-card-head' },
+            h('span', { class: 'state ' + cls }, ev.success ? 'Switched' : 'Failed'),
+            h('strong', null, title)),
+          h('p', { class: 'muted small' }, sub));
+      }));
+    }
+  }
+
+  function openTunnelAutoHeal(t) {
+    autoHealTunnel = t;
+    renderAutoHealModal(t);
+    openDialog($('autoheal-dialog'));
+    $('ah-enabled').focus();
+  }
+
+  if ($('ah-close')) {
+    $('ah-close').addEventListener('click', () => $('autoheal-dialog').close());
+  }
+
+  if ($('autoheal-form')) {
+    $('autoheal-form').addEventListener('submit', async (ev) => {
+      ev.preventDefault();
+      if (!autoHealTunnel) return;
+      const btn = $('ah-save');
+      btn.disabled = true;
+      $('ah-error').textContent = '';
+      $('ah-msg').textContent = '';
+      try {
+        const enabled = $('ah-enabled').checked;
+        const cdnDomain = $('ah-cdn').value.trim();
+        await api('POST', '/api/tunnels/autoheal', {
+          name: autoHealTunnel.name,
+          enabled,
+          cdn_domain: cdnDomain,
+        });
+        $('ah-msg').className = 'good';
+        $('ah-msg').textContent = enabled
+          ? 'Auto-Heal enabled. This tunnel will now automatically benchmark and switch modes if it gets blocked.'
+          : 'Auto-Heal disabled for this tunnel.';
+        lastTunnels = '';
+        await refresh();
+        const updated = tunnelsCache.find((x) => x.name === autoHealTunnel.name);
+        if (updated) {
+          autoHealTunnel = updated;
+          renderAutoHealModal(updated);
+          $('ah-msg').className = 'good';
+          $('ah-msg').textContent = enabled
+            ? 'Auto-Heal enabled. This tunnel will now automatically benchmark and switch modes if it gets blocked.'
+            : 'Auto-Heal disabled for this tunnel.';
+        }
+      } catch (e) {
+        $('ah-error').textContent = e.message;
+      } finally {
+        btn.disabled = false;
+      }
+    });
+  }
+
+  if ($('ah-trigger-btn')) {
+    $('ah-trigger-btn').addEventListener('click', async () => {
+      if (!autoHealTunnel) return;
+      const t = autoHealTunnel;
+      const edge = t.edge ? t.edge.server_id : '';
+      const origin = t.origin ? t.origin.server_id : '';
+      const cdnDomain = $('ah-cdn').value.trim();
+      const btn = $('ah-trigger-btn');
+      btn.disabled = true;
+      $('ah-error').textContent = '';
+      try {
+        if ($('ah-enabled').checked || cdnDomain) {
+          await api('POST', '/api/tunnels/autoheal', {
+            name: t.name,
+            enabled: $('ah-enabled').checked,
+            cdn_domain: cdnDomain,
+          });
+        }
+        const res = await api('POST', '/api/tunnels/autoheal/trigger', {
+          name: t.name,
+          edge,
+          origin,
+          cdn_domain: cdnDomain,
+        });
+        $('autoheal-dialog').close();
+        followJob(
+          res.job,
+          `Smart Failover: ${t.name}`,
+          `Tunnel "${t.name}" has been switched to the best working mode.`,
+          `Could not switch tunnel "${t.name}":`
+        );
+      } catch (e) {
+        $('ah-error').textContent = e.message;
+      } finally {
+        btn.disabled = false;
+      }
+    });
   }
 
   const portList = /^\s*\d{1,5}(\s*,\s*\d{1,5})*\s*$/;

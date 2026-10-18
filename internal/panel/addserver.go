@@ -382,9 +382,18 @@ func (p *Panel) addServer(j *job, r addRequest) (string, error) {
 	ov, derr := p.tryDirect(srv)
 	if derr == nil {
 		j.say("Reached it directly.")
+		if cbURLs := p.allCallbackURLs(); cbURLs != "" && p.ownFingerprint() != "" {
+			if _, err := remoteAgentSetup(rm, "-panel-url "+shellQuote(cbURLs)+
+				" -panel-fingerprint "+shellQuote(p.ownFingerprint())); err == nil {
+				srv.StandbyHub = true
+			}
+		}
 	} else {
 		j.say("Could not reach it directly (%s). Asking it to call the panel instead...", plainAgentError(derr))
-		panelURL := p.publicURL()
+		panelURL := p.allCallbackURLs()
+		if panelURL == "" {
+			panelURL = p.publicURL()
+		}
 		if panelURL == "" {
 			return "", errors.New("the panel does not know its own public address for servers to call; " +
 				"set it in the menu (Web panel). Nothing was saved")
@@ -404,6 +413,9 @@ func (p *Panel) addServer(j *job, r addRequest) (string, error) {
 				"Check that one of the two can reach the other on the ports involved. Nothing was saved", err)
 		}
 		j.say("It is calling the panel.")
+	}
+	if ov != nil && len(ov.IPv6) > 0 {
+		srv.IPv6 = append([]string(nil), ov.IPv6...)
 	}
 	if srv.Name == "" {
 		srv.Name = ov.Hostname

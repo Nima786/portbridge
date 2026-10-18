@@ -226,7 +226,7 @@ func checkPairingPorts(p *PairingData, confDir string, host agentHost, _ string)
 
 	// What this tunnel uses now, if it is being changed.
 	currentLink := 0
-	if cfg, err := engine.LoadConfig(filepath.Join(confDir, p.Name+".conf")); err == nil {
+	if cfg, err := engine.LoadConfig(filepath.Join(confDir, p.Name+".conf")); err == nil && cfg.Mode == engine.ModeDirect {
 		if ps := portsIn(cfg.TunnelAddr); len(ps) > 0 {
 			currentLink = ps[0]
 		}
@@ -346,6 +346,12 @@ func updatePairingData(p *PairingData, confDir string, warns *[]string) error {
 	if err != nil {
 		_ = writeFileAtomic(confFile, oldConf, 0o600)
 		return fmt.Errorf("validating config: %w", err)
+	}
+	if cfg.Transport != engine.TransportPlain && cfg.Transport != engine.TransportKCP && cfg.Mode == engine.ModeDirect {
+		if _, err := engine.EnsureCert(certFile, keyFile, cfg.EffectiveServerName()); err != nil {
+			_ = writeFileAtomic(confFile, oldConf, 0o600)
+			return fmt.Errorf("preparing the certificate: %w", err)
+		}
 	}
 
 	// The firewall rule follows the port, then the service starts on it.

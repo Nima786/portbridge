@@ -28,6 +28,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/Nima786/portbridge/internal/engine"
@@ -136,26 +137,104 @@ func verifyChainFor(raw [][]byte, host string) error {
 	return err
 }
 
+var (
+	callHomeMu     sync.Mutex
+	callHomeCancel context.CancelFunc
+	callHomeSpec   string
+)
+
+// configureCallHome persists panel_url / panel_fingerprint (when on the real
+// system) and starts or updates the in-process callHome loop immediately without
+// needing to restart the agent service.
+func configureCallHome(panelURL, fingerprint, token, confDir string, h http.Handler) error {
+	panelURL = strings.TrimSpace(panelURL)
+	fingerprint = strings.TrimSpace(fingerprint)
+
+	if confDir == "" || confDir == defaultTunnelsDir {
+		if ac, err := readAgentConfig(defaultAgentConf); err == nil {
+			if panelURL == "" || panelURL == "off" {
+				ac.PanelURL = ""
+				ac.PanelFingerprint = ""
+			} else {
+				ac.PanelURL = panelURL
+				ac.PanelFingerprint = fingerprint
+			}
+			_ = writeAgentConfig(defaultAgentConf, ac)
+		}
+	}
+
+	callHomeMu.Lock()
+	defer callHomeMu.Unlock()
+	spec := panelURL + "|" + fingerprint
+	if panelURL == "" || panelURL == "off" {
+		if callHomeCancel != nil {
+			callHomeCancel()
+			callHomeCancel = nil
+		}
+		callHomeSpec = ""
+		return nil
+	}
+	if callHomeSpec == spec && callHomeCancel != nil {
+		return nil
+	}
+	if callHomeCancel != nil {
+		callHomeCancel()
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	callHomeCancel = cancel
+	callHomeSpec = spec
+	go callHome(ctx, panelURL, fingerprint, token, h)
+	return nil
+}
+
 // CallHome is callHome, for the panel's tests.
 func CallHome(ctx context.Context, panelURL, fingerprint, token string, h http.Handler) {
 	callHome(ctx, panelURL, fingerprint, token, h)
 }
 
-// callHome keeps asking the panel for work until ctx ends.
+func splitPanelURLs(raw string) []string {
+	var out []string
+	seen := map[string]bool{}
+	for _, p := range strings.Split(raw, ",") {
+		p = strings.TrimRight(strings.TrimSpace(p), "/")
+		if p != "" && !seen[p] {
+			seen[p] = true
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+// callHome keeps asking the panel for work until ctx ends. When given multiple
+// comma-separated URLs (e.g. domain, IPv4, IPv6), it rotates across them on
+// failure and stays pinned to whichever URL is currently answering.
 func callHome(ctx context.Context, panelURL, fingerprint, token string, h http.Handler) {
-	panelURL = strings.TrimRight(panelURL, "/")
-	// No overall limit on the client: each poll and answer sets its own, and
-	// the transport gives up on a panel that does not start answering.
-	client := panelClient(fingerprint, panelURL, 0)
-	if tr, ok := client.Transport.(*http.Transport); ok {
-		tr.ResponseHeaderTimeout = hubAnswerWait
+	urls := splitPanelURLs(panelURL)
+	if len(urls) == 0 {
+		return
+	}
+	clients := make([]*http.Client, len(urls))
+	for i, u := range urls {
+		c := panelClient(fingerprint, u, 0)
+		if tr, ok := c.Transport.(*http.Transport); ok {
+			tr.ResponseHeaderTimeout = hubAnswerWait
+		}
+		clients[i] = c
 	}
 	logs := newCallHomeLog()
 	backoff := time.Duration(0)
-	log.Printf("[agent] calling the panel at %s", panelURL)
+	idx := 0
+	log.Printf("[agent] calling the panel at %s", strings.Join(urls, ", "))
 	for ctx.Err() == nil {
-		req, err := hubPoll(ctx, client, panelURL, token)
+		curURL := urls[idx]
+		curClient := clients[idx]
+		req, err := hubPoll(ctx, curClient, curURL, token)
 		if err != nil {
+			// If another callback URL is available, try it next before backing off long.
+			idx = (idx + 1) % len(urls)
+			if idx != 0 {
+				continue
+			}
 			if backoff == 0 {
 				backoff = hubBackoffMin
 			} else if backoff *= 2; backoff > hubBackoffMax {
@@ -170,18 +249,18 @@ func callHome(ctx context.Context, panelURL, fingerprint, token string, h http.H
 			continue
 		}
 		if backoff != 0 {
-			log.Printf("[agent] reaching the panel again")
+			log.Printf("[agent] reaching the panel again at %s", curURL)
 		}
 		backoff = 0
 		if req == nil {
 			continue // nothing to do this time
 		}
-		go func(r HubRequest) {
+		go func(r HubRequest, c *http.Client, u string) {
 			rep := runHubRequest(r, token, h)
-			if err := hubReply(ctx, client, panelURL, token, rep); err != nil {
+			if err := hubReply(ctx, c, u, token, rep); err != nil {
 				log.Printf("[agent] could not give the panel its answer: %v", err)
 			}
-		}(*req)
+		}(*req, curClient, curURL)
 	}
 }
 

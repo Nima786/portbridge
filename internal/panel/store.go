@@ -107,12 +107,14 @@ type Server struct {
 	ID          string    `json:"id"`
 	Name        string    `json:"name"`
 	Group       string    `json:"group"`
-	Address     string    `json:"address"`      // what the user typed to reach it
-	AgentURL    string    `json:"agent_url"`    // https://address:port of its agent
-	Fingerprint string    `json:"fingerprint"`  // the agent's certificate, pinned
-	TokenEnc    string    `json:"token"`        // the agent's token, encrypted
-	CallsPanel  bool      `json:"calls_panel"`  // reached by the agent calling in
-	HostKey     string    `json:"ssh_host_key"` // SSH host key seen when it was added
+	Address     string    `json:"address"`               // what the user typed to reach it
+	IPv6        []string  `json:"ipv6,omitempty"`        // known public IPv6 addresses for fallback
+	AgentURL    string    `json:"agent_url"`             // https://address:port of its agent
+	Fingerprint string    `json:"fingerprint"`           // the agent's certificate, pinned
+	TokenEnc    string    `json:"token"`                 // the agent's token, encrypted
+	CallsPanel  bool      `json:"calls_panel"`           // reached by the agent calling in
+	StandbyHub  bool      `json:"standby_hub,omitempty"` // allowed to call in on /hub/poll as a failover route
+	HostKey     string    `json:"ssh_host_key"`          // SSH host key seen when it was added
 	Added       time.Time `json:"added"`
 }
 
@@ -131,13 +133,38 @@ type CFAccount struct {
 	Added    time.Time `json:"added"`
 }
 
+// AutoHealEvent records one automatic or manual mode failover event.
+type AutoHealEvent struct {
+	At        string `json:"at"`
+	FromDesc  string `json:"from_desc"`
+	ToDesc    string `json:"to_desc"`
+	Candidate string `json:"candidate"`
+	Score     int    `json:"score"`
+	Reason    string `json:"reason"`
+	Success   bool   `json:"success"`
+	Error     string `json:"error,omitempty"`
+}
+
+// AutoHealConfig holds per-tunnel Auto-Heal & Smart Failover settings and history.
+type AutoHealConfig struct {
+	Enabled   bool            `json:"enabled"`
+	CDNDomain string          `json:"cdn_domain,omitempty"`
+	State     string          `json:"state,omitempty"`      // "monitoring", "probing", "switching", "cooldown", "error"
+	FailCount int             `json:"fail_count,omitempty"` // consecutive unhealthy checks
+	LastCheck string          `json:"last_check,omitempty"`
+	LastHeal  string          `json:"last_heal,omitempty"`
+	LastNote  string          `json:"last_note,omitempty"`
+	History   []AutoHealEvent `json:"history,omitempty"`
+}
+
 // State is state.json.
 type State struct {
-	Admin      Admin       `json:"admin"`
-	ThisGroup  string      `json:"this_group"` // the group the panel's own server is in, if any
-	ThisName   string      `json:"this_name"`
-	Servers    []Server    `json:"servers"`
-	CFAccounts []CFAccount `json:"cf_accounts,omitempty"`
+	Admin      Admin                     `json:"admin"`
+	ThisGroup  string                    `json:"this_group"` // the group the panel's own server is in, if any
+	ThisName   string                    `json:"this_name"`
+	Servers    []Server                  `json:"servers"`
+	CFAccounts []CFAccount               `json:"cf_accounts,omitempty"`
+	AutoHeal   map[string]AutoHealConfig `json:"auto_heal,omitempty"`
 }
 
 // store guards the state and saves every change at once.
@@ -174,7 +201,17 @@ func (s *store) get() State {
 	defer s.mu.Unlock()
 	st := s.st
 	st.Servers = append([]Server(nil), s.st.Servers...)
+	for i := range st.Servers {
+		st.Servers[i].IPv6 = append([]string(nil), s.st.Servers[i].IPv6...)
+	}
 	st.CFAccounts = append([]CFAccount(nil), s.st.CFAccounts...)
+	if len(s.st.AutoHeal) > 0 {
+		st.AutoHeal = make(map[string]AutoHealConfig, len(s.st.AutoHeal))
+		for k, v := range s.st.AutoHeal {
+			v.History = append([]AutoHealEvent(nil), v.History...)
+			st.AutoHeal[k] = v
+		}
+	}
 	return st
 }
 

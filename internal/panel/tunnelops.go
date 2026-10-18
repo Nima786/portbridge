@@ -137,6 +137,7 @@ type createRequest struct {
 
 	ProxyProtocol string `json:"proxy_protocol"`
 	RelayIP       string `json:"relay_ip"` // optional: the relay's address users connect to
+	AutoHeal      bool   `json:"auto_heal"`
 }
 
 func firstIP(list []string) string {
@@ -375,7 +376,15 @@ func (p *Panel) startCreate(r createRequest) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	return p.startJob(func(j *job) (string, error) { return "", p.createTunnel(j, r.Relay, r.Foreign, spec) }), nil
+	return p.startJob(func(j *job) (string, error) {
+		if err := p.createTunnel(j, r.Relay, r.Foreign, spec); err != nil {
+			return "", err
+		}
+		if r.AutoHeal {
+			_ = p.healer.setConfig(spec.Name, true, strings.TrimSpace(r.Domain))
+		}
+		return "", nil
+	}), nil
 }
 
 // startJob runs work in the background as a job the page can follow.
@@ -531,6 +540,10 @@ func (p *Panel) deleteTunnel(t tunnelTarget) []halfOutcome {
 		}
 		out = append(out, o)
 	}
+	_ = p.store.update(func(st *State) error {
+		delete(st.AutoHeal, t.Name)
+		return nil
+	})
 	logf("deleted tunnel %q", t.Name)
 	return out
 }

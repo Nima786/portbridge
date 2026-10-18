@@ -768,7 +768,8 @@ func tunnelService(confDir, name, action string) error {
 // ---------------------------------------------------------------------------
 
 // EditSpec describes changes to an existing tunnel, matching the CLI menu's
-// "Edit a tunnel" options (ports, real user IP, pool/mux links, max_conn, firewall).
+// "Edit a tunnel" options (ports, real user IP, pool/mux links, max_conn, firewall)
+// as well as full mode/transport hot-swaps for Auto-Heal and Smart Failover.
 type EditSpec struct {
 	Name          string `json:"name"`
 	UserPorts     string `json:"user_ports,omitempty"`
@@ -781,9 +782,26 @@ type EditSpec struct {
 	SpareTTL      string `json:"spare_ttl,omitempty"`
 	Drain         string `json:"drain,omitempty"`
 	PeerIP        string `json:"peer_ip,omitempty"`
+	LocalIP       string `json:"local_ip,omitempty"`
 	Firewall      string `json:"firewall,omitempty"` // "on" or "off"
 	Stage         string `json:"stage,omitempty"`    // "", "prepare", "commit", "rollback"
 	OldConf       string `json:"old_conf,omitempty"`
+
+	// Optional transport / mode replacement fields:
+	Mode        string `json:"mode,omitempty"`         // "direct" or "reverse"
+	Transport   string `json:"transport,omitempty"`    // "plain", "tls", "wss", "grpc", "kcp"
+	ServerName  string `json:"server_name,omitempty"`  // SNI / domain
+	CDN         string `json:"cdn,omitempty"`          // "on" or "off"
+	AltHost     string `json:"alt_host,omitempty"`     // CDN backup domain
+	CleanIPs    string `json:"clean_ips,omitempty"`    // Clean Cloudflare IPs
+	UTLS        string `json:"utls,omitempty"`         // "on" or "off"
+	TLSFragment string `json:"tls_fragment,omitempty"` // "on" or "off"
+	HTTPHeader  string `json:"http_header,omitempty"`  // "on" or "off"
+	HTTPHost    string `json:"http_host,omitempty"`    // HTTP host header
+	RealSite    string `json:"real_site,omitempty"`    // "on" or "off"
+	GRE         string `json:"gre,omitempty"`          // "on" or "off"
+	IPv6        *bool  `json:"ipv6,omitempty"`         // true for IPv6 bridge, false for IPv4
+	Mux         string `json:"mux,omitempty"`          // "on" or "off"
 }
 
 func setConfKey(text, key, val string) string {
@@ -847,6 +865,8 @@ func EditEdge(spec EditSpec, confDir string) (EdgeResult, error) {
 	host := hostFor(confDir)
 
 	confFile := filepath.Join(confDir, spec.Name+".conf")
+	certFile := filepath.Join(confDir, spec.Name+".crt")
+	keyFile := filepath.Join(confDir, spec.Name+".key")
 	oldBytes, err := os.ReadFile(confFile)
 	if err != nil {
 		return res, fmt.Errorf("there is no tunnel %q on this server", spec.Name)
@@ -873,6 +893,12 @@ func EditEdge(spec EditSpec, confDir string) (EdgeResult, error) {
 		if err != nil {
 			restore()
 			return res, err
+		}
+		if cfg.Transport != engine.TransportPlain && cfg.Transport != engine.TransportKCP && !cfg.Dials() {
+			if _, err := engine.EnsureCert(certFile, keyFile, cfg.EffectiveServerName()); err != nil {
+				restore()
+				return res, fmt.Errorf("preparing the certificate: %w", err)
+			}
 		}
 		if err := host.FirewallApply(spec.Name); err != nil {
 			if cfg.GRE {
@@ -910,7 +936,167 @@ func EditEdge(spec EditSpec, confDir string) (EdgeResult, error) {
 
 	text := oldConf
 
-	if curCfg.Role == engine.RoleEdge {
+	if curCfg.Role == engine.RoleEdge && (spec.Mode != "" || spec.Transport != "") {
+		// Full mode / transport replacement while preserving user ports, service ports,
+		// secret, proxy_protocol, pool, max_conn, spare_ttl, and drain.
+		curUsers := portsIn(curCfg.UserListen)
+		curLink := 0
+		if ps := portsIn(curCfg.TunnelAddr); len(ps) > 0 {
+			curLink = ps[0]
+		}
+		uPorts := joinPorts(spec.UserPorts, ", ")
+		if uPorts == "" {
+			uPorts = joinPorts(curCfg.UserListen, ", ")
+		}
+		sPorts := joinPorts(spec.ServicePorts, ",")
+		if sPorts == "" {
+			sPorts = joinPorts(curCfg.ServerInboundPort, ",")
+			if sPorts == "" {
+				sPorts = joinPorts(uPorts, ",")
+			}
+		}
+		linkPort := spec.LinkPort
+		if linkPort == 0 {
+			linkPort = curLink
+		}
+		mode := spec.Mode
+		if mode == "" {
+			mode = kv["mode"]
+		}
+		transport := spec.Transport
+		if transport == "" {
+			transport = kv["transport"]
+		}
+		peerIP := strings.Trim(strings.TrimSpace(spec.PeerIP), "[]")
+		if peerIP == "" {
+			peerIP = kv["peer_ip"]
+			if kv["gre"] == "on" && kv["gre_remote"] != "" {
+				peerIP = kv["gre_remote"]
+			}
+		}
+		localIP := strings.Trim(strings.TrimSpace(spec.LocalIP), "[]")
+		if localIP == "" {
+			localIP = kv["local_ip"]
+		}
+		useV6 := strings.Contains(peerIP, ":") || strings.Contains(localIP, ":")
+		if spec.IPv6 != nil {
+			useV6 = *spec.IPv6
+		}
+		mux := spec.Mux
+		if mux == "" {
+			mux = kv["mux"]
+		}
+		muxLinks := spec.MuxLinks
+		if muxLinks == 0 {
+			muxLinks = curCfg.MuxLinks
+		}
+		pool := spec.Pool
+		if pool == 0 {
+			pool = curCfg.PoolSize
+		}
+		pp := spec.ProxyProtocol
+		if pp == "" {
+			pp = kv["proxy_protocol"]
+		}
+		if pp == "off" {
+			pp = ""
+		}
+
+		es := EdgeSpec{
+			Name:          spec.Name,
+			Mode:          mode,
+			Transport:     transport,
+			ServerName:    spec.ServerName,
+			WSPath:        kv["ws_path"],
+			CDN:           spec.CDN,
+			AltHost:       spec.AltHost,
+			CleanIPs:      spec.CleanIPs,
+			UTLS:          spec.UTLS,
+			TLSFragment:   spec.TLSFragment,
+			HTTPHeader:    spec.HTTPHeader,
+			HTTPHost:      spec.HTTPHost,
+			RealSite:      spec.RealSite,
+			GRE:           spec.GRE,
+			ProxyProtocol: pp,
+			Mux:           mux,
+			MuxLinks:      muxLinks,
+			Pool:          pool,
+			PeerIP:        peerIP,
+			LocalIP:       localIP,
+			IPv6:          useV6,
+			LinkPort:      linkPort,
+			UserPorts:     uPorts,
+			ServicePorts:  sPorts,
+		}
+		es.normalise()
+		if err := es.check(); err != nil {
+			return res, err
+		}
+
+		// Check port clashes on this Relay server, ignoring ports already held by this tunnel.
+		var problems []string
+		claimed := portsClaimedByOthers(confDir, spec.Name)
+		owner := func(p int) string {
+			for _, c := range claimed {
+				if c.port == p {
+					return fmt.Sprintf("tunnel %q (%s)", c.tunnel, c.what)
+				}
+			}
+			return ""
+		}
+		for _, u := range portsIn(es.UserPorts) {
+			if o := owner(u); o != "" {
+				problems = append(problems, fmt.Sprintf("user listen port %d is already used on this server by %s", u, o))
+			} else if !intInSlice(u, curUsers) && !(curCfg.Mode == engine.ModeReverse && u == curLink) {
+				if err := host.PortFree(engine.TransportPlain, u); err != nil {
+					problems = append(problems, fmt.Sprintf("user listen port %d is already in use on this server by another program", u))
+				}
+			}
+		}
+		if !es.dialsOut() {
+			t := engine.TransportPlain
+			if es.Transport == "kcp" {
+				t = engine.TransportKCP
+			}
+			if o := owner(es.LinkPort); o != "" {
+				problems = append(problems, fmt.Sprintf("the port between the servers, %d, is already used on this server by %s", es.LinkPort, o))
+			} else if !(curCfg.Mode == engine.ModeReverse && es.LinkPort == curLink) && !intInSlice(es.LinkPort, curUsers) {
+				if err := host.PortFree(t, es.LinkPort); err != nil {
+					problems = append(problems, fmt.Sprintf("the port between the servers, %d, is already in use on this server", es.LinkPort))
+				}
+			}
+		}
+		if len(problems) > 0 {
+			return res, fmt.Errorf("this server cannot use those ports:\n  - %s\nChange them and try again", strings.Join(problems, "\n  - "))
+		}
+
+		l, err := es.layout()
+		if err != nil {
+			return res, err
+		}
+		if es.RealSite == "on" && !es.dialsOut() {
+			found := ""
+			for _, c := range append([]string{es.ServerName}, coverSiteCandidates...) {
+				if c != "" && reachable(c) {
+					found = c
+					break
+				}
+			}
+			if found != "" && found != es.ServerName {
+				es.ServerName = found
+			}
+		}
+		text = buildEdgeConf(&es, l, confDir, time.Now())
+		if curCfg.MaxConn > 0 && curCfg.MaxConn != 2000 && spec.MaxConn == 0 {
+			text = setConfKey(text, "max_conn", strconv.Itoa(curCfg.MaxConn))
+		}
+		if kv["spare_ttl"] != "" && spec.SpareTTL == "" {
+			text = setConfKey(text, "spare_ttl", kv["spare_ttl"])
+		}
+		if kv["drain"] != "" && spec.Drain == "" {
+			text = setConfKey(text, "drain", kv["drain"])
+		}
+	} else if curCfg.Role == engine.RoleEdge {
 		curUsers := portsIn(curCfg.UserListen)
 		curServices := portsIn(curCfg.ServerInboundPort)
 		if len(curServices) == 0 {
@@ -1019,13 +1205,13 @@ func EditEdge(spec EditSpec, confDir string) (EdgeResult, error) {
 			return res, fmt.Errorf("real user IP (proxy_protocol) must be off, v1 or v2, got %q", spec.ProxyProtocol)
 		}
 	}
-	if spec.MuxLinks > 0 && curCfg.Mux {
+	if spec.MuxLinks > 0 && (curCfg.Mux || spec.Mux == "on") {
 		if spec.MuxLinks < 1 || spec.MuxLinks > 16 {
 			return res, errors.New("the number of shared connections must be from 1 to 16")
 		}
 		text = setConfKey(text, "mux_links", strconv.Itoa(spec.MuxLinks))
 	}
-	if spec.Pool > 0 && !curCfg.Mux {
+	if spec.Pool > 0 && (!curCfg.Mux || spec.Mux == "off") {
 		if spec.Pool < 1 || spec.Pool > 10000 {
 			return res, errors.New("connection pool size must be from 1 to 10000")
 		}
@@ -1037,7 +1223,7 @@ func EditEdge(spec EditSpec, confDir string) (EdgeResult, error) {
 		}
 		text = setConfKey(text, "max_conn", strconv.Itoa(spec.MaxConn))
 	}
-	if ttl := strings.TrimSpace(spec.SpareTTL); ttl != "" && !curCfg.Mux {
+	if ttl := strings.TrimSpace(spec.SpareTTL); ttl != "" && (!curCfg.Mux || spec.Mux == "off") {
 		if d, err := time.ParseDuration(ttl); err != nil || d < 5*time.Second || d > 24*time.Hour {
 			return res, errors.New("spare connection lifetime (spare_ttl) must be a duration between 5s and 24h, such as 60s or 2m")
 		}
@@ -1049,7 +1235,7 @@ func EditEdge(spec EditSpec, confDir string) (EdgeResult, error) {
 		}
 		text = setConfKey(text, "drain", dr)
 	}
-	if pip := strings.TrimSpace(spec.PeerIP); pip != "" && pip != curCfg.PeerIP {
+	if pip := strings.TrimSpace(spec.PeerIP); pip != "" && pip != curCfg.PeerIP && spec.Mode == "" && spec.Transport == "" {
 		if curCfg.GRE {
 			res.Warnings = append(res.Warnings, "peer_ip cannot be changed on a private GRE tunnel")
 		} else {
@@ -1070,7 +1256,7 @@ func EditEdge(spec EditSpec, confDir string) (EdgeResult, error) {
 	if spec.Firewall != "" {
 		switch spec.Firewall {
 		case "on":
-			if curCfg.CDN || curCfg.AltTarget != "" || curCfg.GRE {
+			if curCfg.CDN || curCfg.AltTarget != "" || curCfg.GRE || spec.CDN == "on" || spec.AltHost != "" || spec.GRE == "on" {
 				res.Warnings = append(res.Warnings, "firewall stays off for CDN and GRE tunnels")
 			} else {
 				text = setConfKey(text, "firewall", "on")
@@ -1095,6 +1281,12 @@ func EditEdge(spec EditSpec, confDir string) (EdgeResult, error) {
 	if err != nil {
 		_ = writeFileAtomic(confFile, []byte(oldConf), 0o600)
 		return res, fmt.Errorf("those settings were refused: %w", err)
+	}
+	if newCfg.Transport != engine.TransportPlain && newCfg.Transport != engine.TransportKCP && !newCfg.Dials() {
+		if _, err := engine.EnsureCert(certFile, keyFile, newCfg.EffectiveServerName()); err != nil {
+			_ = writeFileAtomic(confFile, []byte(oldConf), 0o600)
+			return res, fmt.Errorf("preparing the certificate: %w", err)
+		}
 	}
 
 	var code string

@@ -839,6 +839,14 @@
         </div>
       </fieldset>
 
+      <label class="check-card" id="tn-autoheal-row">
+        <input type="checkbox" id="tn-autoheal" checked>
+        <span>
+          <strong>Auto-Heal &amp; Smart Failover (Recommended)</strong>
+          <span class="muted"> — Automatically detects if this tunnel gets blocked or loses links, benchmarks all available modes (Direct, Reverse, IPv4, IPv6, Stealth, gRPC, KCP, CDN), and switches to the best working path automatically.</span>
+        </span>
+      </label>
+
       <details class="advanced-box">
         <summary>Advanced Options</summary>
         <div class="advanced-inner">
@@ -1285,6 +1293,54 @@
     <div class="dialog-footer actions">
       <button type="button" id="cf-rec-cancel">Cancel</button>
       <button type="submit" id="cf-rec-submit" class="primary">Save Record</button>
+    </div>
+  </form>
+</dialog>
+
+<!-- Auto-Heal & Smart Failover Dialog -->
+<dialog id="autoheal-dialog" class="wide" aria-labelledby="ah-title">
+  <form id="autoheal-form" novalidate>
+    <div class="dialog-header dialog-header-row">
+      <div>
+        <h2 id="ah-title">Auto-Heal &amp; Smart Failover</h2>
+        <p id="ah-sub" class="muted small">Automatically monitors tunnel health and switches to the best working transport, direction (Direct / Reverse), IPv4 / IPv6, or CDN route if blocked.</p>
+      </div>
+      <button type="button" id="ah-trigger-btn" class="primary">Test &amp; Switch to Best Mode Now</button>
+    </div>
+
+    <div class="dialog-body">
+      <div id="ah-status-banner" class="notice"></div>
+
+      <label class="check-card">
+        <input type="checkbox" id="ah-enabled">
+        <span>
+          <strong>Enable Automatic Failover (Auto-Heal)</strong>
+          <span class="muted"> — Checks this tunnel every 20 seconds. If the route is blocked or loses all links for consecutive checks, the panel benchmarks all available modes (even if Foreign IPv4 is blocked from Iran, via IPv6 or Reverse Hub) and switches both servers automatically.</span>
+        </span>
+      </label>
+
+      <div class="field-block">
+        <label for="ah-cdn">Optional Cloudflare CDN Failover Subdomain <span class="muted">(pointed at Foreign server with Cloudflare Proxy ON)</span></label>
+        <input id="ah-cdn" placeholder="e.g. edge1.example.com (leave empty to failover across Direct / Reverse / IPv4 / IPv6)" autocapitalize="none" spellcheck="false">
+      </div>
+
+      <p id="ah-msg" role="status"></p>
+      <p id="ah-error" class="error" role="alert"></p>
+
+      <section class="step-section">
+        <div class="step-header">
+          <div>
+            <h3>Failover History</h3>
+            <p class="muted small">Recent automatic or manual mode switches for this tunnel.</p>
+          </div>
+        </div>
+        <div id="ah-history" class="diag-grid"></div>
+      </section>
+    </div>
+
+    <div class="dialog-footer actions">
+      <button type="button" id="ah-close">Close</button>
+      <button type="submit" class="primary" id="ah-save">Save Auto-Heal Settings</button>
     </div>
   </form>
 </dialog>

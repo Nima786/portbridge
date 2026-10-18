@@ -14,7 +14,10 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
+	"net/url"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -43,10 +46,11 @@ type serverView struct {
 }
 
 type heard struct {
-	overview *agent.Overview
-	err      error
-	at       time.Time // last time it answered
-	tried    time.Time
+	overview   *agent.Overview
+	err        error
+	at         time.Time // last time it answered
+	tried      time.Time
+	seededHome bool
 }
 
 // fleet is every server, and what was last heard from each.
@@ -63,32 +67,108 @@ func (f *fleet) call(ctx context.Context, srv Server, method, path string, body 
 	return f.callLimit(ctx, srv, method, path, body, overviewLimit)
 }
 
+func agentURLPort(rawURL string) string {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return ""
+	}
+	_, port, err := net.SplitHostPort(u.Host)
+	if err != nil {
+		return ""
+	}
+	return port
+}
+
 // callLimit is call for an answer that may be larger, such as a release.
+// It tries every available control path so the panel can still manage a
+// foreign server even when Iran -> Foreign IPv4 is blocked:
+//  1. Direct IPv4/Primary URL (or Reverse Hub first if CallsPanel is set)
+//  2. Direct IPv6 agent URLs (https://[<ipv6>]:<port>)
+//  3. Reverse Hub (/hub/poll) if the server is calling in to the panel
 func (f *fleet) callLimit(ctx context.Context, srv Server, method, path string, body []byte, limit int64) (int, []byte, error) {
 	token, err := f.p.store.open(srv.TokenEnc)
 	if err != nil {
 		return 0, nil, err
 	}
+
+	tryDirectURL := func(baseURL string, maxWait time.Duration) (int, []byte, error) {
+		rctx := ctx
+		var cancel context.CancelFunc
+		if maxWait > 0 {
+			rctx, cancel = context.WithTimeout(ctx, maxWait)
+			defer cancel()
+		}
+		req, err := http.NewRequestWithContext(rctx, method, strings.TrimRight(baseURL, "/")+path, bytes.NewReader(body))
+		if err != nil {
+			return 0, nil, err
+		}
+		req.Header.Set("Authorization", "Bearer "+token)
+		if len(body) > 0 {
+			req.Header.Set("Content-Type", "application/json")
+		}
+		resp, err := agent.NewPinnedClient(srv.Fingerprint, baseURL, 10*time.Minute).Do(req)
+		if err != nil {
+			return 0, nil, err
+		}
+		defer resp.Body.Close()
+		b, err := io.ReadAll(io.LimitReader(resp.Body, limit))
+		return resp.StatusCode, b, err
+	}
+
+	var v6URLs []string
+	if port := agentURLPort(srv.AgentURL); port != "" {
+		for _, ip := range srv.IPv6 {
+			cand := "https://" + net.JoinHostPort(ip, port)
+			if !strings.EqualFold(cand, strings.TrimRight(srv.AgentURL, "/")) {
+				v6URLs = append(v6URLs, cand)
+			}
+		}
+	}
+
 	if srv.CallsPanel {
-		return f.p.hub.do(ctx, srv.ID, method, path, body)
+		status, b, herr := f.p.hub.do(ctx, srv.ID, method, path, body)
+		if herr == nil || srv.AgentURL == "" {
+			return status, b, herr
+		}
+		for _, u := range append([]string{srv.AgentURL}, v6URLs...) {
+			if st, rb, derr := tryDirectURL(u, 6*time.Second); derr == nil {
+				return st, rb, nil
+			}
+		}
+		return status, b, herr
 	}
-	req, err := http.NewRequestWithContext(ctx, method, strings.TrimRight(srv.AgentURL, "/")+path, bytes.NewReader(body))
-	if err != nil {
-		return 0, nil, err
+
+	hasFallback := len(v6URLs) > 0 || f.p.hub.connected(srv.ID)
+	var perTry time.Duration
+	if hasFallback && limit <= overviewLimit {
+		perTry = 6 * time.Second
 	}
-	req.Header.Set("Authorization", "Bearer "+token)
-	if len(body) > 0 {
-		req.Header.Set("Content-Type", "application/json")
+
+	status, b, derr := tryDirectURL(srv.AgentURL, perTry)
+	if derr == nil {
+		return status, b, nil
 	}
-	// The context sets how long this may take; the client's own limit is only
-	// a backstop, long enough for a release to cross a slow link.
-	resp, err := agent.NewPinnedClient(srv.Fingerprint, srv.AgentURL, 10*time.Minute).Do(req)
-	if err != nil {
-		return 0, nil, err
+	if strings.Contains(derr.Error(), "does not match the saved fingerprint") {
+		return 0, nil, derr
 	}
-	defer resp.Body.Close()
-	b, err := io.ReadAll(io.LimitReader(resp.Body, limit))
-	return resp.StatusCode, b, err
+
+	for _, u := range v6URLs {
+		st, rb, err6 := tryDirectURL(u, perTry)
+		if err6 == nil {
+			return st, rb, nil
+		}
+		if strings.Contains(err6.Error(), "does not match the saved fingerprint") {
+			return 0, nil, err6
+		}
+	}
+
+	if f.p.hub.connected(srv.ID) {
+		if st, rb, herr := f.p.hub.do(ctx, srv.ID, method, path, body); herr == nil {
+			return st, rb, nil
+		}
+	}
+
+	return 0, nil, derr
 }
 
 // overview asks a server for its overview.
@@ -118,8 +198,8 @@ func (f *fleet) refresh(srv Server) {
 	ctx, cancel := context.WithTimeout(context.Background(), agentTimeout)
 	defer cancel()
 	ov, err := f.overview(ctx, srv)
+	var needSeed bool
 	f.mu.Lock()
-	defer f.mu.Unlock()
 	h := f.by[srv.ID]
 	if h == nil {
 		h = &heard{}
@@ -130,6 +210,64 @@ func (f *fleet) refresh(srv Server) {
 	if err == nil {
 		h.overview = ov
 		h.at = time.Now()
+		if !h.seededHome {
+			needSeed = true
+		}
+	}
+	f.mu.Unlock()
+
+	if err == nil && ov != nil {
+		if len(ov.IPv6) > 0 && !slices.Equal(srv.IPv6, ov.IPv6) {
+			_ = f.p.store.update(func(st *State) error {
+				for i := range st.Servers {
+					if st.Servers[i].ID == srv.ID {
+						st.Servers[i].IPv6 = append([]string(nil), ov.IPv6...)
+						break
+					}
+				}
+				return nil
+			})
+		}
+		if needSeed {
+			f.seedCallHome(srv)
+		}
+	}
+}
+
+// seedCallHome registers the panel's callback URLs and certificate fingerprint
+// with a remote server's agent so it maintains a standby reverse connection on
+// /hub/poll in case direct IPv4 from Iran to Foreign is later blocked.
+func (f *fleet) seedCallHome(srv Server) {
+	cbURLs := f.p.allCallbackURLs()
+	fp := f.p.ownFingerprint()
+	if cbURLs == "" || fp == "" {
+		return
+	}
+	if !srv.StandbyHub && !srv.CallsPanel {
+		_ = f.p.store.update(func(st *State) error {
+			for i := range st.Servers {
+				if st.Servers[i].ID == srv.ID {
+					st.Servers[i].StandbyHub = true
+					srv.StandbyHub = true
+					break
+				}
+			}
+			return nil
+		})
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+	defer cancel()
+	body, _ := json.Marshal(map[string]string{
+		"panel_url":         cbURLs,
+		"panel_fingerprint": fp,
+	})
+	status, _, err := f.call(ctx, srv, http.MethodPost, "/api/callhome", body)
+	if err == nil && (status == http.StatusOK || status == http.StatusNotFound) {
+		f.mu.Lock()
+		if h := f.by[srv.ID]; h != nil {
+			h.seededHome = true
+		}
+		f.mu.Unlock()
 	}
 }
 
