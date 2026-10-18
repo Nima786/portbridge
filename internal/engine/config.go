@@ -220,10 +220,11 @@ type Config struct {
 	// Works with every link, mode and kind of sharing. See proxyproto.go.
 	ProxyProtocol int
 
-	fragmentSet bool
-	resendSet   bool // kcp_resend was written down, so 0 means off rather than unset
-	utlsSet     bool
-	echSet      bool
+	fragmentSet   bool
+	resendSet     bool // kcp_resend was written down, so 0 means off rather than unset
+	utlsSet       bool
+	echSet        bool
+	allowPlainKCP bool
 
 	// Disguise settings prepared once at startup and only read afterwards. They
 	// are what makes a repeat connection cheap; see prepareTLS in transport.go

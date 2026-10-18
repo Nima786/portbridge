@@ -2,8 +2,10 @@ package engine
 
 import (
 	"bytes"
+	"context"
 	"encoding/binary"
 	"net"
+	"strconv"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -126,6 +128,64 @@ func TestSpoofPacketConnHeaderAndDecoyFilter(t *testing.T) {
 	}
 	if addr.String() != u1.LocalAddr().String() {
 		t.Fatalf("c2.ReadFrom addr = %s, want %s", addr.String(), u1.LocalAddr().String())
+	}
+}
+
+func TestProbeListenerDualModeKCPAndSpoof(t *testing.T) {
+	secret := []byte("0123456789abcdef0123456789abcdef")
+	pl, err := StartProbeListener("127.0.0.1", 0, secret, 30*time.Second)
+	if err != nil {
+		t.Fatalf("StartProbeListener: %v", err)
+	}
+	defer pl.Close()
+
+	target := net.JoinHostPort("127.0.0.1", strconv.Itoa(pl.Port))
+	specs := []ProbeCandidateSpec{
+		{
+			ID:         "direct-sni-spoof",
+			Label:      "Decoy Whitelisted SNI",
+			Mode:       "direct",
+			Link:       "website",
+			Transport:  string(TransportTLS),
+			Stealth:    true,
+			SNISpoof:   true,
+			SpoofSNI:   DefaultSpoofSNI,
+			ServerName: DefaultSpoofSNI,
+			TargetAddr: target,
+			Port:       pl.Port,
+		},
+		{
+			ID:         "direct-kcp",
+			Label:      "KCP over UDP",
+			Mode:       "direct",
+			Link:       "kcp",
+			Transport:  string(TransportKCP),
+			TargetAddr: target,
+			Port:       pl.Port,
+		},
+		{
+			ID:         "direct-ip-spoof",
+			Label:      "Source IP + SNI Spoof",
+			Mode:       "direct",
+			Link:       "kcp",
+			Transport:  string(TransportKCP),
+			SNISpoof:   true,
+			SpoofSNI:   DefaultSpoofSNI,
+			IPSpoof:    true,
+			SpoofIP:    DefaultSpoofIP,
+			TargetAddr: target,
+			Port:       pl.Port,
+		},
+	}
+
+	results := RunProbeDialer(context.Background(), specs, secret, 32*1024)
+	if len(results) != len(specs) {
+		t.Fatalf("RunProbeDialer returned %d results, want %d", len(results), len(specs))
+	}
+	for _, r := range results {
+		if r.Status != "ok" {
+			t.Fatalf("candidate %s failed: status=%s error=%s", r.ID, r.Status, r.Error)
+		}
 	}
 }
 

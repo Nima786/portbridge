@@ -24,6 +24,7 @@ const (
 
 	spoofHeaderSize = 8
 	spoofFlagRaw    = 0x01
+	spoofFlagEcho   = 0x02
 	spoofFlagDecoy  = 0x80
 )
 
@@ -397,24 +398,33 @@ func deriveSpoofMask(secret string) [spoofHeaderSize]byte {
 	return mask
 }
 
+func isDecoyClientHello(b []byte) bool {
+	return len(b) >= 44 &&
+		b[0] == 0x16 && b[1] == 0x03 && b[2] == 0x01 &&
+		b[5] == 0x01 && b[9] == 0x03 && b[10] == 0x03
+}
+
 // spoofPacketConn wraps an unconnected *net.UDPConn so KCP can send and receive
 // UDP packets whose IPv4 source address is forged to a whitelisted IP (e.g. 104.18.4.130).
 // It automatically handles both mutual bidirectional IP spoofing and asymmetric setups
 // where only one side's ISP allows outbound source IP spoofing.
 type spoofPacketConn struct {
-	udpConn  *net.UDPConn
-	rawFD    int
-	spoofIP  net.IP
-	localIP  [4]byte
-	localPt  int
-	mask     [spoofHeaderSize]byte
-	spoofSNI string
+	udpConn    *net.UDPConn
+	rawFD      int
+	spoofIP    net.IP
+	localIP    [4]byte
+	localPt    int
+	mask       [spoofHeaderSize]byte
+	spoofSNI   string
+	allowPlain bool
+	plainPeers sync.Map
 
 	mu          sync.RWMutex
 	defaultPeer *net.UDPAddr
-	startedAt   time.Time
+	firstRawTx  time.Time
 	lastDecoyAt time.Time
 	rxConfirmed uint32
+	txConfirmed uint32
 	peerGotRaw  uint32
 	rawFallback uint32
 	closed      uint32
@@ -454,8 +464,8 @@ func newSpoofPacketConn(udpConn *net.UDPConn, cfg *Config, defaultPeer *net.UDPA
 		localPt:     localPort,
 		mask:        deriveSpoofMask(string(cfg.secret)),
 		spoofSNI:    cfg.EffectiveSpoofSNI(),
+		allowPlain:  cfg.allowPlainKCP,
 		defaultPeer: defaultPeer,
-		startedAt:   time.Now(),
 	}
 	if rawFD < 0 {
 		atomic.StoreUint32(&c.rawFallback, 1)
@@ -479,15 +489,19 @@ func detectOutboundIPv4(dst net.IP) net.IP {
 }
 
 func (c *spoofPacketConn) encodePacket(payload []byte, flags byte) []byte {
+	c.mu.RLock()
+	lip := c.localIP
+	c.mu.RUnlock()
+
 	out := make([]byte, spoofHeaderSize+len(payload))
 	out[0] = 'P' ^ c.mask[0]
 	out[1] = 'B' ^ c.mask[1]
 	out[2] = 'S' ^ c.mask[2]
 	out[3] = flags ^ c.mask[3]
-	out[4] = c.localIP[0] ^ c.mask[4]
-	out[5] = c.localIP[1] ^ c.mask[5]
-	out[6] = c.localIP[2] ^ c.mask[6]
-	out[7] = c.localIP[3] ^ c.mask[7]
+	out[4] = lip[0] ^ c.mask[4]
+	out[5] = lip[1] ^ c.mask[5]
+	out[6] = lip[2] ^ c.mask[6]
+	out[7] = lip[3] ^ c.mask[7]
 	copy(out[spoofHeaderSize:], payload)
 	return out
 }
@@ -499,10 +513,20 @@ func (c *spoofPacketConn) ReadFrom(p []byte) (int, net.Addr, error) {
 		if err != nil {
 			return 0, nil, err
 		}
-		if n < spoofHeaderSize {
+		if isDecoyClientHello(buf[:n]) {
 			continue
 		}
-		if (buf[0]^c.mask[0]) != 'P' || (buf[1]^c.mask[1]) != 'B' || (buf[2]^c.mask[2]) != 'S' {
+		if n < spoofHeaderSize || (buf[0]^c.mask[0]) != 'P' || (buf[1]^c.mask[1]) != 'B' || (buf[2]^c.mask[2]) != 'S' {
+			if c.allowPlain && n > 0 {
+				if addr != nil {
+					c.plainPeers.Store(addr.String(), true)
+				}
+				if n > len(p) {
+					n = len(p)
+				}
+				copy(p[:n], buf[:n])
+				return n, addr, nil
+			}
 			// Ignore decoy ClientHello or stray non-PortBridge datagrams.
 			continue
 		}
@@ -520,6 +544,9 @@ func (c *spoofPacketConn) ReadFrom(p []byte) (int, net.Addr, error) {
 		if flags&spoofFlagRaw != 0 {
 			atomic.StoreUint32(&c.peerGotRaw, 1)
 		}
+		if flags&spoofFlagEcho != 0 {
+			atomic.StoreUint32(&c.txConfirmed, 1)
+		}
 
 		// Determine the real peer UDPAddr to present to KCP and record for replies.
 		peerAddr := addr
@@ -527,21 +554,27 @@ func (c *spoofPacketConn) ReadFrom(p []byte) (int, net.Addr, error) {
 		defPeer := c.defaultPeer
 		c.mu.RUnlock()
 
-		if defPeer != nil {
-			peerAddr = &net.UDPAddr{IP: defPeer.IP, Port: addr.Port}
-		} else if senderIP != ([4]byte{}) {
+		if senderIP != ([4]byte{}) {
 			peerAddr = &net.UDPAddr{
 				IP:   net.IPv4(senderIP[0], senderIP[1], senderIP[2], senderIP[3]),
 				Port: addr.Port,
 			}
 			c.mu.Lock()
-			c.defaultPeer = peerAddr
+			if c.defaultPeer == nil {
+				c.defaultPeer = peerAddr
+			}
 			if c.localIP == ([4]byte{}) {
 				if outIP := detectOutboundIPv4(peerAddr.IP); outIP != nil {
 					copy(c.localIP[:], outIP)
 				}
 			}
 			c.mu.Unlock()
+		} else if defPeer != nil {
+			peerAddr = &net.UDPAddr{IP: defPeer.IP, Port: addr.Port}
+		}
+
+		if c.allowPlain && peerAddr != nil {
+			c.plainPeers.Delete(peerAddr.String())
 		}
 
 		payloadLen := n - spoofHeaderSize
@@ -562,6 +595,12 @@ func (c *spoofPacketConn) WriteTo(p []byte, addr net.Addr) (int, error) {
 		}
 		udpAddr = resolved
 	}
+	if c.allowPlain {
+		if _, isPlain := c.plainPeers.Load(udpAddr.String()); isPlain {
+			return c.udpConn.WriteToUDP(p, udpAddr)
+		}
+	}
+
 	c.mu.RLock()
 	if c.defaultPeer != nil && udpAddr.IP.Equal(c.spoofIP) {
 		udpAddr = &net.UDPAddr{IP: c.defaultPeer.IP, Port: udpAddr.Port}
@@ -574,23 +613,44 @@ func (c *spoofPacketConn) WriteTo(p []byte, addr net.Addr) (int, error) {
 		if c.lastDecoyAt.IsZero() || time.Since(c.lastDecoyAt) > 25*time.Second {
 			c.lastDecoyAt = time.Now()
 			decoy := BuildDecoyClientHello(c.spoofSNI)
-			if c.rawFD >= 0 && c.spoofIP != nil {
-				_ = sendRawSpoofedUDP(c.rawFD, c.spoofIP, udpAddr.IP, c.localPt, udpAddr.Port, 64, decoy)
+			sentRawDecoy := false
+			if c.rawFD >= 0 && c.spoofIP != nil && atomic.LoadUint32(&c.rawFallback) == 0 {
+				if err := sendRawSpoofedUDP(c.rawFD, c.spoofIP, udpAddr.IP, c.localPt, udpAddr.Port, 64, decoy); err == nil {
+					sentRawDecoy = true
+				}
 			}
-			_, _ = c.udpConn.WriteToUDP(decoy, udpAddr)
+			if !sentRawDecoy {
+				_, _ = c.udpConn.WriteToUDP(decoy, udpAddr)
+			}
 		}
 		c.mu.Unlock()
+	}
+
+	var baseFlags byte
+	if atomic.LoadUint32(&c.rxConfirmed) != 0 {
+		baseFlags |= spoofFlagEcho
 	}
 
 	// If we have a raw socket, check whether raw spoofed outbound is working or if
 	// the local ISP blocks outbound spoofed IPs (asymmetric BCP38).
 	if c.rawFD >= 0 && atomic.LoadUint32(&c.rawFallback) == 0 {
-		if atomic.LoadUint32(&c.rxConfirmed) == 0 && time.Since(c.startedAt) > 700*time.Millisecond {
-			// No reply received after 700ms of raw-only sends; enable asymmetric fallback
-			// so outbound uses normal UDP while inbound still accepts raw spoofed packets.
+		c.mu.Lock()
+		if c.firstRawTx.IsZero() {
+			c.firstRawTx = time.Now()
+		}
+		rawElapsed := time.Since(c.firstRawTx)
+		c.mu.Unlock()
+
+		fallbackTimeout := 800 * time.Millisecond
+		if atomic.LoadUint32(&c.rxConfirmed) != 0 {
+			fallbackTimeout = 400 * time.Millisecond
+		}
+		if atomic.LoadUint32(&c.txConfirmed) == 0 && rawElapsed > fallbackTimeout {
+			// Peer has not echoed receipt of our raw-spoofed packets; enable asymmetric
+			// fallback so outbound uses normal UDP while inbound still accepts raw spoofed packets.
 			atomic.StoreUint32(&c.rawFallback, 1)
 		} else {
-			pkt := c.encodePacket(p, spoofFlagRaw)
+			pkt := c.encodePacket(p, baseFlags|spoofFlagRaw)
 			if err := sendRawSpoofedUDP(c.rawFD, c.spoofIP, udpAddr.IP, c.localPt, udpAddr.Port, 64, pkt); err == nil {
 				return len(p), nil
 			}
@@ -598,7 +658,7 @@ func (c *spoofPacketConn) WriteTo(p []byte, addr net.Addr) (int, error) {
 		}
 	}
 
-	pkt := c.encodePacket(p, 0)
+	pkt := c.encodePacket(p, baseFlags)
 	if _, err := c.udpConn.WriteToUDP(pkt, udpAddr); err != nil {
 		return 0, err
 	}

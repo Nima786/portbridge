@@ -171,6 +171,8 @@ func StartProbeListener(bindHost string, preferredPort int, secret []byte, ttl t
 		secret:          secret,
 		KCPDataShards:   10,
 		KCPParityShards: 3,
+		IPSpoof:         true,
+		allowPlainKCP:   true,
 	}
 
 	listenHost := bindHost
@@ -438,6 +440,20 @@ func BuildProbeCandidates(mode, ipv4, ipv6 string, port int, cdnDomain string) [
 				Link:       "kcp",
 				Transport:  string(TransportKCP),
 				Stealth:    false,
+				Shared:     true,
+				TargetAddr: addr4,
+				Port:       port,
+			},
+			ProbeCandidateSpec{
+				ID:         mode + "-ip-spoof",
+				Label:      v4Label + " · Source IP + SNI Spoof (" + DefaultSpoofIP + ")",
+				Mode:       mode,
+				Link:       "kcp",
+				Transport:  string(TransportKCP),
+				SNISpoof:   true,
+				SpoofSNI:   DefaultSpoofSNI,
+				IPSpoof:    true,
+				SpoofIP:    DefaultSpoofIP,
 				Shared:     true,
 				TargetAddr: addr4,
 				Port:       port,
