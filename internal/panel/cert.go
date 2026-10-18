@@ -255,6 +255,8 @@ func (p *Panel) getCertificate(hello *tls.ClientHelloInfo) (*tls.Certificate, er
 			}
 		}
 	}
+	p.selfCertMu.RLock()
+	defer p.selfCertMu.RUnlock()
 	return &p.selfCert, nil
 }
 

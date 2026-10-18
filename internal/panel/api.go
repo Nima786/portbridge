@@ -90,6 +90,10 @@ func (p *Panel) routes() http.Handler {
 	mux.HandleFunc("PATCH /api/cf/zones/{zoneID}/records/{recordID}", p.withAuth(p.handlePatchCFRecord))
 	mux.HandleFunc("DELETE /api/cf/zones/{zoneID}/records/{recordID}", p.withAuth(p.handleDeleteCFRecord))
 
+	mux.HandleFunc("POST /api/backup/create", p.withAuth(p.handleBackupCreate))
+	mux.HandleFunc("POST /api/backup/inspect", p.withAuth(p.handleBackupInspect))
+	mux.HandleFunc("POST /api/backup/restore", p.withAuth(p.handleBackupRestore))
+
 	return secureHeaders(mux)
 }
 
@@ -105,6 +109,9 @@ func secureHeaders(next http.Handler) http.Handler {
 		h.Set("Cross-Origin-Resource-Policy", "same-origin")
 		h.Set("Permissions-Policy", "camera=(), microphone=(), geolocation=(), payment=()")
 		switch {
+		case strings.HasPrefix(r.URL.Path, "/api/backup/"):
+			h.Set("Cache-Control", "no-store")
+			r.Body = http.MaxBytesReader(w, r.Body, backupMaxBytes)
 		case strings.HasPrefix(r.URL.Path, "/api/"):
 			h.Set("Cache-Control", "no-store")
 			r.Body = http.MaxBytesReader(w, r.Body, apiBodyMax)
@@ -509,7 +516,7 @@ func (p *Panel) handlePanelInfo(w http.ResponseWriter, _ *http.Request, _ authed
 		"listen":      p.cfg.Listen,
 		"addresses":   p.addresses(),
 		"public_url":  p.publicURL(),
-		"fingerprint": p.selfFP,
+		"fingerprint": p.ownFingerprint(),
 		"certificate": p.certStatus(),
 	})
 }

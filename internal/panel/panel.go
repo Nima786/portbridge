@@ -53,9 +53,10 @@ type Panel struct {
 	pendingMu sync.Mutex
 	pending   map[string]string
 
-	selfCert tls.Certificate
-	selfFP   string
-	certs    *certs // nil without a domain
+	selfCertMu sync.RWMutex
+	selfCert   tls.Certificate
+	selfFP     string
+	certs      *certs // nil without a domain
 
 	// Each password check takes a fair amount of memory on purpose, so only a
 	// couple run at once, however many logins arrive together.
@@ -111,12 +112,18 @@ func (p *Panel) loadSelfCert() error {
 	if len(c.Certificate) == 0 {
 		return errors.New("the panel's certificate is empty")
 	}
+	p.selfCertMu.Lock()
 	p.selfCert = c
 	p.selfFP = fingerprintOf(c.Certificate[0])
+	p.selfCertMu.Unlock()
 	return nil
 }
 
-func (p *Panel) ownFingerprint() string { return p.selfFP }
+func (p *Panel) ownFingerprint() string {
+	p.selfCertMu.RLock()
+	defer p.selfCertMu.RUnlock()
+	return p.selfFP
+}
 
 func (p *Panel) addPending(id, token string) {
 	p.pendingMu.Lock()

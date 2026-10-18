@@ -3072,6 +3072,239 @@
     }
   });
 
+  // ------------------------------------------------------- backup & restore
+
+  let pendingBackupJSON = '';
+
+  async function downloadBackup(ev) {
+    const btn = ev ? ev.currentTarget : $('backup-download-btn');
+    if (btn) btn.disabled = true;
+    if ($('backup-msg')) {
+      $('backup-msg').textContent = '';
+      $('backup-msg').className = '';
+    }
+    if ($('backup-err')) $('backup-err').textContent = '';
+    try {
+      const passphrase = $('backup-pass') ? $('backup-pass').value.trim() : '';
+      const res = await api('POST', '/api/backup/create', { passphrase });
+      const text = JSON.stringify(res.backup, null, 2) + '\n';
+      const blob = new Blob([text], { type: 'application/json' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = res.filename || 'portbridge-backup.json';
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 5000);
+      const note = passphrase
+        ? `Encrypted backup downloaded (${res.filename}). Keep your backup password safe.`
+        : `Full panel backup downloaded (${res.filename}).`;
+      if ($('backup-msg')) {
+        $('backup-msg').textContent = note;
+        $('backup-msg').className = 'good';
+      }
+      setStatus(note);
+    } catch (e) {
+      if ($('backup-err')) $('backup-err').textContent = e.message;
+      setStatus(e.message, true);
+    } finally {
+      if (btn) btn.disabled = false;
+    }
+  }
+
+  if ($('backup-download-btn')) $('backup-download-btn').addEventListener('click', downloadBackup);
+  if ($('backup-quick-download')) $('backup-quick-download').addEventListener('click', downloadBackup);
+
+  function openRestoreDialog() {
+    pendingBackupJSON = '';
+    if ($('restore-file')) $('restore-file').value = '';
+    if ($('restore-pass')) $('restore-pass').value = '';
+    if ($('restore-pass-wrap')) $('restore-pass-wrap').hidden = true;
+    if ($('restore-preview-wrap')) $('restore-preview-wrap').hidden = true;
+    if ($('restore-result-wrap')) {
+      $('restore-result-wrap').hidden = true;
+      $('restore-result-wrap').replaceChildren();
+    }
+    if ($('restore-error')) $('restore-error').textContent = '';
+    if ($('restore-submit')) {
+      $('restore-submit').disabled = true;
+      $('restore-submit').hidden = false;
+    }
+    setRadio('restore-mode', 'merge');
+    if ($('restore-redeploy-remote')) $('restore-redeploy-remote').checked = true;
+    if ($('restore-panel-identity')) $('restore-panel-identity').checked = true;
+    if ($('restore-credentials')) $('restore-credentials').checked = false;
+    syncChoiceCards($('restore-dialog'));
+    $('restore-dialog').showModal();
+  }
+
+  if ($('backup-open-restore-btn')) $('backup-open-restore-btn').addEventListener('click', openRestoreDialog);
+  if ($('backup-quick-restore')) $('backup-quick-restore').addEventListener('click', openRestoreDialog);
+  if ($('restore-close')) $('restore-close').addEventListener('click', () => $('restore-dialog').close());
+
+  async function inspectCurrentBackup() {
+    if (!pendingBackupJSON) return;
+    if ($('restore-error')) $('restore-error').textContent = '';
+    if ($('restore-result-wrap')) $('restore-result-wrap').hidden = true;
+    const passphrase = $('restore-pass') ? $('restore-pass').value.trim() : '';
+    try {
+      const rep = await api('POST', '/api/backup/inspect', {
+        backup_json: pendingBackupJSON,
+        passphrase,
+      });
+      if (rep.needs_passphrase) {
+        $('restore-pass-wrap').hidden = false;
+        $('restore-preview-wrap').hidden = true;
+        $('restore-submit').disabled = true;
+        $('restore-pass').focus();
+        return;
+      }
+      $('restore-pass-wrap').hidden = !rep.encrypted;
+      renderRestorePreview(rep);
+    } catch (e) {
+      $('restore-preview-wrap').hidden = true;
+      $('restore-submit').disabled = true;
+      $('restore-error').textContent = e.message;
+    }
+  }
+
+  function renderRestorePreview(rep) {
+    const sum = $('restore-summary');
+    sum.replaceChildren();
+
+    const hostBadge = rep.same_server
+      ? h('span', { class: 'state ok' }, 'Same Server')
+      : h('span', { class: 'state warn' }, 'Different Server (Migration)');
+    const srcIPs = (rep.source_ipv4 || []).concat(rep.source_ipv6 || []).join(', ') || '—';
+    const curIPs = (rep.current_ipv4 || []).concat(rep.current_ipv6 || []).join(', ') || '—';
+
+    sum.append(
+      h('div', { class: 'diag-item' },
+        h('div', { class: 'diag-top' }, h('strong', null, 'Backup Source Panel'), hostBadge),
+        h('p', { class: 'muted small' }, `Source: ${rep.source_name || 'Panel'} (${srcIPs})${rep.source_group ? ' · Role: ' + rep.source_group.toUpperCase() : ''}`),
+        h('p', { class: 'muted small' }, `This server: ${curIPs} · Created: ${rep.created_at ? rep.created_at.replace('T', ' ').replace('Z', ' UTC') : '—'}`)),
+      h('div', { class: 'diag-item' },
+        h('div', { class: 'diag-top' },
+          h('strong', null, 'Servers & Tunnels in Backup'),
+          h('span', { class: 'state ok' }, `${rep.server_count} server(s) · ${rep.paired_tunnel_count} tunnel(s)`)),
+        h('p', { class: 'muted small' }, rep.server_names && rep.server_names.length
+          ? `Managed servers: ${rep.server_names.join(', ')}`
+          : 'No remote servers in backup (only this panel server).'),
+        h('p', { class: 'muted small' }, rep.paired_tunnel_names && rep.paired_tunnel_names.length
+          ? `Tunnels: ${rep.paired_tunnel_names.join(', ')} (${rep.local_tunnel_count} hosted locally on panel server)`
+          : 'No tunnels recorded in backup.'),
+        h('p', { class: 'muted small' }, `Cloudflare tokens: ${rep.cf_account_count} · Auto-Heal rules: ${rep.auto_heal_count}`))
+    );
+
+    const notesBox = $('restore-notes');
+    notesBox.replaceChildren();
+    if (rep.migration_notes && rep.migration_notes.length) {
+      notesBox.hidden = false;
+      const ul = h('ul', { class: 'mig-notes-list' });
+      for (const n of rep.migration_notes) {
+        ul.append(h('li', null, n));
+      }
+      notesBox.append(h('strong', null, rep.same_server ? 'Restore Check:' : 'Important Server Migration Guidance:'), ul);
+    } else {
+      notesBox.hidden = true;
+    }
+
+    const localBox = $('restore-local-box');
+    if (rep.local_tunnel_count > 0) {
+      localBox.hidden = false;
+      $('restore-local-lead').textContent =
+        `This backup includes ${rep.local_tunnel_count} tunnel(s) (${(rep.local_tunnel_names || []).join(', ')}) that were running directly on the panel server itself:`;
+      $('restore-local-restore-card').hidden = !rep.same_server;
+      $('restore-local-migrate-card').hidden = rep.same_server;
+      setRadio('restore-local-action', rep.same_server ? 'restore' : 'skip');
+    } else {
+      localBox.hidden = true;
+    }
+
+    $('restore-preview-wrap').hidden = false;
+    $('restore-submit').disabled = false;
+    syncChoiceCards($('restore-dialog'));
+  }
+
+  if ($('restore-file')) {
+    $('restore-file').addEventListener('change', async (ev) => {
+      const f = ev.target.files && ev.target.files[0];
+      if (!f) return;
+      try {
+        pendingBackupJSON = await f.text();
+        await inspectCurrentBackup();
+      } catch (e) {
+        $('restore-error').textContent = 'Could not read backup file.';
+      }
+    });
+  }
+
+  if ($('restore-unlock-btn')) {
+    $('restore-unlock-btn').addEventListener('click', inspectCurrentBackup);
+  }
+
+  if ($('restore-form')) {
+    $('restore-form').addEventListener('submit', async (ev) => {
+      ev.preventDefault();
+      if (!pendingBackupJSON) return;
+      const btn = $('restore-submit');
+      btn.disabled = true;
+      $('restore-error').textContent = '';
+      try {
+        const options = {
+          passphrase: $('restore-pass') ? $('restore-pass').value.trim() : '',
+          mode: radio('restore-mode') || 'merge',
+          restore_credentials: $('restore-credentials') ? $('restore-credentials').checked : false,
+          restore_panel_identity: $('restore-panel-identity') ? $('restore-panel-identity').checked : true,
+          local_tunnels_action: !$('restore-local-box').hidden ? (radio('restore-local-action') || 'skip') : '',
+          redeploy_remote_tunnels: $('restore-redeploy-remote') ? $('restore-redeploy-remote').checked : false,
+        };
+        const resp = await api('POST', '/api/backup/restore', {
+          backup_json: pendingBackupJSON,
+          options,
+        });
+        if (resp.csrf) {
+          csrf = resp.csrf;
+        }
+        if (resp.user && $('acc-user')) {
+          $('acc-user').value = resp.user;
+        }
+        const r = resp.result || {};
+        const wrap = $('restore-result-wrap');
+        wrap.replaceChildren();
+        wrap.hidden = false;
+        wrap.append(
+          h('p', { class: 'good' },
+            `Restore complete: ${r.servers_restored || 0} server(s), ${r.cf_accounts_restored || 0} Cloudflare token(s), ${r.auto_heal_restored || 0} Auto-Heal rule(s), and ${r.local_tunnels_restored || 0} local tunnel(s) restored${r.remote_peers_updated ? ` (${r.remote_peers_updated} remote peer(s) updated to this server's IP)` : ''}.`)
+        );
+        if (r.actions_needed && r.actions_needed.length) {
+          const ul = h('ul', { class: 'mig-notes-list' });
+          for (const a of r.actions_needed) ul.append(h('li', null, a));
+          wrap.append(h('strong', null, 'Next Steps for Your Setup:'), ul);
+        }
+        if (r.warnings && r.warnings.length) {
+          const ul = h('ul', { class: 'mig-notes-list' });
+          for (const w of r.warnings) ul.append(h('li', null, w));
+          wrap.append(h('strong', null, 'Warnings:'), ul);
+        }
+        lastServers = lastTunnels = '';
+        await refresh();
+        loadPanelInfo();
+        loadUpdates();
+        setStatus('Backup restored successfully.');
+      } catch (e) {
+        $('restore-error').textContent = e.message;
+      } finally {
+        btn.disabled = false;
+      }
+    });
+  }
+
+  for (const el of document.querySelectorAll('#restore-dialog input[type="radio"]')) {
+    el.addEventListener('change', () => syncChoiceCards($('restore-dialog')));
+  }
+
   // ------------------------------------------------------------------- start
 
   (async () => {

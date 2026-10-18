@@ -4,6 +4,8 @@ package panel
 
 import (
 	"bufio"
+	"context"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -45,6 +47,10 @@ func CmdPanel(args []string) error {
 		return cmdResetPassword(args[1:])
 	case "status":
 		return cmdStatus(args[1:])
+	case "backup":
+		return cmdBackup(args[1:])
+	case "restore":
+		return cmdRestore(args[1:])
 	case "help", "-h", "--help":
 		panelUsage()
 		return nil
@@ -59,6 +65,8 @@ func panelUsage() {
   portbridge panel setup [options]         Set up the panel, or change its settings
   portbridge panel reset-password -user U  Change the login; the password is read from standard input
   portbridge panel status [-get key]       Say how the panel is set up
+  portbridge panel backup [-out file]      Export a full backup of servers, tunnels and settings
+  portbridge panel restore -in file        Restore a backup file into this panel
 
 The menu does all of this for you: portbridge-menu -> Web panel
 `)
@@ -495,6 +503,97 @@ func cmdStatus(args []string) error {
 	}
 	if fp != "" {
 		fmt.Printf("Fingerprint:  %s\n", fp)
+	}
+	return nil
+}
+
+func cmdBackup(args []string) error {
+	fs := flag.NewFlagSet("panel backup", flag.ExitOnError)
+	dir := fs.String("dir", DefaultDir, "where the panel keeps its settings")
+	out := fs.String("out", "", "file to write the backup JSON to (default: stdout)")
+	pass := fs.String("passphrase", "", "optional password to encrypt the backup payload")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	cfg, _ := readConfig(*dir)
+	st, err := openStore(*dir)
+	if err != nil {
+		return err
+	}
+	p := newPanel(*dir, cfg, st)
+	_ = p.loadSelfCert()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	p.fleet.refreshAll()
+	env, err := p.CreateBackup(ctx, strings.TrimSpace(*pass))
+	if err != nil {
+		return err
+	}
+	data, err := json.MarshalIndent(env, "", "  ")
+	if err != nil {
+		return err
+	}
+	data = append(data, '\n')
+	if *out == "" || *out == "-" {
+		_, err = os.Stdout.Write(data)
+		return err
+	}
+	if err := writeFileAtomic(*out, data, 0o600); err != nil {
+		return err
+	}
+	fmt.Printf("Panel backup written to %s\n", *out)
+	return nil
+}
+
+func cmdRestore(args []string) error {
+	fs := flag.NewFlagSet("panel restore", flag.ExitOnError)
+	dir := fs.String("dir", DefaultDir, "where the panel keeps its settings")
+	in := fs.String("in", "", "backup JSON file to restore")
+	pass := fs.String("passphrase", "", "password if the backup is encrypted")
+	mode := fs.String("mode", "merge", "merge or replace")
+	localAction := fs.String("local-tunnels", "", "restore, migrate, or skip (default: auto)")
+	redeploy := fs.Bool("redeploy-remote", false, "re-deploy missing tunnels onto remote servers")
+	creds := fs.Bool("restore-credentials", false, "restore admin login credentials from backup")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if strings.TrimSpace(*in) == "" {
+		return errors.New("give the backup file to restore with -in <file>")
+	}
+	raw, err := os.ReadFile(*in)
+	if err != nil {
+		return err
+	}
+	cfg, _ := readConfig(*dir)
+	st, err := openStore(*dir)
+	if err != nil {
+		return err
+	}
+	p := newPanel(*dir, cfg, st)
+	_ = p.loadSelfCert()
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	res, err := p.RestoreBackup(ctx, raw, RestoreOptions{
+		Passphrase:            strings.TrimSpace(*pass),
+		Mode:                  *mode,
+		RestoreCredentials:    *creds,
+		RestorePanelIdentity:  true,
+		LocalTunnelsAction:    *localAction,
+		RedeployRemoteTunnels: *redeploy,
+	})
+	if err != nil {
+		return err
+	}
+	if panelActive() {
+		_, _ = systemctl("restart", panelUnit)
+	}
+	fmt.Printf("Restored %d server(s), %d Cloudflare token(s), %d Auto-Heal rule(s), %d local tunnel(s).\n",
+		res.ServersRestored, res.CFAccountsRestored, res.AutoHealRestored, res.LocalTunnelsRestored)
+	for _, w := range res.Warnings {
+		fmt.Printf("Warning: %s\n", w)
+	}
+	for _, a := range res.ActionsNeeded {
+		fmt.Printf("Note: %s\n", a)
 	}
 	return nil
 }

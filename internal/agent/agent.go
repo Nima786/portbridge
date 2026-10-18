@@ -973,6 +973,52 @@ func newAgentHandler(token, confDir string, allowUpdates func() bool) *http.Serv
 		writeJSONReply(w, http.StatusOK, map[string]any{"ok": true})
 	})
 
+	// GET /api/tunnels/export: snapshot all tunnel configs and secrets on this server for panel backup.
+	mux.HandleFunc("/api/tunnels/export", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, `{"error":"method not allowed"}`, http.StatusMethodNotAllowed)
+			return
+		}
+		if !checkAgentAuth(r, token) {
+			http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
+			return
+		}
+		snaps, err := ExportTunnels(confDir)
+		if err != nil {
+			writeJSONReply(w, http.StatusUnprocessableEntity, map[string]any{"ok": false, "error": err.Error()})
+			return
+		}
+		writeJSONReply(w, http.StatusOK, map[string]any{"ok": true, "tunnels": snaps})
+	})
+
+	// POST /api/tunnels/import: restore one tunnel snapshot onto this server.
+	mux.HandleFunc("/api/tunnels/import", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, `{"error":"method not allowed"}`, http.StatusMethodNotAllowed)
+			return
+		}
+		if !checkAgentAuth(r, token) {
+			http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
+			return
+		}
+		var req struct {
+			Tunnel     TunnelSnapshot `json:"tunnel"`
+			Overwrite  bool           `json:"overwrite"`
+			NewLocalIP string         `json:"new_local_ip,omitempty"`
+		}
+		if err := json.NewDecoder(io.LimitReader(r.Body, 256*1024)).Decode(&req); err != nil {
+			writeJSONReply(w, http.StatusBadRequest, EdgeResult{Error: "invalid import request: " + err.Error()})
+			return
+		}
+		res, err := ImportTunnel(req.Tunnel, confDir, req.Overwrite, req.NewLocalIP)
+		if err != nil {
+			res.Error = err.Error()
+			writeJSONReply(w, http.StatusUnprocessableEntity, res)
+			return
+		}
+		writeJSONReply(w, http.StatusOK, res)
+	})
+
 	return mux
 }
 

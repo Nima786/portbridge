@@ -1795,3 +1795,154 @@ func applyFirewallAction(confDir, action string) (FirewallInfo, error) {
 	info.Output = outMsg
 	return info, nil
 }
+
+// TunnelSnapshot holds the on-disk files and pairing code for one tunnel half
+// so it can be backed up and restored onto the same or another server.
+type TunnelSnapshot struct {
+	Name        string `json:"name"`
+	Role        string `json:"role"` // "edge" or "origin"
+	Mode        string `json:"mode"` // "direct" or "reverse"
+	Conf        string `json:"conf"`
+	Secret      string `json:"secret"`
+	CertPEM     string `json:"cert_pem,omitempty"`
+	KeyPEM      string `json:"key_pem,omitempty"`
+	PairingCode string `json:"pairing_code,omitempty"`
+}
+
+// ExportTunnels reads all tunnel configurations and secrets in confDir for backup.
+func ExportTunnels(confDir string) ([]TunnelSnapshot, error) {
+	if confDir == "" {
+		confDir = defaultTunnelsDir
+	}
+	entries, err := os.ReadDir(confDir)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	var out []TunnelSnapshot
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".conf") {
+			continue
+		}
+		name := strings.TrimSuffix(e.Name(), ".conf")
+		if validTunnelName(name) != nil {
+			continue
+		}
+		confBytes, err := os.ReadFile(filepath.Join(confDir, name+".conf"))
+		if err != nil {
+			continue
+		}
+		kv, _ := readConfKeys(filepath.Join(confDir, name+".conf"))
+		secBytes, _ := os.ReadFile(filepath.Join(confDir, name+".secret"))
+		crtBytes, _ := os.ReadFile(filepath.Join(confDir, name+".crt"))
+		keyBytes, _ := os.ReadFile(filepath.Join(confDir, name+".key"))
+		code := ""
+		if kv["role"] == "edge" {
+			code, _ = edgePairingCode(confDir, name)
+		}
+		out = append(out, TunnelSnapshot{
+			Name:        name,
+			Role:        kv["role"],
+			Mode:        kv["mode"],
+			Conf:        string(confBytes),
+			Secret:      strings.TrimSpace(string(secBytes)),
+			CertPEM:     string(crtBytes),
+			KeyPEM:      string(keyBytes),
+			PairingCode: code,
+		})
+	}
+	return out, nil
+}
+
+// ImportTunnel restores one tunnel half into confDir and starts its service.
+// If newLocalIP is non-empty, local_ip is updated (used when migrating a panel's
+// local tunnels onto a new server with a different IP).
+func ImportTunnel(snap TunnelSnapshot, confDir string, overwrite bool, newLocalIP string) (EdgeResult, error) {
+	if confDir == "" {
+		confDir = defaultTunnelsDir
+	}
+	res := EdgeResult{Name: snap.Name}
+	if err := validTunnelName(snap.Name); err != nil {
+		return res, err
+	}
+	if strings.TrimSpace(snap.Conf) == "" || strings.TrimSpace(snap.Secret) == "" {
+		return res, errors.New("tunnel backup is missing configuration or secret")
+	}
+
+	agentOpMu.Lock()
+	defer agentOpMu.Unlock()
+	host := hostFor(confDir)
+
+	if err := os.MkdirAll(confDir, 0o700); err != nil {
+		return res, err
+	}
+	_ = os.Chmod(confDir, 0o700)
+
+	confFile := filepath.Join(confDir, snap.Name+".conf")
+	secretFile := filepath.Join(confDir, snap.Name+".secret")
+	certFile := filepath.Join(confDir, snap.Name+".crt")
+	keyFile := filepath.Join(confDir, snap.Name+".key")
+
+	if !overwrite {
+		if _, err := os.Stat(confFile); err == nil {
+			res.OK = true
+			if code, err := edgePairingCode(confDir, snap.Name); err == nil {
+				res.Code = code
+			}
+			return res, nil
+		}
+	}
+
+	confText := snap.Conf
+	confPath := func(ext string) string { return filepath.ToSlash(filepath.Join(confDir, snap.Name+ext)) }
+	confText = setConfKey(confText, "secret_file", confPath(".secret"))
+	if strings.Contains(confText, "cert_file") {
+		confText = setConfKey(confText, "cert_file", confPath(".crt"))
+		confText = setConfKey(confText, "key_file", confPath(".key"))
+	}
+	if newLocalIP != "" && net.ParseIP(newLocalIP) != nil {
+		confText = setConfKey(confText, "local_ip", newLocalIP)
+	}
+
+	if err := writeFileAtomic(secretFile, []byte(strings.TrimSpace(snap.Secret)+"\n"), 0o600); err != nil {
+		return res, err
+	}
+	if snap.CertPEM != "" && snap.KeyPEM != "" {
+		_ = writeFileAtomic(certFile, []byte(snap.CertPEM), 0o644)
+		_ = writeFileAtomic(keyFile, []byte(snap.KeyPEM), 0o600)
+	}
+	if err := writeFileAtomic(confFile, []byte(confText), 0o600); err != nil {
+		return res, err
+	}
+
+	cfg, err := engine.LoadConfig(confFile)
+	if err == nil {
+		if cfg.Transport != engine.TransportPlain && cfg.Transport != engine.TransportKCP && !cfg.Dials() {
+			_, _ = engine.EnsureCert(certFile, keyFile, cfg.EffectiveServerName())
+		}
+		err = cfg.Validate()
+	}
+	if err == nil {
+		err = cfg.LoadSecret()
+	}
+	if err != nil {
+		return res, fmt.Errorf("restored tunnel config invalid: %w", err)
+	}
+
+	if err := host.FirewallApply(snap.Name); err != nil {
+		res.Warnings = append(res.Warnings, err.Error())
+	}
+	_ = host.Reload()
+	if err := host.Enable(snap.Name); err != nil && !errors.Is(err, errNoSystemd) {
+		res.Warnings = append(res.Warnings, err.Error())
+	}
+	_ = host.Restart(snap.Name)
+
+	res.OK = true
+	if cfg.Role == engine.RoleEdge {
+		res.Code, _ = edgePairingCode(confDir, snap.Name)
+	}
+	return res, nil
+}

@@ -262,29 +262,50 @@
       <div class="toolbar">
         <div>
           <h2>Settings</h2>
-          <p class="muted small">Manage panel login credentials, SSL/TLS certificate status, and software updates across all servers.</p>
+          <p class="muted small">Manage panel login credentials, full backups &amp; migration, SSL/TLS certificate status, and software updates.</p>
+        </div>
+        <div class="actions">
+          <button type="button" id="backup-quick-restore">Restore Backup…</button>
+          <button type="button" id="backup-quick-download" class="primary">Download Backup</button>
         </div>
       </div>
       <div class="grid2">
-        <form id="account-form" class="card settings-card" novalidate>
-          <div class="card-head">
-            <h3>Admin Login Credentials</h3>
-            <p class="muted small">Changing credentials immediately signs out any other active sessions.</p>
-          </div>
-          <label for="acc-current">Current password</label>
-          <input id="acc-current" type="password" autocomplete="current-password" required>
-          <label for="acc-user">Username</label>
-          <input id="acc-user" autocomplete="username" autocapitalize="none" spellcheck="false">
-          <label for="acc-new">New password <span class="muted">(leave empty to keep current)</span></label>
-          <input id="acc-new" type="password" autocomplete="new-password" minlength="10" aria-describedby="acc-new-hint">
-          <p id="acc-new-hint" class="muted small">Minimum 10 characters.</p>
-          <label for="acc-again">Confirm new password</label>
-          <input id="acc-again" type="password" autocomplete="new-password">
-          <p id="acc-msg" role="status"></p>
-          <div class="actions">
-            <button type="submit" class="primary">Save credentials</button>
-          </div>
-        </form>
+        <div class="settings-stack">
+          <section class="card settings-card" aria-labelledby="h-backup">
+            <div class="card-head">
+              <h3 id="h-backup">Backup &amp; Restore (Panel Migration)</h3>
+              <p class="muted small">Export a complete snapshot of all managed servers, agent tokens, tunnels, Auto-Heal settings, Cloudflare API tokens, and panel identity—or restore them onto this or a new server.</p>
+            </div>
+            <label for="backup-pass">Optional Backup Encryption Password <span class="muted">(leave empty for plain JSON)</span></label>
+            <input id="backup-pass" type="password" autocomplete="new-password" placeholder="Optional password to encrypt backup file (min 6 chars)">
+            <p id="backup-msg" role="status"></p>
+            <p id="backup-err" class="error" role="alert"></p>
+            <div class="actions left">
+              <button type="button" id="backup-download-btn" class="primary">Download Full Backup (.json)</button>
+              <button type="button" id="backup-open-restore-btn">Restore from Backup File…</button>
+            </div>
+          </section>
+
+          <form id="account-form" class="card settings-card" novalidate>
+            <div class="card-head">
+              <h3>Admin Login Credentials</h3>
+              <p class="muted small">Changing credentials immediately signs out any other active sessions.</p>
+            </div>
+            <label for="acc-current">Current password</label>
+            <input id="acc-current" type="password" autocomplete="current-password" required>
+            <label for="acc-user">Username</label>
+            <input id="acc-user" autocomplete="username" autocapitalize="none" spellcheck="false">
+            <label for="acc-new">New password <span class="muted">(leave empty to keep current)</span></label>
+            <input id="acc-new" type="password" autocomplete="new-password" minlength="10" aria-describedby="acc-new-hint">
+            <p id="acc-new-hint" class="muted small">Minimum 10 characters.</p>
+            <label for="acc-again">Confirm new password</label>
+            <input id="acc-again" type="password" autocomplete="new-password">
+            <p id="acc-msg" role="status"></p>
+            <div class="actions">
+              <button type="submit" class="primary">Save credentials</button>
+            </div>
+          </form>
+        </div>
 
         <div class="settings-stack">
           <section class="card settings-card" aria-labelledby="h-about">
@@ -1344,6 +1365,119 @@
     </div>
   </form>
 </dialog>
+
+<!-- Backup Restore & Migration Dialog -->
+<dialog id="restore-dialog" class="wide" aria-labelledby="restore-title">
+  <form id="restore-form" novalidate>
+    <div class="dialog-header">
+      <div>
+        <h2 id="restore-title">Restore Panel Backup</h2>
+        <p class="muted small">Upload a PortBridge backup file (.json) to restore your servers, tunnels, Cloudflare tokens, and Auto-Heal settings onto this server.</p>
+      </div>
+    </div>
+
+    <div class="dialog-body">
+      <div class="field-block">
+        <label for="restore-file">Backup File (.json)</label>
+        <input id="restore-file" type="file" accept=".json,application/json">
+      </div>
+
+      <div id="restore-pass-wrap" class="step-box" hidden>
+        <label for="restore-pass">Backup Encryption Password</label>
+        <div class="row2">
+          <input id="restore-pass" type="password" autocomplete="off" placeholder="Enter the password used when creating this backup">
+          <button type="button" id="restore-unlock-btn" class="primary">Unlock &amp; Inspect Backup</button>
+        </div>
+      </div>
+
+      <div id="restore-preview-wrap" hidden>
+        <div id="restore-summary" class="diag-grid"></div>
+        <div id="restore-notes" class="notice"></div>
+
+        <fieldset class="step-box">
+          <legend>Restore Mode</legend>
+          <div class="choice-grid cols-2">
+            <label class="choice-card">
+              <input type="radio" name="restore-mode" value="merge" checked>
+              <div class="choice-body">
+                <div class="choice-top"><strong>Merge with Current Panel</strong><span class="pill-tag tag-relay">Recommended</span></div>
+                <span class="choice-desc">Adds and updates servers, tokens, and settings from the backup without deleting any extra servers already on this panel.</span>
+              </div>
+            </label>
+            <label class="choice-card">
+              <input type="radio" name="restore-mode" value="replace">
+              <div class="choice-body">
+                <div class="choice-top"><strong>Replace Panel State</strong></div>
+                <span class="choice-desc">Replaces the server list and Cloudflare tokens on this panel with the exact list from the backup.</span>
+              </div>
+            </label>
+          </div>
+        </fieldset>
+
+        <fieldset id="restore-local-box" class="step-box" hidden>
+          <legend>Tunnels Hosted on the Old Panel Server ("This Server")</legend>
+          <p id="restore-local-lead" class="muted small"></p>
+          <div class="choice-grid">
+            <label class="choice-card" id="restore-local-skip-card">
+              <input type="radio" name="restore-local-action" value="skip">
+              <div class="choice-body">
+                <div class="choice-top"><strong>Keep on Old Server (Do Not Move Local Tunnels Here)</strong><span class="pill-tag tag-relay">Safe if Old Server is Active</span></div>
+                <span class="choice-desc">Leaves those tunnels running on the old panel server without interruption. After restoring, click "+ Add Server" to add the old server by SSH as a managed Relay/Foreign server.</span>
+              </div>
+            </label>
+            <label class="choice-card" id="restore-local-migrate-card">
+              <input type="radio" name="restore-local-action" value="migrate">
+              <div class="choice-body">
+                <div class="choice-top"><strong>Migrate Local Tunnels to This New Server &amp; Update Remote Peers</strong><span class="pill-tag tag-foreign">Replacing Old Server</span></div>
+                <span class="choice-desc">Starts the local tunnels on this machine using this server's IP and automatically updates the remote peer servers to connect to this new server.</span>
+              </div>
+            </label>
+            <label class="choice-card" id="restore-local-restore-card">
+              <input type="radio" name="restore-local-action" value="restore">
+              <div class="choice-body">
+                <div class="choice-top"><strong>Restore Local Tunnels on This Server As-Is</strong></div>
+                <span class="choice-desc">Restores the local tunnel configuration files and starts their services on this server without changing peer IPs.</span>
+              </div>
+            </label>
+          </div>
+        </fieldset>
+
+        <label class="check-card">
+          <input type="checkbox" id="restore-redeploy-remote" checked>
+          <span>
+            <strong>Verify &amp; re-deploy missing tunnels on remote servers</strong>
+            <span class="muted"> — If any remote server was reinstalled and is missing a tunnel from the backup, automatically push and start it. (Existing running tunnels on remote servers are never interrupted.)</span>
+          </span>
+        </label>
+
+        <label class="check-card">
+          <input type="checkbox" id="restore-panel-identity" checked>
+          <span>
+            <strong>Restore panel TLS certificate identity</strong>
+            <span class="muted"> — Preserves the panel's certificate fingerprint so remote servers using Reverse Control Hub ("Agent calls panel") continue to trust this panel.</span>
+          </span>
+        </label>
+
+        <label class="check-card">
+          <input type="checkbox" id="restore-credentials">
+          <span>
+            <strong>Also overwrite admin login username &amp; password from backup</strong>
+            <span class="muted"> — Leave unchecked to keep the username and password you used to sign into this panel.</span>
+          </span>
+        </label>
+      </div>
+
+      <div id="restore-result-wrap" class="notice" hidden></div>
+      <p id="restore-error" class="error" role="alert"></p>
+    </div>
+
+    <div class="dialog-footer actions">
+      <button type="button" id="restore-close">Close</button>
+      <button type="submit" class="primary" id="restore-submit" disabled>Restore Backup Now</button>
+    </div>
+  </form>
+</dialog>
 </body>
 </html>
+
 
