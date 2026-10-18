@@ -41,7 +41,7 @@ const (
 	// firstOneClickVersion is the first PortBridge whose agent can be updated
 	// from the panel.
 	firstOneClickVersion = "v0.15.0"
-	updateCheckEvery     = 6 * time.Hour
+	updateCheckEvery     = 15 * time.Minute
 	serverUpdateWait     = 4 * time.Minute
 	pendingFile          = "update-pending.json"
 )
@@ -193,6 +193,10 @@ func (u *updater) status() updateStatus {
 				su.NeedsSSH = compareVersions(su.Version, firstOneClickVersion) < 0 || refused[v.ID]
 			case c > 0:
 				su.State = "newer"
+				if agent.IsReleaseVersion(su.Version) && (st.Latest == "" || compareVersions(st.Latest, su.Version) < 0) {
+					st.Latest = su.Version
+					st.PanelOlder = true
+				}
 			default:
 				su.State = "current"
 			}

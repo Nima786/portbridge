@@ -3114,7 +3114,6 @@
   }
 
   if ($('backup-download-btn')) $('backup-download-btn').addEventListener('click', downloadBackup);
-  if ($('backup-quick-download')) $('backup-quick-download').addEventListener('click', downloadBackup);
 
   function openRestoreDialog() {
     pendingBackupJSON = '';
@@ -3140,7 +3139,6 @@
   }
 
   if ($('backup-open-restore-btn')) $('backup-open-restore-btn').addEventListener('click', openRestoreDialog);
-  if ($('backup-quick-restore')) $('backup-quick-restore').addEventListener('click', openRestoreDialog);
   if ($('restore-close')) $('restore-close').addEventListener('click', () => $('restore-dialog').close());
 
   async function inspectCurrentBackup() {
