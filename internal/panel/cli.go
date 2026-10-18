@@ -51,6 +51,8 @@ func CmdPanel(args []string) error {
 		return cmdBackup(args[1:])
 	case "restore":
 		return cmdRestore(args[1:])
+	case "remove", "uninstall":
+		return cmdRemove(args[1:])
 	case "help", "-h", "--help":
 		panelUsage()
 		return nil
@@ -67,6 +69,7 @@ func panelUsage() {
   portbridge panel status [-get key]       Say how the panel is set up
   portbridge panel backup [-out file]      Export a full backup of servers, tunnels and settings
   portbridge panel restore -in file        Restore a backup file into this panel
+  portbridge panel remove                  Stop and remove the web panel (keeps tunnels and agent)
 
 The menu does all of this for you: portbridge-menu -> Web panel
 `)
@@ -595,5 +598,28 @@ func cmdRestore(args []string) error {
 	for _, a := range res.ActionsNeeded {
 		fmt.Printf("Note: %s\n", a)
 	}
+	return nil
+}
+
+func cmdRemove(args []string) error {
+	fs := flag.NewFlagSet("panel remove", flag.ExitOnError)
+	dir := fs.String("dir", DefaultDir, "where the panel keeps its settings")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	clean := filepath.Clean(*dir)
+	if clean == "" || clean == "/" || clean == "." || clean == "/etc" || clean == "/etc/portbridge" {
+		return fmt.Errorf("refusing to remove unsafe directory %q", *dir)
+	}
+	if os.Geteuid() == 0 {
+		if _, err := os.Stat("/run/systemd/system"); err == nil {
+			_, _ = systemctl("disable", "--now", panelUnit)
+		}
+	}
+	if err := os.RemoveAll(clean); err != nil {
+		return fmt.Errorf("removing panel directory %s: %w", clean, err)
+	}
+	fmt.Println("The web panel and its settings have been removed from this server.")
+	fmt.Println("Your tunnels and management agent were not touched and are still running.")
 	return nil
 }

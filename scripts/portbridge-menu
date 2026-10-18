@@ -4573,6 +4573,7 @@ panel_menu() {
             item 3 "Turn the panel on"
         fi
         item 4 "View the panel's log"
+        item 5 "Remove the web panel" "keeps your tunnels and agent" "$RED"
         say ""
         item 0 "Back"
         hr
@@ -4595,6 +4596,14 @@ panel_menu() {
                 pause
                 ;;
             4) journalctl -u "$PANEL_UNIT" -n 40 --no-pager; pause ;;
+            5)
+                warn "This removes the web panel and its settings (/etc/portbridge/panel)"
+                warn "from this server. Your tunnels and agent will keep running."
+                if confirm "Remove the web panel from this server?"; then
+                    "$BIN" panel remove
+                fi
+                pause
+                ;;
             *) return 0 ;;
         esac
     done

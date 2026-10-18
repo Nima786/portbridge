@@ -552,11 +552,13 @@ func (p *Panel) RestoreBackup(ctx context.Context, raw []byte, opts RestoreOptio
 	// 2. Re-encrypt server tokens and Cloudflare tokens using this panel's secret.key
 	// and update state.json atomically.
 	var sealedServers []Server
-	for _, bs := range payload.Servers {
+	var matchedOwnServer *BackupServer
+	for i, bs := range payload.Servers {
 		// Never add this server's own IP as a remote server in itself.
 		if isOwnAddress(bs.Address, localOv.IPv4, localOv.IPv6) {
+			matchedOwnServer = &payload.Servers[i]
 			res.Warnings = append(res.Warnings,
-				fmt.Sprintf("Skipped adding %q (%s) as a remote server because %s is this panel's own server.", bs.Name, bs.Address, bs.Address))
+				fmt.Sprintf("Configured this server as %q (%s) and skipped adding it as a duplicate remote server.", bs.Name, bs.Address))
 			continue
 		}
 		tok := bs.PlainToken
@@ -586,6 +588,7 @@ func (p *Panel) RestoreBackup(ctx context.Context, raw []byte, opts RestoreOptio
 		sealedCF = append(sealedCF, acc)
 	}
 
+	autoHealCount := 0
 	if err := p.store.update(func(st *State) error {
 		if opts.RestoreCredentials && payload.Admin.User != "" && payload.Admin.Hash != "" {
 			st.Admin = payload.Admin
@@ -593,8 +596,15 @@ func (p *Panel) RestoreBackup(ctx context.Context, raw []byte, opts RestoreOptio
 			st.Admin = payload.Admin
 		}
 
-		if sameHost || localAction == "restore" || localAction == "migrate" {
-			if payload.Source.ThisGroup != "" && (mode == "replace" || st.ThisGroup == "") {
+		if matchedOwnServer != nil {
+			if matchedOwnServer.Group != "" && (mode == "replace" || st.ThisGroup == "" || st.ThisGroup == "none") {
+				st.ThisGroup = matchedOwnServer.Group
+			}
+			if matchedOwnServer.Name != "" && (mode == "replace" || st.ThisName == "") {
+				st.ThisName = matchedOwnServer.Name
+			}
+		} else if sameHost || localAction == "restore" || localAction == "migrate" {
+			if payload.Source.ThisGroup != "" && (mode == "replace" || st.ThisGroup == "" || st.ThisGroup == "none") {
 				st.ThisGroup = payload.Source.ThisGroup
 			}
 			if payload.Source.ThisName != "" && (mode == "replace" || st.ThisName == "") {
@@ -641,7 +651,20 @@ func (p *Panel) RestoreBackup(ctx context.Context, raw []byte, opts RestoreOptio
 			st.AutoHeal = make(map[string]AutoHealConfig, len(payload.AutoHeal))
 		}
 		for k, v := range payload.AutoHeal {
+			// If this rule belonged to the old panel's "This Server" and local tunnels were skipped
+			// when moving to a different server, don't attach it to the new host's "This Server".
+			if !sameHost && localAction == "skip" && strings.HasPrefix(k, "this/") {
+				continue
+			}
+			// If we restored onto a server that was previously a remote server in the backup,
+			// remap its server ID prefix in AutoHeal keys to "this/".
+			if matchedOwnServer != nil && matchedOwnServer.ID != "" {
+				if strings.HasPrefix(k, matchedOwnServer.ID+"/") {
+					k = "this/" + strings.TrimPrefix(k, matchedOwnServer.ID+"/")
+				}
+			}
 			st.AutoHeal[k] = v
+			autoHealCount++
 		}
 		return nil
 	}); err != nil {
@@ -650,7 +673,7 @@ func (p *Panel) RestoreBackup(ctx context.Context, raw []byte, opts RestoreOptio
 
 	res.ServersRestored = len(sealedServers)
 	res.CFAccountsRestored = len(sealedCF)
-	res.AutoHealRestored = len(payload.AutoHeal)
+	res.AutoHealRestored = autoHealCount
 
 	// 3. Refresh all servers and re-seed Reverse Control Hub (/api/callhome)
 	// so every reachable agent learns this panel's current IPv4/IPv6 URLs and fingerprint.
