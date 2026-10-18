@@ -270,9 +270,9 @@ func (p *Panel) CreateBackup(ctx context.Context, passphrase string) (*BackupEnv
 		wg.Add(1)
 		go func(idx int, s Server) {
 			defer wg.Done()
-			rctx, cancel := context.WithTimeout(ctx, 6*time.Second)
+			rctx, cancel := context.WithTimeout(ctx, 8*time.Second)
 			defer cancel()
-			status, body, err := p.fleet.call(rctx, s, http.MethodGet, "/api/tunnels/export", nil)
+			status, body, err := p.callServer(rctx, s.ID, http.MethodGet, "/api/tunnels/export", nil, overviewLimit)
 			if err != nil || status != http.StatusOK {
 				return
 			}

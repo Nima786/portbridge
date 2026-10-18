@@ -3078,7 +3078,12 @@
 
   async function downloadBackup(ev) {
     const btn = ev ? ev.currentTarget : $('backup-download-btn');
-    if (btn) btn.disabled = true;
+    const origLabel = btn ? btn.textContent : 'Download Full Backup (.json)';
+    if (btn) {
+      btn.disabled = true;
+      btn.textContent = 'Creating Backup…';
+    }
+    if ($('backup-loading-wrap')) $('backup-loading-wrap').hidden = false;
     if ($('backup-msg')) {
       $('backup-msg').textContent = '';
       $('backup-msg').className = '';
@@ -3109,7 +3114,11 @@
       if ($('backup-err')) $('backup-err').textContent = e.message;
       setStatus(e.message, true);
     } finally {
-      if (btn) btn.disabled = false;
+      if ($('backup-loading-wrap')) $('backup-loading-wrap').hidden = true;
+      if (btn) {
+        btn.disabled = false;
+        btn.textContent = origLabel;
+      }
     }
   }
 
@@ -3121,6 +3130,7 @@
     if ($('restore-pass')) $('restore-pass').value = '';
     if ($('restore-pass-wrap')) $('restore-pass-wrap').hidden = true;
     if ($('restore-preview-wrap')) $('restore-preview-wrap').hidden = true;
+    if ($('restore-loading-wrap')) $('restore-loading-wrap').hidden = true;
     if ($('restore-result-wrap')) {
       $('restore-result-wrap').hidden = true;
       $('restore-result-wrap').replaceChildren();
@@ -3129,7 +3139,9 @@
     if ($('restore-submit')) {
       $('restore-submit').disabled = true;
       $('restore-submit').hidden = false;
+      $('restore-submit').textContent = 'Restore Backup Now';
     }
+    if ($('restore-close')) $('restore-close').disabled = false;
     setRadio('restore-mode', 'merge');
     if ($('restore-redeploy-remote')) $('restore-redeploy-remote').checked = true;
     if ($('restore-panel-identity')) $('restore-panel-identity').checked = true;
@@ -3145,6 +3157,8 @@
     if (!pendingBackupJSON) return;
     if ($('restore-error')) $('restore-error').textContent = '';
     if ($('restore-result-wrap')) $('restore-result-wrap').hidden = true;
+    if ($('restore-loading-text')) $('restore-loading-text').textContent = 'Reading and inspecting backup file…';
+    if ($('restore-loading-wrap')) $('restore-loading-wrap').hidden = false;
     const passphrase = $('restore-pass') ? $('restore-pass').value.trim() : '';
     try {
       const rep = await api('POST', '/api/backup/inspect', {
@@ -3164,6 +3178,8 @@
       $('restore-preview-wrap').hidden = true;
       $('restore-submit').disabled = true;
       $('restore-error').textContent = e.message;
+    } finally {
+      if ($('restore-loading-wrap')) $('restore-loading-wrap').hidden = true;
     }
   }
 
@@ -3248,7 +3264,17 @@
       if (!pendingBackupJSON) return;
       const btn = $('restore-submit');
       btn.disabled = true;
+      btn.textContent = 'Restoring Backup…';
+      if ($('restore-close')) $('restore-close').disabled = true;
       $('restore-error').textContent = '';
+      if ($('restore-result-wrap')) $('restore-result-wrap').hidden = true;
+      if ($('restore-loading-text')) {
+        $('restore-loading-text').textContent = 'Restoring servers, tokens, Auto-Heal rules, re-seeding agent connections, and verifying tunnels… Please wait.';
+      }
+      if ($('restore-loading-wrap')) {
+        $('restore-loading-wrap').hidden = false;
+        $('restore-loading-wrap').scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+      }
       try {
         const options = {
           passphrase: $('restore-pass') ? $('restore-pass').value.trim() : '',
@@ -3286,6 +3312,8 @@
           for (const w of r.warnings) ul.append(h('li', null, w));
           wrap.append(h('strong', null, 'Warnings:'), ul);
         }
+        if ($('restore-loading-wrap')) $('restore-loading-wrap').hidden = true;
+        wrap.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
         lastServers = lastTunnels = '';
         await refresh();
         await loadSettings();
@@ -3293,7 +3321,10 @@
       } catch (e) {
         $('restore-error').textContent = e.message;
       } finally {
+        if ($('restore-loading-wrap')) $('restore-loading-wrap').hidden = true;
+        if ($('restore-close')) $('restore-close').disabled = false;
         btn.disabled = false;
+        btn.textContent = 'Restore Backup Now';
       }
     });
   }

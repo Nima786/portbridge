@@ -274,6 +274,12 @@
             </div>
             <label for="backup-pass">Optional Backup Encryption Password <span class="muted">(leave empty for plain JSON)</span></label>
             <input id="backup-pass" type="password" autocomplete="new-password" placeholder="Optional password to encrypt backup file (min 6 chars)">
+            <div id="backup-loading-wrap" class="probe-live-box" hidden>
+              <div class="probe-live-head">
+                <span class="probe-spinner" aria-hidden="true"></span>
+                <span id="backup-loading-text">Exporting servers, tokens, Auto-Heal rules, and tunnel configurations…</span>
+              </div>
+            </div>
             <p id="backup-msg" role="status"></p>
             <p id="backup-err" class="error" role="alert"></p>
             <div class="actions left">
@@ -1461,6 +1467,13 @@
             <span class="muted"> — Leave unchecked to keep the username and password you used to sign into this panel.</span>
           </span>
         </label>
+      </div>
+
+      <div id="restore-loading-wrap" class="probe-live-box" hidden>
+        <div class="probe-live-head">
+          <span class="probe-spinner" aria-hidden="true"></span>
+          <span id="restore-loading-text">Restoring backup and verifying servers &amp; tunnels…</span>
+        </div>
       </div>
 
       <div id="restore-result-wrap" class="notice" hidden></div>
