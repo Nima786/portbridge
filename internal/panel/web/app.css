@@ -2055,7 +2055,42 @@ button.btn-autoheal.is-on {
 }
 
 @media (prefers-reduced-motion: reduce) {
-  * { transition: none !important; animation: none !important; }
+  *:not(.probe-spinner):not(.btn-spinner) { transition: none !important; animation: none !important; }
+  .probe-spinner, .btn-spinner, button.is-loading::before {
+    animation: probe-spin .75s linear infinite !important;
+  }
+}
+
+button.is-loading {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: .5rem;
+  cursor: wait !important;
+}
+button.is-loading::before {
+  content: "";
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  border: 2.2px solid currentColor;
+  border-right-color: transparent;
+  flex-shrink: 0;
+  animation: probe-spin .75s linear infinite !important;
+}
+
+.dialog-status-bar {
+  padding: 0 1.45rem .8rem;
+  background: var(--bg);
+}
+.dialog-status-bar:empty {
+  display: none;
+}
+.dialog-status-bar .probe-live-box {
+  margin-top: .2rem;
+}
+.dialog-status-bar .probe-live-head {
+  margin-bottom: 0;
 }
 
 .mig-notes-list {
@@ -2067,4 +2102,3 @@ button.btn-autoheal.is-on {
 .mig-notes-list li + li {
   margin-top: .35rem;
 }
-

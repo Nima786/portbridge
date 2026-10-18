@@ -956,6 +956,12 @@
   </div>
   <div class="dialog-body">
     <p id="confirm-text"></p>
+    <div id="confirm-loading-wrap" class="probe-live-box" hidden>
+      <div class="probe-live-head">
+        <span class="probe-spinner" aria-hidden="true"></span>
+        <span id="confirm-loading-text">Working… Communicating with server(s)…</span>
+      </div>
+    </div>
     <p id="confirm-error" class="error" role="alert"></p>
   </div>
   <div class="dialog-footer actions">
@@ -1468,14 +1474,15 @@
           </span>
         </label>
       </div>
+    </div>
 
+    <div class="dialog-status-bar">
       <div id="restore-loading-wrap" class="probe-live-box" hidden>
         <div class="probe-live-head">
           <span class="probe-spinner" aria-hidden="true"></span>
           <span id="restore-loading-text">Restoring backup and verifying servers &amp; tunnels…</span>
         </div>
       </div>
-
       <div id="restore-result-wrap" class="notice" hidden></div>
       <p id="restore-error" class="error" role="alert"></p>
     </div>

@@ -610,6 +610,11 @@
     $('confirm-title').textContent = title;
     $('confirm-text').textContent = text;
     $('confirm-yes').textContent = yes;
+    $('confirm-yes').dataset.origLabel = yes;
+    $('confirm-yes').classList.remove('is-loading');
+    $('confirm-yes').disabled = false;
+    $('confirm-no').disabled = false;
+    if ($('confirm-loading-wrap')) $('confirm-loading-wrap').hidden = true;
     $('confirm-error').textContent = '';
     confirmAction = action;
     openDialog($('confirm-dialog'));
@@ -619,14 +624,30 @@
   $('confirm-no').addEventListener('click', () => $('confirm-dialog').close());
   $('confirm-yes').addEventListener('click', async () => {
     const btn = $('confirm-yes');
+    const orig = btn.dataset.origLabel || btn.textContent;
     btn.disabled = true;
+    btn.classList.add('is-loading');
+    if (/^delete/i.test(orig)) {
+      btn.textContent = 'Deleting…';
+    } else if (/^remove/i.test(orig)) {
+      btn.textContent = 'Removing…';
+    } else {
+      btn.textContent = 'Working…';
+    }
+    $('confirm-no').disabled = true;
+    $('confirm-error').textContent = '';
+    if ($('confirm-loading-wrap')) $('confirm-loading-wrap').hidden = false;
     try {
       await confirmAction();
       $('confirm-dialog').close();
     } catch (e) {
       $('confirm-error').textContent = e.message;
     } finally {
+      if ($('confirm-loading-wrap')) $('confirm-loading-wrap').hidden = true;
+      btn.classList.remove('is-loading');
+      btn.textContent = orig;
       btn.disabled = false;
+      $('confirm-no').disabled = false;
     }
   });
 
@@ -1114,7 +1135,10 @@
     const allRunning = halves.length > 0 && halves.every((x) => x.info.running);
     const service = (action, doing) => async (ev) => {
       const btn = ev.currentTarget;
+      const orig = btn.textContent;
       btn.disabled = true;
+      btn.classList.add('is-loading');
+      btn.textContent = `${doing}…`;
       setStatus(`${doing} ${t.name}...`);
       try {
         const res = await api('POST', '/api/tunnels/service', { ...target, action });
@@ -1126,6 +1150,8 @@
       } catch (e) {
         setStatus(e.message, true);
       } finally {
+        btn.classList.remove('is-loading');
+        btn.textContent = orig;
         btn.disabled = false;
       }
     };
@@ -3081,6 +3107,7 @@
     const origLabel = btn ? btn.textContent : 'Download Full Backup (.json)';
     if (btn) {
       btn.disabled = true;
+      btn.classList.add('is-loading');
       btn.textContent = 'Creating Backup…';
     }
     if ($('backup-loading-wrap')) $('backup-loading-wrap').hidden = false;
@@ -3116,6 +3143,7 @@
     } finally {
       if ($('backup-loading-wrap')) $('backup-loading-wrap').hidden = true;
       if (btn) {
+        btn.classList.remove('is-loading');
         btn.disabled = false;
         btn.textContent = origLabel;
       }
@@ -3137,6 +3165,7 @@
     }
     if ($('restore-error')) $('restore-error').textContent = '';
     if ($('restore-submit')) {
+      $('restore-submit').classList.remove('is-loading');
       $('restore-submit').disabled = true;
       $('restore-submit').hidden = false;
       $('restore-submit').textContent = 'Restore Backup Now';
@@ -3159,6 +3188,11 @@
     if ($('restore-result-wrap')) $('restore-result-wrap').hidden = true;
     if ($('restore-loading-text')) $('restore-loading-text').textContent = 'Reading and inspecting backup file…';
     if ($('restore-loading-wrap')) $('restore-loading-wrap').hidden = false;
+    const unlockBtn = $('restore-unlock-btn');
+    if (unlockBtn) {
+      unlockBtn.disabled = true;
+      unlockBtn.classList.add('is-loading');
+    }
     const passphrase = $('restore-pass') ? $('restore-pass').value.trim() : '';
     try {
       const rep = await api('POST', '/api/backup/inspect', {
@@ -3180,6 +3214,10 @@
       $('restore-error').textContent = e.message;
     } finally {
       if ($('restore-loading-wrap')) $('restore-loading-wrap').hidden = true;
+      if (unlockBtn) {
+        unlockBtn.classList.remove('is-loading');
+        unlockBtn.disabled = false;
+      }
     }
   }
 
@@ -3264,6 +3302,7 @@
       if (!pendingBackupJSON) return;
       const btn = $('restore-submit');
       btn.disabled = true;
+      btn.classList.add('is-loading');
       btn.textContent = 'Restoring Backup…';
       if ($('restore-close')) $('restore-close').disabled = true;
       $('restore-error').textContent = '';
@@ -3273,7 +3312,6 @@
       }
       if ($('restore-loading-wrap')) {
         $('restore-loading-wrap').hidden = false;
-        $('restore-loading-wrap').scrollIntoView({ behavior: 'smooth', block: 'nearest' });
       }
       try {
         const options = {
@@ -3313,7 +3351,6 @@
           wrap.append(h('strong', null, 'Warnings:'), ul);
         }
         if ($('restore-loading-wrap')) $('restore-loading-wrap').hidden = true;
-        wrap.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
         lastServers = lastTunnels = '';
         await refresh();
         await loadSettings();
@@ -3323,6 +3360,7 @@
       } finally {
         if ($('restore-loading-wrap')) $('restore-loading-wrap').hidden = true;
         if ($('restore-close')) $('restore-close').disabled = false;
+        btn.classList.remove('is-loading');
         btn.disabled = false;
         btn.textContent = 'Restore Backup Now';
       }
