@@ -140,7 +140,7 @@ func (f *fleet) callLimit(ctx context.Context, srv Server, method, path string, 
 
 	hasFallback := len(v6URLs) > 0 || f.p.hub.connected(srv.ID)
 	var perTry time.Duration
-	if hasFallback && limit <= overviewLimit {
+	if hasFallback && method == http.MethodGet && limit <= overviewLimit {
 		perTry = 6 * time.Second
 	}
 

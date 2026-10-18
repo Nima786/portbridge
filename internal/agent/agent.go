@@ -1078,8 +1078,12 @@ func makeAgentHTTPClient(trust agentTrust, agentURL string) *http.Client {
 		tc.ServerName = agentSNI(agentURL)
 	}
 	return &http.Client{
-		Timeout:   20 * time.Second,
-		Transport: &http.Transport{TLSClientConfig: tc},
+		Timeout: 20 * time.Second,
+		Transport: &http.Transport{
+			DialContext:         (&net.Dialer{Timeout: 5 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
+			TLSHandshakeTimeout: 5 * time.Second,
+			TLSClientConfig:     tc,
+		},
 	}
 }
 

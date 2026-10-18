@@ -736,11 +736,11 @@ func runSingleProbeAttempt(parentCtx context.Context, cfg *Config, routes *route
 	dlStart := time.Now()
 	dlRead, dlErr := io.CopyN(io.Discard, c, int64(burstBytes))
 	dlDur := time.Since(dlStart).Seconds()
+	if dlErr != nil || dlRead < int64(burstBytes) {
+		return hsMS, rtts, 0, 0, true, nil
+	}
 	if dlDur > 0 && dlRead > 0 {
 		dlMbps = (float64(dlRead) * 8 / 1_000_000) / dlDur
-	}
-	if dlErr != nil || dlRead < int64(burstBytes) {
-		return hsMS, rtts, dlMbps, 0, true, nil
 	}
 
 	// Upload burst
@@ -781,11 +781,11 @@ func runSingleProbeAttempt(parentCtx context.Context, cfg *Config, routes *route
 		}
 	}
 	ulDur := time.Since(ulStart).Seconds()
+	if ulErr != nil || ulSent < int64(burstBytes) {
+		return hsMS, rtts, dlMbps, 0, true, nil
+	}
 	if ulDur > 0 && ulSent > 0 {
 		ulMbps = (float64(ulSent) * 8 / 1_000_000) / ulDur
-	}
-	if ulErr != nil || ulSent < int64(burstBytes) {
-		return hsMS, rtts, dlMbps, ulMbps, true, nil
 	}
 
 	_, _ = c.Write([]byte{0x04})
@@ -897,11 +897,20 @@ func scoreCandidate(r *ProbeCandidateResult, maxMbps float64) int {
 	if r.Successes == 0 || r.Status == "blocked" {
 		return 0
 	}
+	// A candidate where the handshake succeeded but the 128 KB transfer froze
+	// mid-stream ("throttled") is blocked by a DPI byte-cap filter and cannot
+	// carry real user traffic. Cap its score well below any working candidate.
+	if r.Status == "throttled" {
+		rttBonus := int(math.Round(8.0 * clamp01(1.0-(r.RTTMS-15.0)/385.0)))
+		score := 10 + rttBonus
+		if score > 20 {
+			score = 20
+		}
+		return score
+	}
+
 	// 1. Reliability (0..45)
 	rel := 45.0 * (float64(r.Successes) / float64(maxInt(1, r.Attempts)))
-	if r.Status == "throttled" {
-		rel = 12.0
-	}
 
 	// 2. Latency & Jitter (0..25)
 	rttScore := 18.0 * clamp01(1.0-(r.RTTMS-15.0)/385.0)

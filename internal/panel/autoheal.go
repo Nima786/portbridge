@@ -61,6 +61,29 @@ func (ah *autoHealer) runtimeOf(name string) *tunnelHealRuntime {
 	return r
 }
 
+// extractTunnelCDNDomain returns the CDN domain configured on a tunnel (either
+// as its primary CDN domain or its hybrid CDN backup domain).
+func extractTunnelCDNDomain(ti agent.TunnelInfo) string {
+	if ti.CDN && ti.ServerName != "" && engine.HostnameRe.MatchString(ti.ServerName) {
+		return ti.ServerName
+	}
+	if ti.AltHost != "" && engine.HostnameRe.MatchString(ti.AltHost) {
+		return ti.AltHost
+	}
+	if ti.CDN {
+		// Fallback extraction from human-readable Link description, e.g. "(sub.domain.com)"
+		if i := strings.IndexByte(ti.Link, '('); i >= 0 {
+			if j := strings.IndexByte(ti.Link[i+1:], ')'); j >= 0 {
+				cand := strings.TrimSpace(ti.Link[i+1 : i+1+j])
+				if strings.Contains(cand, ".") && engine.HostnameRe.MatchString(cand) {
+					return cand
+				}
+			}
+		}
+	}
+	return ""
+}
+
 // attachViews populates AutoHeal on each tunnelView for the UI.
 func (ah *autoHealer) attachViews(tunnels []tunnelView) {
 	st := ah.p.store.get()
@@ -69,6 +92,11 @@ func (ah *autoHealer) attachViews(tunnels []tunnelView) {
 	for i := range tunnels {
 		name := tunnels[i].Name
 		cfg := st.AutoHeal[name]
+		if cfg.CDNDomain == "" && tunnels[i].Edge != nil {
+			if dom := extractTunnelCDNDomain(tunnels[i].Edge.Info); dom != "" {
+				cfg.CDNDomain = dom
+			}
+		}
 		if r := ah.rt[name]; r != nil {
 			cfg.State = r.state
 			cfg.FailCount = r.failCount
@@ -98,13 +126,25 @@ func (ah *autoHealer) setConfig(name string, enabled bool, cdnDomain string) err
 	if cdnDomain != "" && !engine.HostnameRe.MatchString(cdnDomain) {
 		return fmt.Errorf("%q is not a valid domain name", cdnDomain)
 	}
+	if cdnDomain == "" {
+		for _, tv := range pairTunnels(ah.p.fleet.views()) {
+			if tv.Name == name && tv.Edge != nil {
+				if dom := extractTunnelCDNDomain(tv.Edge.Info); dom != "" {
+					cdnDomain = dom
+				}
+				break
+			}
+		}
+	}
 	err := ah.p.store.update(func(st *State) error {
 		if st.AutoHeal == nil {
 			st.AutoHeal = map[string]AutoHealConfig{}
 		}
 		c := st.AutoHeal[name]
 		c.Enabled = enabled
-		c.CDNDomain = cdnDomain
+		if cdnDomain != "" || !enabled {
+			c.CDNDomain = cdnDomain
+		}
 		if enabled && c.State == "" {
 			c.State = "monitoring"
 		}
@@ -153,6 +193,19 @@ func (ah *autoHealer) checkAll(ctx context.Context) {
 		cfg, ok := st.AutoHeal[tv.Name]
 		if !ok || !cfg.Enabled {
 			continue
+		}
+		if cfg.CDNDomain == "" && tv.Edge != nil {
+			if dom := extractTunnelCDNDomain(tv.Edge.Info); dom != "" {
+				cfg.CDNDomain = dom
+				_ = ah.p.store.update(func(s *State) error {
+					c := s.AutoHeal[tv.Name]
+					if c.CDNDomain == "" {
+						c.CDNDomain = dom
+						s.AutoHeal[tv.Name] = c
+					}
+					return nil
+				})
+			}
 		}
 		ah.evaluateTunnel(ctx, tv, cfg)
 	}
@@ -306,6 +359,11 @@ func describeTunnelInfo(ti agent.TunnelInfo) string {
 }
 
 func sameCandidateAsCurrent(c engine.ProbeCandidateResult, ti agent.TunnelInfo) bool {
+	if ti.CDN && !slices.Contains(engine.CDNHTTPSPorts, ti.LinkPort) {
+		// If a CDN tunnel was set to a non-Cloudflare port, switching to a valid
+		// Cloudflare HTTPS port on CDN fixes the port and should not be penalized.
+		return false
+	}
 	curIPv6 := strings.Contains(ti.PeerIP, ":") || strings.Contains(ti.LocalIP, ":")
 	curHTTP := strings.Contains(strings.ToLower(ti.Link), "website header")
 	return strings.EqualFold(c.Mode, ti.Mode) &&
@@ -322,7 +380,11 @@ func (ah *autoHealer) pickBestCandidate(rep *engine.ProbeBenchmarkReport, cur ag
 	var working []engine.ProbeCandidateResult
 	var different []engine.ProbeCandidateResult
 	for _, c := range rep.Results {
-		if c.Status != "ok" && c.Status != "degraded" && c.Status != "throttled" {
+		// Only select candidates where end-to-end data transfer actually succeeded
+		// ("ok" or "degraded"). Never select "throttled" candidates, which are
+		// connections where the handshake opened but data froze mid-stream due to
+		// an ISP/DPI byte-cap filter.
+		if c.Status != "ok" && c.Status != "degraded" {
 			continue
 		}
 		if c.Hybrid {
@@ -348,13 +410,29 @@ func (ah *autoHealer) pickBestCandidate(rep *engine.ProbeBenchmarkReport, cur ag
 
 // chooseFailoverLinkPort picks a bridge port that is free on whichever server
 // will listen for the new tunnel mode (Foreign for direct, Relay for reverse).
-func (ah *autoHealer) chooseFailoverLinkPort(ctx context.Context, relayID, foreignID string, cur agent.TunnelInfo, newMode string) int {
-	candidates := []int{2053, 2083, 2087, 2096, 8443, 4433, 7443, 9443}
-	if cur.LinkPort > 0 && cur.Mode == newMode {
-		// Keep current LinkPort first if it isn't clashing with user/service ports.
-		candidates = append([]int{cur.LinkPort}, candidates...)
-	} else if cur.LinkPort > 0 {
-		candidates = append(candidates, cur.LinkPort)
+func (ah *autoHealer) chooseFailoverLinkPort(ctx context.Context, relayID, foreignID string, cur agent.TunnelInfo, best engine.ProbeCandidateResult) int {
+	var candidates []int
+	if best.CDN {
+		// Cloudflare CDN only forwards its supported HTTPS ports.
+		if best.Port > 0 && slices.Contains(engine.CDNHTTPSPorts, best.Port) {
+			candidates = append(candidates, best.Port)
+		}
+		if cur.LinkPort > 0 && slices.Contains(engine.CDNHTTPSPorts, cur.LinkPort) {
+			candidates = append(candidates, cur.LinkPort)
+		}
+		candidates = append(candidates, engine.CDNHTTPSPorts...)
+	} else {
+		stdPorts := []int{2053, 2083, 2087, 2096, 8443, 443, 4433, 7443, 9443}
+		if best.Port > 0 && slices.Contains(stdPorts, best.Port) {
+			candidates = append(candidates, best.Port)
+		}
+		if cur.LinkPort > 0 && cur.Mode == best.Mode {
+			candidates = append(candidates, cur.LinkPort)
+		}
+		candidates = append(candidates, stdPorts...)
+		if cur.LinkPort > 0 {
+			candidates = append(candidates, cur.LinkPort)
+		}
 	}
 
 	avoid := map[int]bool{}
@@ -374,11 +452,14 @@ func (ah *autoHealer) chooseFailoverLinkPort(ctx context.Context, relayID, forei
 		}
 	}
 	if len(ask) == 0 {
+		if best.CDN {
+			return 2083
+		}
 		return 8443
 	}
 
 	listenServerID := foreignID
-	if newMode == "reverse" {
+	if best.Mode == "reverse" {
 		listenServerID = relayID
 	}
 	st, err := ah.p.portsThere(ctx, listenServerID, ask)
@@ -462,6 +543,22 @@ func (ah *autoHealer) healTunnel(ctx context.Context, j *job, name, relayID, for
 	}
 	curInfo := tv.Edge.Info
 	ev.FromDesc = describeTunnelInfo(curInfo)
+	if cdnDomain == "" {
+		if dom := extractTunnelCDNDomain(curInfo); dom != "" {
+			cdnDomain = dom
+			_ = ah.p.store.update(func(st *State) error {
+				if st.AutoHeal == nil {
+					st.AutoHeal = map[string]AutoHealConfig{}
+				}
+				c := st.AutoHeal[name]
+				if c.CDNDomain == "" {
+					c.CDNDomain = dom
+					st.AutoHeal[name] = c
+				}
+				return nil
+			})
+		}
+	}
 
 	if !force {
 		if unhealthy, _ := tunnelUnhealthyReason(*tv); !unhealthy {
@@ -514,7 +611,7 @@ func (ah *autoHealer) healTunnel(ctx context.Context, j *job, name, relayID, for
 		}
 	}
 
-	linkPort := ah.chooseFailoverLinkPort(ctx, relayID, foreignID, curInfo, best.Mode)
+	linkPort := ah.chooseFailoverLinkPort(ctx, relayID, foreignID, curInfo, best)
 	onOff := func(b bool) string {
 		if b {
 			return "on"

@@ -69,7 +69,9 @@ const (
 func NewPinnedClient(fingerprint, targetURL string, timeout time.Duration) *http.Client {
 	if fingerprint == "" {
 		return &http.Client{Timeout: timeout, Transport: &http.Transport{
-			TLSClientConfig: &tls.Config{MinVersion: tls.VersionTLS12},
+			DialContext:         (&net.Dialer{Timeout: 5 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
+			TLSHandshakeTimeout: 5 * time.Second,
+			TLSClientConfig:     &tls.Config{MinVersion: tls.VersionTLS12},
 		}}
 	}
 	c := makeAgentHTTPClient(agentTrust{Fingerprint: fingerprint}, targetURL)

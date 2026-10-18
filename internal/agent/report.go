@@ -58,6 +58,8 @@ type TunnelInfo struct {
 	Drain         string      `json:"drain,omitempty"`
 	Firewall      bool        `json:"firewall"`
 	CDN           bool        `json:"cdn"`
+	ServerName    string      `json:"server_name,omitempty"`
+	AltHost       string      `json:"alt_host,omitempty"`
 	GRE           bool        `json:"gre"`
 	RealSite      bool        `json:"real_site"`
 	ProxyProtocol string      `json:"proxy_protocol"`
@@ -131,6 +133,8 @@ func tunnelInfo(path string, host agentHost) TunnelInfo {
 	ti.LocalIP = cfg.LocalIP
 	ti.Mux = cfg.Mux
 	ti.CDN = cfg.CDN
+	ti.ServerName = cfg.ServerName
+	ti.AltHost = cfg.AltServerName
 	ti.GRE = cfg.GRE
 	ti.RealSite = cfg.RealSite
 	ti.MaxConn = cfg.MaxConn
