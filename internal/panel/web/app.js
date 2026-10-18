@@ -3274,7 +3274,7 @@
         wrap.hidden = false;
         wrap.append(
           h('p', { class: 'good' },
-            `Restore complete: ${r.servers_restored || 0} server(s), ${r.cf_accounts_restored || 0} Cloudflare token(s), ${r.auto_heal_restored || 0} Auto-Heal rule(s), and ${r.local_tunnels_restored || 0} local tunnel(s) restored${r.remote_peers_updated ? ` (${r.remote_peers_updated} remote peer(s) updated to this server's IP)` : ''}.`)
+            `Restore complete: ${r.servers_restored || 0} server(s), ${r.cf_accounts_restored || 0} Cloudflare token(s), ${r.auto_heal_restored || 0} Auto-Heal rule(s), ${r.local_tunnels_restored || 0} local tunnel(s), and ${r.remote_tunnels_joined || 0} remote tunnel endpoint(s) restored${r.remote_peers_updated ? ` (${r.remote_peers_updated} remote peer(s) updated to this server's IP)` : ''}.`)
         );
         if (r.actions_needed && r.actions_needed.length) {
           const ul = h('ul', { class: 'mig-notes-list' });
@@ -3288,8 +3288,7 @@
         }
         lastServers = lastTunnels = '';
         await refresh();
-        loadPanelInfo();
-        loadUpdates();
+        await loadSettings();
         setStatus('Backup restored successfully.');
       } catch (e) {
         $('restore-error').textContent = e.message;
