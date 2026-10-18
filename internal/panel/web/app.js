@@ -2424,10 +2424,10 @@
     $('tn-opt-domain').hidden = !needDomain;
     if (needDomain) ensureTunnelCFHelper();
     $('tn-opt-clean').hidden = !['cdn', 'grpc-cdn'].includes(link);
-    $('tn-opt-stealth').hidden = !['website', 'grpc'].includes(link);
+    $('tn-opt-stealth').hidden = !['website', 'sni-spoof', 'grpc'].includes(link);
     if ($('tn-opt-snispoof')) {
       $('tn-opt-snispoof').hidden = gre;
-      if (link === 'ip-spoof') {
+      if (link === 'ip-spoof' || link === 'sni-spoof') {
         $('tn-snispoof').checked = true;
         $('tn-snispoof').disabled = true;
         $('tn-snispoof-fields').hidden = false;
@@ -2441,7 +2441,7 @@
     }
     if (link === 'grpc' && $('tn-claim').value === 'www.bing.com') $('tn-claim').value = 'www.google.com';
     if (link !== 'grpc' && $('tn-claim').value === 'www.google.com') $('tn-claim').value = 'www.bing.com';
-    const v6ok = !gre && ['plain', 'website', 'grpc', 'kcp'].includes(link) &&
+    const v6ok = !gre && ['plain', 'website', 'sni-spoof', 'grpc', 'kcp'].includes(link) &&
       hasIPv6(serverById($('tn-relay').value)) && hasIPv6(serverById($('tn-foreign').value));
     $('tn-ipv6-row').hidden = !v6ok;
     if (!v6ok) $('tn-ipv6').checked = false;
@@ -2474,6 +2474,66 @@
     });
   }
 
+  if ($('tn-test-snispoof-btn')) {
+    $('tn-test-snispoof-btn').addEventListener('click', async () => {
+      const btn = $('tn-test-snispoof-btn');
+      const out = $('tn-sni-scan-results');
+      const relay = $('tn-relay').value;
+      const foreign = $('tn-foreign').value;
+      const spoofSNI = ($('tn-spoofsni') && $('tn-spoofsni').value.trim()) || 'challenges.cloudflare.com';
+      if (!relay || !foreign) {
+        out.replaceChildren(h('li', { class: 'bad' }, 'Select both a Relay (Iran) server and a Foreign server first.'));
+        return;
+      }
+      btn.disabled = true;
+      btn.textContent = 'Testing Decoy SNI Tunnel…';
+      out.replaceChildren(h('li', null, `Testing Decoy Whitelisted SNI ("${spoofSNI}") tunnel between Relay and Foreign in both Direct and Reverse directions…`));
+      try {
+        const rep = await api('POST', '/api/probe/sni-test', { relay, foreign, spoof_sni: spoofSNI });
+        const rName = rep.relay_name || 'Relay';
+        const fName = rep.foreign_name || 'Foreign';
+        const items = [];
+        const renderDir = (title, modeKey, res) => {
+          if (!res) return;
+          const ok = res.status === 'ok' || res.status === 'degraded';
+          const v6Tag = res.ipv6 ? ' (over IPv6)' : '';
+          const useBtn = ok
+            ? h('button', {
+                type: 'button',
+                class: 'use-port-btn',
+                onclick: () => {
+                  setRadio('tn-mode', modeKey);
+                  if (res.ipv6 && $('tn-ipv6')) $('tn-ipv6').checked = true;
+                  showTunnelOptions();
+                }
+              }, `Use ${modeKey === 'reverse' ? 'Reverse' : 'Direct'} Mode`)
+            : null;
+          items.push(h('li', { class: ok ? 'good' : 'bad' },
+            h('strong', null, `${title}${v6Tag}: `),
+            ok
+              ? `✓ Working! Connected & verified — ${(res.avg_mbps || 0).toFixed(1)} Mbps avg, ${Math.round(res.rtt_ms || 0)} ms ping using decoy SNI "${spoofSNI}".`
+              : `Blocked / Unreachable (${res.error || 'connection failed'}).`,
+            useBtn));
+        };
+        renderDir(`Direct (${rName} → ${fName})`, 'direct', rep.direct);
+        renderDir(`Reverse (${fName} → ${rName})`, 'reverse', rep.reverse);
+        if (rep.summary) {
+          const anyOK = (rep.direct && (rep.direct.status === 'ok' || rep.direct.status === 'degraded')) ||
+                        (rep.reverse && (rep.reverse.status === 'ok' || rep.reverse.status === 'degraded'));
+          items.push(h('li', { class: anyOK ? 'good' : 'warn' },
+            h('strong', null, anyOK ? '✓ Result: ' : 'Note: '),
+            rep.summary));
+        }
+        out.replaceChildren(...items);
+      } catch (e) {
+        out.replaceChildren(h('li', { class: 'bad' }, e.message));
+      } finally {
+        btn.disabled = false;
+        btn.textContent = 'Test Decoy SNI Tunnel (Relay ↔ Foreign)';
+      }
+    });
+  }
+
   if ($('tn-scan-sni-btn')) {
     $('tn-scan-sni-btn').addEventListener('click', async () => {
       const btn = $('tn-scan-sni-btn');
@@ -2488,9 +2548,10 @@
       out.replaceChildren(h('li', null, 'Probing whitelisted SNIs (challenges.cloudflare.com, www.recaptcha.net, security.vercel.com, etc.) from Relay server…'));
       try {
         const rep = await api('POST', '/api/probe/sni-scan', { relay });
-        const list = rep.results || [];
-        if (rep.best_sni && $('tn-spoofsni')) {
-          $('tn-spoofsni').value = rep.best_sni;
+        const list = Array.isArray(rep) ? rep : (rep.results || []);
+        const best = (!Array.isArray(rep) && rep.best_sni) || (list.find((x) => x.reachable) || {}).sni || '';
+        if (best && $('tn-spoofsni')) {
+          $('tn-spoofsni').value = best;
         }
         const items = list.map((item) => {
           const ok = !!item.reachable;
@@ -2507,8 +2568,8 @@
           return h('li', { class: ok ? 'good' : 'bad' },
             h('strong', { class: 'mono' }, item.sni),
             ok
-              ? ` (${item.category || 'Whitelisted'}) — Reachable · ${Math.round(item.rtt_ms || 0)} ms${item.ip ? ' · IP ' + item.ip : ''}`
-              : ` (${item.category || 'Whitelisted'}) — Blocked (${item.error || 'timeout'})`,
+              ? ` — ✓ Reachable · ${Math.round(item.rtt_ms || 0)} ms`
+              : ` — Blocked (${item.error || 'timeout'})`,
             useBtn);
         });
         out.replaceChildren(...(items.length ? items : [h('li', { class: 'warn' }, 'No SNI scan results returned.')]));
@@ -2516,7 +2577,7 @@
         out.replaceChildren(h('li', { class: 'bad' }, e.message));
       } finally {
         btn.disabled = false;
-        btn.textContent = 'Scan Whitelisted SNIs from Relay Server';
+        btn.textContent = 'Scan Best Whitelisted SNIs';
       }
     });
   }
@@ -2534,24 +2595,37 @@
       }
       btn.disabled = true;
       btn.textContent = 'Testing Raw IP Spoofing…';
-      out.replaceChildren(h('li', null, `Sending raw spoofed UDP probes (src=${spoofIP}) in both directions between Relay and Foreign…`));
+      out.replaceChildren(h('li', null, `Testing whether either server can send raw UDP packets with forged Source IP ${spoofIP}…`));
       try {
         const rep = await api('POST', '/api/probe/spoof-test', { relay, foreign, spoof_ip: spoofIP });
+        const rName = rep.relay_name || 'Relay (Iran)';
+        const fName = rep.foreign_name || 'Foreign';
+        const f2rSpoof = !!(rep.foreign_to_relay_spoof_ok || rep.foreign_can_spoof);
+        const f2rNorm = !!(rep.foreign_to_relay_normal_ok || (rep.foreign_to_relay && rep.foreign_to_relay.normal_received > 0));
+        const r2fSpoof = !!(rep.relay_to_foreign_spoof_ok || rep.relay_can_spoof);
+        const r2fNorm = !!(rep.relay_to_foreign_normal_ok || (rep.relay_to_foreign && rep.relay_to_foreign.normal_received > 0));
         const items = [];
-        const f2rOk = !!rep.foreign_can_spoof;
-        const r2fOk = !!rep.relay_can_spoof;
-        items.push(h('li', { class: f2rOk ? 'good' : (rep.foreign_to_relay && rep.foreign_to_relay.normal_received > 0 ? 'warn' : 'bad') },
-          h('strong', null, 'Foreign → Relay (Iran): '),
-          f2rOk
-            ? `Spoofed Source IP (${spoofIP}) arrived intact (${rep.foreign_to_relay.spoof_received} packets)! Foreign VPS supports outbound IP spoofing.`
-            : `Spoofed packets dropped by Foreign VPS provider (BCP38 filter), normal UDP arrived (${(rep.foreign_to_relay && rep.foreign_to_relay.normal_received) || 0} packets).`));
-        items.push(h('li', { class: r2fOk ? 'good' : (rep.relay_to_foreign && rep.relay_to_foreign.normal_received > 0 ? 'warn' : 'bad') },
-          h('strong', null, 'Relay (Iran) → Foreign: '),
-          r2fOk
-            ? `Spoofed Source IP (${spoofIP}) arrived intact (${rep.relay_to_foreign.spoof_received} packets)! Relay ISP supports outbound IP spoofing.`
-            : `Spoofed packets dropped by Relay ISP (BCP38 filter), normal UDP arrived (${(rep.relay_to_foreign && rep.relay_to_foreign.normal_received) || 0} packets).`));
+
+        items.push(h('li', { class: r2fSpoof ? 'good' : (r2fNorm ? 'warn' : 'bad') },
+          h('strong', null, `${rName} → ${fName} (Relay → Foreign): `),
+          r2fSpoof
+            ? `✓ Supported! Spoofed UDP packets pretending to be ${spoofIP} sent from ${rName} arrived at ${fName}.`
+            : (r2fNorm
+                ? `Filtered by datacenter — ${rName}'s provider drops forged source IPs, but normal UDP works (automatic fallback active).`
+                : `UDP test packets from ${rName} did not reach ${fName} over IPv4.`)));
+
+        items.push(h('li', { class: f2rSpoof ? 'good' : (f2rNorm ? 'warn' : 'bad') },
+          h('strong', null, `${fName} → ${rName} (Foreign → Relay): `),
+          f2rSpoof
+            ? `✓ Supported! Spoofed UDP packets pretending to be ${spoofIP} sent from ${fName} arrived at ${rName}.`
+            : (f2rNorm
+                ? `Filtered by datacenter — ${fName}'s provider drops forged source IPs, but normal UDP works (automatic fallback active).`
+                : `Filtered in transit — UDP packets from ${fName} did not reach ${rName} over IPv4 (return traffic uses automatic fallback).`)));
+
         if (rep.summary) {
-          items.push(h('li', { class: (f2rOk || r2fOk) ? 'good' : 'warn' }, h('strong', null, 'Verdict: '), rep.summary));
+          items.push(h('li', { class: (f2rSpoof || r2fSpoof) ? 'good' : 'warn' },
+            h('strong', null, (f2rSpoof || r2fSpoof) ? '✓ Ready to Use: ' : 'Recommendation: '),
+            rep.summary));
         }
         out.replaceChildren(...items);
       } catch (e) {
@@ -2615,7 +2689,7 @@
     if (!cand) return;
     $('tn-gre').checked = false;
     setRadio('tn-mode', cand.mode === 'reverse' ? 'reverse' : 'direct');
-    setRadio('tn-link', cand.ip_spoof ? 'ip-spoof' : (cand.link || 'website'));
+    setRadio('tn-link', cand.ip_spoof ? 'ip-spoof' : (cand.sni_spoof ? 'sni-spoof' : (cand.link || 'website')));
     $('tn-stealth').checked = !!cand.stealth;
     $('tn-webheader').checked = !!cand.web_header;
     $('tn-ipv6').checked = !!cand.ipv6;
@@ -2882,7 +2956,7 @@
     const link = gre ? 'plain' : radio('tn-link');
     const shared = radio('tn-shared') === 'shared';
     const ipSpoof = !gre && link === 'ip-spoof';
-    const sniSpoof = !gre && (ipSpoof || ($('tn-snispoof') && $('tn-snispoof').checked));
+    const sniSpoof = !gre && (ipSpoof || link === 'sni-spoof' || ($('tn-snispoof') && $('tn-snispoof').checked));
     return {
       name: $('tn-name').value.trim(),
       relay: $('tn-relay').value,
@@ -2892,7 +2966,7 @@
       server_name: $('tn-claim').value.trim(),
       domain: $('tn-domain').value.trim(),
       clean_ips: $('tn-cleanips').value.replace(/\s+/g, ''),
-      stealth: $('tn-stealth').checked,
+      stealth: link === 'sni-spoof' || $('tn-stealth').checked,
       web_header: !gre && $('tn-webheader').checked,
       web_host: $('tn-webhost').value.trim(),
       real_site: $('tn-realsite').checked,

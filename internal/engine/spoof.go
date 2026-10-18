@@ -801,7 +801,7 @@ type SpoofProbeSendResult struct {
 // carrying the given token.
 func RunSpoofProbeListener(ctx context.Context, listenAddr, token string, timeout time.Duration) SpoofProbeListenResult {
 	if timeout <= 0 {
-		timeout = 3 * time.Second
+		timeout = 4 * time.Second
 	}
 	udpAddr, err := net.ResolveUDPAddr("udp4", listenAddr)
 	if err != nil {
@@ -820,6 +820,7 @@ func RunSpoofProbeListener(ctx context.Context, listenAddr, token string, timeou
 	normTag := "PB-SPOOF-PROBE:" + token + ":NORMAL"
 
 	var res SpoofProbeListenResult
+	var shortened bool
 	buf := make([]byte, 512)
 	for time.Now().Before(deadline) {
 		if ctx.Err() != nil {
@@ -844,6 +845,14 @@ func RunSpoofProbeListener(ctx context.Context, listenAddr, token string, timeou
 		}
 		if res.ReceivedSpoofed && res.ReceivedNormal {
 			break
+		}
+		if (res.ReceivedSpoofed || res.ReceivedNormal) && !shortened {
+			shortened = true
+			grace := time.Now().Add(450 * time.Millisecond)
+			if grace.Before(deadline) {
+				deadline = grace
+				_ = conn.SetReadDeadline(deadline)
+			}
 		}
 	}
 	return res
@@ -871,36 +880,39 @@ func SendSpoofProbePackets(targetAddr, spoofIPStr, token string) SpoofProbeSendR
 	rawPayload := []byte("PB-SPOOF-PROBE:" + token + ":RAW")
 	normPayload := []byte("PB-SPOOF-PROBE:" + token + ":NORMAL")
 
-	rawFD, err := openRawSpoofSocket()
-	if err != nil {
-		res.RawError = err.Error()
+	rawFD, rawErr := openRawSpoofSocket()
+	if rawErr != nil {
+		res.RawError = rawErr.Error()
+		rawFD = -1
 	} else {
 		defer closeRawSpoofSocket(rawFD)
-		var sendErr error
-		for i := 0; i < 3; i++ {
+	}
+
+	uConn, uErr := net.DialUDP("udp4", nil, dstAddr)
+	if uErr != nil {
+		res.Error = uErr.Error()
+		return res
+	}
+	defer uConn.Close()
+
+	var sendErr error
+	for i := 0; i < 5; i++ {
+		if rawFD >= 0 {
 			if err := sendRawSpoofedUDP(rawFD, spoofIP, dstAddr.IP, 44300+i, dstAddr.Port, 64, rawPayload); err != nil {
 				sendErr = err
 			} else {
 				res.RawSent = true
 			}
-			time.Sleep(15 * time.Millisecond)
 		}
-		if !res.RawSent && sendErr != nil {
-			res.RawError = sendErr.Error()
-		}
-	}
-
-	uConn, err := net.DialUDP("udp4", nil, dstAddr)
-	if err != nil {
-		res.Error = err.Error()
-		return res
-	}
-	defer uConn.Close()
-	for i := 0; i < 3; i++ {
 		if _, err := uConn.Write(normPayload); err == nil {
 			res.NormalSent = true
 		}
-		time.Sleep(15 * time.Millisecond)
+		if i < 4 {
+			time.Sleep(50 * time.Millisecond)
+		}
+	}
+	if rawFD >= 0 && !res.RawSent && sendErr != nil {
+		res.RawError = sendErr.Error()
 	}
 	return res
 }

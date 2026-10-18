@@ -68,6 +68,7 @@ func (p *Panel) routes() http.Handler {
 	mux.HandleFunc("POST /api/tunnels/speedtest", p.withAuth(p.handleSpeedtestTunnel))
 	mux.HandleFunc("POST /api/tunnels/probe", p.withAuth(p.handleProbeTunnel))
 	mux.HandleFunc("POST /api/probe/sni-scan", p.withAuth(p.handleProbeSNIScan))
+	mux.HandleFunc("POST /api/probe/sni-test", p.withAuth(p.handleProbeSNITest))
 	mux.HandleFunc("POST /api/probe/spoof-test", p.withAuth(p.handleProbeSpoofTest))
 	mux.HandleFunc("POST /api/tunnels/autoheal", p.withAuth(p.handleSetTunnelAutoHeal))
 	mux.HandleFunc("POST /api/tunnels/autoheal/trigger", p.withAuth(p.handleTriggerTunnelAutoHeal))
@@ -809,6 +810,24 @@ func (p *Panel) handleProbeSNIScan(w http.ResponseWriter, r *http.Request, _ aut
 		return
 	}
 	rep, err := p.scanRelaySNIs(r.Context(), strings.TrimSpace(req.Relay), req.SNIs)
+	if err != nil {
+		writeErr(w, http.StatusUnprocessableEntity, capitalise(plainAgentError(err))+".")
+		return
+	}
+	writeJSON(w, http.StatusOK, rep)
+}
+
+func (p *Panel) handleProbeSNITest(w http.ResponseWriter, r *http.Request, _ authed) {
+	agent.ExtendDeadlines(w, 2*time.Minute)
+	var req struct {
+		Relay    string `json:"relay"`
+		Foreign  string `json:"foreign"`
+		SpoofSNI string `json:"spoof_sni"`
+	}
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	rep, err := p.testSNISpoofTunnel(r.Context(), strings.TrimSpace(req.Relay), strings.TrimSpace(req.Foreign), strings.TrimSpace(req.SpoofSNI))
 	if err != nil {
 		writeErr(w, http.StatusUnprocessableEntity, capitalise(plainAgentError(err))+".")
 		return

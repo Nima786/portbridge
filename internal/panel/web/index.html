@@ -679,13 +679,24 @@
           </label>
 
           <label class="choice-card">
+            <input type="radio" name="tn-link" value="sni-spoof">
+            <div class="choice-body">
+              <div class="choice-top">
+                <strong>Decoy Whitelisted SNI Spoof</strong>
+                <span class="pill-tag tag-good">Works on All VPS</span>
+              </div>
+              <span class="choice-desc">Injects a decoy TLS 1.3 ClientHello with a whitelisted SNI (Cloudflare Turnstile / reCAPTCHA) so DPI whitelists the flow while the peer drops the decoy.</span>
+            </div>
+          </label>
+
+          <label class="choice-card">
             <input type="radio" name="tn-link" value="ip-spoof">
             <div class="choice-body">
               <div class="choice-top">
                 <strong>Source IP + Whitelisted SNI Spoof</strong>
-                <span class="pill-tag tag-accent">Anti-Lockdown</span>
+                <span class="pill-tag tag-accent">Raw IP + SNI</span>
               </div>
-              <span class="choice-desc">Forges a whitelisted source IP (Cloudflare Challenges / reCAPTCHA) + decoy TLS ClientHello over KCP/UDP. Supports asymmetric &amp; mutual VPS spoofing.</span>
+              <span class="choice-desc">Forges a whitelisted source IP (104.18.4.130) + decoy TLS ClientHello over KCP/UDP. Requires at least one VPS that allows raw outbound IP spoofing.</span>
             </div>
           </label>
 
@@ -791,7 +802,8 @@
               </div>
             </div>
             <div class="actions left port-check-bar">
-              <button type="button" id="tn-scan-sni-btn">Scan Whitelisted SNIs from Relay Server</button>
+              <button type="button" id="tn-test-snispoof-btn">Test Decoy SNI Tunnel (Relay ↔ Foreign)</button>
+              <button type="button" id="tn-scan-sni-btn">Scan Best Whitelisted SNIs</button>
             </div>
             <ul id="tn-sni-scan-results" class="ports-result" aria-live="polite"></ul>
           </div>

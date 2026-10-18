@@ -51,6 +51,8 @@ type heard struct {
 	at         time.Time // last time it answered
 	tried      time.Time
 	seededHome bool
+	lastURL    string
+	preferHub  bool
 }
 
 // fleet is every server, and what was last heard from each.
@@ -61,6 +63,27 @@ type fleet struct {
 }
 
 func newFleet(p *Panel) *fleet { return &fleet{p: p, by: map[string]*heard{}} }
+
+func (f *fleet) recordPath(id, url string, hub bool) {
+	f.mu.Lock()
+	h := f.by[id]
+	if h == nil {
+		h = &heard{}
+		f.by[id] = h
+	}
+	h.lastURL = url
+	h.preferHub = hub
+	f.mu.Unlock()
+}
+
+func (f *fleet) preferredPath(id string) (url string, hub bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if h := f.by[id]; h != nil {
+		return h.lastURL, h.preferHub
+	}
+	return "", false
+}
 
 // call sends one request to a server's agent and returns its answer.
 func (f *fleet) call(ctx context.Context, srv Server, method, path string, body []byte) (int, []byte, error) {
@@ -144,8 +167,20 @@ func (f *fleet) callLimit(ctx context.Context, srv Server, method, path string, 
 		perTry = 6 * time.Second
 	}
 
+	prefURL, prefHub := f.preferredPath(srv.ID)
+	if prefHub && f.p.hub.connected(srv.ID) {
+		if st, rb, herr := f.p.hub.do(ctx, srv.ID, method, path, body); herr == nil {
+			return st, rb, nil
+		}
+	} else if prefURL != "" && slices.Contains(v6URLs, prefURL) {
+		if st, rb, errPref := tryDirectURL(prefURL, perTry); errPref == nil {
+			return st, rb, nil
+		}
+	}
+
 	status, b, derr := tryDirectURL(srv.AgentURL, perTry)
 	if derr == nil {
+		f.recordPath(srv.ID, srv.AgentURL, false)
 		return status, b, nil
 	}
 	if strings.Contains(derr.Error(), "does not match the saved fingerprint") {
@@ -155,6 +190,7 @@ func (f *fleet) callLimit(ctx context.Context, srv Server, method, path string, 
 	for _, u := range v6URLs {
 		st, rb, err6 := tryDirectURL(u, perTry)
 		if err6 == nil {
+			f.recordPath(srv.ID, u, false)
 			return st, rb, nil
 		}
 		if strings.Contains(err6.Error(), "does not match the saved fingerprint") {
@@ -164,6 +200,7 @@ func (f *fleet) callLimit(ctx context.Context, srv Server, method, path string, 
 
 	if f.p.hub.connected(srv.ID) {
 		if st, rb, herr := f.p.hub.do(ctx, srv.ID, method, path, body); herr == nil {
+			f.recordPath(srv.ID, "", true)
 			return st, rb, nil
 		}
 	}
