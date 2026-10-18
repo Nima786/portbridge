@@ -127,6 +127,21 @@ func buildOriginConf(p *PairingData, secretFile, certFile, keyFile string) strin
 		fmt.Fprintf(&b, "alt_target = %s\n", net.JoinHostPort(p.AltHost, p.TunnelPort))
 		fmt.Fprintf(&b, "alt_server_name = %s\n", p.AltHost)
 	}
+	if p.SNISpoof == "on" {
+		fmt.Fprintf(&b, "sni_spoof = on\n")
+		if p.SpoofSNI != "" {
+			fmt.Fprintf(&b, "spoof_sni = %s\n", p.SpoofSNI)
+		}
+	}
+	if p.IPSpoof == "on" {
+		fmt.Fprintf(&b, "ip_spoof = on\n")
+		if p.SpoofIP != "" {
+			fmt.Fprintf(&b, "spoof_ip = %s\n", p.SpoofIP)
+		}
+		if p.SpoofSNI != "" && p.SNISpoof != "on" {
+			fmt.Fprintf(&b, "spoof_sni = %s\n", p.SpoofSNI)
+		}
+	}
 	if p.ProxyProtocol == "v1" || p.ProxyProtocol == "v2" {
 		fmt.Fprintf(&b, "\n# Tell the service each user's real address; it must be set to expect it.\n")
 		fmt.Fprintf(&b, "proxy_protocol = %s\n", p.ProxyProtocol)

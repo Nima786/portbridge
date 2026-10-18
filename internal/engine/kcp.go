@@ -36,6 +36,7 @@ const (
 
 type kcpConn struct {
 	*kcp.UDPSession
+	ownConn     io.Closer
 	closed      atomic.Bool
 	writeClosed atomic.Bool
 	remoteEOF   atomic.Bool
@@ -47,8 +48,12 @@ type kcpConn struct {
 	wmu sync.Mutex
 }
 
-func newKCPConn(sess *kcp.UDPSession) net.Conn {
-	return &kcpConn{UDPSession: sess}
+func newKCPConn(sess *kcp.UDPSession, ownConn ...io.Closer) net.Conn {
+	var c io.Closer
+	if len(ownConn) > 0 {
+		c = ownConn[0]
+	}
+	return &kcpConn{UDPSession: sess, ownConn: c}
 }
 
 func (c *kcpConn) isKCP() bool {
@@ -172,7 +177,11 @@ func (c *kcpConn) Close() error {
 		if c.wrote.Load() {
 			time.Sleep(kcpLinger)
 		}
-		return c.UDPSession.Close()
+		err := c.UDPSession.Close()
+		if c.ownConn != nil {
+			_ = c.ownConn.Close()
+		}
+		return err
 	}
 	return nil
 }
@@ -194,6 +203,35 @@ func kcpDial(addr string, cfg *Config) (net.Conn, error) {
 		parityShards = cfg.KCPParityShards
 	}
 
+	if cfg.IPSpoof {
+		raddr, err := net.ResolveUDPAddr("udp4", addr)
+		if err != nil {
+			return nil, fmt.Errorf("resolving kcp spoof peer: %w", err)
+		}
+		uConn, err := net.ListenUDP("udp4", nil)
+		if err != nil {
+			return nil, fmt.Errorf("opening kcp spoof udp socket: %w", err)
+		}
+		_ = uConn.SetReadBuffer(4 * 1024 * 1024)
+		_ = uConn.SetWriteBuffer(4 * 1024 * 1024)
+		pConn, err := newSpoofPacketConn(uConn, cfg, raddr)
+		if err != nil {
+			_ = uConn.Close()
+			return nil, err
+		}
+		sess, err := kcp.NewConn(addr, block, dataShards, parityShards, pConn)
+		if err != nil {
+			_ = pConn.Close()
+			return nil, fmt.Errorf("dialing spoofed kcp: %w", err)
+		}
+		tuneKCP(sess, cfg)
+		return newKCPConn(sess, pConn), nil
+	}
+
+	if cfg.SNISpoof {
+		sendUDPDecoyClientHello(addr, cfg.EffectiveSpoofSNI(), cfg.SNISpoofTTL)
+	}
+
 	sess, err := kcp.DialWithOptions(addr, block, dataShards, parityShards)
 	if err != nil {
 		return nil, fmt.Errorf("dialing kcp: %w", err)
@@ -201,6 +239,26 @@ func kcpDial(addr string, cfg *Config) (net.Conn, error) {
 
 	tuneKCP(sess, cfg)
 	return newKCPConn(sess), nil
+}
+
+func sendUDPDecoyClientHello(addr, sni string, ttl int) {
+	raddr, err := net.ResolveUDPAddr("udp4", addr)
+	if err != nil || raddr == nil || raddr.IP == nil {
+		return
+	}
+	if ttl <= 0 {
+		ttl = 5
+	}
+	rawFD, err := openRawSpoofSocket()
+	if err != nil {
+		return
+	}
+	defer closeRawSpoofSocket(rawFD)
+	srcIP := detectOutboundIPv4(raddr.IP)
+	if srcIP == nil {
+		return
+	}
+	_ = sendRawSpoofedUDP(rawFD, srcIP, raddr.IP, 54321, raddr.Port, ttl, BuildDecoyClientHello(sni))
 }
 
 // What KCP does when nothing is set. The window used to be 128 packets, which on
@@ -286,6 +344,34 @@ func kcpListen(addr string, cfg *Config) (net.Listener, error) {
 		parityShards = cfg.KCPParityShards
 	}
 
+	if cfg.IPSpoof {
+		laddr, err := net.ResolveUDPAddr("udp4", addr)
+		if err != nil {
+			return nil, fmt.Errorf("resolving kcp spoof listen addr: %w", err)
+		}
+		uConn, err := net.ListenUDP("udp4", laddr)
+		if err != nil {
+			return nil, fmt.Errorf("listening kcp spoof udp: %w", err)
+		}
+		_ = uConn.SetReadBuffer(4 * 1024 * 1024)
+		_ = uConn.SetWriteBuffer(4 * 1024 * 1024)
+		var defPeer *net.UDPAddr
+		if ip := net.ParseIP(cfg.PeerIP); ip != nil && ip.To4() != nil {
+			defPeer = &net.UDPAddr{IP: ip.To4()}
+		}
+		pConn, err := newSpoofPacketConn(uConn, cfg, defPeer)
+		if err != nil {
+			_ = uConn.Close()
+			return nil, err
+		}
+		ln, err := kcp.ServeConn(block, dataShards, parityShards, pConn)
+		if err != nil {
+			_ = pConn.Close()
+			return nil, fmt.Errorf("serving spoofed kcp: %w", err)
+		}
+		return &kcpListenerWrap{Listener: ln, cfg: cfg, ownConn: pConn}, nil
+	}
+
 	ln, err := kcp.ListenWithOptions(addr, block, dataShards, parityShards)
 	if err != nil {
 		return nil, fmt.Errorf("listening kcp: %w", err)
@@ -297,7 +383,8 @@ func kcpListen(addr string, cfg *Config) (net.Listener, error) {
 
 type kcpListenerWrap struct {
 	*kcp.Listener
-	cfg *Config
+	cfg     *Config
+	ownConn io.Closer
 }
 
 func (l *kcpListenerWrap) Accept() (net.Conn, error) {
@@ -307,4 +394,12 @@ func (l *kcpListenerWrap) Accept() (net.Conn, error) {
 	}
 	tuneKCP(sess, l.cfg)
 	return newKCPConn(sess), nil
+}
+
+func (l *kcpListenerWrap) Close() error {
+	err := l.Listener.Close()
+	if l.ownConn != nil {
+		_ = l.ownConn.Close()
+	}
+	return err
 }

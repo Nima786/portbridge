@@ -156,7 +156,11 @@ func TestPairingCodeFieldsMatch(t *testing.T) {
 
 	// Lines the engine understands that the menu never writes, and why.
 	engineOnly := map[string]string{
-		"ech": "the engine turns it on by itself for a CDN route; nothing in the menu sets it",
+		"ech":       "the engine turns it on by itself for a CDN route; nothing in the menu sets it",
+		"sni_spoof": "configured from the web panel and engine",
+		"spoof_sni": "configured from the web panel and engine",
+		"ip_spoof":  "configured from the web panel and engine",
+		"spoof_ip":  "configured from the web panel and engine",
 	}
 
 	for k := range written {

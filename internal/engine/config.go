@@ -200,6 +200,19 @@ type Config struct {
 	RealSite  bool
 	CoverSite string
 
+	// SNISpoof injects a decoy TLS 1.3 ClientHello carrying SpoofSNI (a whitelisted
+	// hostname such as challenges.cloudflare.com or www.recaptcha.net) right after
+	// the TCP handshake so middlebox DPI whitelists the flow while the destination
+	// server drops the decoy segment.
+	SNISpoof    bool
+	SpoofSNI    string
+	SNISpoofTTL int
+
+	// IPSpoof sends and receives KCP/UDP tunnel packets using a forged whitelisted
+	// source IPv4 address (SpoofIP, default 104.18.4.130) via raw sockets.
+	IPSpoof bool
+	SpoofIP string
+
 	// ProxyProtocol passes each user's real address to the service in the
 	// standard PROXY protocol header: proxyProtocolOff, or the version written
 	// (1 or 2). On the edge any version means "send users' addresses across"; on
@@ -220,6 +233,22 @@ type Config struct {
 	tlsClients  map[string]*tls.Config
 	utlsClients map[string]*utls.Config
 	utlsCache   utls.ClientSessionCache
+}
+
+// EffectiveSpoofSNI returns SpoofSNI when set, or DefaultSpoofSNI otherwise.
+func (c *Config) EffectiveSpoofSNI() string {
+	if strings.TrimSpace(c.SpoofSNI) != "" {
+		return strings.TrimSpace(c.SpoofSNI)
+	}
+	return DefaultSpoofSNI
+}
+
+// EffectiveSpoofIP returns SpoofIP when set, or DefaultSpoofIP otherwise.
+func (c *Config) EffectiveSpoofIP() string {
+	if strings.TrimSpace(c.SpoofIP) != "" {
+		return strings.TrimSpace(c.SpoofIP)
+	}
+	return DefaultSpoofIP
 }
 
 // effectiveServerName falls back to the peer address when no name was given, so
@@ -688,6 +717,30 @@ func (c *Config) Set(key, val string) error {
 				c.CleanIPs = append(c.CleanIPs, p)
 			}
 		}
+	case "sni_spoof":
+		switch strings.ToLower(strings.TrimSpace(val)) {
+		case "on", "yes", "true":
+			c.SNISpoof = true
+		case "off", "no", "false":
+			c.SNISpoof = false
+		default:
+			return fmt.Errorf("sni_spoof must be on or off, got %q", val)
+		}
+	case "spoof_sni":
+		c.SpoofSNI = strings.TrimSpace(val)
+	case "sni_spoof_ttl":
+		return num(&c.SNISpoofTTL)
+	case "ip_spoof":
+		switch strings.ToLower(strings.TrimSpace(val)) {
+		case "on", "yes", "true":
+			c.IPSpoof = true
+		case "off", "no", "false":
+			c.IPSpoof = false
+		default:
+			return fmt.Errorf("ip_spoof must be on or off, got %q", val)
+		}
+	case "spoof_ip":
+		c.SpoofIP = strings.TrimSpace(val)
 	default:
 		return fmt.Errorf("unknown setting %q", key)
 	}
@@ -730,6 +783,29 @@ func (c *Config) Validate() error {
 	}
 	if c.HTTPHost != "" && !HostnameRe.MatchString(c.HTTPHost) {
 		return fmt.Errorf("http_host %q is not a hostname (letters, digits, dots and dashes)", c.HTTPHost)
+	}
+	if c.SpoofSNI != "" && !HostnameRe.MatchString(c.SpoofSNI) {
+		return fmt.Errorf("spoof_sni %q is not a hostname (letters, digits, dots and dashes)", c.SpoofSNI)
+	}
+	if c.SNISpoofTTL < 0 || c.SNISpoofTTL > 64 {
+		return fmt.Errorf("sni_spoof_ttl must be between 0 and 64, got %d", c.SNISpoofTTL)
+	}
+	if c.SpoofIP != "" {
+		ip := net.ParseIP(c.SpoofIP)
+		if ip == nil || ip.To4() == nil {
+			return fmt.Errorf("spoof_ip %q must be a valid IPv4 address", c.SpoofIP)
+		}
+	}
+	if c.SNISpoof && c.SpoofSNI == "" {
+		c.SpoofSNI = DefaultSpoofSNI
+	}
+	if c.IPSpoof {
+		if c.SpoofIP == "" {
+			c.SpoofIP = DefaultSpoofIP
+		}
+		if c.SpoofSNI == "" {
+			c.SpoofSNI = DefaultSpoofSNI
+		}
 	}
 	if c.TLSFragmentSize <= 0 {
 		c.TLSFragmentSize = 40

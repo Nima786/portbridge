@@ -83,6 +83,11 @@ load() {
     role=$(read_conf "$conf" role)
     tunnel_addr=$(read_conf "$conf" tunnel_addr)
     PEER=$(read_conf "$conf" peer_ip)
+    IP_SPOOF=$(read_conf "$conf" ip_spoof)
+    SPOOF_IP=$(read_conf "$conf" spoof_ip)
+    if [ "$IP_SPOOF" = on ] && [ -z "$SPOOF_IP" ]; then
+        SPOOF_IP=104.18.4.130
+    fi
     TRANSPORT=$(read_conf "$conf" transport)
     [ -n "$TRANSPORT" ] || TRANSPORT=plain
     # Missing means on: tunnels made before this setting existed stay protected.
@@ -473,6 +478,9 @@ firewall_apply() {
     else
         add_rule iptables "$name" DROP
         add_rule iptables "$name" ACCEPT 127.0.0.1
+        if [ "$IP_SPOOF" = on ] && [ -n "$SPOOF_IP" ] && valid_ipv4 "$SPOOF_IP" && [ "$SPOOF_IP" != "$PEER" ]; then
+            add_rule iptables "$name" ACCEPT "$SPOOF_IP"
+        fi
         add_rule iptables "$name" ACCEPT "$PEER"
         # The port is bound on IPv6 too. The peer is recorded as IPv4, so close v6
         # rather than leaving an unguarded way in.

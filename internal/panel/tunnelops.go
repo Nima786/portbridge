@@ -126,6 +126,10 @@ type createRequest struct {
 	WebHost    string `json:"web_host"`
 	RealSite   bool   `json:"real_site"`
 	GRE        bool   `json:"gre"`
+	SNISpoof   bool   `json:"sni_spoof"`
+	SpoofSNI   string `json:"spoof_sni"`
+	IPSpoof    bool   `json:"ip_spoof"`
+	SpoofIP    string `json:"spoof_ip"`
 	IPv6       bool   `json:"ipv6"`
 
 	Shared      bool `json:"shared"`
@@ -242,6 +246,9 @@ func (p *Panel) toSpec(r createRequest) (agent.EdgeSpec, error) {
 		}
 	case "kcp":
 		s.Transport = "kcp"
+	case "ip-spoof":
+		s.Transport = "kcp"
+		s.IPSpoof = "on"
 	default:
 		return s, errors.New("choose how the link between the servers should look")
 	}
@@ -253,6 +260,26 @@ func (p *Panel) toSpec(r createRequest) (agent.EdgeSpec, error) {
 	}
 	if r.GRE {
 		s.GRE = "on"
+	} else {
+		if r.SNISpoof {
+			s.SNISpoof = "on"
+			s.SpoofSNI = strings.TrimSpace(r.SpoofSNI)
+			if s.SpoofSNI == "" {
+				s.SpoofSNI = engine.DefaultSpoofSNI
+			}
+		}
+		if r.IPSpoof || s.IPSpoof == "on" {
+			s.Transport = "kcp"
+			s.IPSpoof = "on"
+			s.SpoofIP = strings.TrimSpace(r.SpoofIP)
+			if s.SpoofIP == "" {
+				s.SpoofIP = engine.DefaultSpoofIP
+			}
+			s.SpoofSNI = strings.TrimSpace(r.SpoofSNI)
+			if s.SpoofSNI == "" {
+				s.SpoofSNI = engine.DefaultSpoofSNI
+			}
+		}
 	}
 	if r.Shared {
 		s.Mux, s.MuxLinks = "on", r.SharedLinks
@@ -1324,4 +1351,169 @@ func (p *Panel) probeBetweenServers(parent context.Context, relayID, foreignID, 
 
 	results := append(directRes, reverseRes...)
 	return p.finishProbeSession(*sess, results), nil
+}
+
+func (p *Panel) scanRelaySNIs(parent context.Context, relayID string, candidates []string) ([]engine.SNIScanResult, error) {
+	rv, rok := p.viewOf(relayID)
+	if !rok {
+		return nil, errors.New("choose a Relay (Iran) server first")
+	}
+	if !rv.Online {
+		return nil, fmt.Errorf("Relay server %s is currently offline", rv.Name)
+	}
+	ctx, cancel := context.WithTimeout(parent, 25*time.Second)
+	defer cancel()
+	var rep struct {
+		OK      bool                   `json:"ok"`
+		Results []engine.SNIScanResult `json:"results"`
+		Error   string                 `json:"error"`
+	}
+	_, err := p.callJSON(ctx, relayID, "/api/probe/sni-scan", map[string]any{
+		"candidates": candidates,
+	}, &rep)
+	if err != nil {
+		if errors.Is(err, errTooOld) {
+			return nil, fmt.Errorf("%s is running an older PortBridge release; update it first to scan whitelisted SNIs", p.serverName(relayID))
+		}
+		return nil, fmt.Errorf("%s: %s", p.serverName(relayID), plainAgentError(err))
+	}
+	if !rep.OK {
+		return nil, errors.New(rep.Error)
+	}
+	return rep.Results, nil
+}
+
+type spoofTestReport struct {
+	SpoofIP                string `json:"spoof_ip"`
+	ForeignToRelaySpoofOK  bool   `json:"foreign_to_relay_spoof_ok"`
+	ForeignToRelayNormalOK bool   `json:"foreign_to_relay_normal_ok"`
+	RelayToForeignSpoofOK  bool   `json:"relay_to_foreign_spoof_ok"`
+	RelayToForeignNormalOK bool   `json:"relay_to_foreign_normal_ok"`
+	ForeignRawError        string `json:"foreign_raw_error,omitempty"`
+	RelayRawError          string `json:"relay_raw_error,omitempty"`
+	Mode                   string `json:"mode"` // "symmetric", "asymmetric-foreign", "asymmetric-relay", "filtered"
+	Summary                string `json:"summary"`
+}
+
+func (p *Panel) testSpoofSupport(parent context.Context, relayID, foreignID, spoofIP string) (*spoofTestReport, error) {
+	rv, rok := p.viewOf(relayID)
+	fv, fok := p.viewOf(foreignID)
+	if !rok || !fok {
+		return nil, errors.New("choose both the Relay (Iran) and Foreign servers first")
+	}
+	if !rv.Online {
+		return nil, fmt.Errorf("Relay server %s is currently offline", rv.Name)
+	}
+	if !fv.Online {
+		return nil, fmt.Errorf("Foreign server %s is currently offline", fv.Name)
+	}
+	relayV4, _ := serverAddresses(rv)
+	foreignV4, _ := serverAddresses(fv)
+	if relayV4 == "" || foreignV4 == "" {
+		return nil, errors.New("both servers must have public IPv4 addresses for IP spoofing")
+	}
+	spoofIP = strings.TrimSpace(spoofIP)
+	if spoofIP == "" {
+		spoofIP = engine.DefaultSpoofIP
+	}
+	if ip := net.ParseIP(spoofIP); ip == nil || ip.To4() == nil {
+		return nil, fmt.Errorf("spoof IP %q must be a valid IPv4 address", spoofIP)
+	}
+
+	runDir := func(senderID, receiverID, receiverIP string, port int) (engine.SpoofProbeListenResult, engine.SpoofProbeSendResult, error) {
+		token := fmt.Sprintf("%d", time.Now().UnixNano())
+		var (
+			wg      sync.WaitGroup
+			lRes    engine.SpoofProbeListenResult
+			sRes    engine.SpoofProbeSendResult
+			lCallEr error
+			sCallEr error
+		)
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			lctx, lcancel := context.WithTimeout(parent, 6*time.Second)
+			defer lcancel()
+			var rep struct {
+				OK     bool                          `json:"ok"`
+				Result engine.SpoofProbeListenResult `json:"result"`
+				Error  string                        `json:"error"`
+			}
+			_, lCallEr = p.callJSON(lctx, receiverID, "/api/probe/spoof-listen", map[string]any{
+				"listen_addr": fmt.Sprintf("0.0.0.0:%d", port),
+				"token":       token,
+				"timeout_ms":  2800,
+			}, &rep)
+			lRes = rep.Result
+		}()
+		go func() {
+			defer wg.Done()
+			time.Sleep(350 * time.Millisecond)
+			sctx, scancel := context.WithTimeout(parent, 5*time.Second)
+			defer scancel()
+			var rep struct {
+				OK     bool                        `json:"ok"`
+				Result engine.SpoofProbeSendResult `json:"result"`
+				Error  string                      `json:"error"`
+			}
+			_, sCallEr = p.callJSON(sctx, senderID, "/api/probe/spoof-send", map[string]any{
+				"target_addr": net.JoinHostPort(receiverIP, strconv.Itoa(port)),
+				"spoof_ip":    spoofIP,
+				"token":       token,
+			}, &rep)
+			sRes = rep.Result
+		}()
+		wg.Wait()
+		if lCallEr != nil {
+			return lRes, sRes, lCallEr
+		}
+		if sCallEr != nil {
+			return lRes, sRes, sCallEr
+		}
+		return lRes, sRes, nil
+	}
+
+	// Direction 1: Foreign -> Relay (Iran)
+	f2rListen, f2rSend, err1 := runDir(foreignID, relayID, relayV4, 24433)
+	if err1 != nil {
+		if errors.Is(err1, errTooOld) {
+			return nil, errors.New("one or both servers are running an older PortBridge release; update both servers first")
+		}
+		return nil, fmt.Errorf("testing Foreign -> Relay: %s", plainAgentError(err1))
+	}
+	// Direction 2: Relay (Iran) -> Foreign
+	r2fListen, r2fSend, err2 := runDir(relayID, foreignID, foreignV4, 24434)
+	if err2 != nil {
+		return nil, fmt.Errorf("testing Relay -> Foreign: %s", plainAgentError(err2))
+	}
+
+	rep := &spoofTestReport{
+		SpoofIP:                spoofIP,
+		ForeignToRelaySpoofOK:  f2rListen.ReceivedSpoofed,
+		ForeignToRelayNormalOK: f2rListen.ReceivedNormal,
+		RelayToForeignSpoofOK:  r2fListen.ReceivedSpoofed,
+		RelayToForeignNormalOK: r2fListen.ReceivedNormal,
+		ForeignRawError:        f2rSend.RawError,
+		RelayRawError:          r2fSend.RawError,
+	}
+
+	switch {
+	case rep.ForeignToRelaySpoofOK && rep.RelayToForeignSpoofOK:
+		rep.Mode = "symmetric"
+		rep.Summary = fmt.Sprintf("Both %s and %s allow outbound Source IP Spoofing (%s). Full Mutual IP Spoofing is supported!",
+			p.serverName(foreignID), p.serverName(relayID), spoofIP)
+	case rep.ForeignToRelaySpoofOK:
+		rep.Mode = "asymmetric-foreign"
+		rep.Summary = fmt.Sprintf("%s allows outbound Source IP Spoofing (%s -> %s), while %s filters outbound spoofed IPs. Asymmetric IP Spoofing + Decoy SNI is supported automatically!",
+			p.serverName(foreignID), spoofIP, p.serverName(relayID), p.serverName(relayID))
+	case rep.RelayToForeignSpoofOK:
+		rep.Mode = "asymmetric-relay"
+		rep.Summary = fmt.Sprintf("%s allows outbound Source IP Spoofing (%s -> %s), while %s filters outbound spoofed IPs. Asymmetric IP Spoofing is supported automatically!",
+			p.serverName(relayID), spoofIP, p.serverName(foreignID), p.serverName(foreignID))
+	default:
+		rep.Mode = "filtered"
+		rep.Summary = fmt.Sprintf("Both VPS providers enforce BCP38 source IP filtering (spoofed source IP %s was dropped in transit). Use Decoy Whitelisted SNI Spoofing instead — it works on all VPS providers without IP spoofing.",
+			spoofIP)
+	}
+	return rep, nil
 }

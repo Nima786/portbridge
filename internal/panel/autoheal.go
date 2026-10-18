@@ -659,6 +659,10 @@ func (ah *autoHealer) healTunnel(ctx context.Context, j *job, name, relayID, for
 		HTTPHeader:  onOff(best.WebHeader),
 		HTTPHost:    httpHost,
 		RealSite:    onOff(realSite),
+		SNISpoof:    onOff(best.SNISpoof),
+		SpoofSNI:    best.SpoofSNI,
+		IPSpoof:     onOff(best.IPSpoof),
+		SpoofIP:     best.SpoofIP,
 		GRE:         "off",
 		Mux:         muxMode,
 		MuxLinks:    max(1, curInfo.MuxLinks),
@@ -736,6 +740,10 @@ func describeCandidate(c engine.ProbeCandidateResult) string {
 	tr := strings.ToUpper(c.Transport)
 	if c.CDN {
 		tr += " (CDN)"
+	} else if c.IPSpoof {
+		tr += " (IP Spoof)"
+	} else if c.SNISpoof {
+		tr += " (SNI Spoof)"
 	} else if c.WebHeader {
 		tr += " (HTTP)"
 	} else if c.Stealth {

@@ -967,20 +967,23 @@
   function shortLinkLabel(any) {
     if (!any) return 'TCP';
     if (any.gre) return 'GRE';
+    if (any.ip_spoof) return any.spoof_ip ? `IP Spoof (${any.spoof_ip})` : 'IP Spoof (KCP)';
     const raw = String(any.link || any.transport || '');
+    if (/source IP spoofing/i.test(raw)) return 'IP Spoof (KCP)';
     const m = raw.match(/\(([^(),]+)\)/);
     const host = m ? m[1] : '';
-    if (/CDN backup/i.test(raw)) return host ? `HTTPS (${host}) + CDN` : 'HTTPS + CDN Backup';
-    if (/gRPC through a CDN/i.test(raw)) return host ? `gRPC + CDN (${host})` : 'gRPC + CDN';
-    if (/through a CDN/i.test(raw)) return host ? `CDN (${host})` : 'CDN (WebSocket)';
-    if (/gRPC/i.test(raw)) return host ? `gRPC (${host})` : 'gRPC';
+    const sniSuffix = any.sni_spoof ? ' + Decoy SNI' : '';
+    if (/CDN backup/i.test(raw)) return (host ? `HTTPS (${host}) + CDN` : 'HTTPS + CDN Backup') + sniSuffix;
+    if (/gRPC through a CDN/i.test(raw)) return (host ? `gRPC + CDN (${host})` : 'gRPC + CDN') + sniSuffix;
+    if (/through a CDN/i.test(raw)) return (host ? `CDN (${host})` : 'CDN (WebSocket)') + sniSuffix;
+    if (/gRPC/i.test(raw)) return (host ? `gRPC (${host})` : 'gRPC') + sniSuffix;
     if (/HTTPS site/i.test(raw) || any.transport === 'tls' || any.transport === 'tlsmux') {
-      return host ? `HTTPS (${host})` : 'HTTPS';
+      return (host ? `HTTPS (${host})` : 'HTTPS') + sniSuffix;
     }
-    if (/KCP/i.test(raw) || any.transport === 'kcp') return 'KCP (UDP)';
-    if (/website header/i.test(raw)) return host ? `TCP + HTTP (${host})` : 'TCP + HTTP Header';
-    if (/plain/i.test(raw) || any.transport === 'tcp' || any.transport === 'tcpmux') return 'Plain TCP';
-    return raw.length > 28 ? raw.slice(0, 28) + '…' : (raw || 'TCP');
+    if (/KCP/i.test(raw) || any.transport === 'kcp') return 'KCP (UDP)' + sniSuffix;
+    if (/website header/i.test(raw)) return (host ? `TCP + HTTP (${host})` : 'TCP + HTTP Header') + sniSuffix;
+    if (/plain/i.test(raw) || any.transport === 'tcp' || any.transport === 'tcpmux') return 'Plain TCP' + sniSuffix;
+    return (raw.length > 28 ? raw.slice(0, 28) + '…' : (raw || 'TCP')) + sniSuffix;
   }
 
   function tunnelCard(t) {
@@ -1031,6 +1034,8 @@
     const extraTags = [];
     if (/fragmented/i.test(combinedLinkDesc)) extraTags.push('Stealth (uTLS + Frag)');
     else if (/browser TLS/i.test(combinedLinkDesc)) extraTags.push('uTLS');
+    if (any.sni_spoof) extraTags.push(`Decoy SNI (${any.spoof_sni || 'challenges.cloudflare.com'})`);
+    if (any.ip_spoof) extraTags.push(`Spoof IP (${any.spoof_ip || '104.18.4.130'})`);
     if (any.real_site) extraTags.push('Real-Site Cover');
     if (any.cdn && !/CDN/i.test(shortLink)) extraTags.push('CDN Ready');
     if (any.proxy_protocol && any.proxy_protocol !== 'off') extraTags.push(`PROXY ${any.proxy_protocol}`);
@@ -2420,22 +2425,142 @@
     if (needDomain) ensureTunnelCFHelper();
     $('tn-opt-clean').hidden = !['cdn', 'grpc-cdn'].includes(link);
     $('tn-opt-stealth').hidden = !['website', 'grpc'].includes(link);
+    if ($('tn-opt-snispoof')) {
+      $('tn-opt-snispoof').hidden = gre;
+      if (link === 'ip-spoof') {
+        $('tn-snispoof').checked = true;
+        $('tn-snispoof').disabled = true;
+        $('tn-snispoof-fields').hidden = false;
+      } else {
+        $('tn-snispoof').disabled = false;
+        $('tn-snispoof-fields').hidden = !$('tn-snispoof').checked;
+      }
+    }
+    if ($('tn-opt-ipspoof')) {
+      $('tn-opt-ipspoof').hidden = gre || link !== 'ip-spoof';
+    }
     if (link === 'grpc' && $('tn-claim').value === 'www.bing.com') $('tn-claim').value = 'www.google.com';
     if (link !== 'grpc' && $('tn-claim').value === 'www.google.com') $('tn-claim').value = 'www.bing.com';
     const v6ok = !gre && ['plain', 'website', 'grpc', 'kcp'].includes(link) &&
       hasIPv6(serverById($('tn-relay').value)) && hasIPv6(serverById($('tn-foreign').value));
     $('tn-ipv6-row').hidden = !v6ok;
     if (!v6ok) $('tn-ipv6').checked = false;
-    if (!sharingTouched) setRadio('tn-shared', ['kcp', 'cdn', 'website-cdn-backup', 'grpc', 'grpc-cdn'].includes(link) ? 'shared' : 'one');
+    if (!sharingTouched) setRadio('tn-shared', ['kcp', 'ip-spoof', 'cdn', 'website-cdn-backup', 'grpc', 'grpc-cdn'].includes(link) ? 'shared' : 'one');
     $('tn-opt-links').hidden = radio('tn-shared') !== 'shared';
     syncChoiceCards($('tunnel-dialog'));
   }
 
-  for (const el of document.querySelectorAll('#tunnel-form input[name="tn-mode"], #tunnel-form input[name="tn-link"], #tn-gre, #tn-webheader, #tn-relay, #tn-foreign')) {
+  for (const el of document.querySelectorAll('#tunnel-form input[name="tn-mode"], #tunnel-form input[name="tn-link"], #tn-gre, #tn-webheader, #tn-snispoof, #tn-relay, #tn-foreign')) {
     el.addEventListener('change', showTunnelOptions);
   }
   for (const el of document.querySelectorAll('input[name="tn-shared"]')) {
     el.addEventListener('change', () => { sharingTouched = true; showTunnelOptions(); });
+  }
+
+  if ($('tn-spoofsni-preset')) {
+    $('tn-spoofsni-preset').addEventListener('change', (ev) => {
+      if (ev.target.value && $('tn-spoofsni')) {
+        $('tn-spoofsni').value = ev.target.value;
+        ev.target.value = '';
+      }
+    });
+  }
+  if ($('tn-spoofip-preset')) {
+    $('tn-spoofip-preset').addEventListener('change', (ev) => {
+      if (ev.target.value && $('tn-spoofip')) {
+        $('tn-spoofip').value = ev.target.value;
+        ev.target.value = '';
+      }
+    });
+  }
+
+  if ($('tn-scan-sni-btn')) {
+    $('tn-scan-sni-btn').addEventListener('click', async () => {
+      const btn = $('tn-scan-sni-btn');
+      const out = $('tn-sni-scan-results');
+      const relay = $('tn-relay').value;
+      if (!relay) {
+        out.replaceChildren(h('li', { class: 'bad' }, 'Select a Relay (Iran) server first.'));
+        return;
+      }
+      btn.disabled = true;
+      btn.textContent = 'Scanning Whitelisted SNIs…';
+      out.replaceChildren(h('li', null, 'Probing whitelisted SNIs (challenges.cloudflare.com, www.recaptcha.net, security.vercel.com, etc.) from Relay server…'));
+      try {
+        const rep = await api('POST', '/api/probe/sni-scan', { relay });
+        const list = rep.results || [];
+        if (rep.best_sni && $('tn-spoofsni')) {
+          $('tn-spoofsni').value = rep.best_sni;
+        }
+        const items = list.map((item) => {
+          const ok = !!item.reachable;
+          const useBtn = ok
+            ? h('button', {
+                type: 'button',
+                class: 'use-port-btn',
+                onclick: () => {
+                  $('tn-spoofsni').value = item.sni;
+                  $('tn-spoofsni').focus();
+                }
+              }, `Use ${item.sni}`)
+            : null;
+          return h('li', { class: ok ? 'good' : 'bad' },
+            h('strong', { class: 'mono' }, item.sni),
+            ok
+              ? ` (${item.category || 'Whitelisted'}) — Reachable · ${Math.round(item.rtt_ms || 0)} ms${item.ip ? ' · IP ' + item.ip : ''}`
+              : ` (${item.category || 'Whitelisted'}) — Blocked (${item.error || 'timeout'})`,
+            useBtn);
+        });
+        out.replaceChildren(...(items.length ? items : [h('li', { class: 'warn' }, 'No SNI scan results returned.')]));
+      } catch (e) {
+        out.replaceChildren(h('li', { class: 'bad' }, e.message));
+      } finally {
+        btn.disabled = false;
+        btn.textContent = 'Scan Whitelisted SNIs from Relay Server';
+      }
+    });
+  }
+
+  if ($('tn-test-spoof-btn')) {
+    $('tn-test-spoof-btn').addEventListener('click', async () => {
+      const btn = $('tn-test-spoof-btn');
+      const out = $('tn-spoof-test-results');
+      const relay = $('tn-relay').value;
+      const foreign = $('tn-foreign').value;
+      const spoofIP = ($('tn-spoofip') && $('tn-spoofip').value.trim()) || '104.18.4.130';
+      if (!relay || !foreign) {
+        out.replaceChildren(h('li', { class: 'bad' }, 'Select both a Relay server and a Foreign server first.'));
+        return;
+      }
+      btn.disabled = true;
+      btn.textContent = 'Testing Raw IP Spoofing…';
+      out.replaceChildren(h('li', null, `Sending raw spoofed UDP probes (src=${spoofIP}) in both directions between Relay and Foreign…`));
+      try {
+        const rep = await api('POST', '/api/probe/spoof-test', { relay, foreign, spoof_ip: spoofIP });
+        const items = [];
+        const f2rOk = !!rep.foreign_can_spoof;
+        const r2fOk = !!rep.relay_can_spoof;
+        items.push(h('li', { class: f2rOk ? 'good' : (rep.foreign_to_relay && rep.foreign_to_relay.normal_received > 0 ? 'warn' : 'bad') },
+          h('strong', null, 'Foreign → Relay (Iran): '),
+          f2rOk
+            ? `Spoofed Source IP (${spoofIP}) arrived intact (${rep.foreign_to_relay.spoof_received} packets)! Foreign VPS supports outbound IP spoofing.`
+            : `Spoofed packets dropped by Foreign VPS provider (BCP38 filter), normal UDP arrived (${(rep.foreign_to_relay && rep.foreign_to_relay.normal_received) || 0} packets).`));
+        items.push(h('li', { class: r2fOk ? 'good' : (rep.relay_to_foreign && rep.relay_to_foreign.normal_received > 0 ? 'warn' : 'bad') },
+          h('strong', null, 'Relay (Iran) → Foreign: '),
+          r2fOk
+            ? `Spoofed Source IP (${spoofIP}) arrived intact (${rep.relay_to_foreign.spoof_received} packets)! Relay ISP supports outbound IP spoofing.`
+            : `Spoofed packets dropped by Relay ISP (BCP38 filter), normal UDP arrived (${(rep.relay_to_foreign && rep.relay_to_foreign.normal_received) || 0} packets).`));
+        if (rep.summary) {
+          items.push(h('li', { class: (f2rOk || r2fOk) ? 'good' : 'warn' }, h('strong', null, 'Verdict: '), rep.summary));
+        }
+        out.replaceChildren(...items);
+      } catch (e) {
+        out.replaceChildren(h('li', { class: 'bad' }, e.message));
+      } finally {
+        btn.disabled = false;
+        btn.textContent = 'Test VPS IP-Spoof Capability on Both Servers';
+      }
+    });
   }
 
   // ----------------------------------------- smart route & transport probe
@@ -2490,10 +2615,19 @@
     if (!cand) return;
     $('tn-gre').checked = false;
     setRadio('tn-mode', cand.mode === 'reverse' ? 'reverse' : 'direct');
-    setRadio('tn-link', cand.link || 'website');
+    setRadio('tn-link', cand.ip_spoof ? 'ip-spoof' : (cand.link || 'website'));
     $('tn-stealth').checked = !!cand.stealth;
     $('tn-webheader').checked = !!cand.web_header;
     $('tn-ipv6').checked = !!cand.ipv6;
+    if ($('tn-snispoof')) {
+      $('tn-snispoof').checked = !!(cand.sni_spoof || cand.ip_spoof);
+    }
+    if (cand.spoof_sni && $('tn-spoofsni')) {
+      $('tn-spoofsni').value = cand.spoof_sni;
+    }
+    if (cand.spoof_ip && $('tn-spoofip')) {
+      $('tn-spoofip').value = cand.spoof_ip;
+    }
     if (cand.server_name && ['website', 'website-cdn-backup', 'grpc'].includes(cand.link)) {
       $('tn-claim').value = cand.server_name;
     }
@@ -2717,6 +2851,8 @@
     if (foreignID) $('tn-foreign').value = foreignID;
     $('tn-error').textContent = '';
     $('tn-ports-result').replaceChildren();
+    if ($('tn-sni-scan-results')) $('tn-sni-scan-results').replaceChildren();
+    if ($('tn-spoof-test-results')) $('tn-spoof-test-results').replaceChildren();
     if ($('tn-probe-error')) $('tn-probe-error').textContent = '';
     if ($('tn-probe-live')) $('tn-probe-live').hidden = true;
     if ($('tn-probe-results')) {
@@ -2743,13 +2879,16 @@
 
   function tunnelRequest() {
     const gre = $('tn-gre').checked;
+    const link = gre ? 'plain' : radio('tn-link');
     const shared = radio('tn-shared') === 'shared';
+    const ipSpoof = !gre && link === 'ip-spoof';
+    const sniSpoof = !gre && (ipSpoof || ($('tn-snispoof') && $('tn-snispoof').checked));
     return {
       name: $('tn-name').value.trim(),
       relay: $('tn-relay').value,
       foreign: $('tn-foreign').value,
       mode: radio('tn-mode'),
-      link: gre ? 'plain' : radio('tn-link'),
+      link,
       server_name: $('tn-claim').value.trim(),
       domain: $('tn-domain').value.trim(),
       clean_ips: $('tn-cleanips').value.replace(/\s+/g, ''),
@@ -2757,6 +2896,10 @@
       web_header: !gre && $('tn-webheader').checked,
       web_host: $('tn-webhost').value.trim(),
       real_site: $('tn-realsite').checked,
+      sni_spoof: sniSpoof,
+      spoof_sni: $('tn-spoofsni') ? $('tn-spoofsni').value.trim() : '',
+      ip_spoof: ipSpoof,
+      spoof_ip: $('tn-spoofip') ? $('tn-spoofip').value.trim() : '',
       gre,
       ipv6: $('tn-ipv6').checked,
       shared,

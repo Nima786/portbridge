@@ -73,6 +73,12 @@ type PairingData struct {
 	// Added in version 10, and only sent when used: the service is told each
 	// user's real address (off, v1 or v2). See proxyproto.go.
 	ProxyProtocol string
+
+	// Whitelisted SNI decoy ClientHello and source IP spoofing settings.
+	SNISpoof string
+	SpoofSNI string
+	IPSpoof  string
+	SpoofIP  string
 }
 
 // pairingVersionMax is the newest code this build understands. The menu keeps
@@ -131,6 +137,10 @@ func decodePairingCode(code string) (*PairingData, error) {
 		CoverSite:   kv["cover_site"],
 
 		ProxyProtocol: kv["proxy_protocol"],
+		SNISpoof:      kv["sni_spoof"],
+		SpoofSNI:      kv["spoof_sni"],
+		IPSpoof:       kv["ip_spoof"],
+		SpoofIP:       kv["spoof_ip"],
 	}
 
 	if v, err := strconv.Atoi(p.Version); err == nil && v > pairingVersionMax {
@@ -948,6 +958,75 @@ func newAgentHandler(token, confDir string, allowUpdates func() bool) *http.Serv
 		}
 		results := engine.RunProbeDialer(r.Context(), req.Specs, sec, req.BurstBytes)
 		writeJSONReply(w, http.StatusOK, map[string]any{"ok": true, "results": results})
+	})
+
+	// POST /api/probe/sni-scan: scan candidate whitelisted SNIs from this server.
+	mux.HandleFunc("/api/probe/sni-scan", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, `{"error":"method not allowed"}`, http.StatusMethodNotAllowed)
+			return
+		}
+		if !checkAgentAuth(r, token) {
+			http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
+			return
+		}
+		var req struct {
+			TargetAddr string   `json:"target_addr"`
+			Candidates []string `json:"candidates"`
+		}
+		_ = json.NewDecoder(io.LimitReader(r.Body, 16*1024)).Decode(&req)
+		results := engine.ScanWhitelistedSNIs(r.Context(), req.TargetAddr, req.Candidates)
+		writeJSONReply(w, http.StatusOK, map[string]any{"ok": true, "results": results})
+	})
+
+	// POST /api/probe/spoof-listen: listen for raw spoofed and normal UDP probe packets.
+	mux.HandleFunc("/api/probe/spoof-listen", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, `{"error":"method not allowed"}`, http.StatusMethodNotAllowed)
+			return
+		}
+		if !checkAgentAuth(r, token) {
+			http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
+			return
+		}
+		var req struct {
+			ListenAddr string `json:"listen_addr"`
+			Token      string `json:"token"`
+			TimeoutMS  int    `json:"timeout_ms"`
+		}
+		if err := json.NewDecoder(io.LimitReader(r.Body, 4096)).Decode(&req); err != nil || req.ListenAddr == "" || req.Token == "" {
+			writeJSONReply(w, http.StatusBadRequest, map[string]any{"ok": false, "error": "listen_addr and token required"})
+			return
+		}
+		timeout := time.Duration(req.TimeoutMS) * time.Millisecond
+		if timeout <= 0 || timeout > 10*time.Second {
+			timeout = 3 * time.Second
+		}
+		res := engine.RunSpoofProbeListener(r.Context(), req.ListenAddr, req.Token, timeout)
+		writeJSONReply(w, http.StatusOK, map[string]any{"ok": true, "result": res})
+	})
+
+	// POST /api/probe/spoof-send: send raw spoofed and normal UDP probe packets to peer.
+	mux.HandleFunc("/api/probe/spoof-send", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, `{"error":"method not allowed"}`, http.StatusMethodNotAllowed)
+			return
+		}
+		if !checkAgentAuth(r, token) {
+			http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
+			return
+		}
+		var req struct {
+			TargetAddr string `json:"target_addr"`
+			SpoofIP    string `json:"spoof_ip"`
+			Token      string `json:"token"`
+		}
+		if err := json.NewDecoder(io.LimitReader(r.Body, 4096)).Decode(&req); err != nil || req.TargetAddr == "" || req.Token == "" {
+			writeJSONReply(w, http.StatusBadRequest, map[string]any{"ok": false, "error": "target_addr and token required"})
+			return
+		}
+		res := engine.SendSpoofProbePackets(req.TargetAddr, req.SpoofIP, req.Token)
+		writeJSONReply(w, http.StatusOK, map[string]any{"ok": true, "result": res})
 	})
 
 	// POST /api/callhome: register or update the panel callback URL(s) and fingerprint

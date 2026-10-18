@@ -67,6 +67,8 @@ func (p *Panel) routes() http.Handler {
 	mux.HandleFunc("POST /api/tunnels/check", p.withAuth(p.handleCheckTunnel))
 	mux.HandleFunc("POST /api/tunnels/speedtest", p.withAuth(p.handleSpeedtestTunnel))
 	mux.HandleFunc("POST /api/tunnels/probe", p.withAuth(p.handleProbeTunnel))
+	mux.HandleFunc("POST /api/probe/sni-scan", p.withAuth(p.handleProbeSNIScan))
+	mux.HandleFunc("POST /api/probe/spoof-test", p.withAuth(p.handleProbeSpoofTest))
 	mux.HandleFunc("POST /api/tunnels/autoheal", p.withAuth(p.handleSetTunnelAutoHeal))
 	mux.HandleFunc("POST /api/tunnels/autoheal/trigger", p.withAuth(p.handleTriggerTunnelAutoHeal))
 	mux.HandleFunc("POST /api/ports", p.withAuth(p.handlePorts))
@@ -745,6 +747,7 @@ func (p *Panel) handleProbeTunnel(w http.ResponseWriter, r *http.Request, _ auth
 		Relay     string                        `json:"relay"`
 		Foreign   string                        `json:"foreign"`
 		CDNDomain string                        `json:"cdn_domain"`
+		SpoofIP   string                        `json:"spoof_ip"`
 		DialerID  string                        `json:"dialer_id"`
 		Secret    string                        `json:"secret"`
 		Spec      engine.ProbeCandidateSpec     `json:"spec"`
@@ -772,6 +775,20 @@ func (p *Panel) handleProbeTunnel(w http.ResponseWriter, r *http.Request, _ auth
 	case "finish":
 		rep := p.finishProbeSession(req.Session, req.Results)
 		writeJSON(w, http.StatusOK, rep)
+	case "sni-scan":
+		rep, err := p.scanRelaySNIs(r.Context(), strings.TrimSpace(req.Relay), nil)
+		if err != nil {
+			writeErr(w, http.StatusUnprocessableEntity, capitalise(plainAgentError(err))+".")
+			return
+		}
+		writeJSON(w, http.StatusOK, rep)
+	case "spoof-test":
+		rep, err := p.testSpoofSupport(r.Context(), strings.TrimSpace(req.Relay), strings.TrimSpace(req.Foreign), strings.TrimSpace(req.SpoofIP))
+		if err != nil {
+			writeErr(w, http.StatusUnprocessableEntity, capitalise(plainAgentError(err))+".")
+			return
+		}
+		writeJSON(w, http.StatusOK, rep)
 	default:
 		rep, err := p.probeBetweenServers(r.Context(), strings.TrimSpace(req.Relay), strings.TrimSpace(req.Foreign), strings.TrimSpace(req.CDNDomain))
 		if err != nil {
@@ -780,6 +797,41 @@ func (p *Panel) handleProbeTunnel(w http.ResponseWriter, r *http.Request, _ auth
 		}
 		writeJSON(w, http.StatusOK, rep)
 	}
+}
+
+func (p *Panel) handleProbeSNIScan(w http.ResponseWriter, r *http.Request, _ authed) {
+	agent.ExtendDeadlines(w, 2*time.Minute)
+	var req struct {
+		Relay string   `json:"relay"`
+		SNIs  []string `json:"snis"`
+	}
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	rep, err := p.scanRelaySNIs(r.Context(), strings.TrimSpace(req.Relay), req.SNIs)
+	if err != nil {
+		writeErr(w, http.StatusUnprocessableEntity, capitalise(plainAgentError(err))+".")
+		return
+	}
+	writeJSON(w, http.StatusOK, rep)
+}
+
+func (p *Panel) handleProbeSpoofTest(w http.ResponseWriter, r *http.Request, _ authed) {
+	agent.ExtendDeadlines(w, 2*time.Minute)
+	var req struct {
+		Relay   string `json:"relay"`
+		Foreign string `json:"foreign"`
+		SpoofIP string `json:"spoof_ip"`
+	}
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	rep, err := p.testSpoofSupport(r.Context(), strings.TrimSpace(req.Relay), strings.TrimSpace(req.Foreign), strings.TrimSpace(req.SpoofIP))
+	if err != nil {
+		writeErr(w, http.StatusUnprocessableEntity, capitalise(plainAgentError(err))+".")
+		return
+	}
+	writeJSON(w, http.StatusOK, rep)
 }
 
 func (p *Panel) handleSetTunnelAutoHeal(w http.ResponseWriter, r *http.Request, _ authed) {

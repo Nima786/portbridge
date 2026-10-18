@@ -679,6 +679,17 @@
           </label>
 
           <label class="choice-card">
+            <input type="radio" name="tn-link" value="ip-spoof">
+            <div class="choice-body">
+              <div class="choice-top">
+                <strong>Source IP + Whitelisted SNI Spoof</strong>
+                <span class="pill-tag tag-accent">Anti-Lockdown</span>
+              </div>
+              <span class="choice-desc">Forges a whitelisted source IP (Cloudflare Challenges / reCAPTCHA) + decoy TLS ClientHello over KCP/UDP. Supports asymmetric &amp; mutual VPS spoofing.</span>
+            </div>
+          </label>
+
+          <label class="choice-card">
             <input type="radio" name="tn-link" value="plain">
             <div class="choice-body">
               <div class="choice-top">
@@ -747,6 +758,68 @@
             <input type="checkbox" id="tn-stealth">
             <span><strong>Browser TLS Fingerprint + Fragmentation (Stealth)</strong> <span class="muted">(mimics Chrome/Firefox TLS handshake and splits initial packets)</span></span>
           </label>
+        </div>
+
+        <div id="tn-opt-snispoof" class="sub-panel">
+          <label class="check" id="tn-snispoof-check-wrap">
+            <input type="checkbox" id="tn-snispoof">
+            <span><strong>Decoy Whitelisted SNI Spoofing (Out-of-Window ClientHello)</strong> <span class="muted">(injects a decoy TLS 1.3 ClientHello carrying a whitelisted SNI right after connect so passive DPI whitelists the flow while the peer drops the decoy; works on all VPS providers)</span></span>
+          </label>
+          <div id="tn-snispoof-fields" hidden>
+            <div class="row2">
+              <div>
+                <label for="tn-spoofsni">Whitelisted Decoy SNI Hostname</label>
+                <input id="tn-spoofsni" value="challenges.cloudflare.com" autocapitalize="none" spellcheck="false" placeholder="challenges.cloudflare.com">
+              </div>
+              <div>
+                <label for="tn-spoofsni-preset">Quick Preset <span class="muted">(Whitelisted Infrastructure)</span></label>
+                <select id="tn-spoofsni-preset">
+                  <option value="">— Pick a whitelisted SNI —</option>
+                  <option value="challenges.cloudflare.com">challenges.cloudflare.com (Cloudflare Turnstile / CAPTCHA)</option>
+                  <option value="www.recaptcha.net">www.recaptcha.net (Google reCAPTCHA)</option>
+                  <option value="security.vercel.com">security.vercel.com (Vercel Security Checkpoint)</option>
+                  <option value="cdnjs.cloudflare.com">cdnjs.cloudflare.com (Cloudflare JS Library CDN)</option>
+                  <option value="cdn.jsdelivr.net">cdn.jsdelivr.net (jsDelivr Open-Source CDN)</option>
+                  <option value="cloudflare-dns.com">cloudflare-dns.com (Cloudflare DoH)</option>
+                  <option value="one.one.one.one">one.one.one.one (Cloudflare 1.1.1.1)</option>
+                  <option value="radar.cloudflare.com">radar.cloudflare.com (Cloudflare Radar)</option>
+                  <option value="www.google.com">www.google.com (Google Search)</option>
+                  <option value="fonts.gstatic.com">fonts.gstatic.com (Google Fonts Static)</option>
+                  <option value="unpkg.com">unpkg.com (UNPKG Web Asset CDN)</option>
+                  <option value="shaparak.ir">shaparak.ir (Domestic Banking Network)</option>
+                </select>
+              </div>
+            </div>
+            <div class="actions left port-check-bar">
+              <button type="button" id="tn-scan-sni-btn">Scan Whitelisted SNIs from Relay Server</button>
+            </div>
+            <ul id="tn-sni-scan-results" class="ports-result" aria-live="polite"></ul>
+          </div>
+        </div>
+
+        <div id="tn-opt-ipspoof" class="sub-panel" hidden>
+          <div class="row2">
+            <div>
+              <label for="tn-spoofip">Spoofed Whitelisted Source IPv4 <span class="muted">(forged on raw outbound UDP packets)</span></label>
+              <input id="tn-spoofip" value="104.18.4.130" autocapitalize="none" spellcheck="false" placeholder="104.18.4.130">
+            </div>
+            <div>
+              <label for="tn-spoofip-preset">Quick Preset <span class="muted">(Whitelisted Anycast IPs)</span></label>
+              <select id="tn-spoofip-preset">
+                <option value="">— Pick a whitelisted IPv4 —</option>
+                <option value="104.18.4.130">104.18.4.130 — Cloudflare Challenges (challenges.cloudflare.com)</option>
+                <option value="104.16.132.229">104.16.132.229 — Cloudflare CDNJS (cdnjs.cloudflare.com)</option>
+                <option value="142.250.185.206">142.250.185.206 — Google reCAPTCHA (www.recaptcha.net)</option>
+                <option value="104.26.10.240">104.26.10.240 — Cloudflare Edge Anycast</option>
+                <option value="1.1.1.1">1.1.1.1 — Cloudflare DNS (one.one.one.one)</option>
+              </select>
+            </div>
+          </div>
+          <p class="muted small hint-box">Requires at least one server (typically the Foreign VPS) to permit raw outbound source IP spoofing (non-BCP38). If the Relay ISP blocks outbound IP spoofing, PortBridge automatically switches that leg to asymmetric mode while keeping spoofed return packets active.</p>
+          <div class="actions left port-check-bar">
+            <button type="button" id="tn-test-spoof-btn">Test VPS IP-Spoof Capability on Both Servers</button>
+          </div>
+          <ul id="tn-spoof-test-results" class="ports-result" aria-live="polite"></ul>
         </div>
 
         <label class="check-card" id="tn-ipv6-row" hidden>

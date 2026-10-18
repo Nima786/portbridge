@@ -481,6 +481,9 @@ func wrapDial(raw net.Conn, cfg *Config) (net.Conn, error) {
 // for. The purpose only matters to the websocket disguise, which authenticates
 // inside the upgrade request and so has to say it there.
 func wrapDialPurpose(raw net.Conn, cfg *Config, purpose byte) (net.Conn, error) {
+	if cfg.SNISpoof && cfg.Transport != TransportKCP {
+		_ = injectDecoyClientHello(raw, cfg.EffectiveSpoofSNI(), cfg.SNISpoofTTL)
+	}
 	switch cfg.Transport {
 	case TransportPlain, TransportKCP:
 		if cfg.Transport == TransportPlain && cfg.HTTPHeader {
@@ -723,6 +726,14 @@ func describeTransport(cfg *Config) string {
 			base = fmt.Sprintf("disguised as gRPC over HTTP/2 (%s)", cfg.EffectiveServerName())
 		}
 	case TransportKCP:
+		if cfg.IPSpoof {
+			return fmt.Sprintf("loss-resistant KCP/UDP transport with FEC (%d/%d shards) and source IP spoofing (%s / %s)",
+				cfg.KCPDataShards, cfg.KCPParityShards, cfg.EffectiveSpoofIP(), cfg.EffectiveSpoofSNI())
+		}
+		if cfg.SNISpoof {
+			return fmt.Sprintf("loss-resistant KCP/UDP transport with FEC (%d/%d shards) and decoy SNI (%s)",
+				cfg.KCPDataShards, cfg.KCPParityShards, cfg.EffectiveSpoofSNI())
+		}
 		return fmt.Sprintf("loss-resistant KCP/UDP transport with FEC (%d/%d shards)", cfg.KCPDataShards, cfg.KCPParityShards)
 	default:
 		if cfg.GRE {
@@ -733,7 +744,13 @@ func describeTransport(cfg *Config) string {
 			if host == "" {
 				host = defaultHTTPHost
 			}
+			if cfg.SNISpoof && cfg.Dials() {
+				return fmt.Sprintf("plain, opening like web traffic to %s (not encrypted) [decoy SNI %s]", host, cfg.EffectiveSpoofSNI())
+			}
 			return fmt.Sprintf("plain, opening like web traffic to %s (not encrypted)", host)
+		}
+		if cfg.SNISpoof && cfg.Dials() {
+			return fmt.Sprintf("plain, no disguise [decoy SNI %s]", cfg.EffectiveSpoofSNI())
 		}
 		return "plain, no disguise"
 	}
@@ -757,6 +774,9 @@ func describeTransport(cfg *Config) string {
 		}
 		if cfg.useECH() || (backupOnly && !cfg.echSet) {
 			stealth = append(stealth, "ECH"+suffix)
+		}
+		if cfg.SNISpoof {
+			stealth = append(stealth, fmt.Sprintf("decoy SNI %s", cfg.EffectiveSpoofSNI()))
 		}
 		if len(cfg.CleanIPs) > 0 {
 			stealth = append(stealth, fmt.Sprintf("%d clean CF IPs", len(cfg.CleanIPs)))

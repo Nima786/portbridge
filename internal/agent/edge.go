@@ -44,6 +44,10 @@ type EdgeSpec struct {
 	RealSite    string `json:"real_site,omitempty"` // strangers are shown the real website
 	CoverSite   string `json:"cover_site,omitempty"`
 	GRE         string `json:"gre,omitempty"`
+	SNISpoof    string `json:"sni_spoof,omitempty"` // decoy ClientHello with whitelisted SNI
+	SpoofSNI    string `json:"spoof_sni,omitempty"`
+	IPSpoof     string `json:"ip_spoof,omitempty"` // source IP spoofing over raw sockets
+	SpoofIP     string `json:"spoof_ip,omitempty"`
 
 	ProxyProtocol string `json:"proxy_protocol,omitempty"` // off, v1 or v2
 	Mux           string `json:"mux,omitempty"`
@@ -91,6 +95,19 @@ func (s *EdgeSpec) normalise() {
 		s.Transport = "plain"
 		s.ServerName, s.WSPath, s.CDN, s.AltHost, s.CleanIPs = "", "", "off", "", ""
 		s.UTLS, s.TLSFragment, s.HTTPHeader, s.HTTPHost, s.RealSite, s.CoverSite = "", "", "", "", "", ""
+		s.SNISpoof, s.SpoofSNI, s.IPSpoof, s.SpoofIP = "", "", "", ""
+	}
+	if s.IPSpoof == "on" {
+		s.Transport = "kcp"
+		if strings.TrimSpace(s.SpoofIP) == "" {
+			s.SpoofIP = engine.DefaultSpoofIP
+		}
+		if strings.TrimSpace(s.SpoofSNI) == "" {
+			s.SpoofSNI = engine.DefaultSpoofSNI
+		}
+	}
+	if s.SNISpoof == "on" && strings.TrimSpace(s.SpoofSNI) == "" {
+		s.SpoofSNI = engine.DefaultSpoofSNI
 	}
 	if s.Transport == "kcp" {
 		s.ServerName, s.WSPath, s.CDN = "", "", "off"
@@ -159,6 +176,7 @@ func (s *EdgeSpec) check() error {
 	for _, f := range []struct{ name, val string }{
 		{"cdn", s.CDN}, {"mux", s.Mux}, {"utls", s.UTLS}, {"tls_fragment", s.TLSFragment},
 		{"http_header", s.HTTPHeader}, {"gre", s.GRE}, {"real_site", s.RealSite},
+		{"sni_spoof", s.SNISpoof}, {"ip_spoof", s.IPSpoof},
 	} {
 		if f.val != "" && f.val != "on" && f.val != "off" {
 			return fmt.Errorf("%s must be on or off, got %q", f.name, f.val)
@@ -205,9 +223,16 @@ func (s *EdgeSpec) check() error {
 	}
 	for _, h := range []struct{ what, val string }{
 		{"the name the link claims", s.ServerName}, {"the CDN backup domain", s.AltHost}, {"the web header's site", s.HTTPHost},
+		{"the spoofed whitelisted SNI", s.SpoofSNI},
 	} {
 		if h.val != "" && !engine.HostnameRe.MatchString(h.val) {
 			return fmt.Errorf("%s, %q, is not a host name", h.what, h.val)
+		}
+	}
+	if s.SpoofIP != "" {
+		ip := net.ParseIP(s.SpoofIP)
+		if ip == nil || ip.To4() == nil {
+			return fmt.Errorf("spoofed IP %q must be a valid IPv4 address", s.SpoofIP)
 		}
 	}
 	if s.CoverSite != "" && !validCoverSite(s.CoverSite) {
@@ -236,8 +261,8 @@ func (s *EdgeSpec) check() error {
 		return errors.New("showing strangers the real website works only with the website or HTTP/2 link, without a CDN")
 	}
 	if s.IPv6 {
-		if s.GRE == "on" || s.cdnInvolved() || s.Transport == "wss" {
-			return errors.New("IPv6 between the servers is not offered with GRE, a CDN or the web-socket link")
+		if s.GRE == "on" || s.cdnInvolved() || s.Transport == "wss" || s.IPSpoof == "on" {
+			return errors.New("IPv6 between the servers is not offered with GRE, source IP spoofing, a CDN or the web-socket link")
 		}
 		if ip := net.ParseIP(s.PeerIP); ip == nil || ip.To4() != nil {
 			return errors.New("for IPv6 between the servers, the foreign server's address must be its IPv6 one")
@@ -379,6 +404,21 @@ func buildEdgeConf(s *EdgeSpec, l edgeLayout, confDir string, now time.Time) str
 			w("cover_site = %s\n", s.CoverSite)
 		}
 	}
+	if s.SNISpoof == "on" {
+		w("sni_spoof = on\n")
+		if s.SpoofSNI != "" {
+			w("spoof_sni = %s\n", s.SpoofSNI)
+		}
+	}
+	if s.IPSpoof == "on" {
+		w("ip_spoof = on\n")
+		if s.SpoofIP != "" {
+			w("spoof_ip = %s\n", s.SpoofIP)
+		}
+		if s.SpoofSNI != "" && s.SNISpoof != "on" {
+			w("spoof_sni = %s\n", s.SpoofSNI)
+		}
+	}
 	if s.ProxyProtocol == "v1" || s.ProxyProtocol == "v2" {
 		w("\n# Pass each user's real address on; the service must be set to expect it.\n")
 		w("proxy_protocol = %s\n", s.ProxyProtocol)
@@ -452,6 +492,23 @@ func EncodePairingCode(p *PairingData) string {
 		fmt.Fprintf(&extra, "proxy_protocol=%s\n", p.ProxyProtocol)
 		v = max(v, 10)
 	}
+	if p.SNISpoof == "on" {
+		extra.WriteString("sni_spoof=on\n")
+		if p.SpoofSNI != "" {
+			fmt.Fprintf(&extra, "spoof_sni=%s\n", p.SpoofSNI)
+		}
+		v = max(v, 10)
+	}
+	if p.IPSpoof == "on" {
+		extra.WriteString("ip_spoof=on\n")
+		if p.SpoofIP != "" {
+			fmt.Fprintf(&extra, "spoof_ip=%s\n", p.SpoofIP)
+		}
+		if p.SpoofSNI != "" && p.SNISpoof != "on" {
+			fmt.Fprintf(&extra, "spoof_sni=%s\n", p.SpoofSNI)
+		}
+		v = max(v, 10)
+	}
 	mux, links := p.Mux, p.MuxLinks
 	if mux == "" {
 		mux = "off"
@@ -517,6 +574,7 @@ func edgePairingCode(confDir, name string) (string, error) {
 		UTLS: kv["utls"], TLSFragment: kv["tls_fragment"], CleanIPs: strings.ReplaceAll(kv["clean_ips"], " ", ""),
 		HTTPHeader: kv["http_header"], HTTPHost: kv["http_host"], GRE: kv["gre"],
 		RealSite: kv["real_site"], CoverSite: kv["cover_site"], ProxyProtocol: kv["proxy_protocol"],
+		SNISpoof: kv["sni_spoof"], SpoofSNI: kv["spoof_sni"], IPSpoof: kv["ip_spoof"], SpoofIP: kv["spoof_ip"],
 		Secret: strings.TrimSpace(string(secret)),
 	}), nil
 }
@@ -800,6 +858,10 @@ type EditSpec struct {
 	HTTPHost    string `json:"http_host,omitempty"`    // HTTP host header
 	RealSite    string `json:"real_site,omitempty"`    // "on" or "off"
 	GRE         string `json:"gre,omitempty"`          // "on" or "off"
+	SNISpoof    string `json:"sni_spoof,omitempty"`    // "on" or "off"
+	SpoofSNI    string `json:"spoof_sni,omitempty"`    // whitelisted SNI hostname
+	IPSpoof     string `json:"ip_spoof,omitempty"`     // "on" or "off"
+	SpoofIP     string `json:"spoof_ip,omitempty"`     // whitelisted IPv4 address
 	IPv6        *bool  `json:"ipv6,omitempty"`         // true for IPv6 bridge, false for IPv4
 	Mux         string `json:"mux,omitempty"`          // "on" or "off"
 }
@@ -1017,6 +1079,10 @@ func EditEdge(spec EditSpec, confDir string) (EdgeResult, error) {
 			HTTPHost:      spec.HTTPHost,
 			RealSite:      spec.RealSite,
 			GRE:           spec.GRE,
+			SNISpoof:      spec.SNISpoof,
+			SpoofSNI:      spec.SpoofSNI,
+			IPSpoof:       spec.IPSpoof,
+			SpoofIP:       spec.SpoofIP,
 			ProxyProtocol: pp,
 			Mux:           mux,
 			MuxLinks:      muxLinks,

@@ -345,6 +345,7 @@ func validatePairing(p *PairingData) error {
 	for _, f := range []struct{ name, val string }{
 		{"cdn", p.CDN}, {"mux", p.Mux}, {"utls", p.UTLS}, {"tls_fragment", p.TLSFragment},
 		{"ech", p.ECH}, {"http_header", p.HTTPHeader}, {"gre", p.GRE}, {"real_site", p.RealSite},
+		{"sni_spoof", p.SNISpoof}, {"ip_spoof", p.IPSpoof},
 	} {
 		if f.val != "" && f.val != "on" && f.val != "off" {
 			return fmt.Errorf("%s must be on or off, got %q", f.name, f.val)
@@ -369,6 +370,15 @@ func validatePairing(p *PairingData) error {
 	}
 	if p.HTTPHost != "" && !engine.HostnameRe.MatchString(p.HTTPHost) {
 		return fmt.Errorf("web header name %q is not a hostname", p.HTTPHost)
+	}
+	if p.SpoofSNI != "" && !engine.HostnameRe.MatchString(p.SpoofSNI) {
+		return fmt.Errorf("spoof_sni %q is not a hostname", p.SpoofSNI)
+	}
+	if p.SpoofIP != "" {
+		ip := net.ParseIP(p.SpoofIP)
+		if ip == nil || ip.To4() == nil {
+			return fmt.Errorf("spoof_ip %q must be a valid IPv4 address", p.SpoofIP)
+		}
 	}
 	if p.CoverSite != "" && !validCoverSite(p.CoverSite) {
 		return fmt.Errorf("cover site %q is not a host name, or a host name and port", p.CoverSite)

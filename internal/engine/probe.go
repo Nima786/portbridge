@@ -41,6 +41,10 @@ type ProbeCandidateSpec struct {
 	Transport  string `json:"transport"`  // engine transport: "tls", "wss", "grpc", "kcp", "plain"
 	Stealth    bool   `json:"stealth"`    // uTLS browser fingerprint + ClientHello fragmentation
 	WebHeader  bool   `json:"web_header"` // HTTP header obfuscation on plain TCP
+	SNISpoof   bool   `json:"sni_spoof,omitempty"`
+	SpoofSNI   string `json:"spoof_sni,omitempty"`
+	IPSpoof    bool   `json:"ip_spoof,omitempty"`
+	SpoofIP    string `json:"spoof_ip,omitempty"`
 	CDN        bool   `json:"cdn"`
 	IPv6       bool   `json:"ipv6"`
 	Shared     bool   `json:"shared"` // recommended pooling mode (mux vs pool)
@@ -390,6 +394,20 @@ func BuildProbeCandidates(mode, ipv4, ipv6 string, port int, cdnDomain string) [
 				Port:       port,
 			},
 			ProbeCandidateSpec{
+				ID:         mode + "-sni-spoof",
+				Label:      v4Label + " · Decoy Whitelisted SNI (" + DefaultSpoofSNI + ")",
+				Mode:       mode,
+				Link:       "website",
+				Transport:  string(TransportTLS),
+				Stealth:    true,
+				SNISpoof:   true,
+				SpoofSNI:   DefaultSpoofSNI,
+				Shared:     false,
+				ServerName: DefaultSpoofSNI,
+				TargetAddr: addr4,
+				Port:       port,
+			},
+			ProbeCandidateSpec{
 				ID:         mode + "-tls",
 				Label:      v4Label + " · Fake TLS Website (SNI)",
 				Mode:       mode,
@@ -570,6 +588,10 @@ func probeOneSpec(parentCtx context.Context, spec ProbeCandidateSpec, secret []b
 		CDN:             spec.CDN,
 		HTTPHeader:      spec.WebHeader,
 		HTTPHost:        spec.ServerName,
+		SNISpoof:        spec.SNISpoof,
+		SpoofSNI:        spec.SpoofSNI,
+		IPSpoof:         spec.IPSpoof,
+		SpoofIP:         spec.SpoofIP,
 		UTLS:            false,
 		TLSFragment:     false,
 		ECH:             false,
