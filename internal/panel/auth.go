@@ -16,8 +16,11 @@ import (
 	"crypto/rand"
 	"crypto/subtle"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -28,6 +31,7 @@ import (
 const (
 	sessionIdle     = 2 * time.Hour
 	sessionLifetime = 12 * time.Hour
+	sessionsFile    = "sessions.enc"
 	lockAfter       = 5
 	lockFor         = 15 * time.Minute
 	failureWindow   = 15 * time.Minute
@@ -113,6 +117,13 @@ type session struct {
 	seen    time.Time
 }
 
+type savedSession struct {
+	User    string    `json:"user"`
+	CSRF    string    `json:"csrf"`
+	Created time.Time `json:"created"`
+	Seen    time.Time `json:"seen"`
+}
+
 type failures struct {
 	times       []time.Time
 	lockedUntil time.Time
@@ -124,10 +135,91 @@ type sessions struct {
 	byID     map[string]*session
 	failures map[string]*failures
 	now      func() time.Time
+	st       *store
 }
 
 func newSessions() *sessions {
 	return &sessions{byID: map[string]*session{}, failures: map[string]*failures{}, now: time.Now}
+}
+
+func newSessionsWithStore(st *store) *sessions {
+	s := newSessions()
+	s.st = st
+	s.mu.Lock()
+	s.loadLocked()
+	s.mu.Unlock()
+	return s
+}
+
+func (s *sessions) loadLocked() {
+	if s.st == nil || s.st.dir == "" {
+		return
+	}
+	raw, err := os.ReadFile(filepath.Join(s.st.dir, sessionsFile))
+	if err != nil {
+		return
+	}
+	plain, err := s.st.open(strings.TrimSpace(string(raw)))
+	if err != nil {
+		return
+	}
+	var saved map[string]savedSession
+	if json.Unmarshal([]byte(plain), &saved) != nil {
+		return
+	}
+	now := s.now()
+	adminUser := s.st.get().Admin.User
+	for id, v := range saved {
+		if id == "" || v.User == "" || v.CSRF == "" {
+			continue
+		}
+		if adminUser != "" && v.User != adminUser {
+			continue
+		}
+		if now.Sub(v.Seen) > sessionIdle || now.Sub(v.Created) > sessionLifetime {
+			continue
+		}
+		s.byID[id] = &session{
+			user:    v.User,
+			csrf:    v.CSRF,
+			created: v.Created,
+			seen:    v.Seen,
+		}
+	}
+}
+
+func (s *sessions) saveLocked() {
+	if s.st == nil || s.st.dir == "" {
+		return
+	}
+	path := filepath.Join(s.st.dir, sessionsFile)
+	now := s.now()
+	saved := make(map[string]savedSession, len(s.byID))
+	for id, sess := range s.byID {
+		if now.Sub(sess.seen) > sessionIdle || now.Sub(sess.created) > sessionLifetime {
+			delete(s.byID, id)
+			continue
+		}
+		saved[id] = savedSession{
+			User:    sess.user,
+			CSRF:    sess.csrf,
+			Created: sess.created,
+			Seen:    sess.seen,
+		}
+	}
+	if len(saved) == 0 {
+		_ = os.Remove(path)
+		return
+	}
+	data, err := json.Marshal(saved)
+	if err != nil {
+		return
+	}
+	sealed, err := s.st.seal(string(data))
+	if err != nil {
+		return
+	}
+	_ = writeFileAtomic(path, []byte(sealed+"\n"), 0o600)
 }
 
 func randomToken() string {
@@ -145,6 +237,7 @@ func (s *sessions) create(user string) (id string, sess *session) {
 	sess = &session{user: user, csrf: randomToken(), created: now, seen: now}
 	id = randomToken()
 	s.byID[id] = sess
+	s.saveLocked()
 	return id, sess
 }
 
@@ -162,15 +255,21 @@ func (s *sessions) lookup(id string) *session {
 	now := s.now()
 	if now.Sub(sess.seen) > sessionIdle || now.Sub(sess.created) > sessionLifetime {
 		delete(s.byID, id)
+		s.saveLocked()
 		return nil
 	}
+	prevSeen := sess.seen
 	sess.seen = now
+	if now.Sub(prevSeen) >= time.Minute {
+		s.saveLocked()
+	}
 	return sess
 }
 
 func (s *sessions) end(id string) {
 	s.mu.Lock()
 	delete(s.byID, id)
+	s.saveLocked()
 	s.mu.Unlock()
 }
 
@@ -178,6 +277,7 @@ func (s *sessions) end(id string) {
 func (s *sessions) endAll() {
 	s.mu.Lock()
 	s.byID = map[string]*session{}
+	s.saveLocked()
 	s.mu.Unlock()
 }
 

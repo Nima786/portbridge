@@ -48,6 +48,7 @@ type addRequest struct {
 
 // job is one server being added, with what has happened so far.
 type job struct {
+	id       string
 	mu       sync.Mutex
 	lines    []string
 	done     bool

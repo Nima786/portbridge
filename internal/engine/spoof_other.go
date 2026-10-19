@@ -17,6 +17,14 @@ func sendRawSpoofedUDP(_ int, _, _ net.IP, _, _ int, _ int, _ []byte) error {
 	return errors.New("raw socket IP spoofing is only supported on Linux")
 }
 
+func sendRawTCPPacket(_ int, _, _ net.IP, _, _ uint16, _, _ uint32, _ byte, _ int, _ []byte, _ bool) error {
+	return errors.New("raw socket TCP injection is only supported on Linux")
+}
+
 func injectDecoyClientHello(_ net.Conn, _ string, _ int) error {
 	return nil
+}
+
+func setIPConnSocketMark(_ *net.IPConn, _ int) error {
+	return errors.New("SO_MARK is only supported on Linux")
 }

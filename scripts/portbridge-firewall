@@ -42,14 +42,18 @@ usage() {
     cat >&2 <<'EOF'
 Usage:
   portbridge-firewall status                 every tunnel at a glance
-  portbridge-firewall apply  <tunnel-name>   lock, or unlock if turned off; make the GRE link
+  portbridge-firewall apply  <tunnel-name>   lock, or unlock if turned off; make the GRE/SIT link
   portbridge-firewall remove <tunnel-name>
   portbridge-firewall show   <tunnel-name>
   portbridge-firewall sweep [all]            remove what is left behind by tunnels that no longer exist
   portbridge-firewall gre-check              can this server make GRE links at all?
   portbridge-firewall gre-addr <this-ip> <other-ip>
-                                             the link's name and the two private addresses
+                                             the GRE link's name and the two private addresses
   portbridge-firewall gre-test <tunnel-name> is the other end of the GRE link answering?
+  portbridge-firewall sit-check              can this server make 6in4 (SIT) links at all?
+  portbridge-firewall sit-addr <this-ip> <other-ip>
+                                             the 6in4 link's name and the two private IPv6 addresses
+  portbridge-firewall sit-test <tunnel-name> is the other end of the 6in4 link answering?
 EOF
     exit 2
 }
@@ -115,6 +119,7 @@ load() {
 
     PROTO=tcp
     [ "$TRANSPORT" = kcp ] && PROTO=udp
+    [ "$TRANSPORT" = icmp ] && PROTO=icmp
     return 0
 }
 
@@ -141,7 +146,11 @@ rule_spec() {
     local name=$1 target=$2 src=${3-}
     RULE=()
     [ -n "$src" ] && RULE+=(-s "$src")
-    RULE+=(-p "$PROTO" --dport "$TPORT" -m comment --comment "$(tag "$name")" -j "$target")
+    if [ "$PROTO" = icmp ]; then
+        RULE+=(-p icmp -m comment --comment "$(tag "$name")" -j "$target")
+    else
+        RULE+=(-p "$PROTO" --dport "$TPORT" -m comment --comment "$(tag "$name")" -j "$target")
+    fi
 }
 
 # add_rule <tool> <name> <target> [source]
@@ -164,6 +173,11 @@ purge_own() {
     have "$tool" || return 0
     "$tool" -S INPUT 2>/dev/null |
         grep -E -- "^-A INPUT .*--comment \"?$(tag "$name")\"?( |$)" |
+        while read -r rule; do
+            delete_rule "$tool" "$rule"
+        done
+    "$tool" -S OUTPUT 2>/dev/null |
+        grep -E -- "^-A OUTPUT .*--comment \"?$(tag "$name")\"?( |$)" |
         while read -r rule; do
             delete_rule "$tool" "$rule"
         done
@@ -342,7 +356,7 @@ link_apply() {
     fi
     # The link is built on this server's own public address. A server that only
     # sees it through address translation cannot receive GRE on it.
-    if ! ip -4 -o addr show 2>/dev/null | grep -qF "inet $GRE_LOCAL/"; then
+    if ! ip -4 -o addr show 2>/dev/null | grep -qE "inet ${GRE_LOCAL//./\\.}[/ ]"; then
         echo "this server does not carry the address $GRE_LOCAL on any of its network cards," >&2
         echo "so it sits behind address translation, and a GRE link cannot be made from it" >&2
         return 1
@@ -437,6 +451,196 @@ cmd_gre_test() {
     exit 1
 }
 
+# ---------------------------------------------------------- private 6in4 (SIT) link
+#
+# Encapsulates IPv6 packets directly inside IPv4 Protocol 41 (SIT) between two
+# IPv4 servers, giving servers without native IPv6 a private /64 IPv6 link.
+
+SIT_MTU=1400
+
+sit_pair() {
+    local mine=$1 other=$2 lo hi digest h8 g1 g2 low high
+    valid_ipv4 "$mine" && valid_ipv4 "$other" || return 1
+    [ "$mine" != "$other" ] || return 1
+    if [ "$(ip2int "$other")" -lt "$(ip2int "$mine")" ]; then
+        lo=$other hi=$mine
+    else
+        lo=$mine hi=$other
+    fi
+    digest=$(printf '%s' "sit:$lo-$hi" | sha256sum)
+    h8=${digest:0:8}
+    g1=${digest:0:4}
+    g2=${digest:4:4}
+    low="fd99:$g1:$g2::1"
+    high="fd99:$g1:$g2::2"
+    SIT_IFACE="pbs$h8"
+    if [ "$mine" = "$lo" ]; then
+        SIT_OWN=$low SIT_PEER=$high
+    else
+        SIT_OWN=$high SIT_PEER=$low
+    fi
+}
+
+sit_conf() {
+    local conf="$CONF_DIR/$1.conf"
+    SIT_ON=$(read_conf "$conf" sit)
+    [ -n "$SIT_ON" ] || SIT_ON=off
+    SIT_LOCAL=$(read_conf "$conf" sit_local)
+    SIT_REMOTE=$(read_conf "$conf" sit_remote)
+}
+
+sit_tag() { printf 'portbridge-sit:%s' "$1"; }
+
+sit_firewall_open() {
+    have iptables || return 0
+    iptables -C INPUT -s "$SIT_REMOTE" -p 41 -m comment --comment "$(sit_tag "$SIT_IFACE")" -j ACCEPT 2>/dev/null ||
+        iptables -I INPUT 1 -s "$SIT_REMOTE" -p 41 -m comment --comment "$(sit_tag "$SIT_IFACE")" -j ACCEPT 2>/dev/null || true
+}
+
+sit_firewall_close() {
+    local rule
+    have iptables || return 0
+    iptables -S INPUT 2>/dev/null |
+        grep -E -- "^-A INPUT .*--comment \"?$(sit_tag "$SIT_IFACE")\"?( |$)" |
+        while read -r rule; do
+            delete_rule iptables "$rule"
+        done
+}
+
+sit_unsupported_hint() {
+    echo "this server cannot make 6in4 (SIT) links. The host kernel does not allow SIT"
+    echo "tunnels (common on some restricted containers). Ask the provider, or use a"
+    echo "different kind of tunnel on this server."
+}
+
+sit_used_by_others() {
+    local self=$1 f n
+    for f in "$CONF_DIR"/*.conf; do
+        [ -e "$f" ] || continue
+        n=$(basename "$f" .conf)
+        [ "$n" = "$self" ] && continue
+        [ "$(read_conf "$f" sit)" = on ] || continue
+        if [ "$(read_conf "$f" sit_local)" = "$SIT_LOCAL" ] && [ "$(read_conf "$f" sit_remote)" = "$SIT_REMOTE" ]; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+sit_release() {
+    local name=$1
+    sit_conf "$name"
+    [ -n "$SIT_LOCAL" ] && [ -n "$SIT_REMOTE" ] || return 0
+    sit_pair "$SIT_LOCAL" "$SIT_REMOTE" || return 0
+    if sit_used_by_others "$name"; then
+        return 0
+    fi
+    if have ip && ip link show "$SIT_IFACE" >/dev/null 2>&1; then
+        ip link del "$SIT_IFACE" 2>/dev/null && echo "private 6in4 link $SIT_IFACE removed"
+    fi
+    sit_firewall_close
+    return 0
+}
+
+sit_apply() {
+    local name=$1
+    sit_conf "$name"
+    if [ "$SIT_ON" != on ]; then
+        sit_release "$name"
+        return 0
+    fi
+
+    if ! sit_pair "$SIT_LOCAL" "$SIT_REMOTE"; then
+        echo "tunnel $name has sit = on but sit_local '$SIT_LOCAL' and sit_remote '$SIT_REMOTE' are not two different IPv4 addresses" >&2
+        return 1
+    fi
+    if ! have ip; then
+        echo "the 'ip' command is missing; install iproute2 to use a 6in4 link" >&2
+        return 1
+    fi
+    if ! ip -4 -o addr show 2>/dev/null | grep -qE "inet ${SIT_LOCAL//./\\.}[/ ]"; then
+        echo "this server does not carry the address $SIT_LOCAL on any of its network cards," >&2
+        echo "so it sits behind address translation, and a 6in4 link cannot be made from it" >&2
+        return 1
+    fi
+
+    modprobe sit 2>/dev/null || true
+    local err
+    if ! ip link show "$SIT_IFACE" >/dev/null 2>&1; then
+        if ! err=$(ip tunnel add "$SIT_IFACE" mode sit local "$SIT_LOCAL" remote "$SIT_REMOTE" ttl 64 2>&1); then
+            echo "could not make the 6in4 link $SIT_IFACE: $err" >&2
+            sit_unsupported_hint >&2
+            return 1
+        fi
+    fi
+    if ! ip -6 addr show dev "$SIT_IFACE" 2>/dev/null | grep -qF "inet6 $SIT_OWN/"; then
+        ip -6 addr add "$SIT_OWN/64" dev "$SIT_IFACE" 2>/dev/null || {
+            echo "could not give the 6in4 link its IPv6 address $SIT_OWN" >&2
+            return 1
+        }
+    fi
+    ip link set "$SIT_IFACE" mtu "$SIT_MTU" up 2>/dev/null || {
+        echo "could not bring the 6in4 link $SIT_IFACE up" >&2
+        return 1
+    }
+    sit_firewall_open
+    echo "private 6in4 link $SIT_IFACE is up: this server $SIT_OWN, the other server $SIT_PEER"
+    return 0
+}
+
+cmd_sit_check() {
+    have ip || {
+        echo "the 'ip' command is missing; install iproute2 to use a 6in4 link"
+        exit 1
+    }
+    modprobe sit 2>/dev/null || true
+    local err probe=pbschk$$
+    if err=$(ip tunnel add "$probe" mode sit local 127.0.0.1 remote 192.0.2.1 ttl 64 2>&1); then
+        ip link del "$probe" 2>/dev/null
+        echo "this server can make 6in4 (SIT) links"
+        return 0
+    fi
+    echo "$err"
+    sit_unsupported_hint
+    exit 1
+}
+
+cmd_sit_addr() {
+    sit_pair "$1" "$2" || {
+        echo "portbridge-firewall: '$1' and '$2' must be two different plain IPv4 addresses" >&2
+        exit 1
+    }
+    echo "$SIT_IFACE $SIT_OWN $SIT_PEER"
+}
+
+cmd_sit_test() {
+    local name=$1
+    load "$name" || exit 1
+    sit_conf "$name"
+    if [ "$SIT_ON" != on ]; then
+        echo "tunnel $name does not use a 6in4 link"
+        return 0
+    fi
+    sit_pair "$SIT_LOCAL" "$SIT_REMOTE" || {
+        echo "tunnel $name has unusable 6in4 addresses"
+        exit 1
+    }
+    if ! ip link show "$SIT_IFACE" >/dev/null 2>&1; then
+        echo "the 6in4 link $SIT_IFACE is not there on this server"
+        exit 1
+    fi
+    if ! have ping; then
+        echo "the 6in4 link $SIT_IFACE is up (ping is not installed, so the other end was not tried)"
+        return 0
+    fi
+    if ping -6 -c 3 -W 2 "$SIT_PEER" >/dev/null 2>&1; then
+        echo "the other end of the 6in4 link answers ($SIT_PEER)"
+        return 0
+    fi
+    echo "the 6in4 link $SIT_IFACE is up here, but the other end ($SIT_PEER) does not answer"
+    exit 1
+}
+
 firewall_apply() {
     local name=$1
     load "$name" || exit 1
@@ -464,6 +668,22 @@ firewall_apply() {
 
     # Start clean, so a changed peer address never leaves the old one allowed.
     purge_everything "$name"
+
+    if [ "$TRANSPORT" = faketcp ] && have iptables; then
+        iptables -C OUTPUT -p tcp --sport "$TPORT" --tcp-flags RST RST -m comment --comment "$(tag "$name")" -j DROP 2>/dev/null ||
+            iptables -I OUTPUT 1 -p tcp --sport "$TPORT" --tcp-flags RST RST -m comment --comment "$(tag "$name")" -j DROP 2>/dev/null || true
+    fi
+
+    if [ "$PROTO" = icmp ]; then
+        if have iptables; then
+            iptables -C OUTPUT -d "$PEER" -p icmp --icmp-type echo-reply -m mark ! --mark 0x7062 -m comment --comment "$(tag "$name")" -j DROP 2>/dev/null ||
+                iptables -I OUTPUT 1 -d "$PEER" -p icmp --icmp-type echo-reply -m mark ! --mark 0x7062 -m comment --comment "$(tag "$name")" -j DROP 2>/dev/null || true
+        fi
+        add_rule iptables "$name" ACCEPT 127.0.0.1
+        add_rule iptables "$name" ACCEPT "$PEER"
+        echo "tunnel ICMP echo is allowed from $PEER"
+        return 0
+    fi
 
     # Added bottom to top, each at the top of the chain: the drop first, then the
     # addresses allowed through, which end up above it.
@@ -494,20 +714,11 @@ firewall_apply() {
 
 # cmd_sweep [quiet|all] - removes whatever PortBridge left behind for tunnels that
 # no longer exist: firewall rules carrying a tunnel's tag when that tunnel has no
-# settings file any more, GRE rules and links no tunnel needs. It is the safety net
-# under every other way of cleaning up: a tunnel deleted by hand, by an older
-# version, by a program that stopped half way, or on a server where the rule
-# listing was written in a form the older cleaning did not understand.
-#
-# It touches only rules whose comment is "portbridge:<name>" or
-# "portbridge-gre:<link>", and only links named like the ones this makes. Nobody
-# else's rules are looked at. If the settings directory is missing it does nothing,
-# since it could not tell what is still wanted; "all" is for uninstalling, when
-# nothing is.
+# settings file any more, GRE/SIT rules and links no tunnel needs.
 cmd_sweep() {
     local mode=${1-} tool rule name iface f n used="" removed=0
     local re_tunnel='--comment "?portbridge:([A-Za-z0-9_-]+)"?( |$)'
-    local re_link='--comment "?portbridge-gre:(pbg[0-9a-f]{8})"?( |$)'
+    local re_link='--comment "?portbridge-(gre|sit):((pbg|pbs)[0-9a-f]{8})"?( |$)'
 
     if [ "$mode" != all ]; then
         if [ ! -d "$CONF_DIR" ]; then
@@ -518,34 +729,41 @@ cmd_sweep() {
             [ -e "$f" ] || continue
             n=$(basename "$f" .conf)
             gre_conf "$n"
-            [ "$GRE_ON" = on ] || continue
-            gre_pair "$GRE_LOCAL" "$GRE_REMOTE" && used="$used $GRE_IFACE "
+            if [ "$GRE_ON" = on ]; then
+                gre_pair "$GRE_LOCAL" "$GRE_REMOTE" && used="$used $GRE_IFACE "
+            fi
+            sit_conf "$n"
+            if [ "$SIT_ON" = on ]; then
+                sit_pair "$SIT_LOCAL" "$SIT_REMOTE" && used="$used $SIT_IFACE "
+            fi
         done
     fi
 
     for tool in iptables ip6tables; do
         have "$tool" || continue
-        while read -r rule; do
-            if [[ "$rule" =~ $re_tunnel ]]; then
-                name=${BASH_REMATCH[1]}
-                [ "$mode" != all ] && [ -f "$CONF_DIR/$name.conf" ] && continue
-            elif [[ "$rule" =~ $re_link ]]; then
-                iface=${BASH_REMATCH[1]}
-                case "$used" in *" $iface "*) continue ;; esac
-            else
-                continue
-            fi
-            delete_rule "$tool" "$rule"
-            removed=$((removed + 1))
-        done < <("$tool" -S INPUT 2>/dev/null)
+        for chain in INPUT OUTPUT; do
+            while read -r rule; do
+                if [[ "$rule" =~ $re_tunnel ]]; then
+                    name=${BASH_REMATCH[1]}
+                    [ "$mode" != all ] && [ -f "$CONF_DIR/$name.conf" ] && continue
+                elif [[ "$rule" =~ $re_link ]]; then
+                    iface=${BASH_REMATCH[2]}
+                    case "$used" in *" $iface "*) continue ;; esac
+                else
+                    continue
+                fi
+                delete_rule "$tool" "$rule"
+                removed=$((removed + 1))
+            done < <("$tool" -S "$chain" 2>/dev/null)
+        done
     done
 
     if have ip; then
         for iface in $(ip -o link show 2>/dev/null | awk -F': ' '{print $2}' | sed 's/@.*//'); do
-            [[ "$iface" =~ ^pbg[0-9a-f]{8}$ ]] || continue
+            [[ "$iface" =~ ^(pbg|pbs)[0-9a-f]{8}$ ]] || continue
             case "$used" in *" $iface "*) continue ;; esac
             if ip link del "$iface" 2>/dev/null; then
-                echo "removed the GRE link $iface, which no tunnel uses"
+                echo "removed the private link $iface, which no tunnel uses"
                 removed=$((removed + 1))
             fi
         done
@@ -559,13 +777,14 @@ cmd_sweep() {
     return 0
 }
 
-# cmd_apply makes the GRE link first, since a tunnel over one cannot start
+# cmd_apply makes the GRE/SIT link first, since a tunnel over one cannot start
 # without it, then sets the port rule. A link that cannot be made is reported
 # and makes the command fail, but the port rule is still dealt with.
 cmd_apply() {
     local name=$1 rc=0
     load "$name" || exit 1
     link_apply "$name" || rc=1
+    sit_apply "$name" || rc=1
     firewall_apply "$name"
     # Starting a tunnel is a good moment to clear away what deleted ones left.
     cmd_sweep quiet
@@ -579,9 +798,10 @@ cmd_remove() {
     # since the rules were added, and leaving them behind shuts a port for good.
     purge_everything "$name"
     echo "firewall rules for tunnel $name removed"
-    # The GRE link goes too, unless another tunnel between the same two servers
+    # The GRE/SIT link goes too, unless another tunnel between the same two servers
     # is still using it.
     link_release "$name"
+    sit_release "$name"
 }
 
 cmd_status() {
@@ -630,6 +850,28 @@ cmd_status() {
         fi
         printf '%-16s %-13s %s <-> %s  (%s)\n' "$name" "$GRE_IFACE" "$GRE_OWN" "$GRE_PEER" "$up"
     done
+
+    # The 6in4 (SIT) links, for the tunnels that use one.
+    local sit_shown=0
+    for f in "$CONF_DIR"/*.conf; do
+        [ -e "$f" ] || continue
+        name=$(basename "$f" .conf)
+        sit_conf "$name"
+        [ "$SIT_ON" = on ] || continue
+        if [ "$sit_shown" -eq 0 ]; then
+            printf '\n%-16s %-13s %s\n' "TUNNEL" "6IN4 LINK" "THIS SERVER <-> OTHER SERVER"
+            sit_shown=1
+        fi
+        if ! sit_pair "$SIT_LOCAL" "$SIT_REMOTE"; then
+            printf '%-16s %-13s %s\n' "$name" "?" "unusable addresses in its settings"
+            continue
+        fi
+        up=down
+        if have ip && ip link show "$SIT_IFACE" 2>/dev/null | grep -q 'UP'; then
+            up=up
+        fi
+        printf '%-16s %-13s %s <-> %s  (%s)\n' "$name" "$SIT_IFACE" "$SIT_OWN" "$SIT_PEER" "$up"
+    done
 }
 
 cmd_show() {
@@ -662,5 +904,8 @@ case "${1-}:$#" in
     gre-check:1) cmd_gre_check ;;
     gre-addr:3) cmd_gre_addr "$2" "$3" ;;
     gre-test:2) cmd_gre_test "$2" ;;
+    sit-check:1) cmd_sit_check ;;
+    sit-addr:3) cmd_sit_addr "$2" "$3" ;;
+    sit-test:2) cmd_sit_test "$2" ;;
     *) usage ;;
 esac

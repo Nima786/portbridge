@@ -75,10 +75,12 @@ type PairingData struct {
 	ProxyProtocol string
 
 	// Whitelisted SNI decoy ClientHello and source IP spoofing settings.
-	SNISpoof string
-	SpoofSNI string
-	IPSpoof  string
-	SpoofIP  string
+	SNISpoof   string
+	SpoofSNI   string
+	IPSpoof    string
+	SpoofIP    string
+	SIT        string
+	AntiFreeze string
 }
 
 // pairingVersionMax is the newest code this build understands. The menu keeps
@@ -141,6 +143,8 @@ func decodePairingCode(code string) (*PairingData, error) {
 		SpoofSNI:      kv["spoof_sni"],
 		IPSpoof:       kv["ip_spoof"],
 		SpoofIP:       kv["spoof_ip"],
+		SIT:           kv["sit"],
+		AntiFreeze:    kv["anti_freeze"],
 	}
 
 	if v, err := strconv.Atoi(p.Version); err == nil && v > pairingVersionMax {
@@ -258,7 +262,7 @@ func applyPairingWarn(p *PairingData, confDir string, warns *[]string) error {
 	}
 
 	// In direct mode with TLS, origin is listening, so ensure certificate is prepared
-	if cfg.Transport != engine.TransportPlain && cfg.Transport != engine.TransportKCP && cfg.Mode == engine.ModeDirect {
+	if cfg.Transport != engine.TransportPlain && !engine.IsKCPFamily(cfg.Transport) && cfg.Mode == engine.ModeDirect {
 		if _, err := engine.EnsureCert(certFile, keyFile, cfg.EffectiveServerName()); err != nil {
 			undo()
 			return fmt.Errorf("preparing the certificate: %w", err)
@@ -266,13 +270,16 @@ func applyPairingWarn(p *PairingData, confDir string, warns *[]string) error {
 	}
 
 	if err := host.FirewallApply(p.Name); err != nil {
-		if cfg.GRE {
-			// The helper also makes the GRE link, and a tunnel that runs over
+		if cfg.GRE || cfg.SIT {
+			// The helper also makes the GRE/SIT link, and a tunnel that runs over
 			// one cannot start without it. Say why instead of leaving a service
 			// that fails to find its address.
 			_ = host.FirewallRemove(p.Name)
 			undo()
 			_ = host.FirewallSweep()
+			if cfg.SIT {
+				return fmt.Errorf("this server could not make the private 6in4 (SIT) link: %w", err)
+			}
 			return fmt.Errorf("this server could not make the private GRE link: %w", err)
 		}
 		log.Printf("[%s] warning: %v", p.Name, err)
@@ -900,7 +907,7 @@ func newAgentHandler(token, confDir string, allowUpdates func() bool) *http.Serv
 			PreferredPort int `json:"preferred_port"`
 		}
 		_ = json.NewDecoder(io.LimitReader(r.Body, 4096)).Decode(&req)
-		pl, err := engine.StartProbeListener("0.0.0.0", req.PreferredPort, nil, 120*time.Second)
+		pl, err := engine.StartProbeListener("0.0.0.0", req.PreferredPort, nil, 300*time.Second)
 		if err != nil {
 			writeJSONReply(w, http.StatusUnprocessableEntity, map[string]any{"ok": false, "error": err.Error()})
 			return
@@ -1706,7 +1713,7 @@ func registerProbeListener(pl *engine.ProbeListener) string {
 	probeMu.Lock()
 	activeProbes[id] = pl
 	probeMu.Unlock()
-	time.AfterFunc(80*time.Second, func() {
+	time.AfterFunc(300*time.Second, func() {
 		stopProbeListener(id)
 	})
 	return id

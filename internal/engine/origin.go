@@ -150,7 +150,7 @@ func (o *origin) serveStream(tunnel net.Conn) {
 
 // runDirect accepts tunnel connections from the edge.
 func (o *origin) runDirect(ctx context.Context) error {
-	if o.cfg.Transport != TransportPlain && o.cfg.Transport != TransportKCP {
+	if o.cfg.Transport != TransportPlain && !o.cfg.Transport.IsPacketBased() {
 		cert, err := EnsureCert(o.cfg.CertFile, o.cfg.KeyFile, o.cfg.EffectiveServerName())
 		if err != nil {
 			return fmt.Errorf("preparing the disguise: %w", err)
@@ -169,7 +169,7 @@ func (o *origin) runDirect(ctx context.Context) error {
 
 	var ln net.Listener
 	var err error
-	if o.cfg.Transport == TransportKCP {
+	if o.cfg.Transport.IsPacketBased() {
 		ln, err = kcpListen(o.cfg.TunnelAddr, o.cfg)
 	} else {
 		ln, err = net.Listen("tcp", o.cfg.TunnelAddr)
@@ -210,7 +210,7 @@ func (o *origin) runDirect(ctx context.Context) error {
 				tuneSocket(raw)
 				c, err := wrapAccept(raw, o.cfg, o.cert, o.guard)
 				if err != nil {
-					if errors.Is(err, errStrangerForwarded) {
+					if errors.Is(err, errStrangerForwarded) || errors.Is(err, errSplitLegAttached) {
 						return
 					}
 					o.logAuth.printf("refused a tunnel connection from %s: %v", raw.RemoteAddr(), err)

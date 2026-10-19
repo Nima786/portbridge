@@ -1318,6 +1318,9 @@ func (cs *carrierSet) add(conn net.Conn) bool {
 	cs.mu.Unlock()
 
 	c.start()
+	if cs.dial != nil && needsKeepalive(conn) {
+		c.sendControl(muxFrame{typ: muxPing})
+	}
 	if cs.onStream != nil {
 		go cs.acceptLoop(c)
 	}

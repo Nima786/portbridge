@@ -139,3 +139,35 @@ func TestSessionsRunOut(t *testing.T) {
 		t.Fatalf("endAll left a session")
 	}
 }
+
+func TestSessionsSurvivePanelRestart(t *testing.T) {
+	dir := t.TempDir()
+	st, err := openStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = st.update(func(s *State) error {
+		s.Admin = Admin{User: "admin", Hash: "h"}
+		return nil
+	})
+	s1 := newSessionsWithStore(st)
+	id, sess := s1.create("admin")
+
+	// Simulate panel restart by reloading store and sessions from disk.
+	st2, err := openStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s2 := newSessionsWithStore(st2)
+	got := s2.lookup(id)
+	if got == nil || got.user != "admin" || got.csrf != sess.csrf {
+		t.Fatalf("session did not survive panel restart: %+v", got)
+	}
+
+	// Ending all sessions removes the persisted session file.
+	s2.endAll()
+	s3 := newSessionsWithStore(st2)
+	if s3.lookup(id) != nil {
+		t.Fatalf("session survived after endAll")
+	}
+}

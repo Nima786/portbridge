@@ -460,7 +460,7 @@ func (r *router) dialRoute(i int, timeout time.Duration) (net.Conn, error) {
 	if i < 0 || i >= len(r.targets) {
 		return nil, errors.New("no such route")
 	}
-	if r.cfg != nil && r.cfg.Transport == TransportKCP {
+	if r.cfg != nil && r.cfg.Transport.IsPacketBased() {
 		return kcpDial(r.targets[i].addr, r.cfg)
 	}
 	d := net.Dialer{Timeout: timeout}

@@ -685,7 +685,51 @@
                 <strong>Decoy Whitelisted SNI Spoof</strong>
                 <span class="pill-tag tag-good">Works on All VPS</span>
               </div>
-              <span class="choice-desc">Injects a decoy TLS 1.3 ClientHello with a whitelisted SNI (Cloudflare Turnstile / reCAPTCHA) so DPI whitelists the flow while the peer drops the decoy.</span>
+              <span class="choice-desc">Injects a low-TTL out-of-window decoy TLS 1.3 ClientHello with a whitelisted SNI (Cloudflare Turnstile / reCAPTCHA) so DPI whitelists the flow while the peer drops the decoy.</span>
+            </div>
+          </label>
+
+          <label class="choice-card">
+            <input type="radio" name="tn-link" value="split">
+            <div class="choice-body">
+              <div class="choice-top">
+                <strong>Split-Stream TLS (Anti-Freeze Rotation)</strong>
+                <span class="pill-tag tag-good">Byte-Cap Bypass</span>
+              </div>
+              <span class="choice-desc">Continuously rotates underlying TLS sockets every 14 KB with pre-warmed legs so DPI byte-counter filters never freeze long-lived streams.</span>
+            </div>
+          </label>
+
+          <label class="choice-card">
+            <input type="radio" name="tn-link" value="faketcp">
+            <div class="choice-body">
+              <div class="choice-top">
+                <strong>Raw FakeTCP · Paqet-Style (KCP+FEC)</strong>
+                <span class="pill-tag tag-accent">Paqet · Raw TCP</span>
+              </div>
+              <span class="choice-desc">Carries KCP+FEC inside raw TCP PSH|ACK segments with outer source-port rotation and low-TTL SYN decoy, bypassing UDP throttles while ignoring ISP TCP RST injection.</span>
+            </div>
+          </label>
+
+          <label class="choice-card">
+            <input type="radio" name="tn-link" value="icmp">
+            <div class="choice-body">
+              <div class="choice-top">
+                <strong>ICMP Ping Tunnel (KCP+FEC)</strong>
+                <span class="pill-tag">Ping Tunnel</span>
+              </div>
+              <span class="choice-desc">Encapsulates KCP+FEC inside realistic ICMP Echo Request &amp; Reply (ping) packets when both TCP and UDP ports are heavily filtered.</span>
+            </div>
+          </label>
+
+          <label class="choice-card">
+            <input type="radio" name="tn-link" value="sit">
+            <div class="choice-body">
+              <div class="choice-top">
+                <strong>Private 6in4 Link (SIT Protocol 41)</strong>
+                <span class="pill-tag">Protocol 41</span>
+              </div>
+              <span class="choice-desc">Builds a deterministic private IPv6 link (fd99::/64 over IP protocol 41) between IPv4 servers so traffic rides inside IPv6-in-IPv4 packets.</span>
             </div>
           </label>
 

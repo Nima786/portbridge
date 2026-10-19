@@ -66,6 +66,19 @@ func buildOriginConf(p *PairingData, secretFile, certFile, keyFile string) strin
 			firewall = "off"
 		}
 	}
+	sitOn := p.SIT == "on"
+	if sitOn {
+		own, peer, err := engine.SITAddrs(p.ServerIP, p.RelayIP)
+		if err == nil {
+			if p.Mode == "direct" {
+				tunnelAddr = net.JoinHostPort(own, p.TunnelPort)
+			} else {
+				tunnelAddr = net.JoinHostPort(peer, p.TunnelPort)
+			}
+			peerIP = peer
+			firewall = "off"
+		}
+	}
 
 	var b strings.Builder
 	fmt.Fprintf(&b, "# PortBridge tunnel %q, deployed by management agent\n", p.Name)
@@ -85,6 +98,12 @@ func buildOriginConf(p *PairingData, secretFile, certFile, keyFile string) strin
 		fmt.Fprintf(&b, "gre_local = %s\n", p.ServerIP)
 		fmt.Fprintf(&b, "gre_remote = %s\n", p.RelayIP)
 	}
+	if sitOn {
+		fmt.Fprintf(&b, "\n# Carried over a private 6in4 (SIT) IPv6-over-IPv4 link between the two servers.\n")
+		fmt.Fprintf(&b, "sit = on\n")
+		fmt.Fprintf(&b, "sit_local = %s\n", p.ServerIP)
+		fmt.Fprintf(&b, "sit_remote = %s\n", p.RelayIP)
+	}
 	fmt.Fprintf(&b, "\ntransport = %s\n", p.Transport)
 	if p.Transport == "plain" && p.HTTPHeader == "on" {
 		fmt.Fprintf(&b, "http_header = on\n")
@@ -92,7 +111,7 @@ func buildOriginConf(p *PairingData, secretFile, certFile, keyFile string) strin
 			fmt.Fprintf(&b, "http_host = %s\n", p.HTTPHost)
 		}
 	}
-	if p.Transport != "plain" && p.Transport != "kcp" {
+	if p.Transport != "plain" && !engine.IsKCPFamily(engine.Transport(p.Transport)) {
 		if p.ServerName != "" {
 			fmt.Fprintf(&b, "server_name = %s\n", p.ServerName)
 		}
@@ -141,6 +160,9 @@ func buildOriginConf(p *PairingData, secretFile, certFile, keyFile string) strin
 		if p.SpoofSNI != "" && p.SNISpoof != "on" {
 			fmt.Fprintf(&b, "spoof_sni = %s\n", p.SpoofSNI)
 		}
+	}
+	if p.AntiFreeze == "on" {
+		fmt.Fprintf(&b, "anti_freeze = on\n")
 	}
 	if p.ProxyProtocol == "v1" || p.ProxyProtocol == "v2" {
 		fmt.Fprintf(&b, "\n# Tell the service each user's real address; it must be set to expect it.\n")
@@ -362,7 +384,7 @@ func updatePairingData(p *PairingData, confDir string, warns *[]string) error {
 		_ = writeFileAtomic(confFile, oldConf, 0o600)
 		return fmt.Errorf("validating config: %w", err)
 	}
-	if cfg.Transport != engine.TransportPlain && cfg.Transport != engine.TransportKCP && cfg.Mode == engine.ModeDirect {
+	if cfg.Transport != engine.TransportPlain && !engine.IsKCPFamily(cfg.Transport) && cfg.Mode == engine.ModeDirect {
 		if _, err := engine.EnsureCert(certFile, keyFile, cfg.EffectiveServerName()); err != nil {
 			_ = writeFileAtomic(confFile, oldConf, 0o600)
 			return fmt.Errorf("preparing the certificate: %w", err)
@@ -371,8 +393,11 @@ func updatePairingData(p *PairingData, confDir string, warns *[]string) error {
 
 	// The firewall rule follows the port, then the service starts on it.
 	if err := host.FirewallApply(p.Name); err != nil {
-		if cfg.GRE {
+		if cfg.GRE || cfg.SIT {
 			restore()
+			if cfg.SIT {
+				return fmt.Errorf("this server could not make the private 6in4 (SIT) link, so the old settings were put back: %w", err)
+			}
 			return fmt.Errorf("this server could not make the private GRE link, so the old settings were put back: %w", err)
 		}
 		log.Printf("[%s] warning: %v", p.Name, err)

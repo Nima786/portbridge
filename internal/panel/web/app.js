@@ -377,7 +377,9 @@
       }
       if (statusIsProblem) setStatus('');
     } catch (e) {
-      if (e.status !== 401) setStatus(e.message, true);
+      if (e.status !== 401 && !(e.status === 0 && $('job-dialog') && $('job-dialog').open)) {
+        setStatus(e.message, true);
+      }
     }
   }
 
@@ -885,17 +887,56 @@
     if (!$('job-dialog').open) openDialog($('job-dialog'));
     $('job-title').focus();
     let seen = 0;
+    let restartTries = 0;
+    const syncMe = async () => {
+      try {
+        const me = await api('GET', '/api/me');
+        if (me && me.version) {
+          loadedVersion = me.version;
+          $('version').textContent = me.version;
+        }
+        if (me && me.csrf) csrf = me.csrf;
+      } catch (_) {}
+    };
     const poll = async () => {
       let job;
       try {
         job = await api('GET', '/api/jobs/' + encodeURIComponent(id));
+        restartTries = 0;
       } catch (e) {
         if (e.status === 401) return;
-        $('job-result').textContent = e.status === 0 || e.status === 404
-          ? 'The panel is restarting on the new version. Please sign in again in a moment to view the results.'
-          : e.message;
+        if (e.status === 404 && restartTries < 25) {
+          restartTries++;
+          try {
+            const u = await api('GET', '/api/updates');
+            if (u && u.job && u.job !== id) {
+              id = u.job;
+              setTimeout(poll, 1000);
+              return;
+            }
+            if (u && !u.running && !u.panel_older) {
+              await syncMe();
+              $('job-log').append(h('li', null, `The panel's own server is now on ${u.panel}.`));
+              $('job-log').scrollTop = $('job-log').scrollHeight;
+              $('job-note').hidden = true;
+              $('job-result').textContent = u.note ? `${failText} ${sentence(u.note)}` : okText;
+              $('job-result').className = u.note ? 'bad' : 'good';
+              lastServers = lastTunnels = '';
+              refresh();
+              return;
+            }
+          } catch (_) {}
+        }
+        if ((e.status === 0 || e.status === 404 || e.status === 502 || e.status === 503 || e.status === 504) && restartTries < 25) {
+          restartTries++;
+          $('job-result').textContent = 'Restarting panel service on the new version, please wait...';
+          $('job-result').className = '';
+          setTimeout(poll, 1500);
+          return;
+        }
+        $('job-result').textContent = e.message;
+        $('job-result').className = 'bad';
         $('job-note').hidden = true;
-        setTimeout(waitForPanel, 5000);
         return;
       }
       const lines = job.lines || [];
@@ -905,6 +946,7 @@
         setTimeout(poll, 1500);
         return;
       }
+      await syncMe();
       $('job-note').hidden = true;
       $('job-result').textContent = job.error ? `${failText} ${sentence(job.error)}` : okText;
       $('job-result').className = job.error ? 'bad' : 'good';
@@ -912,14 +954,6 @@
       refresh();
     };
     poll();
-  }
-
-  async function waitForPanel() {
-    try {
-      await api('GET', '/api/me');
-    } catch (e) {
-      if (e.status === 0) setTimeout(waitForPanel, 5000);
-    }
   }
   $('job-close').addEventListener('click', () => $('job-dialog').close());
 
@@ -967,9 +1001,15 @@
   function shortLinkLabel(any) {
     if (!any) return 'TCP';
     if (any.gre) return 'GRE';
+    if (any.sit) return '6in4 (Protocol 41)';
     if (any.ip_spoof) return any.spoof_ip ? `IP Spoof (${any.spoof_ip})` : 'IP Spoof (KCP)';
+    if (any.anti_freeze) return 'Split-Stream TLS';
     const raw = String(any.link || any.transport || '');
     if (/source IP spoofing/i.test(raw)) return 'IP Spoof (KCP)';
+    if (/6in4/i.test(raw)) return '6in4 (Protocol 41)';
+    if (/split-stream/i.test(raw)) return 'Split-Stream TLS';
+    if (/FakeTCP/i.test(raw) || any.transport === 'faketcp') return 'FakeTCP · Paqet (KCP)';
+    if (/ICMP/i.test(raw) || any.transport === 'icmp') return 'ICMP Ping (KCP)';
     const m = raw.match(/\(([^(),]+)\)/);
     const host = m ? m[1] : '';
     const sniSuffix = any.sni_spoof ? ' + Decoy SNI' : '';
@@ -1034,6 +1074,8 @@
     const extraTags = [];
     if (/fragmented/i.test(combinedLinkDesc)) extraTags.push('Stealth (uTLS + Frag)');
     else if (/browser TLS/i.test(combinedLinkDesc)) extraTags.push('uTLS');
+    if (any.sit) extraTags.push('6in4 (Protocol 41)');
+    if (any.anti_freeze) extraTags.push('Anti-Freeze (24KB Rotation)');
     if (any.sni_spoof) extraTags.push(`Decoy SNI (${any.spoof_sni || 'challenges.cloudflare.com'})`);
     if (any.ip_spoof) extraTags.push(`Spoof IP (${any.spoof_ip || '104.18.4.130'})`);
     if (any.real_site) extraTags.push('Real-Site Cover');
@@ -1218,7 +1260,7 @@
     $('et-firewall').checked = fw;
 
     if ($('et-peer-ip')) $('et-peer-ip').value = (ei && ei.peer_ip) || (oi && oi.peer_ip) || '';
-    if ($('et-peer-wrap')) $('et-peer-wrap').hidden = !!any.gre;
+    if ($('et-peer-wrap')) $('et-peer-wrap').hidden = !!(any.gre || any.sit);
     if ($('et-spare-ttl-wrap')) $('et-spare-ttl-wrap').hidden = isMux;
     if ($('et-spare-ttl')) $('et-spare-ttl').value = (ei && ei.spare_ttl) || (oi && oi.spare_ttl) || '1m0s';
     if ($('et-drain')) $('et-drain').value = (ei && ei.drain) || (oi && oi.drain) || '10s';
@@ -2419,14 +2461,14 @@
     const link = gre ? 'plain' : radio('tn-link');
     $('tn-opt-webheader').hidden = gre || link !== 'plain';
     $('tn-webhost').disabled = !$('tn-webheader').checked;
-    $('tn-opt-claim').hidden = !['website', 'website-cdn-backup', 'grpc'].includes(link);
+    $('tn-opt-claim').hidden = !['website', 'split', 'sit', 'website-cdn-backup', 'grpc'].includes(link);
     const needDomain = ['cdn', 'website-cdn-backup', 'grpc-cdn'].includes(link);
     $('tn-opt-domain').hidden = !needDomain;
     if (needDomain) ensureTunnelCFHelper();
     $('tn-opt-clean').hidden = !['cdn', 'grpc-cdn'].includes(link);
-    $('tn-opt-stealth').hidden = !['website', 'sni-spoof', 'grpc'].includes(link);
+    $('tn-opt-stealth').hidden = !['website', 'split', 'sit', 'sni-spoof', 'grpc'].includes(link);
     if ($('tn-opt-snispoof')) {
-      $('tn-opt-snispoof').hidden = gre;
+      $('tn-opt-snispoof').hidden = gre || ['kcp', 'icmp', 'faketcp', 'sit'].includes(link);
       if (link === 'ip-spoof' || link === 'sni-spoof') {
         $('tn-snispoof').checked = true;
         $('tn-snispoof').disabled = true;
@@ -2441,11 +2483,11 @@
     }
     if (link === 'grpc' && $('tn-claim').value === 'www.bing.com') $('tn-claim').value = 'www.google.com';
     if (link !== 'grpc' && $('tn-claim').value === 'www.google.com') $('tn-claim').value = 'www.bing.com';
-    const v6ok = !gre && ['plain', 'website', 'sni-spoof', 'grpc', 'kcp'].includes(link) &&
+    const v6ok = !gre && ['plain', 'website', 'split', 'sni-spoof', 'grpc', 'kcp'].includes(link) &&
       hasIPv6(serverById($('tn-relay').value)) && hasIPv6(serverById($('tn-foreign').value));
     $('tn-ipv6-row').hidden = !v6ok;
     if (!v6ok) $('tn-ipv6').checked = false;
-    if (!sharingTouched) setRadio('tn-shared', ['kcp', 'ip-spoof', 'cdn', 'website-cdn-backup', 'grpc', 'grpc-cdn'].includes(link) ? 'shared' : 'one');
+    if (!sharingTouched) setRadio('tn-shared', ['kcp', 'icmp', 'faketcp', 'ip-spoof', 'split', 'cdn', 'website-cdn-backup', 'grpc', 'grpc-cdn'].includes(link) ? 'shared' : 'one');
     $('tn-opt-links').hidden = radio('tn-shared') !== 'shared';
     syncChoiceCards($('tunnel-dialog'));
   }
@@ -2689,7 +2731,7 @@
     if (!cand) return;
     $('tn-gre').checked = false;
     setRadio('tn-mode', cand.mode === 'reverse' ? 'reverse' : 'direct');
-    setRadio('tn-link', cand.ip_spoof ? 'ip-spoof' : (cand.sni_spoof ? 'sni-spoof' : (cand.link || 'website')));
+    setRadio('tn-link', cand.ip_spoof ? 'ip-spoof' : (cand.anti_freeze ? 'split' : (cand.sni_spoof ? 'sni-spoof' : (cand.link || 'website'))));
     $('tn-stealth').checked = !!cand.stealth;
     $('tn-webheader').checked = !!cand.web_header;
     $('tn-ipv6').checked = !!cand.ipv6;
@@ -2702,7 +2744,7 @@
     if (cand.spoof_ip && $('tn-spoofip')) {
       $('tn-spoofip').value = cand.spoof_ip;
     }
-    if (cand.server_name && ['website', 'website-cdn-backup', 'grpc'].includes(cand.link)) {
+    if (cand.server_name && ['website', 'split', 'sit', 'website-cdn-backup', 'grpc'].includes(cand.link)) {
       $('tn-claim').value = cand.server_name;
     }
     if (cand.domain) {
@@ -2710,6 +2752,10 @@
     }
     sharingTouched = true;
     setRadio('tn-shared', cand.shared ? 'shared' : 'one');
+    if (cand.shared && $('tn-links-n')) {
+      const isRawKCP = cand.link === 'icmp' || cand.link === 'faketcp' || cand.ip_spoof;
+      $('tn-links-n').value = isRawKCP ? '2' : '4';
+    }
     if (cand.port && ['cdn', 'website-cdn-backup', 'grpc-cdn'].includes(cand.link)) {
       $('tn-linkport').value = String(cand.port);
     }
@@ -2722,7 +2768,7 @@
     if (isActive) {
       return h('div', { class: 'probe-row active' },
         h('div', { class: 'probe-row-label' }, r.label,
-          h('span', { class: 'probe-row-sub' }, 'Running handshake, ping & payload burst...')),
+          h('span', { class: 'probe-row-sub' }, 'Running handshake, ping & download/upload burst...')),
         h('span', { class: 'state note' }, 'Testing…'),
         h('span', { class: 'probe-metric' }, '…'),
         h('span', { class: 'probe-metric' }, '…'),
@@ -2747,9 +2793,17 @@
     const st = stMap[r.status] || ['bad', r.status || 'Blocked'];
     const scoreCls = r.score >= 75 ? '' : (r.score >= 45 ? ' warn' : ' bad');
     const canUse = !isLive && (r.status === 'ok' || r.status === 'degraded');
-    let speedText = '—';
+    let speedNode = '—';
     if (r.successes > 0) {
-      speedText = (r.status === 'throttled' && !(r.avg_mbps > 0)) ? 'Frozen' : `${r.avg_mbps.toFixed(1)} Mbps`;
+      if (r.status === 'throttled' && !(r.avg_mbps > 0)) {
+        speedNode = 'Frozen';
+      } else if (r.down_mbps > 0 || r.up_mbps > 0) {
+        speedNode = h('span', { title: `Download: ${(r.down_mbps || 0).toFixed(1)} Mbps · Upload: ${(r.up_mbps || 0).toFixed(1)} Mbps` },
+          `${r.avg_mbps.toFixed(1)} Mbps`,
+          h('span', { class: 'probe-row-sub' }, `↓${(r.down_mbps || 0).toFixed(1)} · ↑${(r.up_mbps || 0).toFixed(1)}`));
+      } else {
+        speedNode = `${r.avg_mbps.toFixed(1)} Mbps`;
+      }
     }
     return h('div', { class: 'probe-row' },
       h('div', { class: 'probe-row-label' },
@@ -2757,7 +2811,7 @@
         r.error && r.status !== 'ok' ? h('span', { class: 'probe-row-sub' }, r.error) : null),
       h('span', { class: 'state ' + st[0] }, st[1]),
       h('span', { class: 'probe-metric' }, r.successes > 0 ? `${Math.round(r.rtt_ms)} ms` : '—'),
-      h('span', { class: 'probe-metric' }, speedText),
+      h('span', { class: 'probe-metric' }, speedNode),
       isLive
         ? h('span', { class: 'muted small' }, r.status === 'ok' ? 'Done' : (r.status === 'throttled' ? 'Capped' : '—'))
         : h('span', { class: 'probe-score-pill' + scoreCls }, `${r.score}/100`),
@@ -2857,7 +2911,7 @@
           setProbeProgress(`Step ${i + 1} of ${cands.length}: ${spec.label}…`, pct);
           renderProbeResults({ results: liveState, notes: sess.notes }, true, i);
 
-          const isTCPDirect = !spec.cdn && spec.transport !== 'kcp' && spec.target_addr;
+          const isTCPDirect = !spec.cdn && !['kcp', 'icmp', 'faketcp'].includes(spec.transport) && spec.target_addr;
           if (isTCPDirect && (deadTCP[spec.target_addr] || 0) >= 2) {
             const skipped = Object.assign({}, spec, {
               status: 'blocked',
@@ -2956,7 +3010,9 @@
     const link = gre ? 'plain' : radio('tn-link');
     const shared = radio('tn-shared') === 'shared';
     const ipSpoof = !gre && link === 'ip-spoof';
-    const sniSpoof = !gre && (ipSpoof || link === 'sni-spoof' || ($('tn-snispoof') && $('tn-snispoof').checked));
+    const sit = !gre && link === 'sit';
+    const antiFreeze = !gre && link === 'split';
+    const sniSpoof = !gre && !sit && (ipSpoof || link === 'sni-spoof' || ($('tn-snispoof') && !$('tn-opt-snispoof').hidden && $('tn-snispoof').checked));
     return {
       name: $('tn-name').value.trim(),
       relay: $('tn-relay').value,
@@ -2966,7 +3022,7 @@
       server_name: $('tn-claim').value.trim(),
       domain: $('tn-domain').value.trim(),
       clean_ips: $('tn-cleanips').value.replace(/\s+/g, ''),
-      stealth: link === 'sni-spoof' || $('tn-stealth').checked,
+      stealth: ['sni-spoof', 'split'].includes(link) || $('tn-stealth').checked,
       web_header: !gre && $('tn-webheader').checked,
       web_host: $('tn-webhost').value.trim(),
       real_site: $('tn-realsite').checked,
@@ -2975,6 +3031,8 @@
       ip_spoof: ipSpoof,
       spoof_ip: $('tn-spoofip') ? $('tn-spoofip').value.trim() : '',
       gre,
+      sit,
+      anti_freeze: antiFreeze,
       ipv6: $('tn-ipv6').checked,
       shared,
       shared_links: shared ? Number($('tn-links-n').value || 4) : 0,
@@ -3285,10 +3343,10 @@
     b.addEventListener('click', () => {
       const u = updatesCache || {};
       const self = u.panel_older
-        ? ` The panel host will update to ${u.latest} first and restart briefly, then automatically update the remaining servers.`
+        ? ` After the other servers are updated, this panel host will also update to ${u.latest} and restart briefly without logging you out.`
         : '';
       openConfirm('Update all servers?',
-        `Each server will be updated one by one, and its tunnels will restart for a few seconds.${self}`,
+        `Each server will be updated one by one while you stay in the panel, and its tunnels will restart for a few seconds.${self}`,
         'Update All Servers',
         async () => {
           const res = await api('POST', '/api/updates');

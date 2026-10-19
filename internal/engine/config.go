@@ -102,6 +102,12 @@ type Config struct {
 	GRELocal  string
 	GRERemote string
 
+	// SIT runs the tunnel over a private 6in4 (IP protocol 41) IPv6 link between
+	// the two servers' public IPv4 addresses. See sit.go.
+	SIT       bool
+	SITLocal  string
+	SITRemote string
+
 	PoolSize    int
 	MaxConn     int
 	MaxPending  int
@@ -212,6 +218,10 @@ type Config struct {
 	// source IPv4 address (SpoofIP, default 104.18.4.130) via raw sockets.
 	IPSpoof bool
 	SpoofIP string
+
+	// AntiFreeze rotates underlying TLS/TCP carrier legs every 24 KB so no single
+	// TCP 5-tuple ever reaches the ISP's mid-stream byte-counter freeze threshold.
+	AntiFreeze bool
 
 	// ProxyProtocol passes each user's real address to the service in the
 	// standard PROXY protocol header: proxyProtocolOff, or the version written
@@ -604,6 +614,19 @@ func (c *Config) Set(key, val string) error {
 		c.GRELocal = strings.TrimSpace(val)
 	case "gre_remote":
 		c.GRERemote = strings.TrimSpace(val)
+	case "sit":
+		switch strings.ToLower(val) {
+		case "on", "yes", "true":
+			c.SIT = true
+		case "off", "no", "false":
+			c.SIT = false
+		default:
+			return fmt.Errorf("sit must be on or off, got %q", val)
+		}
+	case "sit_local":
+		c.SITLocal = strings.TrimSpace(val)
+	case "sit_remote":
+		c.SITRemote = strings.TrimSpace(val)
 	case "secret_file":
 		c.SecretFile = val
 	case "status_file":
@@ -742,6 +765,15 @@ func (c *Config) Set(key, val string) error {
 		}
 	case "spoof_ip":
 		c.SpoofIP = strings.TrimSpace(val)
+	case "anti_freeze":
+		switch strings.ToLower(strings.TrimSpace(val)) {
+		case "on", "yes", "true":
+			c.AntiFreeze = true
+		case "off", "no", "false":
+			c.AntiFreeze = false
+		default:
+			return fmt.Errorf("anti_freeze must be on or off, got %q", val)
+		}
 	default:
 		return fmt.Errorf("unknown setting %q", key)
 	}
@@ -774,7 +806,7 @@ func (c *Config) Validate() error {
 		// Said out loud rather than quietly doing nothing, or worse, quietly
 		// sending a CDN's connection to the real website instead of to us.
 		switch {
-		case c.Transport == TransportPlain || c.Transport == TransportKCP:
+		case c.Transport == TransportPlain || c.Transport.IsPacketBased():
 			return fmt.Errorf("real_site needs a website-style link (tls, wss, h2 or grpc); the %s link has no handshake to hide behind", c.Transport)
 		case c.CDN:
 			return fmt.Errorf("real_site cannot be used with cdn = on: a CDN makes its own connection and cannot carry the proof")
@@ -853,6 +885,9 @@ func (c *Config) Validate() error {
 		}
 	}
 	if err := c.validateGRE(); err != nil {
+		return err
+	}
+	if err := c.validateSIT(); err != nil {
 		return err
 	}
 
@@ -962,10 +997,10 @@ func (c *Config) Validate() error {
 	}
 
 	if !ValidTransport(c.Transport) {
-		return fmt.Errorf("transport must be %q, %q, %q, %q, %q or %q, got %q",
-			TransportPlain, TransportTLS, TransportWSS, TransportH2, TransportGRPC, TransportKCP, c.Transport)
+		return fmt.Errorf("transport must be %q, %q, %q, %q, %q, %q, %q or %q, got %q",
+			TransportPlain, TransportTLS, TransportWSS, TransportH2, TransportGRPC, TransportKCP, TransportICMP, TransportFakeTCP, c.Transport)
 	}
-	if c.Transport != TransportPlain && c.Transport != TransportKCP {
+	if c.Transport != TransportPlain && !c.Transport.IsPacketBased() {
 		// Only the accepting side presents a certificate, and it is created on
 		// demand, so a missing path is a configuration gap rather than a
 		// missing file.

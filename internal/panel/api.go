@@ -742,7 +742,7 @@ func (p *Panel) handleSpeedtestTunnel(w http.ResponseWriter, r *http.Request, _ 
 }
 
 func (p *Panel) handleProbeTunnel(w http.ResponseWriter, r *http.Request, _ authed) {
-	agent.ExtendDeadlines(w, 3*time.Minute)
+	agent.ExtendDeadlines(w, 5*time.Minute)
 	var req struct {
 		Action    string                        `json:"action"`
 		Relay     string                        `json:"relay"`

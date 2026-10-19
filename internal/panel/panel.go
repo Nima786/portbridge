@@ -76,7 +76,7 @@ func newPanel(dir string, cfg Config, st *store) *Panel {
 		dir:        dir,
 		cfg:        cfg,
 		store:      st,
-		sessions:   newSessions(),
+		sessions:   newSessionsWithStore(st),
 		tunnelsDir: defaultTunnelsDir,
 		jobs:       map[string]*job{},
 		pending:    map[string]string{},

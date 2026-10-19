@@ -55,6 +55,12 @@ const (
 
 	// TransportKCP wraps the link in encrypted KCP over UDP with Reed-Solomon Forward Error Correction.
 	TransportKCP Transport = "kcp"
+
+	// TransportICMP wraps KCP + FEC inside raw IPv4 ICMP Echo Request (Type 8) and Echo Reply (Type 0) ping packets.
+	TransportICMP Transport = "icmp"
+
+	// TransportFakeTCP wraps KCP + FEC inside raw IPv4 TCP PSH|ACK segments with realistic advancing sequence numbers.
+	TransportFakeTCP Transport = "faketcp"
 )
 
 const (
@@ -69,10 +75,21 @@ const (
 
 func ValidTransport(t Transport) bool {
 	switch t {
-	case TransportPlain, TransportTLS, TransportWSS, TransportH2, TransportGRPC, TransportKCP:
+	case TransportPlain, TransportTLS, TransportWSS, TransportH2, TransportGRPC, TransportKCP, TransportICMP, TransportFakeTCP:
 		return true
 	}
 	return false
+}
+
+// IsPacketBased reports whether the transport uses KCP over a packet socket
+// (UDP, raw ICMP Echo, or raw FakeTCP) rather than a kernel TCP listener/dialer.
+func (t Transport) IsPacketBased() bool {
+	return t == TransportKCP || t == TransportICMP || t == TransportFakeTCP
+}
+
+// IsKCPFamily reports whether t is a packet-based KCP transport (kcp, icmp, or faketcp).
+func IsKCPFamily(t Transport) bool {
+	return t.IsPacketBased()
 }
 
 // alpnFor keeps the advertised protocols consistent with what the disguise
@@ -481,16 +498,34 @@ func wrapDial(raw net.Conn, cfg *Config) (net.Conn, error) {
 // for. The purpose only matters to the websocket disguise, which authenticates
 // inside the upgrade request and so has to say it there.
 func wrapDialPurpose(raw net.Conn, cfg *Config, purpose byte) (net.Conn, error) {
-	if cfg.SNISpoof && cfg.Transport != TransportKCP {
-		_ = injectDecoyClientHello(raw, cfg.EffectiveSpoofSNI(), cfg.SNISpoofTTL)
+	injectedDecoy := false
+	if cfg.SNISpoof && cfg.Transport != TransportKCP && cfg.Transport != TransportICMP && cfg.Transport != TransportFakeTCP && !isDecoyRawBypassed(raw.RemoteAddr()) {
+		if injectDecoyClientHello(raw, cfg.EffectiveSpoofSNI(), cfg.SNISpoofTTL) == nil {
+			injectedDecoy = true
+		}
 	}
 	switch cfg.Transport {
-	case TransportPlain, TransportKCP:
+	case TransportPlain, TransportKCP, TransportICMP, TransportFakeTCP:
 		if cfg.Transport == TransportPlain && cfg.HTTPHeader {
 			if err := httpHeaderDial(raw, cfg.HTTPHost); err != nil {
+				if injectedDecoy {
+					if fresh, dialErr := redialPeer(raw); dialErr == nil {
+						if err2 := httpHeaderDial(fresh, cfg.HTTPHost); err2 == nil {
+							markDecoyRawBypass(raw.RemoteAddr())
+							if cfg.AntiFreeze {
+								return newSplitClientConn(fresh, fresh.RemoteAddr(), cfg, purpose)
+							}
+							return fresh, nil
+						}
+						_ = fresh.Close()
+					}
+				}
 				_ = raw.Close()
 				return nil, err
 			}
+		}
+		if cfg.Transport == TransportPlain && cfg.AntiFreeze {
+			return newSplitClientConn(raw, raw.RemoteAddr(), cfg, purpose)
 		}
 		return raw, nil
 
@@ -502,6 +537,16 @@ func wrapDialPurpose(raw net.Conn, cfg *Config, purpose byte) (net.Conn, error) 
 		}
 
 		conn, err := wrapDialTLSOnce(raw, cfg, purpose, echList)
+		if err != nil && injectedDecoy && isTLSStageError(err) {
+			if fresh, dialErr := redialPeer(raw); dialErr == nil {
+				if connClean, errClean := wrapDialTLSOnce(fresh, cfg, purpose, echList); errClean == nil {
+					markDecoyRawBypass(raw.RemoteAddr())
+					return connClean, nil
+				} else {
+					_ = fresh.Close()
+				}
+			}
+		}
 		// Only a failed handshake is grounds for retrying without ECH.
 		if err == nil || len(echList) == 0 || !isTLSStageError(err) {
 			return conn, err
@@ -599,6 +644,9 @@ func wrapDialTLSOnce(raw net.Conn, cfg *Config, purpose byte, echConfigList []by
 			return nil, err
 		}
 		if cfg.Transport == TransportTLS {
+			if cfg.AntiFreeze {
+				return newSplitClientConn(uClient, raw.RemoteAddr(), cfg, purpose)
+			}
 			return uClient, nil
 		}
 		if cfg.Transport == TransportWSS {
@@ -631,6 +679,9 @@ func wrapDialTLSOnce(raw net.Conn, cfg *Config, purpose byte, echConfigList []by
 		return nil, err
 	}
 	if cfg.Transport == TransportTLS {
+		if cfg.AntiFreeze {
+			return newSplitClientConn(tc, raw.RemoteAddr(), cfg, purpose)
+		}
 		return tc, nil
 	}
 	if cfg.Transport == TransportWSS {
@@ -642,12 +693,16 @@ func wrapDialTLSOnce(raw net.Conn, cfg *Config, purpose byte, echConfigList []by
 // wrapAccept is the same from the point of view of the side that accepted.
 func wrapAccept(raw net.Conn, cfg *Config, cert *tls.Certificate, guard ...*replayGuard) (net.Conn, error) {
 	switch cfg.Transport {
-	case TransportPlain, TransportKCP:
+	case TransportPlain, TransportKCP, TransportICMP, TransportFakeTCP:
 		if cfg.Transport == TransportPlain && cfg.HTTPHeader {
 			if err := httpHeaderAccept(raw); err != nil {
 				_ = raw.Close()
 				return nil, err
 			}
+		}
+		if cfg.Transport == TransportPlain && cfg.AntiFreeze {
+			sc, _, err := defaultSplitManager.AcceptLeg(raw, cfg.secret)
+			return sc, err
 		}
 		return raw, nil
 
@@ -681,6 +736,10 @@ func wrapAccept(raw net.Conn, cfg *Config, cert *tls.Certificate, guard ...*repl
 			return nil, err
 		}
 		if cfg.Transport == TransportTLS {
+			if cfg.AntiFreeze {
+				sc, _, err := defaultSplitManager.AcceptLeg(ts, cfg.secret)
+				return sc, err
+			}
 			return ts, nil
 		}
 		if cfg.Transport == TransportWSS {
@@ -702,7 +761,11 @@ func describeTransport(cfg *Config) string {
 	base := ""
 	switch cfg.Transport {
 	case TransportTLS:
-		base = fmt.Sprintf("disguised as an HTTPS site (%s)", cfg.EffectiveServerName())
+		if cfg.AntiFreeze {
+			base = fmt.Sprintf("disguised as an HTTPS site (%s) with anti-freeze split-stream rotation (24 KB/leg)", cfg.EffectiveServerName())
+		} else {
+			base = fmt.Sprintf("disguised as an HTTPS site (%s)", cfg.EffectiveServerName())
+		}
 	case TransportWSS:
 		if cfg.CDN {
 			base = fmt.Sprintf("disguised as a websocket over HTTPS (%s%s) and routed through a CDN, so this server's address never appears on it",
@@ -735,9 +798,16 @@ func describeTransport(cfg *Config) string {
 				cfg.KCPDataShards, cfg.KCPParityShards, cfg.EffectiveSpoofSNI())
 		}
 		return fmt.Sprintf("loss-resistant KCP/UDP transport with FEC (%d/%d shards)", cfg.KCPDataShards, cfg.KCPParityShards)
+	case TransportICMP:
+		return fmt.Sprintf("ICMP Echo Request/Reply ping tunnel with KCP+FEC (%d/%d shards)", cfg.KCPDataShards, cfg.KCPParityShards)
+	case TransportFakeTCP:
+		return fmt.Sprintf("FakeTCP raw socket PSH|ACK tunnel with KCP+FEC (%d/%d shards)", cfg.KCPDataShards, cfg.KCPParityShards)
 	default:
 		if cfg.GRE {
 			return "plain, carried over a private GRE link between the two servers (not encrypted)"
+		}
+		if cfg.SIT {
+			return "plain, carried over a private 6in4 (SIT protocol 41) IPv6 link between the two servers (not encrypted)"
 		}
 		if cfg.HTTPHeader {
 			host := cfg.HTTPHost
@@ -758,6 +828,9 @@ func describeTransport(cfg *Config) string {
 	if cfg.RealSite && !cfg.CDN {
 		base += " (real site shown to strangers)"
 	}
+	if cfg.SIT {
+		base += " over private 6in4 (SIT) IPv6 link"
+	}
 
 	if cfg.Dials() {
 		var stealth []string
@@ -777,6 +850,9 @@ func describeTransport(cfg *Config) string {
 		}
 		if cfg.SNISpoof {
 			stealth = append(stealth, fmt.Sprintf("decoy SNI %s", cfg.EffectiveSpoofSNI()))
+		}
+		if cfg.AntiFreeze {
+			stealth = append(stealth, "anti-freeze split-stream")
 		}
 		if len(cfg.CleanIPs) > 0 {
 			stealth = append(stealth, fmt.Sprintf("%d clean CF IPs", len(cfg.CleanIPs)))

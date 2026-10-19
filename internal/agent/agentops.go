@@ -134,6 +134,9 @@ func needRoot() error {
 }
 
 func (systemHost) PortFree(t engine.Transport, port int) error {
+	if t == engine.TransportICMP {
+		return nil
+	}
 	addr := ":" + strconv.Itoa(port)
 	if t == engine.TransportKCP {
 		pc, err := net.ListenPacket("udp", addr)
@@ -344,8 +347,9 @@ func validatePairing(p *PairingData) error {
 	}
 	for _, f := range []struct{ name, val string }{
 		{"cdn", p.CDN}, {"mux", p.Mux}, {"utls", p.UTLS}, {"tls_fragment", p.TLSFragment},
-		{"ech", p.ECH}, {"http_header", p.HTTPHeader}, {"gre", p.GRE}, {"real_site", p.RealSite},
-		{"sni_spoof", p.SNISpoof}, {"ip_spoof", p.IPSpoof},
+		{"ech", p.ECH}, {"http_header", p.HTTPHeader}, {"gre", p.GRE}, {"sit", p.SIT},
+		{"real_site", p.RealSite}, {"sni_spoof", p.SNISpoof}, {"ip_spoof", p.IPSpoof},
+		{"anti_freeze", p.AntiFreeze},
 	} {
 		if f.val != "" && f.val != "on" && f.val != "off" {
 			return fmt.Errorf("%s must be on or off, got %q", f.name, f.val)
@@ -366,6 +370,20 @@ func validatePairing(p *PairingData) error {
 		}
 		if _, _, err := engine.GREAddrs(p.ServerIP, p.RelayIP); err != nil {
 			return fmt.Errorf("a GRE tunnel needs both servers' public IPv4 addresses in its code: %w", err)
+		}
+	}
+	if p.SIT == "on" {
+		if p.GRE == "on" {
+			return errors.New("a 6in4 (SIT) link cannot be combined with a GRE link")
+		}
+		if p.Transport != "plain" {
+			return errors.New("a 6in4 (SIT) link carries the plain link only")
+		}
+		if p.CDN == "on" || p.AltHost != "" {
+			return errors.New("a 6in4 (SIT) link cannot be combined with a CDN")
+		}
+		if _, _, err := engine.SITAddrs(p.ServerIP, p.RelayIP); err != nil {
+			return fmt.Errorf("a 6in4 (SIT) tunnel needs both servers' public IPv4 addresses in its code: %w", err)
 		}
 	}
 	if p.HTTPHost != "" && !engine.HostnameRe.MatchString(p.HTTPHost) {

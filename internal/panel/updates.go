@@ -59,13 +59,15 @@ var fetchRelease = agent.FetchRelease
 type updater struct {
 	p *Panel
 
-	mu       sync.Mutex
-	latest   string
-	checked  time.Time
-	checkErr string
-	jobID    string
-	offers   map[string]offered
-	note     string // what happened to an update that restarted the panel
+	mu        sync.Mutex
+	latest    string
+	checked   time.Time
+	checkErr  string
+	jobID     string
+	offers    map[string]offered
+	note      string // what happened to an update that restarted the panel
+	cacheKey  string
+	cacheData []byte
 	// needSSH is servers that refused a one-click update, so their card offers
 	// the update with their SSH login, which also allows one-click updates.
 	needSSH map[string]bool
@@ -236,13 +238,22 @@ func (u *updater) updateAll(j *job) error {
 		latest = u.latest
 		u.mu.Unlock()
 	}
+	target := engine.Version
+	panelNeedsUpdate := false
 	if latest != "" && compareVersions(engine.Version, latest) < 0 {
-		return u.updatePanel(j, latest)
-	}
-	if latest == "" {
+		target = latest
+		panelNeedsUpdate = true
+	} else if latest == "" {
 		j.say("Could not find out the newest version, so the other servers are brought up to the panel's own, %s.", engine.Version)
 	}
-	return u.updateServers(j, engine.Version)
+	srvErr := u.updateServers(j, target)
+	if !panelNeedsUpdate {
+		return srvErr
+	}
+	if err := u.updatePanel(j, target, srvErr); err != nil {
+		return err
+	}
+	return srvErr
 }
 
 // pending is what an update that restarts the panel leaves for the panel that
@@ -252,13 +263,28 @@ type pending struct {
 	ThenServers bool      `json:"then_servers"`
 	Started     time.Time `json:"started"`
 	From        string    `json:"from"`
+	JobID       string    `json:"job_id,omitempty"`
+	Lines       []string  `json:"lines,omitempty"`
+	ServerErr   string    `json:"server_err,omitempty"`
 }
 
-// releaseForPanel gets a release for the panel's own server: from GitHub, or
+// releaseFor gets a release for the panel or another server: from GitHub, or
 // failing that, through one of the servers.
 func (u *updater) releaseFor(j *job, version, arch string) ([]byte, error) {
+	u.mu.Lock()
+	if u.cacheKey == version+"/"+arch && len(u.cacheData) > 0 {
+		cached := u.cacheData
+		u.mu.Unlock()
+		return cached, nil
+	}
+	u.mu.Unlock()
+
 	archive, err := fetchRelease(version, arch)
 	if err == nil {
+		u.mu.Lock()
+		u.cacheKey = version + "/" + arch
+		u.cacheData = archive
+		u.mu.Unlock()
 		return archive, nil
 	}
 	j.say("This server cannot download it from GitHub (%v); asking another server to...", err)
@@ -267,6 +293,10 @@ func (u *updater) releaseFor(j *job, version, arch string) ([]byte, error) {
 		a, ferr := u.fetchInParts(s, version, arch)
 		if ferr == nil {
 			j.say("%s downloaded it, checked it against GitHub's published checksum, and passed it on.", s.Name)
+			u.mu.Lock()
+			u.cacheKey = version + "/" + arch
+			u.cacheData = a
+			u.mu.Unlock()
 			return a, nil
 		}
 		last = ferr
@@ -277,15 +307,28 @@ func (u *updater) releaseFor(j *job, version, arch string) ([]byte, error) {
 	return nil, fmt.Errorf("no server could download PortBridge %s from GitHub (%v)", version, last)
 }
 
-// updatePanel updates the panel's own server; the panel restarts on the new
-// version and then carries on with the other servers by itself.
-func (u *updater) updatePanel(j *job, target string) error {
-	j.say("Updating this server, the panel's own, from %s to %s first...", engine.Version, target)
+// updatePanel updates the panel's own server after the other servers have been
+// updated; the panel restarts on the new version while keeping the user signed in.
+func (u *updater) updatePanel(j *job, target string, srvErr error) error {
+	j.say("Updating this server, the panel's own, from %s to %s...", engine.Version, target)
 	archive, err := u.releaseFor(j, target, runtime.GOARCH)
 	if err != nil {
 		return err
 	}
-	pend := pending{Target: target, ThenServers: true, Started: time.Now().UTC(), From: engine.Version}
+	j.say("Restarting the panel service on %s now...", target)
+	var srvErrStr string
+	if srvErr != nil {
+		srvErrStr = srvErr.Error()
+	}
+	pend := pending{
+		Target:      target,
+		ThenServers: false,
+		Started:     time.Now().UTC(),
+		From:        engine.Version,
+		JobID:       j.id,
+		Lines:       j.view().Lines,
+		ServerErr:   srvErrStr,
+	}
 	data, _ := json.Marshal(pend)
 	if err := writeFileAtomic(filepath.Join(u.p.dir, pendingFile), data, 0o600); err != nil {
 		return err
@@ -298,7 +341,6 @@ func (u *updater) updatePanel(j *job, target string) error {
 		_ = os.Remove(filepath.Join(u.p.dir, pendingFile))
 		return fmt.Errorf("this server could not be updated: %v", err)
 	}
-	j.say("The panel is restarting on %s now. Log in again in a minute: it then updates the other servers by itself.", target)
 	return nil
 }
 
@@ -324,10 +366,32 @@ func (u *updater) resume() {
 	}
 	logf("updated from %s to %s", pend.From, pend.Target)
 	if !pend.ThenServers {
+		id := pend.JobID
+		if id == "" {
+			id = newID(9)
+		}
+		lines := append([]string(nil), pend.Lines...)
+		lines = append(lines, fmt.Sprintf("The panel's own server is now on %s.", pend.Target))
+		j := &job{
+			id:      id,
+			lines:   lines,
+			done:    true,
+			err:     pend.ServerErr,
+			started: time.Now(),
+		}
+		u.p.jobsMu.Lock()
+		u.p.jobs[id] = j
+		u.p.jobsMu.Unlock()
+		u.mu.Lock()
+		u.jobID = id
+		u.mu.Unlock()
 		return
 	}
 	u.mu.Lock()
 	u.jobID = u.p.startJob(func(j *job) (string, error) {
+		for _, l := range pend.Lines {
+			j.say("%s", l)
+		}
 		j.say("The panel's own server is now on %s.", pend.Target)
 		// Give servers that call the panel a moment to find it again.
 		time.Sleep(resumeSettle)
@@ -351,6 +415,9 @@ func (u *updater) updateServers(j *job, target string) error {
 		}
 		todo = append(todo, s)
 	}
+	sort.SliceStable(todo, func(i, k int) bool {
+		return todo[i].Group == GroupForeign && todo[k].Group != GroupForeign
+	})
 	if len(todo) == 0 {
 		j.say("Every server already has %s.", target)
 		return nil

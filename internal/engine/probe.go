@@ -37,14 +37,15 @@ type ProbeCandidateSpec struct {
 	ID         string `json:"id"`
 	Label      string `json:"label"`
 	Mode       string `json:"mode"`       // "direct" or "reverse"
-	Link       string `json:"link"`       // panel/CLI link key: "website", "website-cdn-backup", "cdn", "grpc", "grpc-cdn", "kcp", "plain"
-	Transport  string `json:"transport"`  // engine transport: "tls", "wss", "grpc", "kcp", "plain"
+	Link       string `json:"link"`       // panel/CLI link key: "website", "sni-spoof", "split", "website-cdn-backup", "cdn", "grpc", "grpc-cdn", "kcp", "ip-spoof", "faketcp", "icmp", "plain"
+	Transport  string `json:"transport"`  // engine transport: "tls", "wss", "grpc", "kcp", "icmp", "faketcp", "plain"
 	Stealth    bool   `json:"stealth"`    // uTLS browser fingerprint + ClientHello fragmentation
 	WebHeader  bool   `json:"web_header"` // HTTP header obfuscation on plain TCP
 	SNISpoof   bool   `json:"sni_spoof,omitempty"`
 	SpoofSNI   string `json:"spoof_sni,omitempty"`
 	IPSpoof    bool   `json:"ip_spoof,omitempty"`
 	SpoofIP    string `json:"spoof_ip,omitempty"`
+	AntiFreeze bool   `json:"anti_freeze,omitempty"`
 	CDN        bool   `json:"cdn"`
 	IPv6       bool   `json:"ipv6"`
 	Shared     bool   `json:"shared"` // recommended pooling mode (mux vs pool)
@@ -80,17 +81,20 @@ type ProbeBenchmarkReport struct {
 	Notes       []string               `json:"notes,omitempty"`
 }
 
-// ProbeListener accepts multi-transport probe connections on one TCP port and
-// one UDP (KCP) port with the same port number.
+// ProbeListener accepts multi-transport probe connections on one TCP port,
+// one UDP (KCP) port, and optional raw ICMP / FakeTCP listeners with the same port number.
 type ProbeListener struct {
 	Port   int
 	Secret []byte
 
-	tcpLn  net.Listener
-	kcpLn  net.Listener
-	cert   tls.Certificate
-	closed chan struct{}
-	once   sync.Once
+	tcpLn     net.Listener
+	kcpLn     net.Listener
+	icmpLn    net.Listener
+	fakeTCPLn net.Listener
+	splitMgr  *splitSessionManager
+	cert      tls.Certificate
+	closed    chan struct{}
+	once      sync.Once
 }
 
 type peekedConn struct {
@@ -148,7 +152,7 @@ func StartProbeListener(bindHost string, preferredPort int, secret []byte, ttl t
 		}
 	}
 	if ttl <= 0 {
-		ttl = 90 * time.Second
+		ttl = 300 * time.Second
 	}
 	cert, err := makeEphemeralCert("www.bing.com")
 	if err != nil {
@@ -206,23 +210,46 @@ func StartProbeListener(bindHost string, preferredPort int, secret []byte, ttl t
 		return nil, errors.New("could not find a free TCP+UDP port for the probe listener")
 	}
 
+	rawAddr := net.JoinHostPort(listenHost, strconv.Itoa(chosenPort))
+	icmpLn, _ := kcpListen(rawAddr, &Config{
+		Transport:       TransportICMP,
+		secret:          secret,
+		KCPDataShards:   10,
+		KCPParityShards: 3,
+	})
+	fakeTCPLn, _ := kcpListen(rawAddr, &Config{
+		Transport:       TransportFakeTCP,
+		secret:          secret,
+		KCPDataShards:   10,
+		KCPParityShards: 3,
+	})
+
 	pl := &ProbeListener{
-		Port:   chosenPort,
-		Secret: secret,
-		tcpLn:  tcpLn,
-		kcpLn:  kcpLn,
-		cert:   cert,
-		closed: make(chan struct{}),
+		Port:      chosenPort,
+		Secret:    secret,
+		tcpLn:     tcpLn,
+		kcpLn:     kcpLn,
+		icmpLn:    icmpLn,
+		fakeTCPLn: fakeTCPLn,
+		splitMgr:  newSplitSessionManager(),
+		cert:      cert,
+		closed:    make(chan struct{}),
 	}
 
 	go pl.serveTCP()
-	go pl.serveKCP()
+	go pl.servePacketLn(pl.kcpLn)
+	if pl.icmpLn != nil {
+		go pl.servePacketLn(pl.icmpLn)
+	}
+	if pl.fakeTCPLn != nil {
+		go pl.servePacketLn(pl.fakeTCPLn)
+	}
 	time.AfterFunc(ttl, func() { pl.Close() })
 
 	return pl, nil
 }
 
-// Close stops both the TCP and UDP probe listeners.
+// Close stops all probe listeners.
 func (pl *ProbeListener) Close() {
 	pl.once.Do(func() {
 		close(pl.closed)
@@ -231,6 +258,12 @@ func (pl *ProbeListener) Close() {
 		}
 		if pl.kcpLn != nil {
 			_ = pl.kcpLn.Close()
+		}
+		if pl.icmpLn != nil {
+			_ = pl.icmpLn.Close()
+		}
+		if pl.fakeTCPLn != nil {
+			_ = pl.fakeTCPLn.Close()
 		}
 	})
 }
@@ -316,6 +349,32 @@ func (pl *ProbeListener) handleTCPConn(raw net.Conn) {
 			}
 			runSpeedtestServer(h2Conn)
 
+		case 'S': // Possible Anti-Freeze Split-Stream ("SPLIT1...") or random auth nonce starting with 'S'
+			var rest [5]byte
+			if _, err := io.ReadFull(ts, rest[:]); err != nil {
+				_ = ts.Close()
+				return
+			}
+			six := append([]byte{'S'}, rest[:]...)
+			fullPeek := &peekedConn{Conn: ts, peeked: six}
+			if string(six) == splitMagic {
+				sc, isInitial, err := pl.splitMgr.AcceptLeg(fullPeek, pl.Secret)
+				if err != nil || !isInitial {
+					return
+				}
+				if _, err := recvAuthPurpose(sc, pl.Secret, nil); err != nil {
+					_ = sc.Close()
+					return
+				}
+				runSpeedtestServer(sc)
+				return
+			}
+			if _, err := recvAuthPurpose(fullPeek, pl.Secret, nil); err != nil {
+				_ = ts.Close()
+				return
+			}
+			runSpeedtestServer(fullPeek)
+
 		default: // Raw Fake TLS (TransportTLS)
 			if _, err := recvAuthPurpose(innerConn, pl.Secret, nil); err != nil {
 				_ = ts.Close()
@@ -344,9 +403,12 @@ func (pl *ProbeListener) handleTCPConn(raw net.Conn) {
 	}
 }
 
-func (pl *ProbeListener) serveKCP() {
+func (pl *ProbeListener) servePacketLn(ln net.Listener) {
+	if ln == nil {
+		return
+	}
 	for {
-		c, err := pl.kcpLn.Accept()
+		c, err := ln.Accept()
 		if err != nil {
 			select {
 			case <-pl.closed:
@@ -396,10 +458,25 @@ func BuildProbeCandidates(mode, ipv4, ipv6 string, port int, cdnDomain string) [
 				Port:       port,
 			},
 			ProbeCandidateSpec{
+				ID:         mode + "-split",
+				Label:      v4Label + " · Split-Stream TLS (Anti-Freeze Rotation)",
+				Mode:       mode,
+				Link:       "split",
+				Transport:  string(TransportTLS),
+				Stealth:    true,
+				SNISpoof:   true,
+				SpoofSNI:   DefaultSpoofSNI,
+				AntiFreeze: true,
+				Shared:     true,
+				ServerName: DefaultSpoofSNI,
+				TargetAddr: addr4,
+				Port:       port,
+			},
+			ProbeCandidateSpec{
 				ID:         mode + "-sni-spoof",
 				Label:      v4Label + " · Decoy Whitelisted SNI (" + DefaultSpoofSNI + ")",
 				Mode:       mode,
-				Link:       "website",
+				Link:       "sni-spoof",
 				Transport:  string(TransportTLS),
 				Stealth:    true,
 				SNISpoof:   true,
@@ -448,12 +525,32 @@ func BuildProbeCandidates(mode, ipv4, ipv6 string, port int, cdnDomain string) [
 				ID:         mode + "-ip-spoof",
 				Label:      v4Label + " · Source IP + SNI Spoof (" + DefaultSpoofIP + ")",
 				Mode:       mode,
-				Link:       "kcp",
+				Link:       "ip-spoof",
 				Transport:  string(TransportKCP),
 				SNISpoof:   true,
 				SpoofSNI:   DefaultSpoofSNI,
 				IPSpoof:    true,
 				SpoofIP:    DefaultSpoofIP,
+				Shared:     true,
+				TargetAddr: addr4,
+				Port:       port,
+			},
+			ProbeCandidateSpec{
+				ID:         mode + "-faketcp",
+				Label:      v4Label + " · Raw FakeTCP · Paqet-Style (KCP+FEC)",
+				Mode:       mode,
+				Link:       "faketcp",
+				Transport:  string(TransportFakeTCP),
+				Shared:     true,
+				TargetAddr: addr4,
+				Port:       port,
+			},
+			ProbeCandidateSpec{
+				ID:         mode + "-icmp",
+				Label:      v4Label + " · ICMP Ping Tunnel (KCP+FEC)",
+				Mode:       mode,
+				Link:       "icmp",
+				Transport:  string(TransportICMP),
 				Shared:     true,
 				TargetAddr: addr4,
 				Port:       port,
@@ -497,6 +594,21 @@ func BuildProbeCandidates(mode, ipv4, ipv6 string, port int, cdnDomain string) [
 				IPv6:       true,
 				Shared:     false,
 				ServerName: "www.bing.com",
+				TargetAddr: addr6,
+				Port:       port,
+			},
+			ProbeCandidateSpec{
+				ID:         mode + "-ipv6-sni-spoof",
+				Label:      dirLabel + " (IPv6) · Decoy Whitelisted SNI (" + DefaultSpoofSNI + ")",
+				Mode:       mode,
+				Link:       "sni-spoof",
+				Transport:  string(TransportTLS),
+				Stealth:    true,
+				SNISpoof:   true,
+				SpoofSNI:   DefaultSpoofSNI,
+				IPv6:       true,
+				Shared:     false,
+				ServerName: DefaultSpoofSNI,
 				TargetAddr: addr6,
 				Port:       port,
 			},
@@ -558,7 +670,7 @@ func BuildProbeCandidates(mode, ipv4, ipv6 string, port int, cdnDomain string) [
 // ProbeListener using the shared ephemeral secret.
 func RunProbeDialer(ctx context.Context, specs []ProbeCandidateSpec, secret []byte, burstBytes int) []ProbeCandidateResult {
 	if burstBytes <= 0 {
-		burstBytes = 128 * 1024 // 128 KB down + 128 KB up per main test (~256 KB sustained burst)
+		burstBytes = 256 * 1024 // 256 KB down + 256 KB up per main test (~512 KB sustained burst)
 	}
 	results := make([]ProbeCandidateResult, 0, len(specs))
 	deadTCP := map[string]int{}
@@ -567,7 +679,7 @@ func RunProbeDialer(ctx context.Context, specs []ProbeCandidateSpec, secret []by
 		if ctx.Err() != nil {
 			break
 		}
-		isTCPDirect := !spec.CDN && spec.Transport != string(TransportKCP) && spec.TargetAddr != ""
+		isTCPDirect := !spec.CDN && !Transport(spec.Transport).IsPacketBased() && spec.TargetAddr != ""
 		if isTCPDirect && deadTCP[spec.TargetAddr] >= 2 {
 			results = append(results, ProbeCandidateResult{
 				ProbeCandidateSpec: spec,
@@ -608,6 +720,7 @@ func probeOneSpec(parentCtx context.Context, spec ProbeCandidateSpec, secret []b
 		SpoofSNI:        spec.SpoofSNI,
 		IPSpoof:         spec.IPSpoof,
 		SpoofIP:         spec.SpoofIP,
+		AntiFreeze:      spec.AntiFreeze,
 		UTLS:            false,
 		TLSFragment:     false,
 		ECH:             false,
@@ -677,6 +790,15 @@ func probeOneSpec(parentCtx context.Context, spec ProbeCandidateSpec, secret []b
 		res.JitterMS = round2(jitterSum / float64(len(rtts)-1))
 	}
 
+	// In Reverse mode, the Foreign server is the probe dialer and the Relay
+	// (Iran) server is the listener. Phase 0x02 (Listener -> Dialer) therefore
+	// measures Relay -> Foreign (User Upload), and Phase 0x03 (Dialer -> Listener)
+	// measures Foreign -> Relay (User Download). Swap them so DownMbps is always
+	// User Download (Foreign -> Relay) and UpMbps is always User Upload.
+	if spec.Mode == "reverse" {
+		dlMbps, ulMbps = ulMbps, dlMbps
+	}
+
 	res.DownMbps = round1(dlMbps)
 	res.UpMbps = round1(ulMbps)
 	res.AvgMbps = round1((dlMbps + ulMbps) / 2.0)
@@ -700,7 +822,14 @@ func probeOneSpec(parentCtx context.Context, spec ProbeCandidateSpec, secret []b
 }
 
 func runSingleProbeAttempt(parentCtx context.Context, cfg *Config, routes *router, secret []byte, pings int, burstBytes uint32) (hsMS float64, rtts []float64, dlMbps, ulMbps float64, partial bool, err error) {
-	ctx, cancel := context.WithTimeout(parentCtx, 4500*time.Millisecond)
+	attemptTimeout := 6500 * time.Millisecond
+	if cfg.AntiFreeze {
+		attemptTimeout = 10000 * time.Millisecond
+		if burstBytes > 32*1024 {
+			burstBytes = 32 * 1024
+		}
+	}
+	ctx, cancel := context.WithTimeout(parentCtx, attemptTimeout)
 	defer cancel()
 
 	t0 := time.Now()
@@ -758,68 +887,144 @@ func runSingleProbeAttempt(parentCtx context.Context, cfg *Config, routes *route
 		_ = c.SetDeadline(dl)
 	}
 
-	// Download burst: once at least 1 ping has succeeded, any failure during the
-	// bulk transfer indicates a mid-stream DPI packet-cap or throttle rather than
-	// an unreachable endpoint.
-	var dlHdr [5]byte
-	dlHdr[0] = 0x02
-	binary.BigEndian.PutUint32(dlHdr[1:], burstBytes)
-	if _, err := c.Write(dlHdr[:]); err != nil {
-		return hsMS, rtts, 0, 0, true, nil
+	minRTTSec := 0.0
+	if len(rtts) > 0 {
+		minRTT := rtts[0]
+		for _, r := range rtts[1:] {
+			if r < minRTT {
+				minRTT = r
+			}
+		}
+		minRTTSec = minRTT / 1000.0
 	}
-	var ack [1]byte
-	if _, err := io.ReadFull(c, ack[:]); err != nil {
-		return hsMS, rtts, 0, 0, true, nil
+
+	// Helper to run one 0x02 (Listener -> Dialer) transfer of sz bytes.
+	runPhase02 := func(sz uint32) (int64, float64, error) {
+		var hdr [5]byte
+		hdr[0] = 0x02
+		binary.BigEndian.PutUint32(hdr[1:], sz)
+		reqStart := time.Now()
+		if _, err := c.Write(hdr[:]); err != nil {
+			return 0, 0, err
+		}
+		var ackByte [1]byte
+		if _, err := io.ReadFull(c, ackByte[:]); err != nil {
+			return 0, 0, err
+		}
+		readStart := time.Now()
+		n, rerr := io.CopyN(io.Discard, c, int64(sz))
+		dur := time.Since(readStart).Seconds()
+		if minRTTSec > 0 {
+			totalSec := time.Since(reqStart).Seconds()
+			netDur := totalSec - minRTTSec
+			if netDur < totalSec*0.5 {
+				netDur = totalSec * 0.5
+			}
+			if netDur > dur {
+				dur = netDur
+			}
+		}
+		return n, dur, rerr
 	}
-	dlStart := time.Now()
-	dlRead, dlErr := io.CopyN(io.Discard, c, int64(burstBytes))
-	dlDur := time.Since(dlStart).Seconds()
-	if dlErr != nil || dlRead < int64(burstBytes) {
+
+	payload := make([]byte, 32*1024)
+	_, _ = rand.Read(payload[:128])
+	for i := 128; i < len(payload); i++ {
+		payload[i] = payload[i%128] ^ byte(i)
+	}
+
+	// Helper to run one 0x03 (Dialer -> Listener) transfer of sz bytes.
+	runPhase03 := func(sz uint32) (int64, float64, error) {
+		var hdr [5]byte
+		hdr[0] = 0x03
+		binary.BigEndian.PutUint32(hdr[1:], sz)
+		if _, err := c.Write(hdr[:]); err != nil {
+			return 0, 0, err
+		}
+		var ackByte [1]byte
+		if _, err := io.ReadFull(c, ackByte[:]); err != nil {
+			return 0, 0, err
+		}
+		writeStart := time.Now()
+		var sent int64
+		var werr error
+		for sent < int64(sz) {
+			chunk := int64(len(payload))
+			if rem := int64(sz) - sent; rem < chunk {
+				chunk = rem
+			}
+			n, err := c.Write(payload[:chunk])
+			if n > 0 {
+				sent += int64(n)
+			}
+			if err != nil {
+				werr = err
+				break
+			}
+		}
+		if werr == nil {
+			if _, err := io.ReadFull(c, ackByte[:]); err != nil {
+				werr = err
+			}
+		}
+		dur := time.Since(writeStart).Seconds()
+		if minRTTSec > 0 && dur > minRTTSec {
+			// Subtract one-way propagation of the final 1-byte completion ACK
+			adj := dur - minRTTSec*0.5
+			if adj < dur*0.65 {
+				adj = dur * 0.65
+			}
+			dur = adj
+		}
+		return sent, dur, werr
+	}
+
+	// Phase 0x02 (Listener -> Dialer):
+	// When burstBytes >= 192 KB, first send a warm-up command so TCP exits Slow Start
+	// (and any packet token-bucket burst is primed) before timing the steady-state burst.
+	measure02 := burstBytes
+	if !cfg.AntiFreeze && burstBytes >= 192*1024 {
+		warmup02 := uint32(128 * 1024)
+		if cfg.Transport == TransportICMP {
+			warmup02 = 512 * 1024
+		}
+		if wn, _, werr := runPhase02(warmup02); werr != nil || wn < int64(warmup02) {
+			return hsMS, rtts, 0, 0, true, nil
+		}
+		if !cfg.Transport.IsPacketBased() {
+			measure02 = 384 * 1024
+		} else if cfg.Transport == TransportICMP {
+			measure02 = 512 * 1024
+		}
+	}
+	dlRead, dlDur, dlErr := runPhase02(measure02)
+	if dlErr != nil || dlRead < int64(measure02) {
 		return hsMS, rtts, 0, 0, true, nil
 	}
 	if dlDur > 0 && dlRead > 0 {
 		dlMbps = (float64(dlRead) * 8 / 1_000_000) / dlDur
 	}
 
-	// Upload burst
-	var ulHdr [5]byte
-	ulHdr[0] = 0x03
-	binary.BigEndian.PutUint32(ulHdr[1:], burstBytes)
-	if _, err := c.Write(ulHdr[:]); err != nil {
-		return hsMS, rtts, dlMbps, 0, true, nil
-	}
-	if _, err := io.ReadFull(c, ack[:]); err != nil {
-		return hsMS, rtts, dlMbps, 0, true, nil
-	}
-	payload := make([]byte, 32*1024)
-	_, _ = rand.Read(payload[:128])
-	for i := 128; i < len(payload); i++ {
-		payload[i] = payload[i%128] ^ byte(i)
-	}
-	ulStart := time.Now()
-	var ulSent int64
-	var ulErr error
-	for ulSent < int64(burstBytes) {
-		chunk := int64(len(payload))
-		if rem := int64(burstBytes) - ulSent; rem < chunk {
-			chunk = rem
+	// Phase 0x03 (Dialer -> Listener):
+	// Warm up the Dialer -> Listener direction first (critical for Reverse mode where
+	// Dialer -> Listener is User Download Foreign -> Relay, and where transit routers
+	// often apply a ~768 KB token-bucket burst allowance to ICMP Echo Requests before
+	// enforcing their sustained ICMP rate limit).
+	measure03 := burstBytes
+	if !cfg.AntiFreeze && burstBytes >= 192*1024 {
+		warmup03 := uint32(128 * 1024)
+		if cfg.Transport == TransportICMP {
+			warmup03 = 768 * 1024
+			measure03 = 512 * 1024
+		} else if !cfg.Transport.IsPacketBased() {
+			measure03 = 384 * 1024
 		}
-		n, werr := c.Write(payload[:chunk])
-		if n > 0 {
-			ulSent += int64(n)
-		}
-		if werr != nil {
-			ulErr = werr
-			break
+		if wn, _, werr := runPhase03(warmup03); werr != nil || wn < int64(warmup03) {
+			return hsMS, rtts, dlMbps, 0, true, nil
 		}
 	}
-	if ulErr == nil {
-		if _, err := io.ReadFull(c, ack[:]); err != nil {
-			ulErr = err
-		}
-	}
-	ulDur := time.Since(ulStart).Seconds()
-	if ulErr != nil || ulSent < int64(burstBytes) {
+	ulSent, ulDur, ulErr := runPhase03(measure03)
+	if ulErr != nil || ulSent < int64(measure03) {
 		return hsMS, rtts, dlMbps, 0, true, nil
 	}
 	if ulDur > 0 && ulSent > 0 {
@@ -830,14 +1035,24 @@ func runSingleProbeAttempt(parentCtx context.Context, cfg *Config, routes *route
 	return hsMS, rtts, dlMbps, ulMbps, false, nil
 }
 
+func effectiveProbeMbps(r *ProbeCandidateResult) float64 {
+	if r.DownMbps > 0 && r.UpMbps > 0 {
+		minDir := math.Min(r.DownMbps, r.UpMbps)
+		return 0.45*minDir + 0.35*r.DownMbps + 0.20*r.UpMbps
+	}
+	return r.AvgMbps
+}
+
 // FinalizeProbeReport scores and ranks all candidate results and synthesizes a
 // hybrid Fake TLS + CDN Auto-Fallback recommendation if both Direct Fake TLS
 // and Cloudflare CDN succeeded.
 func FinalizeProbeReport(results []ProbeCandidateResult, cdnDomain string) *ProbeBenchmarkReport {
 	var maxMbps float64
-	for _, r := range results {
-		if r.Status == "ok" && r.AvgMbps > maxMbps {
-			maxMbps = r.AvgMbps
+	for i := range results {
+		if results[i].Status == "ok" {
+			if eff := effectiveProbeMbps(&results[i]); eff > maxMbps {
+				maxMbps = eff
+			}
 		}
 	}
 	if maxMbps < 5 {
@@ -857,7 +1072,7 @@ func FinalizeProbeReport(results []ProbeCandidateResult, cdnDomain string) *Prob
 		if r.Status != "ok" {
 			continue
 		}
-		if r.Mode == "direct" && r.Link == "website" && !r.IPv6 {
+		if r.Mode == "direct" && (r.Link == "website" || r.Link == "sni-spoof") && !r.IPv6 {
 			if bestDirectTLS == nil || r.Score > bestDirectTLS.Score {
 				bestDirectTLS = r
 			}
@@ -914,7 +1129,7 @@ func FinalizeProbeReport(results []ProbeCandidateResult, cdnDomain string) *Prob
 		if results[i].Score != results[j].Score {
 			return results[i].Score > results[j].Score
 		}
-		return results[i].AvgMbps > results[j].AvgMbps
+		return effectiveProbeMbps(&results[i]) > effectiveProbeMbps(&results[j])
 	})
 
 	rep := &ProbeBenchmarkReport{
@@ -935,7 +1150,7 @@ func scoreCandidate(r *ProbeCandidateResult, maxMbps float64) int {
 	if r.Successes == 0 || r.Status == "blocked" {
 		return 0
 	}
-	// A candidate where the handshake succeeded but the 128 KB transfer froze
+	// A candidate where the handshake succeeded but the transfer froze
 	// mid-stream ("throttled") is blocked by a DPI byte-cap filter and cannot
 	// carry real user traffic. Cap its score well below any working candidate.
 	if r.Status == "throttled" {
@@ -954,22 +1169,27 @@ func scoreCandidate(r *ProbeCandidateResult, maxMbps float64) int {
 	rttScore := 18.0 * clamp01(1.0-(r.RTTMS-15.0)/385.0)
 	jitScore := 7.0 * clamp01(1.0-r.JitterMS/80.0)
 
-	// 3. Throughput (0..20): 12 pts relative to best in batch + 8 pts absolute (up to 40 Mbps)
-	relSpeed := 12.0 * clamp01(r.AvgMbps/maxMbps)
-	absSpeed := 8.0 * clamp01(r.AvgMbps/40.0)
+	// 3. Throughput (0..20): weights both Download and Upload (plus bidirectional floor)
+	effMbps := effectiveProbeMbps(r)
+	relSpeed := 12.0 * clamp01(effMbps/maxMbps)
+	absSpeed := 8.0 * clamp01(effMbps/40.0)
 	tpScore := relSpeed + absSpeed
 
-	// 4. DPI Resistance / Disguise Bonus (0..10)
+	// 4. DPI Resistance & Transport Efficiency Bonus (0..10)
 	var dpiBonus float64
 	switch {
-	case r.Link == "website" && r.Stealth:
+	case (r.Link == "website" && r.Stealth) || r.Link == "sni-spoof" || r.Link == "split":
 		dpiBonus = 10.0
 	case r.Link == "website" || r.Link == "grpc":
 		dpiBonus = 9.0
 	case r.Link == "cdn" || r.Link == "grpc-cdn":
-		dpiBonus = 9.0
-	case r.Link == "kcp":
+		dpiBonus = 8.5
+	case r.Link == "faketcp" || r.Link == "ip-spoof":
 		dpiBonus = 7.0
+	case r.Link == "kcp":
+		dpiBonus = 6.5
+	case r.Link == "icmp":
+		dpiBonus = 6.0
 	case r.WebHeader:
 		dpiBonus = 3.0
 	default:

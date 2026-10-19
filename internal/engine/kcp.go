@@ -203,6 +203,34 @@ func kcpDial(addr string, cfg *Config) (net.Conn, error) {
 		parityShards = cfg.KCPParityShards
 	}
 
+	if cfg.Transport == TransportICMP {
+		pConn, err := newICMPDialConn(addr, cfg.secret)
+		if err != nil {
+			return nil, err
+		}
+		sess, err := kcp.NewConn(addr, block, dataShards, parityShards, pConn)
+		if err != nil {
+			_ = pConn.Close()
+			return nil, fmt.Errorf("dialing icmp kcp: %w", err)
+		}
+		tuneKCP(sess, cfg)
+		return newKCPConn(sess, pConn), nil
+	}
+
+	if cfg.Transport == TransportFakeTCP {
+		pConn, err := newFakeTCPDialConn(addr, cfg)
+		if err != nil {
+			return nil, err
+		}
+		sess, err := kcp.NewConn(addr, block, dataShards, parityShards, pConn)
+		if err != nil {
+			_ = pConn.Close()
+			return nil, fmt.Errorf("dialing faketcp kcp: %w", err)
+		}
+		tuneKCP(sess, cfg)
+		return newKCPConn(sess, pConn), nil
+	}
+
 	if cfg.IPSpoof {
 		raddr, err := net.ResolveUDPAddr("udp4", addr)
 		if err != nil {
@@ -319,15 +347,21 @@ func tuneKCP(sess *kcp.UDPSession, cfg *Config) {
 		resend = kcpDefaultResend
 	}
 	sess.SetNoDelay(1, orDefault(cfg.KCPInterval, kcpDefaultInterval), resend, nc)
-	w := orDefault(cfg.KCPWindow, kcpDefaultWindow)
+	defaultWin := kcpDefaultWindow
+	defaultMTU := kcpDefaultMTU
+	if cfg.Transport == TransportICMP || cfg.Transport == TransportFakeTCP {
+		defaultWin = 256
+		defaultMTU = 1200
+	}
+	w := orDefault(cfg.KCPWindow, defaultWin)
 	sess.SetWindowSize(w, w)
-	if m := orDefault(cfg.KCPMTU, kcpDefaultMTU); m != kcpDefaultMTU {
+	if m := orDefault(cfg.KCPMTU, defaultMTU); m != kcpDefaultMTU {
 		sess.SetMtu(m)
 	}
 	sess.SetACKNoDelay(true)
 }
 
-// kcpListen listens for incoming KCP connections over UDP.
+// kcpListen listens for incoming KCP connections over UDP, ICMP, or FakeTCP.
 func kcpListen(addr string, cfg *Config) (net.Listener, error) {
 	key := sha256.Sum256(cfg.secret)
 	block, err := kcp.NewAESBlockCrypt(key[:16])
@@ -342,6 +376,32 @@ func kcpListen(addr string, cfg *Config) (net.Listener, error) {
 	}
 	if cfg.KCPParityShards >= 0 {
 		parityShards = cfg.KCPParityShards
+	}
+
+	if cfg.Transport == TransportICMP {
+		pConn, err := newICMPListenConn(addr, cfg.secret)
+		if err != nil {
+			return nil, err
+		}
+		ln, err := kcp.ServeConn(block, dataShards, parityShards, pConn)
+		if err != nil {
+			_ = pConn.Close()
+			return nil, fmt.Errorf("serving icmp kcp: %w", err)
+		}
+		return &kcpListenerWrap{Listener: ln, cfg: cfg, ownConn: pConn}, nil
+	}
+
+	if cfg.Transport == TransportFakeTCP {
+		pConn, err := newFakeTCPListenConn(addr, cfg)
+		if err != nil {
+			return nil, err
+		}
+		ln, err := kcp.ServeConn(block, dataShards, parityShards, pConn)
+		if err != nil {
+			_ = pConn.Close()
+			return nil, fmt.Errorf("serving faketcp kcp: %w", err)
+		}
+		return &kcpListenerWrap{Listener: ln, cfg: cfg, ownConn: pConn}, nil
 	}
 
 	if cfg.IPSpoof {

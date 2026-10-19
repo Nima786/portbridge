@@ -44,10 +44,12 @@ type EdgeSpec struct {
 	RealSite    string `json:"real_site,omitempty"` // strangers are shown the real website
 	CoverSite   string `json:"cover_site,omitempty"`
 	GRE         string `json:"gre,omitempty"`
+	SIT         string `json:"sit,omitempty"`
 	SNISpoof    string `json:"sni_spoof,omitempty"` // decoy ClientHello with whitelisted SNI
 	SpoofSNI    string `json:"spoof_sni,omitempty"`
 	IPSpoof     string `json:"ip_spoof,omitempty"` // source IP spoofing over raw sockets
 	SpoofIP     string `json:"spoof_ip,omitempty"`
+	AntiFreeze  string `json:"anti_freeze,omitempty"` // multi-connection split-stream leg rotation
 
 	ProxyProtocol string `json:"proxy_protocol,omitempty"` // off, v1 or v2
 	Mux           string `json:"mux,omitempty"`
@@ -82,6 +84,7 @@ func (s *EdgeSpec) normalise() {
 	def(&s.CDN, "off")
 	def(&s.Mux, "off")
 	def(&s.GRE, "off")
+	def(&s.SIT, "off")
 	if s.MuxLinks == 0 {
 		s.MuxLinks = 4
 	}
@@ -93,9 +96,28 @@ func (s *EdgeSpec) normalise() {
 	// As the menu does for a GRE link: nothing to disguise, so nothing left over.
 	if s.GRE == "on" {
 		s.Transport = "plain"
+		s.SIT = "off"
 		s.ServerName, s.WSPath, s.CDN, s.AltHost, s.CleanIPs = "", "", "off", "", ""
 		s.UTLS, s.TLSFragment, s.HTTPHeader, s.HTTPHost, s.RealSite, s.CoverSite = "", "", "", "", "", ""
-		s.SNISpoof, s.SpoofSNI, s.IPSpoof, s.SpoofIP = "", "", "", ""
+		s.SNISpoof, s.SpoofSNI, s.IPSpoof, s.SpoofIP, s.AntiFreeze = "", "", "", "", ""
+	}
+	if s.SIT == "on" {
+		s.Transport = "plain"
+		s.GRE = "off"
+		s.ServerName, s.WSPath, s.CDN, s.AltHost, s.CleanIPs = "", "", "off", "", ""
+		s.UTLS, s.TLSFragment, s.HTTPHeader, s.HTTPHost, s.RealSite, s.CoverSite = "", "", "", "", "", ""
+		s.SNISpoof, s.SpoofSNI, s.IPSpoof, s.SpoofIP, s.AntiFreeze = "", "", "", "", ""
+	}
+	if s.AntiFreeze == "on" {
+		if s.Transport == "" || s.Transport == "plain" || engine.IsKCPFamily(engine.Transport(s.Transport)) {
+			s.Transport = "tls"
+		}
+		if strings.TrimSpace(s.UTLS) == "" {
+			s.UTLS = "on"
+		}
+		if strings.TrimSpace(s.TLSFragment) == "" {
+			s.TLSFragment = "on"
+		}
 	}
 	if s.IPSpoof == "on" {
 		s.Transport = "kcp"
@@ -109,7 +131,7 @@ func (s *EdgeSpec) normalise() {
 	if s.SNISpoof == "on" && strings.TrimSpace(s.SpoofSNI) == "" {
 		s.SpoofSNI = engine.DefaultSpoofSNI
 	}
-	if s.Transport == "kcp" {
+	if engine.IsKCPFamily(engine.Transport(s.Transport)) {
 		s.ServerName, s.WSPath, s.CDN = "", "", "off"
 	}
 	if s.Transport == "wss" && s.WSPath == "" {
@@ -169,14 +191,14 @@ func (s *EdgeSpec) check() error {
 		return fmt.Errorf("mode %q is not direct or reverse", s.Mode)
 	}
 	switch s.Transport {
-	case "plain", "tls", "wss", "grpc", "kcp":
+	case "plain", "tls", "wss", "grpc", "kcp", "icmp", "faketcp":
 	default:
-		return fmt.Errorf("link type %q is not one of plain, tls, wss, grpc or kcp", s.Transport)
+		return fmt.Errorf("link type %q is not one of plain, tls, wss, grpc, kcp, icmp or faketcp", s.Transport)
 	}
 	for _, f := range []struct{ name, val string }{
 		{"cdn", s.CDN}, {"mux", s.Mux}, {"utls", s.UTLS}, {"tls_fragment", s.TLSFragment},
-		{"http_header", s.HTTPHeader}, {"gre", s.GRE}, {"real_site", s.RealSite},
-		{"sni_spoof", s.SNISpoof}, {"ip_spoof", s.IPSpoof},
+		{"http_header", s.HTTPHeader}, {"gre", s.GRE}, {"sit", s.SIT}, {"real_site", s.RealSite},
+		{"sni_spoof", s.SNISpoof}, {"ip_spoof", s.IPSpoof}, {"anti_freeze", s.AntiFreeze},
 	} {
 		if f.val != "" && f.val != "on" && f.val != "off" {
 			return fmt.Errorf("%s must be on or off, got %q", f.name, f.val)
@@ -257,12 +279,12 @@ func (s *EdgeSpec) check() error {
 	if s.HTTPHeader == "on" && s.Transport != "plain" {
 		return errors.New("the web header only applies to a plain link")
 	}
-	if s.RealSite == "on" && (s.cdnInvolved() || s.Transport == "plain" || s.Transport == "kcp") {
+	if s.RealSite == "on" && (s.cdnInvolved() || s.Transport == "plain" || engine.IsKCPFamily(engine.Transport(s.Transport))) {
 		return errors.New("showing strangers the real website works only with the website or HTTP/2 link, without a CDN")
 	}
 	if s.IPv6 {
-		if s.GRE == "on" || s.cdnInvolved() || s.Transport == "wss" || s.IPSpoof == "on" {
-			return errors.New("IPv6 between the servers is not offered with GRE, source IP spoofing, a CDN or the web-socket link")
+		if s.GRE == "on" || s.SIT == "on" || s.cdnInvolved() || s.Transport == "wss" || s.IPSpoof == "on" || s.Transport == "icmp" || s.Transport == "faketcp" {
+			return errors.New("IPv6 between the servers is not offered with GRE, 6in4 (SIT), source IP spoofing, ICMP, FakeTCP, a CDN or the web-socket link")
 		}
 		if ip := net.ParseIP(s.PeerIP); ip == nil || ip.To4() != nil {
 			return errors.New("for IPv6 between the servers, the foreign server's address must be its IPv6 one")
@@ -278,9 +300,11 @@ func (s *EdgeSpec) check() error {
 // works them out.
 type edgeLayout struct {
 	tunnelAddr string
-	peerConf   string // peer_ip in the file: the GRE link's address over GRE
+	peerConf   string // peer_ip in the file: the GRE/SIT link's address over GRE/SIT
 	greLocal   string
 	greRemote  string
+	sitLocal   string
+	sitRemote  string
 }
 
 func (s *EdgeSpec) layout() (edgeLayout, error) {
@@ -300,6 +324,19 @@ func (s *EdgeSpec) layout() (edgeLayout, error) {
 			return l, fmt.Errorf("a GRE link needs plain IPv4 addresses for both servers: %w", err)
 		}
 		l.greLocal, l.greRemote = s.LocalIP, s.PeerIP
+		l.peerConf = peer
+		if s.Mode == "direct" {
+			l.tunnelAddr = net.JoinHostPort(peer, strconv.Itoa(s.LinkPort))
+		} else {
+			l.tunnelAddr = net.JoinHostPort(own, strconv.Itoa(s.LinkPort))
+		}
+	}
+	if s.SIT == "on" {
+		own, peer, err := engine.SITAddrs(s.LocalIP, s.PeerIP)
+		if err != nil {
+			return l, fmt.Errorf("a 6in4 (SIT) link needs plain IPv4 addresses for both servers: %w", err)
+		}
+		l.sitLocal, l.sitRemote = s.LocalIP, s.PeerIP
 		l.peerConf = peer
 		if s.Mode == "direct" {
 			l.tunnelAddr = net.JoinHostPort(peer, strconv.Itoa(s.LinkPort))
@@ -341,6 +378,9 @@ func buildEdgeConf(s *EdgeSpec, l edgeLayout, confDir string, now time.Time) str
 	case s.GRE == "on":
 		w("# off because the port can only be reached through the private GRE link.\n")
 		w("firewall = off\n")
+	case s.SIT == "on":
+		w("# off because the port can only be reached through the private 6in4 (SIT) link.\n")
+		w("firewall = off\n")
 	case s.cdnInvolved():
 		w("# off because the link can arrive from a CDN, whose address is not\n")
 		w("# the other server, so the port cannot be locked to one address.\n")
@@ -359,6 +399,12 @@ func buildEdgeConf(s *EdgeSpec, l edgeLayout, confDir string, now time.Time) str
 		w("gre_local = %s\n", l.greLocal)
 		w("gre_remote = %s\n", l.greRemote)
 	}
+	if s.SIT == "on" {
+		w("\n# Runs over a private 6in4 (SIT) IPv6-over-IPv4 link between the two servers.\n")
+		w("sit = on\n")
+		w("sit_local = %s\n", l.sitLocal)
+		w("sit_remote = %s\n", l.sitRemote)
+	}
 	w("\n# What the link looks like to anyone watching it. See the menu.\n")
 	w("transport = %s\n", s.Transport)
 	if s.Transport == "plain" && s.HTTPHeader == "on" {
@@ -370,7 +416,7 @@ func buildEdgeConf(s *EdgeSpec, l edgeLayout, confDir string, now time.Time) str
 		w("http_header = on\n")
 		w("http_host = %s\n", host)
 	}
-	if s.Transport != "plain" && s.Transport != "kcp" {
+	if s.Transport != "plain" && !engine.IsKCPFamily(engine.Transport(s.Transport)) {
 		if s.ServerName != "" {
 			w("server_name = %s\n", s.ServerName)
 		}
@@ -418,6 +464,9 @@ func buildEdgeConf(s *EdgeSpec, l edgeLayout, confDir string, now time.Time) str
 		if s.SpoofSNI != "" && s.SNISpoof != "on" {
 			w("spoof_sni = %s\n", s.SpoofSNI)
 		}
+	}
+	if s.AntiFreeze == "on" {
+		w("anti_freeze = on\n")
 	}
 	if s.ProxyProtocol == "v1" || s.ProxyProtocol == "v2" {
 		w("\n# Pass each user's real address on; the service must be set to expect it.\n")
@@ -481,6 +530,10 @@ func EncodePairingCode(p *PairingData) string {
 		extra.WriteString("gre=on\n")
 		v = max(v, 8)
 	}
+	if p.SIT == "on" {
+		extra.WriteString("sit=on\n")
+		v = max(v, 10)
+	}
 	if p.RealSite == "on" {
 		extra.WriteString("real_site=on\n")
 		if p.CoverSite != "" {
@@ -507,6 +560,10 @@ func EncodePairingCode(p *PairingData) string {
 		if p.SpoofSNI != "" && p.SNISpoof != "on" {
 			fmt.Fprintf(&extra, "spoof_sni=%s\n", p.SpoofSNI)
 		}
+		v = max(v, 10)
+	}
+	if p.AntiFreeze == "on" {
+		extra.WriteString("anti_freeze=on\n")
 		v = max(v, 10)
 	}
 	mux, links := p.Mux, p.MuxLinks
@@ -556,6 +613,9 @@ func edgePairingCode(confDir, name string) (string, error) {
 	if kv["gre"] == "on" {
 		serverIP = kv["gre_remote"]
 	}
+	if kv["sit"] == "on" {
+		serverIP = kv["sit_remote"]
+	}
 	or := func(v, d string) string {
 		if v == "" {
 			return d
@@ -572,10 +632,11 @@ func edgePairingCode(confDir, name string) (string, error) {
 		Transport: or(kv["transport"], "plain"), ServerName: kv["server_name"], WSPath: kv["ws_path"],
 		CDN: or(kv["cdn"], "off"), AltHost: alt, Mux: or(kv["mux"], "off"), MuxLinks: or(kv["mux_links"], "4"),
 		UTLS: kv["utls"], TLSFragment: kv["tls_fragment"], CleanIPs: strings.ReplaceAll(kv["clean_ips"], " ", ""),
-		HTTPHeader: kv["http_header"], HTTPHost: kv["http_host"], GRE: kv["gre"],
+		HTTPHeader: kv["http_header"], HTTPHost: kv["http_host"], GRE: kv["gre"], SIT: kv["sit"],
 		RealSite: kv["real_site"], CoverSite: kv["cover_site"], ProxyProtocol: kv["proxy_protocol"],
 		SNISpoof: kv["sni_spoof"], SpoofSNI: kv["spoof_sni"], IPSpoof: kv["ip_spoof"], SpoofIP: kv["spoof_ip"],
-		Secret: strings.TrimSpace(string(secret)),
+		AntiFreeze: kv["anti_freeze"],
+		Secret:     strings.TrimSpace(string(secret)),
 	}), nil
 }
 
@@ -614,9 +675,9 @@ func checkEdgePorts(s *EdgeSpec, confDir string, host agentHost) error {
 		}
 	}
 	if !s.dialsOut() {
-		t := engine.TransportPlain
-		if s.Transport == "kcp" {
-			t = engine.TransportKCP
+		t := engine.Transport(s.Transport)
+		if !engine.IsKCPFamily(t) {
+			t = engine.TransportPlain
 		}
 		if o := owner(s.LinkPort); o != "" {
 			problems = append(problems, fmt.Sprintf("the port between the servers, %d, is already used on this server by %s", s.LinkPort, o))
@@ -675,6 +736,15 @@ func CreateEdge(spec EdgeSpec, confDir string) (EdgeResult, error) {
 				"it sits behind address translation, and a GRE link cannot be made from it", s.LocalIP)
 		}
 	}
+	if s.SIT == "on" {
+		if err := sitCheck(host); err != nil {
+			return res, err
+		}
+		if !hasLocalAddress(s.LocalIP) {
+			return res, fmt.Errorf("%s is not an address this server has on any of its network cards; "+
+				"it sits behind address translation, and a 6in4 (SIT) link cannot be made from it", s.LocalIP)
+		}
+	}
 
 	// Strangers reaching this server are passed to the real website, so this
 	// server has to be able to reach it.
@@ -731,10 +801,13 @@ func CreateEdge(spec EdgeSpec, confDir string) (EdgeResult, error) {
 	}
 
 	if err := host.FirewallApply(s.Name); err != nil {
-		if s.GRE == "on" {
+		if s.GRE == "on" || s.SIT == "on" {
 			_ = host.FirewallRemove(s.Name)
 			undo()
 			_ = host.FirewallSweep()
+			if s.SIT == "on" {
+				return res, fmt.Errorf("this server could not make the private 6in4 (SIT) link: %w", err)
+			}
 			return res, fmt.Errorf("this server could not make the private GRE link: %w", err)
 		}
 		res.Warnings = append(res.Warnings, err.Error())
@@ -776,6 +849,20 @@ func greCheck(host agentHost) error {
 	}
 	if out, err := hostRun(firewallHelper, "gre-check"); err != nil {
 		return fmt.Errorf("a GRE link is not possible on this server: %s", out)
+	}
+	return nil
+}
+
+// sitCheck asks the firewall helper whether this server can make 6in4 (SIT) links.
+func sitCheck(host agentHost) error {
+	if _, ok := host.(systemHost); !ok {
+		return nil
+	}
+	if _, err := os.Stat(firewallHelper); err != nil {
+		return nil
+	}
+	if out, err := hostRun(firewallHelper, "sit-check"); err != nil {
+		return fmt.Errorf("a 6in4 (SIT) link is not possible on this server: %s", out)
 	}
 	return nil
 }
@@ -847,7 +934,7 @@ type EditSpec struct {
 
 	// Optional transport / mode replacement fields:
 	Mode        string `json:"mode,omitempty"`         // "direct" or "reverse"
-	Transport   string `json:"transport,omitempty"`    // "plain", "tls", "wss", "grpc", "kcp"
+	Transport   string `json:"transport,omitempty"`    // "plain", "tls", "wss", "grpc", "kcp", "icmp", "faketcp"
 	ServerName  string `json:"server_name,omitempty"`  // SNI / domain
 	CDN         string `json:"cdn,omitempty"`          // "on" or "off"
 	AltHost     string `json:"alt_host,omitempty"`     // CDN backup domain
@@ -858,10 +945,12 @@ type EditSpec struct {
 	HTTPHost    string `json:"http_host,omitempty"`    // HTTP host header
 	RealSite    string `json:"real_site,omitempty"`    // "on" or "off"
 	GRE         string `json:"gre,omitempty"`          // "on" or "off"
+	SIT         string `json:"sit,omitempty"`          // "on" or "off"
 	SNISpoof    string `json:"sni_spoof,omitempty"`    // "on" or "off"
 	SpoofSNI    string `json:"spoof_sni,omitempty"`    // whitelisted SNI hostname
 	IPSpoof     string `json:"ip_spoof,omitempty"`     // "on" or "off"
 	SpoofIP     string `json:"spoof_ip,omitempty"`     // whitelisted IPv4 address
+	AntiFreeze  string `json:"anti_freeze,omitempty"`  // "on" or "off"
 	IPv6        *bool  `json:"ipv6,omitempty"`         // true for IPv6 bridge, false for IPv4
 	Mux         string `json:"mux,omitempty"`          // "on" or "off"
 }
@@ -956,15 +1045,18 @@ func EditEdge(spec EditSpec, confDir string) (EdgeResult, error) {
 			restore()
 			return res, err
 		}
-		if cfg.Transport != engine.TransportPlain && cfg.Transport != engine.TransportKCP && !cfg.Dials() {
+		if cfg.Transport != engine.TransportPlain && !engine.IsKCPFamily(cfg.Transport) && !cfg.Dials() {
 			if _, err := engine.EnsureCert(certFile, keyFile, cfg.EffectiveServerName()); err != nil {
 				restore()
 				return res, fmt.Errorf("preparing the certificate: %w", err)
 			}
 		}
 		if err := host.FirewallApply(spec.Name); err != nil {
-			if cfg.GRE {
+			if cfg.GRE || cfg.SIT {
 				restore()
+				if cfg.SIT {
+					return res, fmt.Errorf("this server could not make the private 6in4 (SIT) link: %w", err)
+				}
 				return res, fmt.Errorf("this server could not make the private GRE link: %w", err)
 			}
 			res.Warnings = append(res.Warnings, err.Error())
@@ -1035,6 +1127,9 @@ func EditEdge(spec EditSpec, confDir string) (EdgeResult, error) {
 			if kv["gre"] == "on" && kv["gre_remote"] != "" {
 				peerIP = kv["gre_remote"]
 			}
+			if kv["sit"] == "on" && kv["sit_remote"] != "" {
+				peerIP = kv["sit_remote"]
+			}
 		}
 		localIP := strings.Trim(strings.TrimSpace(spec.LocalIP), "[]")
 		if localIP == "" {
@@ -1079,10 +1174,12 @@ func EditEdge(spec EditSpec, confDir string) (EdgeResult, error) {
 			HTTPHost:      spec.HTTPHost,
 			RealSite:      spec.RealSite,
 			GRE:           spec.GRE,
+			SIT:           spec.SIT,
 			SNISpoof:      spec.SNISpoof,
 			SpoofSNI:      spec.SpoofSNI,
 			IPSpoof:       spec.IPSpoof,
 			SpoofIP:       spec.SpoofIP,
+			AntiFreeze:    spec.AntiFreeze,
 			ProxyProtocol: pp,
 			Mux:           mux,
 			MuxLinks:      muxLinks,
@@ -1120,9 +1217,9 @@ func EditEdge(spec EditSpec, confDir string) (EdgeResult, error) {
 			}
 		}
 		if !es.dialsOut() {
-			t := engine.TransportPlain
-			if es.Transport == "kcp" {
-				t = engine.TransportKCP
+			t := engine.Transport(es.Transport)
+			if !engine.IsKCPFamily(t) {
+				t = engine.TransportPlain
 			}
 			if o := owner(es.LinkPort); o != "" {
 				problems = append(problems, fmt.Sprintf("the port between the servers, %d, is already used on this server by %s", es.LinkPort, o))
@@ -1239,9 +1336,9 @@ func EditEdge(spec EditSpec, confDir string) (EdgeResult, error) {
 			}
 		}
 		if curCfg.Mode == engine.ModeReverse {
-			t := engine.TransportPlain
-			if curCfg.Transport == engine.TransportKCP {
-				t = engine.TransportKCP
+			t := curCfg.Transport
+			if !engine.IsKCPFamily(t) {
+				t = engine.TransportPlain
 			}
 			if o := owner(linkPort); o != "" {
 				problems = append(problems, fmt.Sprintf("the port between the servers, %d, is already used on this server by %s", linkPort, o))
@@ -1302,8 +1399,8 @@ func EditEdge(spec EditSpec, confDir string) (EdgeResult, error) {
 		text = setConfKey(text, "drain", dr)
 	}
 	if pip := strings.TrimSpace(spec.PeerIP); pip != "" && pip != curCfg.PeerIP && spec.Mode == "" && spec.Transport == "" {
-		if curCfg.GRE {
-			res.Warnings = append(res.Warnings, "peer_ip cannot be changed on a private GRE tunnel")
+		if curCfg.GRE || curCfg.SIT {
+			res.Warnings = append(res.Warnings, "peer_ip cannot be changed on a private GRE or 6in4 (SIT) tunnel")
 		} else {
 			pip = strings.Trim(pip, "[]")
 			if net.ParseIP(pip) == nil && !engine.HostnameRe.MatchString(pip) {
@@ -1322,8 +1419,8 @@ func EditEdge(spec EditSpec, confDir string) (EdgeResult, error) {
 	if spec.Firewall != "" {
 		switch spec.Firewall {
 		case "on":
-			if curCfg.CDN || curCfg.AltTarget != "" || curCfg.GRE || spec.CDN == "on" || spec.AltHost != "" || spec.GRE == "on" {
-				res.Warnings = append(res.Warnings, "firewall stays off for CDN and GRE tunnels")
+			if curCfg.CDN || curCfg.AltTarget != "" || curCfg.GRE || curCfg.SIT || spec.CDN == "on" || spec.AltHost != "" || spec.GRE == "on" || spec.SIT == "on" {
+				res.Warnings = append(res.Warnings, "firewall stays off for CDN, GRE and 6in4 (SIT) tunnels")
 			} else {
 				text = setConfKey(text, "firewall", "on")
 			}
@@ -1348,7 +1445,7 @@ func EditEdge(spec EditSpec, confDir string) (EdgeResult, error) {
 		_ = writeFileAtomic(confFile, []byte(oldConf), 0o600)
 		return res, fmt.Errorf("those settings were refused: %w", err)
 	}
-	if newCfg.Transport != engine.TransportPlain && newCfg.Transport != engine.TransportKCP && !newCfg.Dials() {
+	if newCfg.Transport != engine.TransportPlain && !engine.IsKCPFamily(newCfg.Transport) && !newCfg.Dials() {
 		if _, err := engine.EnsureCert(certFile, keyFile, newCfg.EffectiveServerName()); err != nil {
 			_ = writeFileAtomic(confFile, []byte(oldConf), 0o600)
 			return res, fmt.Errorf("preparing the certificate: %w", err)
@@ -1378,8 +1475,11 @@ func EditEdge(spec EditSpec, confDir string) (EdgeResult, error) {
 		_ = host.Restart(spec.Name)
 	}
 	if err := host.FirewallApply(spec.Name); err != nil {
-		if newCfg.GRE {
+		if newCfg.GRE || newCfg.SIT {
 			restore()
+			if newCfg.SIT {
+				return res, fmt.Errorf("this server could not make the private 6in4 (SIT) link: %w", err)
+			}
 			return res, fmt.Errorf("this server could not make the private GRE link: %w", err)
 		}
 		res.Warnings = append(res.Warnings, err.Error())
@@ -1482,6 +1582,17 @@ func CheckTunnel(confDir, name string) (TunnelCheckReport, error) {
 			add("Private GRE link", "ok", "Configured", "")
 		}
 	}
+	if cfg.SIT {
+		if _, isSys := host.(systemHost); isSys {
+			if out, err := hostRun(firewallHelper, "sit-test", name); err == nil {
+				add("Private 6in4 (SIT) link", "ok", out, "")
+			} else {
+				add("Private 6in4 (SIT) link", "bad", out, "6in4 / SIT (IP protocol 41) may be filtered between these servers.")
+			}
+		} else {
+			add("Private 6in4 (SIT) link", "ok", "Configured", "")
+		}
+	}
 
 	if cfg.Role == engine.RoleEdge {
 		for _, p := range ti.UserPorts {
@@ -1502,8 +1613,8 @@ func CheckTunnel(confDir, name string) (TunnelCheckReport, error) {
 	}
 
 	if cfg.Dials() {
-		if cfg.Transport == engine.TransportKCP {
-			add("Peer bridge port", "note", fmt.Sprintf("UDP (%s) — verified by link state below", cfg.TunnelAddr), "")
+		if engine.IsKCPFamily(cfg.Transport) {
+			add("Peer bridge port", "note", fmt.Sprintf("%s (%s) — verified by link state below", strings.ToUpper(string(cfg.Transport)), cfg.TunnelAddr), "")
 		} else if _, isSys := host.(systemHost); isSys {
 			c, err := net.DialTimeout("tcp", cfg.TunnelAddr, 3*time.Second)
 			if err == nil {
@@ -1517,7 +1628,7 @@ func CheckTunnel(confDir, name string) (TunnelCheckReport, error) {
 		}
 	} else {
 		busy := host.PortFree(cfg.Transport, ti.LinkPort) != nil
-		if _, isNo := host.(noHost); isNo {
+		if _, isNo := host.(noHost); isNo || cfg.Transport == engine.TransportICMP || cfg.Transport == engine.TransportFakeTCP {
 			busy = ti.Running
 		}
 		if busy {
@@ -1752,7 +1863,7 @@ func readFirewallStatus(confDir string) FirewallInfo {
 	for _, ti := range TunnelsReport(confDir) {
 		cfg, err := engine.LoadConfig(filepath.Join(confDir, ti.Name+".conf"))
 		dials := false
-		cdnOrGRE := ti.CDN || ti.GRE
+		cdnOrGRE := ti.CDN || ti.GRE || ti.SIT
 		if err == nil {
 			dials = cfg.Dials()
 			cdnOrGRE = cdnOrGRE || cfg.AltTarget != ""
@@ -1786,7 +1897,7 @@ func readFirewallStatus(confDir string) FirewallInfo {
 				case r.DialsOut:
 					lines = append(lines, fmt.Sprintf("%s: dials out to %s:%d (no bridge listener on this server)", r.Name, r.PeerIP, r.LinkPort))
 				case r.CDNOrGRE:
-					lines = append(lines, fmt.Sprintf("%s: bridge port %d open (CDN / GRE tunnel)", r.Name, r.LinkPort))
+					lines = append(lines, fmt.Sprintf("%s: bridge port %d open (CDN / GRE / 6in4 tunnel)", r.Name, r.LinkPort))
 				case r.Locked:
 					lines = append(lines, fmt.Sprintf("%s: bridge port %d locked to %s", r.Name, r.LinkPort, r.PeerIP))
 				default:
@@ -1817,7 +1928,7 @@ func applyFirewallAction(confDir, action string) (FirewallInfo, error) {
 		if err := host.FirewallSweep(); err != nil {
 			return FirewallInfo{}, err
 		}
-		outMsg = "Cleaned up any leftover firewall rules and GRE links from removed tunnels."
+		outMsg = "Cleaned up any leftover firewall rules and GRE/6in4 links from removed tunnels."
 	case "on-all", "off-all":
 		val := "on"
 		if action == "off-all" {
@@ -1835,7 +1946,7 @@ func applyFirewallAction(confDir, action string) (FirewallInfo, error) {
 			if err != nil {
 				continue
 			}
-			if val == "on" && (cfg.CDN || cfg.AltTarget != "" || cfg.GRE) {
+			if val == "on" && (cfg.CDN || cfg.AltTarget != "" || cfg.GRE || cfg.SIT) {
 				continue
 			}
 			raw, err := os.ReadFile(confPath)
@@ -1985,7 +2096,7 @@ func ImportTunnel(snap TunnelSnapshot, confDir string, overwrite bool, newLocalI
 
 	cfg, err := engine.LoadConfig(confFile)
 	if err == nil {
-		if cfg.Transport != engine.TransportPlain && cfg.Transport != engine.TransportKCP && !cfg.Dials() {
+		if cfg.Transport != engine.TransportPlain && !engine.IsKCPFamily(cfg.Transport) && !cfg.Dials() {
 			_, _ = engine.EnsureCert(certFile, keyFile, cfg.EffectiveServerName())
 		}
 		err = cfg.Validate()

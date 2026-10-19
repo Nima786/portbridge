@@ -126,6 +126,8 @@ type createRequest struct {
 	WebHost    string `json:"web_host"`
 	RealSite   bool   `json:"real_site"`
 	GRE        bool   `json:"gre"`
+	SIT        bool   `json:"sit"`
+	AntiFreeze bool   `json:"anti_freeze"`
 	SNISpoof   bool   `json:"sni_spoof"`
 	SpoofSNI   string `json:"spoof_sni"`
 	IPSpoof    bool   `json:"ip_spoof"`
@@ -216,6 +218,25 @@ func (p *Panel) toSpec(r createRequest) (agent.EdgeSpec, error) {
 		}
 		s.UTLS, s.TLSFragment = on(r.Stealth), on(r.Stealth)
 		s.RealSite = on(r.RealSite)
+	case "split":
+		s.Transport = "tls"
+		s.ServerName = claimed
+		if s.ServerName == "" {
+			s.ServerName = engine.DefaultSpoofSNI
+		}
+		s.UTLS, s.TLSFragment = "on", "on"
+		s.SNISpoof, s.SpoofSNI = "on", s.ServerName
+		s.RealSite = on(r.RealSite)
+		s.AntiFreeze = "on"
+	case "sit":
+		s.Transport = "tls"
+		s.ServerName = claimed
+		if s.ServerName == "" {
+			s.ServerName = "www.bing.com"
+		}
+		s.UTLS, s.TLSFragment = on(r.Stealth), on(r.Stealth)
+		s.RealSite = on(r.RealSite)
+		s.SIT = "on"
 	case "cdn":
 		s.Transport, s.CDN, s.ServerName, s.CleanIPs = "wss", "on", domain, r.CleanIPs
 		if domain == "" {
@@ -246,6 +267,10 @@ func (p *Panel) toSpec(r createRequest) (agent.EdgeSpec, error) {
 		}
 	case "kcp":
 		s.Transport = "kcp"
+	case "faketcp":
+		s.Transport = "faketcp"
+	case "icmp":
+		s.Transport = "icmp"
 	case "sni-spoof":
 		s.Transport = "tls"
 		s.SNISpoof = "on"
@@ -273,7 +298,12 @@ func (p *Panel) toSpec(r createRequest) (agent.EdgeSpec, error) {
 	}
 	if r.GRE {
 		s.GRE = "on"
+	} else if r.SIT || s.SIT == "on" {
+		s.SIT = "on"
 	} else {
+		if r.AntiFreeze {
+			s.AntiFreeze = "on"
+		}
 		if r.SNISpoof {
 			s.SNISpoof = "on"
 			s.SpoofSNI = strings.TrimSpace(r.SpoofSNI)
@@ -297,7 +327,11 @@ func (p *Panel) toSpec(r createRequest) (agent.EdgeSpec, error) {
 	if r.Shared {
 		s.Mux, s.MuxLinks = "on", r.SharedLinks
 		if s.MuxLinks == 0 {
-			s.MuxLinks = 4
+			if s.Transport == "icmp" || s.Transport == "faketcp" || s.IPSpoof == "on" {
+				s.MuxLinks = 2
+			} else {
+				s.MuxLinks = 4
+			}
 		}
 	}
 	if s.ProxyProtocol == "off" {
@@ -306,7 +340,7 @@ func (p *Panel) toSpec(r createRequest) (agent.EdgeSpec, error) {
 
 	rv4, rv6 := addressesOf(relay)
 	fv4, fv6 := addressesOf(foreign)
-	if r.IPv6 {
+	if r.IPv6 && s.GRE != "on" && s.SIT != "on" {
 		if rv6 == "" || fv6 == "" {
 			return s, errors.New("both servers need a public IPv6 address for IPv6 between them")
 		}
@@ -430,7 +464,7 @@ func (p *Panel) startCreate(r createRequest) (string, error) {
 // startJob runs work in the background as a job the page can follow.
 func (p *Panel) startJob(work func(*job) (string, error)) string {
 	id := newID(9)
-	j := &job{started: time.Now()}
+	j := &job{id: id, started: time.Now()}
 	p.jobsMu.Lock()
 	p.jobs[id] = j
 	for k, o := range p.jobs {
@@ -803,6 +837,18 @@ func (p *Panel) editTunnel(j *job, r editTunnelRequest) error {
 	for _, w := range commit.Warnings {
 		j.say("Note from %s: %s", relay, w)
 	}
+
+	// Because Origin was restarted before Edge committed its restart, any
+	// reverse-mode connections Origin dialed during the commit window landed on
+	// the old Edge process that just exited. Restart Origin once more now that
+	// the new Edge listener is up so the tunnel works immediately.
+	var reSync struct {
+		OK bool `json:"ok"`
+	}
+	_, _ = p.callJSON(ctx, r.Origin, "/api/tunnel/service", map[string]string{
+		"name":   spec.Name,
+		"action": "restart",
+	}, &reSync)
 
 	j.say("Tunnel %q is updated and running on both servers.", spec.Name)
 	p.refreshOne(r.Edge)
@@ -1249,13 +1295,13 @@ func (p *Panel) startProbeSession(parent context.Context, relayID, foreignID, cd
 }
 
 func (p *Panel) runProbeStep(parent context.Context, dialerID, secret string, spec engine.ProbeCandidateSpec) (engine.ProbeCandidateResult, error) {
-	dctx, dcancel := context.WithTimeout(parent, 12*time.Second)
+	dctx, dcancel := context.WithTimeout(parent, 15*time.Second)
 	defer dcancel()
 	var drep probeDialReply
 	_, err := p.callJSON(dctx, dialerID, "/api/probe/dial", map[string]any{
 		"specs":       []engine.ProbeCandidateSpec{spec},
 		"secret":      secret,
-		"burst_bytes": 128 * 1024,
+		"burst_bytes": 0,
 	}, &drep)
 	if err != nil {
 		return engine.ProbeCandidateResult{
@@ -1338,7 +1384,7 @@ func (p *Panel) probeBetweenServers(parent context.Context, relayID, foreignID, 
 			_, err := p.callJSON(parent, sess.RelayID, "/api/probe/dial", map[string]any{
 				"specs":       directSpecs,
 				"secret":      sess.DirectSecret,
-				"burst_bytes": 128 * 1024,
+				"burst_bytes": 0,
 			}, &drep)
 			if err == nil && drep.OK {
 				directRes = drep.Results
@@ -1353,7 +1399,7 @@ func (p *Panel) probeBetweenServers(parent context.Context, relayID, foreignID, 
 			_, err := p.callJSON(parent, sess.ForeignID, "/api/probe/dial", map[string]any{
 				"specs":       reverseSpecs,
 				"secret":      sess.ReverseSecret,
-				"burst_bytes": 128 * 1024,
+				"burst_bytes": 0,
 			}, &rrep)
 			if err == nil && rrep.OK {
 				reverseRes = rrep.Results

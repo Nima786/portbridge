@@ -122,7 +122,7 @@ func runEdge(ctx context.Context, cfg *Config, st *status) error {
 	// In reverse mode this side accepts, so it needs a certificate before the
 	// disguise can be prepared. Both are set up together, once, because a
 	// connection that has to build its own is the most expensive kind.
-	if cfg.Transport != TransportPlain && cfg.Transport != TransportKCP && cfg.Mode == ModeReverse {
+	if cfg.Transport != TransportPlain && !cfg.Transport.IsPacketBased() && cfg.Mode == ModeReverse {
 		cert, err := EnsureCert(cfg.CertFile, cfg.KeyFile, cfg.EffectiveServerName())
 		if err != nil {
 			return fmt.Errorf("preparing the disguise: %w", err)
@@ -209,7 +209,7 @@ func runEdge(ctx context.Context, cfg *Config, st *status) error {
 	// In reverse mode we also listen for the origin's incoming connections.
 	if cfg.Mode == ModeReverse {
 		var tunnelLn net.Listener
-		if cfg.Transport == TransportKCP {
+		if cfg.Transport.IsPacketBased() {
 			tunnelLn, err = kcpListen(cfg.TunnelAddr, cfg)
 		} else {
 			tunnelLn, err = net.Listen("tcp", cfg.TunnelAddr)
@@ -290,7 +290,7 @@ func (e *edge) acceptTunnel(ctx context.Context, ln net.Listener) {
 				tuneSocket(raw)
 				c, err := wrapAccept(raw, e.cfg, e.cert, e.guard)
 				if err != nil {
-					if errors.Is(err, errStrangerForwarded) {
+					if errors.Is(err, errStrangerForwarded) || errors.Is(err, errSplitLegAttached) {
 						return
 					}
 					e.logAuth.printf("refused a tunnel connection from %s: %v", raw.RemoteAddr(), err)

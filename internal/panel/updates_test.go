@@ -352,6 +352,9 @@ func TestThePanelUpdatesItselfFirstThenCarriesOn(t *testing.T) {
 	fetchRelease = func(v, arch string) ([]byte, error) { return []byte("release " + v), nil }
 	var installed agent.UpdateRequest
 	p.updates.selfInstall = func(req agent.UpdateRequest) (agent.UpdateResult, error) {
+		if far.state().version != "v0.16.0" {
+			t.Errorf("other servers should be updated before the panel restarts itself")
+		}
 		installed = req
 		return agent.UpdateResult{OK: true, Version: req.Version}, nil
 	}
@@ -360,26 +363,32 @@ func TestThePanelUpdatesItselfFirstThenCarriesOn(t *testing.T) {
 	if st := p.updates.status(); st.Latest != "v0.16.0" || !st.PanelOlder {
 		t.Fatalf("the newer release was not noticed: %+v", st)
 	}
-	v := waitJob(t, p, p.updates.start())
+	jobID := p.updates.start()
+	v := waitJob(t, p, jobID)
 	if v.Error != "" || installed.Version != "v0.16.0" || string(installed.Archive) != "release v0.16.0" {
-		t.Fatalf("the panel's own server was not updated first: %q %+v", v.Error, installed)
+		t.Fatalf("the panel's own server was not updated after the other servers: %q %+v", v.Error, installed)
 	}
-	if far.state().lastAsked != "" {
-		t.Fatalf("other servers were updated before the panel came back on the new version")
+	if st := far.state(); st.version != "v0.16.0" {
+		t.Fatalf("other servers were not updated before the panel restarted: %+v", st)
 	}
 	if _, err := os.Stat(filepath.Join(p.dir, pendingFile)); err != nil {
 		t.Fatalf("nothing was left for the restarted panel to carry on from")
 	}
 
-	// The panel comes back on the new version and carries on by itself.
+	// Simulate the panel restarting on the new version: it restores the same job ID
+	// with the completed log so the browser's open progress dialog finishes cleanly.
+	p.jobsMu.Lock()
+	delete(p.jobs, jobID)
+	p.jobsMu.Unlock()
 	engine.Version = "v0.16.0"
 	p.updates.resume()
 	if _, err := os.Stat(filepath.Join(p.dir, pendingFile)); err == nil {
 		t.Fatalf("the note to carry on was not cleared")
 	}
-	v = waitJob(t, p, p.updates.status().Job)
-	if st := far.state(); v.Error != "" || st.version != "v0.16.0" {
-		t.Fatalf("the other servers were not updated after the restart: %q %+v\n%s", v.Error, st, strings.Join(v.Lines, "\n"))
+	v = waitJob(t, p, jobID)
+	log := strings.Join(v.Lines, "\n")
+	if v.Error != "" || !v.Done || !strings.Contains(log, "now on v0.16.0") {
+		t.Fatalf("the restored job after panel restart was not completed cleanly: %q\n%s", v.Error, log)
 	}
 }
 

@@ -404,6 +404,42 @@ func isDecoyClientHello(b []byte) bool {
 		b[5] == 0x01 && b[9] == 0x03 && b[10] == 0x03
 }
 
+var decoyRawBypass sync.Map // map[string]time.Time
+
+func peerHostKey(addr net.Addr) string {
+	if addr == nil {
+		return ""
+	}
+	s := addr.String()
+	if h, _, err := net.SplitHostPort(s); err == nil {
+		return h
+	}
+	return s
+}
+
+func isDecoyRawBypassed(addr net.Addr) bool {
+	k := peerHostKey(addr)
+	if k == "" {
+		return false
+	}
+	v, ok := decoyRawBypass.Load(k)
+	if !ok {
+		return false
+	}
+	t, ok := v.(time.Time)
+	if !ok || time.Since(t) > 15*time.Minute {
+		decoyRawBypass.Delete(k)
+		return false
+	}
+	return true
+}
+
+func markDecoyRawBypass(addr net.Addr) {
+	if k := peerHostKey(addr); k != "" {
+		decoyRawBypass.Store(k, time.Now())
+	}
+}
+
 // spoofPacketConn wraps an unconnected *net.UDPConn so KCP can send and receive
 // UDP packets whose IPv4 source address is forged to a whitelisted IP (e.g. 104.18.4.130).
 // It automatically handles both mutual bidirectional IP spoofing and asymmetric setups

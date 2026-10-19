@@ -35,6 +35,23 @@ func closeRawSpoofSocket(fd int) {
 	}
 }
 
+func setIPConnSocketMark(ipConn *net.IPConn, mark int) error {
+	if ipConn == nil || mark == 0 {
+		return nil
+	}
+	rc, err := ipConn.SyscallConn()
+	if err != nil {
+		return err
+	}
+	var sockErr error
+	if err := rc.Control(func(fd uintptr) {
+		sockErr = syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_MARK, mark)
+	}); err != nil {
+		return err
+	}
+	return sockErr
+}
+
 func sendRawSpoofedUDP(fd int, srcIP, dstIP net.IP, srcPort, dstPort int, ttl int, payload []byte) error {
 	if fd < 0 {
 		return errors.New("raw socket not open")
@@ -49,6 +66,35 @@ func sendRawSpoofedUDP(fd int, srcIP, dstIP net.IP, srcPort, dstPort int, ttl in
 	}
 	var sa syscall.SockaddrInet4
 	sa.Port = dstPort
+	copy(sa.Addr[:], dst4)
+	return syscall.Sendto(fd, pkt, 0, &sa)
+}
+
+func sendRawTCPPacket(fd int, srcIP, dstIP net.IP, srcPort, dstPort uint16, seq, ack uint32, flags byte, ttl int, payload []byte, corruptChecksum bool) error {
+	if fd < 0 {
+		return errors.New("raw socket not open")
+	}
+	dst4 := dstIP.To4()
+	if dst4 == nil {
+		return errors.New("destination IPv4 required")
+	}
+	pkt, err := buildIPv4TCPPacket(srcIP, dstIP, int(srcPort), int(dstPort), seq, ack, ttl, corruptChecksum, payload)
+	if err != nil {
+		return err
+	}
+	if flags != 0 && len(pkt) >= 40 {
+		pkt[33] = flags
+		pkt[36] = 0
+		pkt[37] = 0
+		csum := tcpUDPChecksum(srcIP.To4(), dst4, 6, pkt[20:])
+		if corruptChecksum {
+			csum ^= 0xffff
+		}
+		pkt[36] = byte(csum >> 8)
+		pkt[37] = byte(csum)
+	}
+	var sa syscall.SockaddrInet4
+	sa.Port = int(dstPort)
 	copy(sa.Addr[:], dst4)
 	return syscall.Sendto(fd, pkt, 0, &sa)
 }
@@ -124,28 +170,16 @@ func injectDecoyClientHello(conn net.Conn, sni string, ttl int) error {
 	sa.Port = rAddr.Port
 	copy(sa.Addr[:], dst4)
 
-	// 1. Out-of-window sequence decoy (Seq = sndNxt - 32768) with valid TCP checksum:
-	//    Stateless / window-tolerant DPI parses the ClientHello SNI; the destination
-	//    RFC 793 TCP stack drops the segment as an old duplicate before rcv_nxt.
-	if haveSeq {
-		if pkt, err := buildIPv4TCPPacket(src4, dst4, lAddr.Port, rAddr.Port, sndNxt-32768, rcvNxt, 64, false, decoy); err == nil {
-			_ = syscall.Sendto(rawFD, pkt, 0, &sa)
-		}
+	// Low-TTL exact-sequence decoy with inverted TCP checksum:
+	// Passes local ISP DPI hops and expires before reaching the remote server,
+	// preventing cloud hypervisors with TX checksum offload from delivering an
+	// in-window decoy segment to the destination socket.
+	hopTTL := ttl
+	if hopTTL <= 0 || hopTTL > 32 {
+		hopTTL = 3
 	}
-
-	// 2. Exact-sequence decoy with inverted TCP checksum:
-	//    Sequence-strict DPI that skips TCP checksum verification parses the ClientHello SNI;
-	//    the destination kernel drops the segment on checksum failure.
-	if pkt, err := buildIPv4TCPPacket(src4, dst4, lAddr.Port, rAddr.Port, sndNxt, rcvNxt, 64, true, decoy); err == nil {
+	if pkt, err := buildIPv4TCPPacket(src4, dst4, lAddr.Port, rAddr.Port, sndNxt, rcvNxt, hopTTL, true, decoy); err == nil {
 		_ = syscall.Sendto(rawFD, pkt, 0, &sa)
-	}
-
-	// 3. Optional low-TTL exact-sequence decoy when sni_spoof_ttl is explicitly configured:
-	//    Passes local ISP DPI hops and expires before reaching the remote server.
-	if ttl > 0 && ttl <= 32 && haveSeq {
-		if pkt, err := buildIPv4TCPPacket(src4, dst4, lAddr.Port, rAddr.Port, sndNxt, rcvNxt, ttl, false, decoy); err == nil {
-			_ = syscall.Sendto(rawFD, pkt, 0, &sa)
-		}
 	}
 
 	time.Sleep(5 * time.Millisecond)

@@ -169,7 +169,7 @@ func runSpeedtestClient(c net.Conn, cfg *Config, out io.Writer, sizeMB ...float6
 		float64(avgRTT)/float64(time.Millisecond),
 		jitterMS)
 
-	// Phase 2: Download Test
+	// Phase 2 & 3: Download and Upload Tests
 	mb := 1.0
 	if len(sizeMB) > 0 && sizeMB[0] > 0 {
 		mb = sizeMB[0]
@@ -178,110 +178,164 @@ func runSpeedtestClient(c net.Conn, cfg *Config, out io.Writer, sizeMB ...float6
 	if testSize == 0 {
 		testSize = 1024 * 1024
 	}
-	fmt.Fprintf(out, "⬇️  Testing download throughput (%.2f MB)...\n", float64(testSize)/(1024*1024))
-	dlHeader := make([]byte, 5)
-	dlHeader[0] = 0x02
-	binary.BigEndian.PutUint32(dlHeader[1:], testSize)
-	_ = c.SetDeadline(time.Now().Add(120 * time.Second))
-	if _, err := c.Write(dlHeader); err != nil {
-		return fmt.Errorf("download phase start: %w", err)
-	}
 
-	var dlReady [1]byte
-	_ = c.SetReadDeadline(time.Now().Add(60 * time.Second))
-	if _, err := io.ReadFull(c, dlReady[:]); err != nil {
-		return fmt.Errorf("download ready ACK: %w", err)
-	}
-
-	dlStart := time.Now()
 	readBuf := make([]byte, 32*1024)
-	var dlRead int64
-	var dlErr error
-	for dlRead < int64(testSize) {
-		toRead := int64(len(readBuf))
-		if rem := int64(testSize) - dlRead; rem < toRead {
-			toRead = rem
-		}
-		_ = c.SetReadDeadline(time.Now().Add(60 * time.Second))
-		n, err := c.Read(readBuf[:toRead])
-		if n > 0 {
-			dlRead += int64(n)
-		}
-		if err != nil {
-			dlErr = err
-			break
-		}
-	}
-	dlElapsed := time.Since(dlStart)
-	if dlRead == 0 && dlErr != nil {
-		return fmt.Errorf("download reading: %w", dlErr)
-	}
-	dlMBps := (float64(dlRead) / (1024 * 1024)) / dlElapsed.Seconds()
-	dlMbps := (float64(dlRead) * 8 / 1_000_000) / dlElapsed.Seconds()
-
-	if dlErr != nil {
-		fmt.Fprintf(out, "   Download: %.2f MB/s (%.1f Mbps) (partial: %d/%d bytes in %.2fs: %v)\n\n", dlMBps, dlMbps, dlRead, testSize, dlElapsed.Seconds(), dlErr)
-	} else {
-		fmt.Fprintf(out, "   Download: %.2f MB/s (%.1f Mbps) in %.2fs\n\n", dlMBps, dlMbps, dlElapsed.Seconds())
-	}
-
-	// Phase 3: Upload Test
-	fmt.Fprintf(out, "⬆️  Testing upload throughput (%.2f MB)...\n", float64(testSize)/(1024*1024))
-	ulHeader := make([]byte, 5)
-	ulHeader[0] = 0x03
-	binary.BigEndian.PutUint32(ulHeader[1:], testSize)
-	_ = c.SetDeadline(time.Now().Add(120 * time.Second))
-	if _, err := c.Write(ulHeader); err != nil {
-		return fmt.Errorf("upload phase start: %w", err)
-	}
-
-	var ulReady [1]byte
-	_ = c.SetReadDeadline(time.Now().Add(60 * time.Second))
-	if _, err := io.ReadFull(c, ulReady[:]); err != nil {
-		return fmt.Errorf("upload ready ACK: %w", err)
-	}
-
 	sendChunk := make([]byte, 32*1024)
 	_, _ = rand.Read(sendChunk[:128])
 	for i := 128; i < len(sendChunk); i++ {
 		sendChunk[i] = sendChunk[i%128] ^ byte(i)
 	}
 
-	ulStart := time.Now()
-	var ulSent int64
-	var ulErr error
-	for ulSent < int64(testSize) {
-		toWrite := int64(len(sendChunk))
-		if rem := int64(testSize) - ulSent; rem < toWrite {
-			toWrite = rem
+	runServerToClient := func(sz uint32) (int64, time.Duration, error) {
+		hdr := make([]byte, 5)
+		hdr[0] = 0x02
+		binary.BigEndian.PutUint32(hdr[1:], sz)
+		_ = c.SetDeadline(time.Now().Add(120 * time.Second))
+		reqStart := time.Now()
+		if _, err := c.Write(hdr); err != nil {
+			return 0, 0, fmt.Errorf("download phase start: %w", err)
 		}
-		_ = c.SetWriteDeadline(time.Now().Add(60 * time.Second))
-		n, err := c.Write(sendChunk[:toWrite])
-		if n > 0 {
-			ulSent += int64(n)
-		}
-		if err != nil {
-			ulErr = err
-			break
-		}
-	}
-
-	var ulAck [1]byte
-	if ulErr == nil {
+		var ready [1]byte
 		_ = c.SetReadDeadline(time.Now().Add(60 * time.Second))
-		if _, err := io.ReadFull(c, ulAck[:]); err != nil {
-			ulErr = err
+		if _, err := io.ReadFull(c, ready[:]); err != nil {
+			return 0, 0, fmt.Errorf("download ready ACK: %w", err)
 		}
+		start := time.Now()
+		var nRead int64
+		var rErr error
+		for nRead < int64(sz) {
+			toRead := int64(len(readBuf))
+			if rem := int64(sz) - nRead; rem < toRead {
+				toRead = rem
+			}
+			_ = c.SetReadDeadline(time.Now().Add(60 * time.Second))
+			n, err := c.Read(readBuf[:toRead])
+			if n > 0 {
+				nRead += int64(n)
+			}
+			if err != nil {
+				rErr = err
+				break
+			}
+		}
+		elapsed := time.Since(start)
+		totalElapsed := time.Since(reqStart)
+		netElapsed := totalElapsed - avgRTT
+		if minNet := time.Duration(float64(totalElapsed) * 0.5); netElapsed < minNet {
+			netElapsed = minNet
+		}
+		if netElapsed > elapsed {
+			elapsed = netElapsed
+		}
+		return nRead, elapsed, rErr
 	}
-	ulElapsed := time.Since(ulStart)
-	if ulSent == 0 && ulErr != nil {
-		return fmt.Errorf("upload writing: %w", ulErr)
-	}
-	ulMBps := (float64(ulSent) / (1024 * 1024)) / ulElapsed.Seconds()
-	ulMbps := (float64(ulSent) * 8 / 1_000_000) / ulElapsed.Seconds()
 
+	runClientToServer := func(sz uint32) (int64, time.Duration, error) {
+		hdr := make([]byte, 5)
+		hdr[0] = 0x03
+		binary.BigEndian.PutUint32(hdr[1:], sz)
+		_ = c.SetDeadline(time.Now().Add(120 * time.Second))
+		if _, err := c.Write(hdr); err != nil {
+			return 0, 0, fmt.Errorf("upload phase start: %w", err)
+		}
+		var ready [1]byte
+		_ = c.SetReadDeadline(time.Now().Add(60 * time.Second))
+		if _, err := io.ReadFull(c, ready[:]); err != nil {
+			return 0, 0, fmt.Errorf("upload ready ACK: %w", err)
+		}
+		start := time.Now()
+		var nSent int64
+		var wErr error
+		for nSent < int64(sz) {
+			toWrite := int64(len(sendChunk))
+			if rem := int64(sz) - nSent; rem < toWrite {
+				toWrite = rem
+			}
+			_ = c.SetWriteDeadline(time.Now().Add(60 * time.Second))
+			n, err := c.Write(sendChunk[:toWrite])
+			if n > 0 {
+				nSent += int64(n)
+			}
+			if err != nil {
+				wErr = err
+				break
+			}
+		}
+		var doneAck [1]byte
+		if wErr == nil {
+			_ = c.SetReadDeadline(time.Now().Add(60 * time.Second))
+			if _, err := io.ReadFull(c, doneAck[:]); err != nil {
+				wErr = err
+			}
+		}
+		elapsed := time.Since(start)
+		if elapsed > avgRTT && avgRTT > 0 {
+			adj := elapsed - avgRTT/2
+			if minAdj := time.Duration(float64(elapsed) * 0.65); adj < minAdj {
+				adj = minAdj
+			}
+			elapsed = adj
+		}
+		return nSent, elapsed, wErr
+	}
+
+	// In Reverse mode when Origin (Foreign) dials Edge (Relay), Client->Server is
+	// Foreign->Relay (User Download) and Server->Client is Relay->Foreign (User Upload).
+	reverseOriginDial := cfg != nil && cfg.Mode == ModeReverse && cfg.Role == RoleOrigin
+	doWarmup := cfg != nil && !cfg.AntiFreeze && testSize >= 256*1024
+	warmupSz := uint32(256 * 1024)
+	if cfg != nil && cfg.Transport == TransportICMP {
+		warmupSz = 768 * 1024
+	}
+
+	fmt.Fprintf(out, "⬇️  Testing download throughput (%.2f MB)...\n", float64(testSize)/(1024*1024))
+	var dlBytes int64
+	var dlElapsed time.Duration
+	var dlErr error
+	if reverseOriginDial {
+		if doWarmup {
+			_, _, _ = runClientToServer(warmupSz)
+		}
+		dlBytes, dlElapsed, dlErr = runClientToServer(testSize)
+	} else {
+		if doWarmup {
+			_, _, _ = runServerToClient(warmupSz)
+		}
+		dlBytes, dlElapsed, dlErr = runServerToClient(testSize)
+	}
+	if dlBytes == 0 && dlErr != nil {
+		return fmt.Errorf("download test: %w", dlErr)
+	}
+	dlMBps := (float64(dlBytes) / (1024 * 1024)) / dlElapsed.Seconds()
+	dlMbps := (float64(dlBytes) * 8 / 1_000_000) / dlElapsed.Seconds()
+	if dlErr != nil {
+		fmt.Fprintf(out, "   Download: %.2f MB/s (%.1f Mbps) (partial: %d/%d bytes in %.2fs: %v)\n\n", dlMBps, dlMbps, dlBytes, testSize, dlElapsed.Seconds(), dlErr)
+	} else {
+		fmt.Fprintf(out, "   Download: %.2f MB/s (%.1f Mbps) in %.2fs\n\n", dlMBps, dlMbps, dlElapsed.Seconds())
+	}
+
+	fmt.Fprintf(out, "⬆️  Testing upload throughput (%.2f MB)...\n", float64(testSize)/(1024*1024))
+	var ulBytes int64
+	var ulElapsed time.Duration
+	var ulErr error
+	if reverseOriginDial {
+		if doWarmup {
+			_, _, _ = runServerToClient(warmupSz)
+		}
+		ulBytes, ulElapsed, ulErr = runServerToClient(testSize)
+	} else {
+		if doWarmup {
+			_, _, _ = runClientToServer(warmupSz)
+		}
+		ulBytes, ulElapsed, ulErr = runClientToServer(testSize)
+	}
+	if ulBytes == 0 && ulErr != nil {
+		return fmt.Errorf("upload test: %w", ulErr)
+	}
+	ulMBps := (float64(ulBytes) / (1024 * 1024)) / ulElapsed.Seconds()
+	ulMbps := (float64(ulBytes) * 8 / 1_000_000) / ulElapsed.Seconds()
 	if ulErr != nil {
-		fmt.Fprintf(out, "   Upload: %.2f MB/s (%.1f Mbps) (partial: %d/%d bytes in %.2fs: %v)\n\n", ulMBps, ulMbps, ulSent, testSize, ulElapsed.Seconds(), ulErr)
+		fmt.Fprintf(out, "   Upload: %.2f MB/s (%.1f Mbps) (partial: %d/%d bytes in %.2fs: %v)\n\n", ulMBps, ulMbps, ulBytes, testSize, ulElapsed.Seconds(), ulErr)
 	} else {
 		fmt.Fprintf(out, "   Upload: %.2f MB/s (%.1f Mbps) in %.2fs\n\n", ulMBps, ulMbps, ulElapsed.Seconds())
 	}

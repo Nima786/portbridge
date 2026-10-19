@@ -61,11 +61,13 @@ type TunnelInfo struct {
 	ServerName    string      `json:"server_name,omitempty"`
 	AltHost       string      `json:"alt_host,omitempty"`
 	GRE           bool        `json:"gre"`
+	SIT           bool        `json:"sit"`
 	RealSite      bool        `json:"real_site"`
 	SNISpoof      bool        `json:"sni_spoof"`
 	SpoofSNI      string      `json:"spoof_sni,omitempty"`
 	IPSpoof       bool        `json:"ip_spoof"`
 	SpoofIP       string      `json:"spoof_ip,omitempty"`
+	AntiFreeze    bool        `json:"anti_freeze"`
 	ProxyProtocol string      `json:"proxy_protocol"`
 	PairID        string      `json:"pair_id,omitempty"`
 	Running       bool        `json:"running"`
@@ -140,11 +142,13 @@ func tunnelInfo(path string, host agentHost) TunnelInfo {
 	ti.ServerName = cfg.ServerName
 	ti.AltHost = cfg.AltServerName
 	ti.GRE = cfg.GRE
+	ti.SIT = cfg.SIT
 	ti.RealSite = cfg.RealSite
 	ti.SNISpoof = cfg.SNISpoof
 	ti.SpoofSNI = cfg.SpoofSNI
 	ti.IPSpoof = cfg.IPSpoof
 	ti.SpoofIP = cfg.SpoofIP
+	ti.AntiFreeze = cfg.AntiFreeze
 	ti.MaxConn = cfg.MaxConn
 	if cfg.SpareTTL > 0 {
 		ti.SpareTTL = cfg.SpareTTL.String()

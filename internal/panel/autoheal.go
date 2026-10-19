@@ -344,8 +344,12 @@ func describeTunnelInfo(ti agent.TunnelInfo) string {
 	}
 	tr := strings.ToUpper(ti.Transport)
 	linkLower := strings.ToLower(ti.Link)
-	if ti.CDN {
+	if ti.SIT {
+		tr += " (6in4)"
+	} else if ti.CDN {
 		tr += " (CDN)"
+	} else if ti.AntiFreeze {
+		tr += " (Split-Stream)"
 	} else if strings.Contains(linkLower, "website header") {
 		tr += " (HTTP)"
 	} else if strings.Contains(linkLower, "fragmented") || strings.Contains(linkLower, "browser tls") {
@@ -370,6 +374,7 @@ func sameCandidateAsCurrent(c engine.ProbeCandidateResult, ti agent.TunnelInfo) 
 		strings.EqualFold(c.Transport, ti.Transport) &&
 		c.IPv6 == curIPv6 &&
 		c.CDN == ti.CDN &&
+		c.AntiFreeze == ti.AntiFreeze &&
 		c.WebHeader == curHTTP
 }
 
@@ -619,10 +624,14 @@ func (ah *autoHealer) healTunnel(ctx context.Context, j *job, name, relayID, for
 		return "off"
 	}
 	muxMode := "on"
-	if best.Transport == "kcp" {
+	if !best.Shared && !curInfo.Mux && !engine.IsKCPFamily(engine.Transport(best.Transport)) {
 		muxMode = "off"
-	} else if !curInfo.Mux {
-		muxMode = "off"
+	}
+	muxLinks := max(1, curInfo.MuxLinks)
+	if best.Transport == "icmp" || best.Transport == "faketcp" || best.IPSpoof {
+		if curInfo.MuxLinks <= 0 || curInfo.MuxLinks == 4 {
+			muxLinks = 2
+		}
 	}
 	ipv6Flag := best.IPv6
 	serverName := best.ServerName
@@ -664,8 +673,10 @@ func (ah *autoHealer) healTunnel(ctx context.Context, j *job, name, relayID, for
 		IPSpoof:     onOff(best.IPSpoof),
 		SpoofIP:     best.SpoofIP,
 		GRE:         "off",
+		SIT:         "off",
+		AntiFreeze:  onOff(best.AntiFreeze),
 		Mux:         muxMode,
-		MuxLinks:    max(1, curInfo.MuxLinks),
+		MuxLinks:    muxLinks,
 		Pool:        curInfo.PoolSize,
 	}
 
@@ -729,6 +740,14 @@ func (ah *autoHealer) healTunnel(ctx context.Context, j *job, name, relayID, for
 		return fmt.Errorf("%s could not restart on new mode: %s", relayName, commit.Error)
 	}
 
+	var reSync struct {
+		OK bool `json:"ok"`
+	}
+	_, _ = ah.p.callJSON(ctx, foreignID, "/api/tunnel/service", map[string]string{
+		"name":   name,
+		"action": "restart",
+	}, &reSync)
+
 	say("Tunnel %q switched from [%s] to [%s] (Score %d/100) and is now running on both servers!", name, ev.FromDesc, ev.ToDesc, best.Score)
 	ah.p.refreshOne(relayID)
 	ah.p.refreshOne(foreignID)
@@ -742,6 +761,8 @@ func describeCandidate(c engine.ProbeCandidateResult) string {
 		tr += " (CDN)"
 	} else if c.IPSpoof {
 		tr += " (IP Spoof)"
+	} else if c.AntiFreeze {
+		tr += " (Split-Stream)"
 	} else if c.SNISpoof {
 		tr += " (SNI Spoof)"
 	} else if c.WebHeader {
