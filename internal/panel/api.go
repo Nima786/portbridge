@@ -66,6 +66,7 @@ func (p *Panel) routes() http.Handler {
 	mux.HandleFunc("POST /api/tunnels/logs", p.withAuth(p.handleTunnelLogs))
 	mux.HandleFunc("POST /api/tunnels/check", p.withAuth(p.handleCheckTunnel))
 	mux.HandleFunc("POST /api/tunnels/speedtest", p.withAuth(p.handleSpeedtestTunnel))
+	mux.HandleFunc("POST /api/tunnels/test-outbound", p.withAuth(p.handleTestOutboundTunnel))
 	mux.HandleFunc("POST /api/tunnels/probe", p.withAuth(p.handleProbeTunnel))
 	mux.HandleFunc("POST /api/probe/sni-scan", p.withAuth(p.handleProbeSNIScan))
 	mux.HandleFunc("POST /api/probe/sni-test", p.withAuth(p.handleProbeSNITest))
@@ -738,6 +739,33 @@ func (p *Panel) handleSpeedtestTunnel(w http.ResponseWriter, r *http.Request, _ 
 		"ok":     true,
 		"server": srvName,
 		"output": out,
+	})
+}
+
+func (p *Panel) handleTestOutboundTunnel(w http.ResponseWriter, r *http.Request, _ authed) {
+	agent.ExtendDeadlines(w, 60*time.Second)
+	var req struct {
+		tunnelTarget
+		CustomHost string `json:"custom_host"`
+	}
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	if err := p.knownTarget(req.tunnelTarget); err != nil {
+		writeErr(w, http.StatusBadRequest, capitalise(err.Error())+".")
+		return
+	}
+	res, err := p.testOutboundTunnel(r.Context(), req.tunnelTarget, req.CustomHost)
+	if err != nil {
+		writeJSON(w, http.StatusUnprocessableEntity, map[string]any{
+			"ok":    false,
+			"error": capitalise(plainAgentError(err)) + ".",
+		})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":     true,
+		"result": res,
 	})
 }
 

@@ -349,11 +349,20 @@ func validatePairing(p *PairingData) error {
 		{"cdn", p.CDN}, {"mux", p.Mux}, {"utls", p.UTLS}, {"tls_fragment", p.TLSFragment},
 		{"ech", p.ECH}, {"http_header", p.HTTPHeader}, {"gre", p.GRE}, {"sit", p.SIT},
 		{"real_site", p.RealSite}, {"sni_spoof", p.SNISpoof}, {"ip_spoof", p.IPSpoof},
-		{"anti_freeze", p.AntiFreeze},
+		{"anti_freeze", p.AntiFreeze}, {"website_bridge", p.WebsiteBridge},
+		{"outbound_proxy", p.OutboundProxy},
 	} {
 		if f.val != "" && f.val != "on" && f.val != "off" {
 			return fmt.Errorf("%s must be on or off, got %q", f.name, f.val)
 		}
+	}
+	if p.OutboundProxyPort != "" {
+		if _, ok := portOK(p.OutboundProxyPort); !ok {
+			return fmt.Errorf("outbound_proxy_port %q is not a port number", p.OutboundProxyPort)
+		}
+	}
+	if p.OutboundProxyMode != "" && p.OutboundProxyMode != "split" && p.OutboundProxyMode != "all" {
+		return fmt.Errorf("outbound_proxy_mode must be split or all, got %q", p.OutboundProxyMode)
 	}
 	if n, err := strconv.Atoi(p.MuxLinks); err != nil || n < 1 || n > 64 {
 		return fmt.Errorf("mux links %q is not a sensible number", p.MuxLinks)

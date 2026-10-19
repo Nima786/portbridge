@@ -292,3 +292,93 @@ func TestTunnelCapacityAndMuxSwitchingOnBothServers(t *testing.T) {
 		t.Fatalf("origin did not switch back to mux=off (pool=80, max=2500): %+v", origin[0])
 	}
 }
+
+func TestWebsiteBridgeCreateAndEditOnBothServers(t *testing.T) {
+	p, foreignID, foreignDir := twoServers(t)
+
+	req := newTunnel("wpbridge")
+	req.ServicePorts = "18081,18443"
+	req.UserPorts = "18081,18443"
+	req.LinkPort = 28443
+	req.ProxyProtocol = "v1"
+	req.SharedLinks = 8
+	req.MaxConn = 4000
+	req.WebsiteBridge = true
+	req.WebsiteDomains = "myshop.ir, example.com"
+	req.OutboundProxy = true
+	req.OutboundProxyPort = 28080
+	req.OutboundProxyMode = "split"
+	req.OutboundIranDomains = ".ir, shaparak.ir, kavenegar.com"
+	req.OutboundBypassDomains = "telegram.org, api.telegram.org"
+
+	if v := waitJob(t, p, mustCreate(t, p, req)); v.Error != "" {
+		t.Fatalf("create website bridge failed: %s\n%s", v.Error, strings.Join(v.Lines, "\n"))
+	}
+
+	edge, origin := agent.TunnelsReport(p.tunnelsDir), agent.TunnelsReport(foreignDir)
+	if len(edge) != 1 || len(origin) != 1 {
+		t.Fatalf("expected 1 website bridge on both ends, got %d and %d", len(edge), len(origin))
+	}
+	for _, side := range []struct {
+		name string
+		ti   agent.TunnelInfo
+	}{
+		{"edge", edge[0]},
+		{"origin", origin[0]},
+	} {
+		if !side.ti.WebsiteBridge || !side.ti.OutboundProxy || !side.ti.Mux {
+			t.Fatalf("%s missing website_bridge/outbound_proxy/mux: %+v", side.name, side.ti)
+		}
+		if side.ti.OutboundProxyPort != 28080 || side.ti.OutboundProxyMode != "split" {
+			t.Fatalf("%s outbound proxy port/mode mismatch: %+v", side.name, side.ti)
+		}
+		if side.ti.WebsiteDomains != "myshop.ir, example.com" {
+			t.Fatalf("%s website_domains mismatch: %q", side.name, side.ti.WebsiteDomains)
+		}
+	}
+
+	// Edit the Website Bridge outbound proxy port, mode, and domain lists.
+	editJob, err := p.startEditTunnel(editTunnelRequest{
+		Name:                  "wpbridge",
+		Edge:                  "this",
+		Origin:                foreignID,
+		ServicePorts:          "18081,18443",
+		UserPorts:             "18081,18443",
+		LinkPort:              28443,
+		ProxyProtocol:         "v1",
+		Mux:                   "on",
+		MuxLinks:              12,
+		MaxConn:               6000,
+		WebsiteDomains:        "myshop.ir, example.com, pay.myshop.ir",
+		OutboundProxy:         "on",
+		OutboundProxyPort:     28081,
+		OutboundProxyMode:     "all",
+		OutboundIranDomains:   ".ir, zarinpal.com",
+		OutboundBypassDomains: "telegram.org, t.me, stripe.com",
+	})
+	if err != nil {
+		t.Fatalf("startEditTunnel failed: %v", err)
+	}
+	if v := waitJob(t, p, editJob); v.Error != "" {
+		t.Fatalf("edit website bridge failed: %s\n%s", v.Error, strings.Join(v.Lines, "\n"))
+	}
+
+	edge, origin = agent.TunnelsReport(p.tunnelsDir), agent.TunnelsReport(foreignDir)
+	for _, side := range []struct {
+		name string
+		ti   agent.TunnelInfo
+	}{
+		{"edge", edge[0]},
+		{"origin", origin[0]},
+	} {
+		if side.ti.OutboundProxyPort != 28081 || side.ti.OutboundProxyMode != "all" {
+			t.Fatalf("%s updated outbound proxy port/mode mismatch: %+v", side.name, side.ti)
+		}
+		if side.ti.WebsiteDomains != "myshop.ir, example.com, pay.myshop.ir" {
+			t.Fatalf("%s updated website_domains mismatch: %q", side.name, side.ti.WebsiteDomains)
+		}
+		if side.ti.MuxLinks != 12 || side.ti.MaxConn != 6000 {
+			t.Fatalf("%s updated mux_links/max_conn mismatch: %+v", side.name, side.ti)
+		}
+	}
+}

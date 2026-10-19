@@ -172,9 +172,9 @@ func runEdge(ctx context.Context, cfg *Config, st *status) error {
 	st.health = e.health
 
 	if cfg.Mux {
-		// The edge is always the side that starts sessions, whichever side
-		// dialled, so it never needs a handler for incoming ones.
-		e.links = newCarrierSet(cfg.MuxLinks, dial, nil)
+		// The edge starts visitor sessions, and also handles reverse outbound
+		// proxy streams when the origin runs a Website Bridge outbound proxy.
+		e.links = newCarrierSet(cfg.MuxLinks, dial, e.serveOutboundStream)
 		e.links.SetOnTeardown(e.triggerTeardown)
 		st.links = e.links
 		go e.links.maintain(ctx.Done())
@@ -305,6 +305,10 @@ func (e *edge) acceptTunnel(ctx context.Context, ln net.Listener) {
 				}
 				if purpose == authPurposeSpeedtest {
 					go runSpeedtestServer(c)
+					return
+				}
+				if purpose == authPurposeOutboundProxy {
+					go e.serveOutboundStream(c)
 					return
 				}
 				// Say by name when the two servers disagree about shared

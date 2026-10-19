@@ -726,10 +726,11 @@ type carrier struct {
 	ctrl chan *[]byte
 	data chan *[]byte
 
-	mu      sync.Mutex
-	streams map[uint32]*muxStream
-	nextID  uint32
-	closed  bool
+	mu            sync.Mutex
+	streams       map[uint32]*muxStream
+	nextID        uint32
+	nextReverseID uint32
+	closed        bool
 
 	incoming chan *muxStream
 	done     chan struct{}
@@ -840,15 +841,16 @@ func (c *carrier) returnGrow(n int) {
 
 func newCarrier(conn net.Conn) *carrier {
 	c := &carrier{
-		conn:     conn,
-		ctrl:     make(chan *[]byte, muxCtrlQueue),
-		data:     make(chan *[]byte, muxDataQueue),
-		streams:  make(map[uint32]*muxStream),
-		nextID:   1,
-		incoming: make(chan *muxStream, 64),
-		done:     make(chan struct{}),
-		growLeft: muxGrowBudget,
-		born:     time.Now(),
+		conn:          conn,
+		ctrl:          make(chan *[]byte, muxCtrlQueue),
+		data:          make(chan *[]byte, muxDataQueue),
+		streams:       make(map[uint32]*muxStream),
+		nextID:        1,
+		nextReverseID: 0x80000001,
+		incoming:      make(chan *muxStream, 64),
+		done:          make(chan struct{}),
+		growLeft:      muxGrowBudget,
+		born:          time.Now(),
 	}
 	atomic.StoreInt64(&c.lastHeard, time.Now().UnixNano())
 	return c
@@ -1018,10 +1020,32 @@ func (c *carrier) open(targetPort ...uint16) (*muxStream, error) {
 	}
 	id := c.nextID
 	c.nextID++
+	if c.nextID >= 0x80000000 {
+		c.nextID = 1
+	}
 	s := newMuxStream(c, id, true)
 	if len(targetPort) > 0 {
 		s.targetPort = targetPort[0]
 	}
+	c.streams[id] = s
+	c.mu.Unlock()
+	return s, nil
+}
+
+// openReverse starts a stream from the origin side back to the edge side using
+// high-bit stream numbers so they never collide with edge-initiated sessions.
+func (c *carrier) openReverse() (*muxStream, error) {
+	c.mu.Lock()
+	if c.closed {
+		c.mu.Unlock()
+		return nil, errMuxClosed
+	}
+	id := c.nextReverseID
+	c.nextReverseID++
+	if c.nextReverseID < 0x80000001 {
+		c.nextReverseID = 0x80000001
+	}
+	s := newMuxStream(c, id, true)
 	c.streams[id] = s
 	c.mu.Unlock()
 	return s, nil
@@ -1441,6 +1465,36 @@ func (cs *carrierSet) open(done <-chan struct{}, targetPort ...uint16) (net.Conn
 	for {
 		if c := cs.best(); c != nil {
 			s, err := c.open(tp)
+			if err == nil {
+				return s, nil
+			}
+			cs.remove(c)
+			continue
+		}
+
+		select {
+		case <-cs.added:
+		case <-done:
+			return nil, errNoCarrier
+		case <-giveUp.C:
+			reason, _ := cs.lastErr.Load().(string)
+			if reason != "" {
+				return nil, fmt.Errorf("%w (last attempt: %s)", errNoCarrier, reason)
+			}
+			return nil, errNoCarrier
+		}
+	}
+}
+
+// openReverse starts a reverse session from origin back to edge over an active
+// shared link.
+func (cs *carrierSet) openReverse(done <-chan struct{}) (net.Conn, error) {
+	giveUp := time.NewTimer(muxWaitForLink)
+	defer giveUp.Stop()
+
+	for {
+		if c := cs.best(); c != nil {
+			s, err := c.openReverse()
 			if err == nil {
 				return s, nil
 			}

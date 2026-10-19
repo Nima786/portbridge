@@ -51,7 +51,8 @@ const (
 	authPurposeTunnelPooled byte = 0x01
 	authPurposeTunnelMux    byte = 0x02
 
-	authPurposeSpeedtest byte = 0x05
+	authPurposeSpeedtest     byte = 0x05
+	authPurposeOutboundProxy byte = 0x06
 
 	authTimeLen  = 8
 	authNonceLen = 8
@@ -76,6 +77,10 @@ const (
 	// what it always did, and an older server is never sent a byte it does not
 	// know unless both were set up for it.
 	msgActivateFrom = 0x09
+
+	// msgOutboundDial asks the edge (Iran server) to dial a target host:port on
+	// behalf of the origin's local Website Bridge outbound proxy.
+	msgOutboundDial = 0x0A
 
 	// Sent before closing, but only once the MAC has already verified, so these
 	// never leak information to a peer that does not hold the secret.

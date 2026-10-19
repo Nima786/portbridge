@@ -168,6 +168,28 @@ func buildOriginConf(p *PairingData, secretFile, certFile, keyFile string) strin
 		fmt.Fprintf(&b, "\n# Tell the service each user's real address; it must be set to expect it.\n")
 		fmt.Fprintf(&b, "proxy_protocol = %s\n", p.ProxyProtocol)
 	}
+	if p.WebsiteBridge == "on" {
+		fmt.Fprintf(&b, "\n# Dedicated Website Bridge settings\n")
+		fmt.Fprintf(&b, "website_bridge = on\n")
+		if wd := cleanDomainCSV(p.WebsiteDomains); wd != "" {
+			fmt.Fprintf(&b, "website_domains = %s\n", wd)
+		}
+	}
+	if p.OutboundProxy == "on" {
+		fmt.Fprintf(&b, "outbound_proxy = on\n")
+		if pp := strings.TrimSpace(p.OutboundProxyPort); pp != "" {
+			fmt.Fprintf(&b, "outbound_proxy_port = %s\n", pp)
+		}
+		if pm := strings.TrimSpace(p.OutboundProxyMode); pm != "" {
+			fmt.Fprintf(&b, "outbound_proxy_mode = %s\n", pm)
+		}
+		if id := cleanDomainCSV(p.OutboundIranDomains); id != "" {
+			fmt.Fprintf(&b, "outbound_iran_domains = %s\n", id)
+		}
+		if bd := cleanDomainCSV(p.OutboundBypassDomains); bd != "" {
+			fmt.Fprintf(&b, "outbound_bypass_domains = %s\n", bd)
+		}
+	}
 	fmt.Fprintf(&b, "\nmux = %s\n", p.Mux)
 	if p.Mux == "on" {
 		fmt.Fprintf(&b, "mux_links = %s\n", p.MuxLinks)
@@ -239,6 +261,9 @@ func portsClaimedByOthers(confDir, except string) []claimedPort {
 				out = append(out, claimedPort{p, name, "its users"})
 			}
 		}
+		if cfg.Role == engine.RoleOrigin && cfg.OutboundProxy && cfg.OutboundProxyPort > 0 {
+			out = append(out, claimedPort{cfg.OutboundProxyPort, name, "its website outbound proxy"})
+		}
 	}
 	return out
 }
@@ -267,9 +292,15 @@ func checkPairingPorts(p *PairingData, confDir string, host agentHost, _ string)
 
 	// What this tunnel uses now, if it is being changed.
 	currentLink := 0
-	if cfg, err := engine.LoadConfig(filepath.Join(confDir, p.Name+".conf")); err == nil && cfg.Mode == engine.ModeDirect {
-		if ps := portsIn(cfg.TunnelAddr); len(ps) > 0 {
-			currentLink = ps[0]
+	currentProxyPort := 0
+	if cfg, err := engine.LoadConfig(filepath.Join(confDir, p.Name+".conf")); err == nil {
+		if cfg.Mode == engine.ModeDirect {
+			if ps := portsIn(cfg.TunnelAddr); len(ps) > 0 {
+				currentLink = ps[0]
+			}
+		}
+		if cfg.OutboundProxy {
+			currentProxyPort = cfg.OutboundProxyPort
 		}
 	}
 
@@ -297,6 +328,32 @@ func checkPairingPorts(p *PairingData, confDir string, host agentHost, _ string)
 		}
 	}
 
+	if p.OutboundProxy == "on" {
+		opp := 18080
+		if n, ok := portOK(p.OutboundProxyPort); ok {
+			opp = n
+		}
+		for _, c := range others {
+			if c.port == opp {
+				problems = append(problems, fmt.Sprintf(
+					"the website outbound proxy port %d is already used by %q for %s on this server; choose another port (e.g. %d)",
+					opp, c.tunnel, c.what, opp+1))
+			}
+		}
+		if opp != currentProxyPort {
+			if err := host.PortFree(engine.TransportPlain, opp); err != nil {
+				problems = append(problems, fmt.Sprintf(
+					"the website outbound proxy port %d is already in use on this server; choose another port (e.g. %d)", opp, opp+1))
+			}
+		}
+		for _, in := range inbound {
+			if in == opp {
+				problems = append(problems, fmt.Sprintf(
+					"the website outbound proxy port (%d) cannot be the same as a web server port", opp))
+			}
+		}
+	}
+
 	for _, in := range inbound {
 		for _, c := range others {
 			if c.port == in {
@@ -306,8 +363,13 @@ func checkPairingPorts(p *PairingData, confDir string, host agentHost, _ string)
 			}
 		}
 		if !host.Listening(in) {
-			notes = append(notes, fmt.Sprintf(
-				"nothing is answering on service port %d on this server yet; make sure the service (Xray) is running there", in))
+			if p.WebsiteBridge == "on" {
+				notes = append(notes, fmt.Sprintf(
+					"nothing is answering on web port %d on this server yet; make sure your web server (LiteSpeed / Nginx / Apache) is listening there", in))
+			} else {
+				notes = append(notes, fmt.Sprintf(
+					"nothing is answering on service port %d on this server yet; make sure the service (Xray) is running there", in))
+			}
 		}
 	}
 

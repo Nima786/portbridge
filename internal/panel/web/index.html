@@ -63,6 +63,10 @@
           <span>Tunnels</span>
           <span id="count-tunnels" class="tab-count" hidden>0</span>
         </button>
+        <button type="button" role="tab" id="tab-websites" aria-controls="view-websites" aria-selected="false" tabindex="-1">
+          <span>Websites</span>
+          <span id="count-websites" class="tab-count" hidden>0</span>
+        </button>
         <button type="button" role="tab" id="tab-dns" aria-controls="view-dns" aria-selected="false" tabindex="-1">
           <span>DNS</span>
           <span id="count-zones" class="tab-count" hidden>0</span>
@@ -169,13 +173,27 @@
       <div class="toolbar">
         <div>
           <h2>Tunnels</h2>
-          <p class="muted small">Live status, port routing, and telemetry for all tunnels. Tunnels created here are fully compatible with the CLI menu.</p>
+          <p class="muted small">Live status, port routing, and telemetry for all VPN &amp; port-forwarding tunnels. Tunnels created here are fully compatible with the CLI menu.</p>
         </div>
         <div class="actions">
           <button type="button" class="new-tunnel primary">+ New Tunnel</button>
         </div>
       </div>
       <div id="tunnel-list" class="tunnels"></div>
+    </section>
+
+    <!-- WEBSITES TAB -->
+    <section id="view-websites" role="tabpanel" aria-labelledby="tab-websites" hidden>
+      <div class="toolbar">
+        <div>
+          <h2>Website Bridges <span class="muted small">· Iran IP Entry + Smart Outbound Proxy</span></h2>
+          <p class="muted small">Host WordPress, CyberPanel, LiteSpeed Enterprise, or Nginx websites on a Foreign VPS while giving visitors and Iranian payment/SMS gateways an Iranian IP — without blocking Telegram or international APIs.</p>
+        </div>
+        <div class="actions">
+          <button type="button" id="new-website-btn" class="primary">+ New Website Bridge</button>
+        </div>
+      </div>
+      <div id="website-list" class="tunnels"></div>
     </section>
 
     <!-- DNS (CLOUDFLARE) TAB -->
@@ -1764,11 +1782,365 @@
 
     <div class="dialog-footer actions">
       <button type="button" id="restore-close">Close</button>
-      <button type="submit" class="primary" id="restore-submit" disabled>Restore Backup Now</button>
+      <button type="submit" id="restore-submit" class="primary" disabled>Restore Backup Now</button>
     </div>
   </form>
 </dialog>
+
+<!-- Creating or editing a Website Bridge -->
+<dialog id="website-dialog" class="wide" aria-labelledby="wb-title">
+  <form id="website-form" novalidate>
+    <div class="dialog-header">
+      <div>
+        <h2 id="wb-title">New Website Bridge</h2>
+        <p id="wb-sub" class="muted small">Forward visitors from a cheap Iran VPS IP to your Foreign web server (LiteSpeed / CyberPanel / WordPress / Nginx), and give WordPress a smart local outbound proxy for Iranian banks &amp; SMS gateways while keeping Telegram direct.</p>
+      </div>
+    </div>
+
+    <div class="dialog-body">
+      <!-- STEP 1: Servers, Name & Domains -->
+      <section class="step-section">
+        <div class="step-header">
+          <span class="step-num">1</span>
+          <div>
+            <h3>Servers, Bridge Name &amp; Website Domains</h3>
+            <p class="muted small">One Website Bridge can serve unlimited domains on the same Foreign web server via automatic TLS SNI &amp; Host routing.</p>
+          </div>
+        </div>
+
+        <div id="wb-create-servers" class="row2">
+          <div class="endpoint-pick endpoint-relay">
+            <label for="wb-relay"><span class="role-dot relay-dot"></span> Iran Entry Server (Public Iran IP)</label>
+            <select id="wb-relay" required></select>
+          </div>
+          <div class="endpoint-pick endpoint-foreign">
+            <label for="wb-foreign"><span class="role-dot foreign-dot"></span> Foreign Hosting Server (LiteSpeed / WordPress)</label>
+            <select id="wb-foreign" required></select>
+          </div>
+        </div>
+
+        <div class="row2">
+          <div id="wb-name-wrap">
+            <label for="wb-name">Bridge Name <span class="muted">(letters, numbers, dash or underscore)</span></label>
+            <input id="wb-name" maxlength="40" autocapitalize="none" spellcheck="false" pattern="[A-Za-z0-9_-]+" placeholder="e.g. uk-wordpress or main-websites">
+          </div>
+          <div>
+            <label for="wb-domains">Website Domains <span class="muted">(comma-separated, for reference &amp; DNS guide)</span></label>
+            <input id="wb-domains" autocapitalize="none" spellcheck="false" placeholder="e.g. myshop.ir, example.com">
+          </div>
+        </div>
+      </section>
+
+      <!-- STEP 2: Incoming Web Ports & Visitor Real IP -->
+      <fieldset class="step-section">
+        <legend class="step-header">
+          <span class="step-num">2</span>
+          <span>
+            <span class="step-title">Incoming Web Ports &amp; Visitor Real IP</span>
+            <span class="step-sub">Forwards HTTP &amp; HTTPS from the Iran VPS IP to LiteSpeed / Nginx on your Foreign server with TLS SNI intact.</span>
+          </span>
+        </legend>
+
+        <div class="row2">
+          <div>
+            <label for="wb-ports">Web Ports <span class="muted">(Iran Entry → Foreign Web Server)</span></label>
+            <span class="field-hint">Standard HTTP &amp; HTTPS ports are <code>80,443</code></span>
+            <input id="wb-ports" value="80,443" placeholder="80,443" inputmode="numeric">
+          </div>
+          <div>
+            <label for="wb-linkport">Internal Tunnel Bridge Port <span class="muted">(between the 2 servers)</span></label>
+            <span class="field-hint">Must be different from Web Ports (default <code>8443</code> so <code>443</code> stays free for websites)</span>
+            <input id="wb-linkport" type="number" min="1" max="65535" value="8443" inputmode="numeric">
+          </div>
+        </div>
+
+        <div class="port-check-row">
+          <button type="button" id="wb-check-ports">Check Web &amp; Bridge Ports on Both Servers</button>
+          <ul id="wb-ports-result" class="port-results" aria-live="polite"></ul>
+        </div>
+
+        <label>Visitor Real IP Forwarding (PROXY Protocol)</label>
+        <div class="choice-grid cols-3">
+          <label class="choice-card compact">
+            <input type="radio" name="wb-proxy" value="v1" checked>
+            <div class="choice-body">
+              <div class="choice-top"><strong>PROXY Protocol v1</strong><span class="pill-tag tag-good">Recommended</span></div>
+              <span class="choice-desc">Passes real visitor IPs to LiteSpeed Enterprise, OpenLiteSpeed &amp; Nginx (auto-bypasses if not enabled yet).</span>
+            </div>
+          </label>
+          <label class="choice-card compact">
+            <input type="radio" name="wb-proxy" value="v2">
+            <div class="choice-body">
+              <div class="choice-top"><strong>PROXY Protocol v2</strong></div>
+              <span class="choice-desc">Binary header for HAProxy / Envoy.</span>
+            </div>
+          </label>
+          <label class="choice-card compact">
+            <input type="radio" name="wb-proxy" value="off">
+            <div class="choice-body">
+              <div class="choice-top"><strong>Disabled</strong></div>
+              <span class="choice-desc">Web server sees 127.0.0.1 as visitor IP.</span>
+            </div>
+          </label>
+        </div>
+      </fieldset>
+
+      <!-- STEP 3: Smart Outbound Proxy for Banks, SMS Gateways & Telegram -->
+      <fieldset class="step-section">
+        <legend class="step-header">
+          <span class="step-num">3</span>
+          <span>
+            <span class="step-title">Smart Outbound Proxy (Iran IP for Banks/SMS · Direct UK IP for Telegram)</span>
+            <span class="step-sub">Runs a local HTTP/HTTPS &amp; SOCKS5 proxy on <code>127.0.0.1</code> on your Foreign server so WordPress plugins can reach Iran-only gateways via your Iran VPS IP without breaking Telegram.</span>
+          </span>
+        </legend>
+
+        <label class="check-card">
+          <input type="checkbox" id="wb-outbound" checked>
+          <span>
+            <strong>Enable Smart Local Outbound Proxy on Foreign Server</strong>
+            <span class="muted"> — Listens only on <code>127.0.0.1</code> on the Foreign server (never exposed to the public internet) and routes outbound website API calls automatically.</span>
+          </span>
+        </label>
+
+        <div id="wb-outbound-box">
+          <div class="row2">
+            <div>
+              <label for="wb-proxy-port">Local Proxy Port on Foreign Server <span class="muted">(127.0.0.1)</span></label>
+              <span class="field-hint">Supports HTTP Proxy, HTTPS CONNECT &amp; SOCKS5 on the same port (default <code>18080</code>)</span>
+              <input id="wb-proxy-port" type="number" min="1024" max="65535" value="18080" inputmode="numeric">
+            </div>
+            <div>
+              <label>Outbound Routing Mode</label>
+              <span class="field-hint">Choose how requests sent to <code>127.0.0.1:<span id="wb-port-preview">18080</span></code> are routed</span>
+              <div class="choice-grid cols-2">
+                <label class="choice-card compact">
+                  <input type="radio" name="wb-proxy-mode" value="split" checked>
+                  <div class="choice-body">
+                    <div class="choice-top"><strong>Smart Split</strong><span class="pill-tag tag-good">Recommended</span></div>
+                    <span class="choice-desc">Iranian banks/SMS &amp; <code>.ir</code> exit via Iran IP; everything else exits directly via Foreign IP.</span>
+                  </div>
+                </label>
+                <label class="choice-card compact">
+                  <input type="radio" name="wb-proxy-mode" value="all">
+                  <div class="choice-body">
+                    <div class="choice-top"><strong>All via Iran IP</strong></div>
+                    <span class="choice-desc">All proxy traffic exits via Iran IP except domains in the Direct Bypass List.</span>
+                  </div>
+                </label>
+              </div>
+            </div>
+          </div>
+
+          <div class="row2">
+            <div>
+              <label for="wb-iran-domains">Iran-IP Domains &amp; Gateways <span class="muted">(routed via Iran VPS IP)</span></label>
+              <span class="field-hint">Suffixes like <code>.ir</code> match every <code>*.ir</code> domain automatically. Add any custom SMS/bank domains on a non-<code>.ir</code> TLD.</span>
+              <textarea id="wb-iran-domains" rows="3" spellcheck="false"></textarea>
+            </div>
+            <div>
+              <label for="wb-bypass-domains">Direct Foreign-IP Bypass Domains <span class="muted">(always direct via UK/Foreign IP)</span></label>
+              <span class="field-hint">Telegram (<code>telegram.org</code>), WordPress updates, and international APIs bypass the Iran server completely.</span>
+              <textarea id="wb-bypass-domains" rows="3" spellcheck="false"></textarea>
+            </div>
+          </div>
+        </div>
+      </fieldset>
+
+      <!-- STEP 4: Transport & Multiplexed Capacity -->
+      <fieldset class="step-section">
+        <legend class="step-header">
+          <span class="step-num">4</span>
+          <span>
+            <span class="step-title">Inter-Server Link &amp; Multiplexed Web Capacity</span>
+            <span class="step-sub">Website Bridges always use Shared Multiplexed Links (Mux) so hundreds of parallel CSS/JS/image requests load over persistent encrypted trunks with zero handshake delay.</span>
+          </span>
+        </legend>
+
+        <div id="wb-create-transport">
+          <div class="row2">
+            <div>
+              <label>Connection Direction</label>
+              <div class="choice-grid cols-2">
+                <label class="choice-card compact">
+                  <input type="radio" name="wb-mode" value="direct" checked>
+                  <div class="choice-body">
+                    <div class="choice-top"><strong>Direct (Iran → Foreign)</strong><span class="pill-tag tag-good">Best</span></div>
+                    <span class="choice-desc">Iran server dials Foreign server.</span>
+                  </div>
+                </label>
+                <label class="choice-card compact">
+                  <input type="radio" name="wb-mode" value="reverse">
+                  <div class="choice-body">
+                    <div class="choice-top"><strong>Reverse (Foreign → Iran)</strong></div>
+                    <span class="choice-desc">Foreign server dials Iran server.</span>
+                  </div>
+                </label>
+              </div>
+            </div>
+            <div>
+              <label for="wb-link">Inter-Server Disguise</label>
+              <select id="wb-link">
+                <option value="website">Fake TLS Website + Stealth (Recommended)</option>
+                <option value="sni-spoof">Decoy Whitelisted SNI Spoof (challenges.cloudflare.com)</option>
+                <option value="split">Split-Stream TLS (Anti-Freeze Rotation)</option>
+                <option value="plain">Raw TCP (Fastest on clean routes)</option>
+                <option value="kcp">KCP over UDP (Packet-loss repair)</option>
+              </select>
+              <label for="wb-sni" class="small muted">Camouflage SNI / Host</label>
+              <input id="wb-sni" value="www.bing.com" autocapitalize="none" spellcheck="false">
+            </div>
+          </div>
+
+          <label class="check-card">
+            <input type="checkbox" id="wb-ipv6">
+            <span>
+              <strong>Use IPv6 Between Servers</strong>
+              <span class="muted"> — Connect the Iran and Foreign servers over their IPv6 addresses when IPv4 is filtered or IPv6 is faster (visitors still connect via IPv4 &amp; IPv6).</span>
+            </span>
+          </label>
+        </div>
+
+        <div class="row2">
+          <div>
+            <label for="wb-mux-links">Parallel Multiplexed Trunks (Mux Links) <span class="muted">(1 to 16)</span></label>
+            <span class="field-hint"><code>8</code> parallel persistent links is ideal for busy WordPress / WooCommerce sites</span>
+            <input id="wb-mux-links" type="number" min="1" max="16" value="8" inputmode="numeric">
+          </div>
+          <div>
+            <label for="wb-max-conn">Max Concurrent HTTP/HTTPS Requests</label>
+            <span class="field-hint">Total simultaneous visitor + API streams (default <code>4000</code>)</span>
+            <input id="wb-max-conn" type="number" min="100" max="100000" value="4000" inputmode="numeric">
+          </div>
+        </div>
+
+        <label class="check-card" id="wb-autoheal-wrap">
+          <input type="checkbox" id="wb-autoheal" checked>
+          <span>
+            <strong>Enable Auto-Heal &amp; Smart Failover</strong>
+            <span class="muted"> — Automatically monitors the bridge between your Iran and Foreign servers and switches transport or direction if the route is disrupted.</span>
+          </span>
+        </label>
+      </fieldset>
+
+      <p id="wb-error" class="error" role="alert"></p>
+    </div>
+
+    <div class="dialog-footer actions">
+      <button type="button" id="wb-cancel">Cancel</button>
+      <button type="submit" id="wb-submit" class="primary">Create Website Bridge</button>
+    </div>
+  </form>
+</dialog>
+
+<!-- WordPress, CyberPanel & LiteSpeed Setup Guide Dialog -->
+<dialog id="wp-setup-dialog" class="wide" aria-labelledby="wp-setup-title">
+  <div>
+    <div class="dialog-header">
+      <div>
+        <h2 id="wp-setup-title">WordPress, CyberPanel &amp; LiteSpeed Setup</h2>
+        <p id="wp-setup-sub" class="muted small">Copy-paste configuration for your Foreign hosting server so your websites use the Iran IP for incoming visitors and Iranian payment/SMS gateways while keeping Telegram direct.</p>
+      </div>
+    </div>
+
+    <div class="dialog-body">
+      <section class="step-section">
+        <div class="step-header">
+          <span class="step-num">1</span>
+          <div>
+            <h3>Point Your Domain DNS to the Iran Entry Server IP</h3>
+            <p id="wp-dns-desc" class="muted small"></p>
+          </div>
+        </div>
+        <div id="wp-dns-box" class="notice"></div>
+      </section>
+
+      <section class="step-section">
+        <div class="step-header">
+          <span class="step-num">2</span>
+          <div>
+            <h3>Add to <code>wp-config.php</code> (WordPress HTTP API + Telegram Bypass)</h3>
+            <p class="muted small">Paste these lines into your site's <code>wp-config.php</code> (above <code>/* That's all, stop editing! */</code>). WordPress will send outbound calls to PortBridge's local Smart Proxy on <code>127.0.0.1</code>.</p>
+          </div>
+        </div>
+        <pre id="wp-config-snippet" class="log-view"></pre>
+        <div class="actions left">
+          <button type="button" id="wp-copy-config" class="primary">Copy wp-config.php Snippet</button>
+        </div>
+      </section>
+
+      <section class="step-section">
+        <div class="step-header">
+          <span class="step-num">3</span>
+          <div>
+            <h3>Optional Must-Use Plugin for Direct PHP <code>curl_init()</code> Gateways</h3>
+            <p class="muted small">Some Iranian bank/SMS plugins call PHP <code>curl_init()</code> directly instead of WordPress's HTTP API. Save this file as <code>wp-content/mu-plugins/portbridge-proxy.php</code> to route all PHP cURL requests through the Smart Proxy automatically.</p>
+          </div>
+        </div>
+        <pre id="wp-muplugin-snippet" class="log-view"></pre>
+        <div class="actions left">
+          <button type="button" id="wp-copy-muplugin">Copy mu-plugin PHP Code</button>
+        </div>
+      </section>
+
+      <section class="step-section">
+        <div class="step-header">
+          <span class="step-num">4</span>
+          <div>
+            <h3>Real Visitor IP in LiteSpeed Enterprise / CyberPanel</h3>
+            <p class="muted small">So WordPress, WooCommerce, and Wordfence see each visitor's real IP instead of <code>127.0.0.1</code>:</p>
+          </div>
+        </div>
+        <ol id="wp-litespeed-steps" class="cf-steps"></ol>
+      </section>
+    </div>
+
+    <div class="dialog-footer actions">
+      <button type="button" id="wp-setup-close" class="primary">Done</button>
+    </div>
+  </div>
+</dialog>
+
+<!-- Live Outbound Proxy Routing Tester Dialog -->
+<dialog id="outbound-test-dialog" class="wide" aria-labelledby="obt-title">
+  <div>
+    <div class="dialog-header dialog-header-row">
+      <div>
+        <h2 id="obt-title">Test Smart Outbound Proxy Routing</h2>
+        <p id="obt-sub" class="muted small">Tests live from your Foreign hosting server through <code>127.0.0.1</code> to verify that Iranian gateways exit with your Iran VPS IP and Telegram exits with your Foreign VPS IP.</p>
+      </div>
+      <button type="button" id="obt-rerun">Re-run Test</button>
+    </div>
+
+    <div class="dialog-body">
+      <div class="row2">
+        <div>
+          <label for="obt-custom-host">Test Any Specific Domain <span class="muted">(optional — e.g. api.kavenegar.com, bpm.shaparak.ir, api.zarinpal.com)</span></label>
+          <div class="cf-quick-row">
+            <input id="obt-custom-host" autocapitalize="none" spellcheck="false" placeholder="e.g. api.kavenegar.com or bpm.shaparak.ir">
+            <button type="button" id="obt-test-custom" class="primary">Test Domain</button>
+          </div>
+        </div>
+      </div>
+
+      <div id="obt-loading" class="probe-live-box" hidden>
+        <div class="probe-live-head">
+          <span class="probe-spinner" aria-hidden="true"></span>
+          <span id="obt-loading-text">Testing outbound proxy routing from the Foreign server…</span>
+        </div>
+      </div>
+
+      <p id="obt-error" class="error" role="alert"></p>
+      <div id="obt-results" class="diag-grid"></div>
+    </div>
+
+    <div class="dialog-footer actions">
+      <button type="button" id="obt-close" class="primary">Close</button>
+    </div>
+  </div>
+</dialog>
 </body>
 </html>
+
 
 

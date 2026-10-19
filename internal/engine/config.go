@@ -230,6 +230,17 @@ type Config struct {
 	// Works with every link, mode and kind of sharing. See proxyproto.go.
 	ProxyProtocol int
 
+	// WebsiteBridge marks this tunnel as a dedicated Website Bridge (shown in the
+	// Websites tab of the panel rather than the VPN Tunnels tab) and enables the
+	// smart local outbound proxy on the origin server when OutboundProxy is set.
+	WebsiteBridge         bool
+	WebsiteDomains        string
+	OutboundProxy         bool
+	OutboundProxyPort     int
+	OutboundProxyMode     string
+	OutboundIranDomains   string
+	OutboundBypassDomains string
+
 	fragmentSet   bool
 	resendSet     bool // kcp_resend was written down, so 0 means off rather than unset
 	utlsSet       bool
@@ -411,20 +422,22 @@ func DefaultConfig() *Config {
 		Transport: TransportPlain,
 		// Off for the same reason, and because sharing connections costs speed
 		// on a lossy route. It is a choice, not an improvement.
-		Mux:              false,
-		MuxLinks:         4,
-		PathProbe:        true,
-		KCPDataShards:    10,
-		KCPParityShards:  3,
-		KCPWindow:        kcpDefaultWindow,
-		KCPMTU:           kcpDefaultMTU,
-		KCPInterval:      kcpDefaultInterval,
-		KCPResend:        kcpDefaultResend,
-		TLSFragment:      false,
-		TLSFragmentSize:  40,
-		TLSFragmentSleep: 3 * time.Millisecond,
-		UTLS:             false,
-		UTLSProfile:      "chrome",
+		Mux:               false,
+		MuxLinks:          4,
+		PathProbe:         true,
+		KCPDataShards:     10,
+		KCPParityShards:   3,
+		KCPWindow:         kcpDefaultWindow,
+		KCPMTU:            kcpDefaultMTU,
+		KCPInterval:       kcpDefaultInterval,
+		KCPResend:         kcpDefaultResend,
+		TLSFragment:       false,
+		TLSFragmentSize:   40,
+		TLSFragmentSleep:  3 * time.Millisecond,
+		UTLS:              false,
+		UTLSProfile:       "chrome",
+		OutboundProxyPort: 18080,
+		OutboundProxyMode: "split",
 	}
 }
 
@@ -774,6 +787,43 @@ func (c *Config) Set(key, val string) error {
 		default:
 			return fmt.Errorf("anti_freeze must be on or off, got %q", val)
 		}
+	case "website_bridge":
+		switch strings.ToLower(strings.TrimSpace(val)) {
+		case "on", "yes", "true":
+			c.WebsiteBridge = true
+		case "off", "no", "false":
+			c.WebsiteBridge = false
+		default:
+			return fmt.Errorf("website_bridge must be on or off, got %q", val)
+		}
+	case "website_domains":
+		c.WebsiteDomains = strings.TrimSpace(val)
+	case "outbound_proxy":
+		switch strings.ToLower(strings.TrimSpace(val)) {
+		case "on", "yes", "true":
+			c.OutboundProxy = true
+		case "off", "no", "false":
+			c.OutboundProxy = false
+		default:
+			return fmt.Errorf("outbound_proxy must be on or off, got %q", val)
+		}
+	case "outbound_proxy_port":
+		return num(&c.OutboundProxyPort)
+	case "outbound_proxy_mode":
+		mode := strings.ToLower(strings.TrimSpace(val))
+		switch mode {
+		case "split", "all", "":
+			if mode == "" {
+				mode = "split"
+			}
+			c.OutboundProxyMode = mode
+		default:
+			return fmt.Errorf("outbound_proxy_mode must be split or all, got %q", val)
+		}
+	case "outbound_iran_domains":
+		c.OutboundIranDomains = strings.TrimSpace(val)
+	case "outbound_bypass_domains":
+		c.OutboundBypassDomains = strings.TrimSpace(val)
 	default:
 		return fmt.Errorf("unknown setting %q", key)
 	}
@@ -1047,6 +1097,23 @@ func (c *Config) Validate() error {
 		}
 		if ip := net.ParseIP(c.ServerName); ip != nil {
 			return fmt.Errorf("server_name must be a hostname when using a cdn, not the address %s", c.ServerName)
+		}
+	}
+	if c.OutboundProxy {
+		if c.OutboundProxyPort <= 0 {
+			c.OutboundProxyPort = 18080
+		}
+		if c.OutboundProxyPort < 1 || c.OutboundProxyPort > 65535 {
+			return fmt.Errorf("outbound_proxy_port must be between 1 and 65535, got %d", c.OutboundProxyPort)
+		}
+		if c.OutboundProxyMode == "" {
+			c.OutboundProxyMode = "split"
+		}
+		if c.OutboundProxyMode != "split" && c.OutboundProxyMode != "all" {
+			return fmt.Errorf("outbound_proxy_mode must be split or all, got %q", c.OutboundProxyMode)
+		}
+		if c.Role == RoleOrigin && !c.Mux && c.Mode != ModeReverse {
+			return fmt.Errorf("outbound_proxy requires shared connections (mux = on) or reverse mode")
 		}
 	}
 	return nil

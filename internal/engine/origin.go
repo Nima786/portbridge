@@ -167,8 +167,14 @@ func (o *origin) runDirect(ctx context.Context) error {
 		go o.links.maintain(ctx.Done())
 	}
 
+	proxyLn, err := startOutboundProxy(ctx, o)
+	if err != nil {
+		return err
+	} else if proxyLn != nil {
+		defer proxyLn.Close()
+	}
+
 	var ln net.Listener
-	var err error
 	if o.cfg.Transport.IsPacketBased() {
 		ln, err = kcpListen(o.cfg.TunnelAddr, o.cfg)
 	} else {
@@ -290,6 +296,13 @@ func (o *origin) runReverse(ctx context.Context) error {
 		return o.runReverseMux(ctx)
 	}
 
+	proxyLn, err := startOutboundProxy(ctx, o)
+	if err != nil {
+		return err
+	} else if proxyLn != nil {
+		defer proxyLn.Close()
+	}
+
 	workers := o.cfg.PoolSize
 	if workers < 1 {
 		workers = 1
@@ -329,6 +342,13 @@ func (o *origin) runReverseMux(ctx context.Context) error {
 	o.links.SetOnTeardown(o.triggerTeardown)
 	o.st.links = o.links
 	go o.links.maintain(ctx.Done())
+
+	proxyLn, err := startOutboundProxy(ctx, o)
+	if err != nil {
+		return err
+	} else if proxyLn != nil {
+		defer proxyLn.Close()
+	}
 
 	<-ctx.Done()
 	log.Printf("shutting down; letting live sessions finish for up to %s", o.cfg.Drain)

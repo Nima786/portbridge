@@ -40,40 +40,47 @@ type TunnelLive struct {
 
 // TunnelInfo is one half of a tunnel, as this server has it.
 type TunnelInfo struct {
-	Name          string      `json:"name"`
-	Role          string      `json:"role"`
-	Mode          string      `json:"mode"`
-	Transport     string      `json:"transport"`
-	Link          string      `json:"link"`
-	LinkPort      int         `json:"link_port"`
-	PeerIP        string      `json:"peer_ip"`
-	LocalIP       string      `json:"local_ip"`
-	UserPorts     []int       `json:"user_ports,omitempty"`
-	ServicePorts  []int       `json:"service_ports,omitempty"`
-	Mux           bool        `json:"mux"`
-	MuxLinks      int         `json:"mux_links,omitempty"`
-	PoolSize      int         `json:"pool_size,omitempty"`
-	MaxConn       int         `json:"max_conn,omitempty"`
-	SpareTTL      string      `json:"spare_ttl,omitempty"`
-	Drain         string      `json:"drain,omitempty"`
-	Firewall      bool        `json:"firewall"`
-	CDN           bool        `json:"cdn"`
-	ServerName    string      `json:"server_name,omitempty"`
-	AltHost       string      `json:"alt_host,omitempty"`
-	GRE           bool        `json:"gre"`
-	SIT           bool        `json:"sit"`
-	RealSite      bool        `json:"real_site"`
-	SNISpoof      bool        `json:"sni_spoof"`
-	SpoofSNI      string      `json:"spoof_sni,omitempty"`
-	IPSpoof       bool        `json:"ip_spoof"`
-	SpoofIP       string      `json:"spoof_ip,omitempty"`
-	AntiFreeze    bool        `json:"anti_freeze"`
-	ProxyProtocol string      `json:"proxy_protocol"`
-	PairID        string      `json:"pair_id,omitempty"`
-	Running       bool        `json:"running"`
-	ServiceNote   string      `json:"service_note,omitempty"`
-	Live          *TunnelLive `json:"live,omitempty"`
-	Problem       string      `json:"problem,omitempty"`
+	Name                  string      `json:"name"`
+	Role                  string      `json:"role"`
+	Mode                  string      `json:"mode"`
+	Transport             string      `json:"transport"`
+	Link                  string      `json:"link"`
+	LinkPort              int         `json:"link_port"`
+	PeerIP                string      `json:"peer_ip"`
+	LocalIP               string      `json:"local_ip"`
+	UserPorts             []int       `json:"user_ports,omitempty"`
+	ServicePorts          []int       `json:"service_ports,omitempty"`
+	Mux                   bool        `json:"mux"`
+	MuxLinks              int         `json:"mux_links,omitempty"`
+	PoolSize              int         `json:"pool_size,omitempty"`
+	MaxConn               int         `json:"max_conn,omitempty"`
+	SpareTTL              string      `json:"spare_ttl,omitempty"`
+	Drain                 string      `json:"drain,omitempty"`
+	Firewall              bool        `json:"firewall"`
+	CDN                   bool        `json:"cdn"`
+	ServerName            string      `json:"server_name,omitempty"`
+	AltHost               string      `json:"alt_host,omitempty"`
+	GRE                   bool        `json:"gre"`
+	SIT                   bool        `json:"sit"`
+	RealSite              bool        `json:"real_site"`
+	SNISpoof              bool        `json:"sni_spoof"`
+	SpoofSNI              string      `json:"spoof_sni,omitempty"`
+	IPSpoof               bool        `json:"ip_spoof"`
+	SpoofIP               string      `json:"spoof_ip,omitempty"`
+	AntiFreeze            bool        `json:"anti_freeze"`
+	ProxyProtocol         string      `json:"proxy_protocol"`
+	WebsiteBridge         bool        `json:"website_bridge,omitempty"`
+	WebsiteDomains        string      `json:"website_domains,omitempty"`
+	OutboundProxy         bool        `json:"outbound_proxy,omitempty"`
+	OutboundProxyPort     int         `json:"outbound_proxy_port,omitempty"`
+	OutboundProxyMode     string      `json:"outbound_proxy_mode,omitempty"`
+	OutboundIranDomains   string      `json:"outbound_iran_domains,omitempty"`
+	OutboundBypassDomains string      `json:"outbound_bypass_domains,omitempty"`
+	PairID                string      `json:"pair_id,omitempty"`
+	Running               bool        `json:"running"`
+	ServiceNote           string      `json:"service_note,omitempty"`
+	Live                  *TunnelLive `json:"live,omitempty"`
+	Problem               string      `json:"problem,omitempty"`
 }
 
 // Overview is everything the panel shows about one server.
@@ -149,6 +156,15 @@ func tunnelInfo(path string, host agentHost) TunnelInfo {
 	ti.IPSpoof = cfg.IPSpoof
 	ti.SpoofIP = cfg.SpoofIP
 	ti.AntiFreeze = cfg.AntiFreeze
+	ti.WebsiteBridge = cfg.WebsiteBridge
+	ti.WebsiteDomains = cfg.WebsiteDomains
+	ti.OutboundProxy = cfg.OutboundProxy
+	if cfg.OutboundProxy {
+		ti.OutboundProxyPort = cfg.OutboundProxyPort
+		ti.OutboundProxyMode = cfg.OutboundProxyMode
+		ti.OutboundIranDomains = cfg.OutboundIranDomains
+		ti.OutboundBypassDomains = cfg.OutboundBypassDomains
+	}
 	ti.MaxConn = cfg.MaxConn
 	if cfg.SpareTTL > 0 {
 		ti.SpareTTL = cfg.SpareTTL.String()

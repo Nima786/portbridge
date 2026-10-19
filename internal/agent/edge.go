@@ -10,12 +10,16 @@ package agent
 // can show, edit and delete it as one of its own.
 
 import (
+	"bufio"
 	"crypto/rand"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -63,6 +67,14 @@ type EdgeSpec struct {
 	LinkPort     int    `json:"link_port"`
 	UserPorts    string `json:"user_ports"`    // where users connect here: "443, 8443"
 	ServicePorts string `json:"service_ports"` // the service on the foreign server: "443,8443"
+
+	WebsiteBridge         string `json:"website_bridge,omitempty"`
+	WebsiteDomains        string `json:"website_domains,omitempty"`
+	OutboundProxy         string `json:"outbound_proxy,omitempty"`
+	OutboundProxyPort     int    `json:"outbound_proxy_port,omitempty"`
+	OutboundProxyMode     string `json:"outbound_proxy_mode,omitempty"`
+	OutboundIranDomains   string `json:"outbound_iran_domains,omitempty"`
+	OutboundBypassDomains string `json:"outbound_bypass_domains,omitempty"`
 }
 
 // EdgeResult is what making or editing the Iran half gives back.
@@ -73,6 +85,20 @@ type EdgeResult struct {
 	OldConf  string   `json:"old_conf,omitempty"` // previous config text when staging an edit
 	Warnings []string `json:"warnings,omitempty"`
 	Error    string   `json:"error,omitempty"`
+}
+
+func cleanDomainCSV(raw string) string {
+	fields := strings.FieldsFunc(raw, func(r rune) bool {
+		return r == ',' || r == ';' || r == '\n' || r == '\r' || r == '\t' || r == ' '
+	})
+	var out []string
+	for _, f := range fields {
+		f = strings.TrimSpace(strings.ReplaceAll(f, "=", ""))
+		if f != "" {
+			out = append(out, f)
+		}
+	}
+	return strings.Join(out, ", ")
 }
 
 func (s *EdgeSpec) normalise() {
@@ -94,6 +120,28 @@ func (s *EdgeSpec) normalise() {
 	}
 	s.UserPorts = joinPorts(s.UserPorts, ", ")
 	s.ServicePorts = joinPorts(s.ServicePorts, ",")
+	s.WebsiteDomains = cleanDomainCSV(s.WebsiteDomains)
+	s.OutboundIranDomains = cleanDomainCSV(s.OutboundIranDomains)
+	s.OutboundBypassDomains = cleanDomainCSV(s.OutboundBypassDomains)
+	if s.WebsiteBridge == "on" {
+		if s.OutboundProxy == "" {
+			s.OutboundProxy = "on"
+		}
+		if s.Mux == "" || s.Mux == "off" {
+			// Website Bridges with OutboundProxy in Direct mode require Shared Mux.
+			if s.OutboundProxy == "on" && s.Mode != "reverse" {
+				s.Mux = "on"
+			}
+		}
+	}
+	if s.OutboundProxy == "on" {
+		if s.OutboundProxyPort <= 0 {
+			s.OutboundProxyPort = 18080
+		}
+		if s.OutboundProxyMode == "" {
+			s.OutboundProxyMode = "split"
+		}
+	}
 	// As the menu does for a GRE link: nothing to disguise, so nothing left over.
 	if s.GRE == "on" {
 		s.Transport = "plain"
@@ -200,9 +248,21 @@ func (s *EdgeSpec) check() error {
 		{"cdn", s.CDN}, {"mux", s.Mux}, {"utls", s.UTLS}, {"tls_fragment", s.TLSFragment},
 		{"http_header", s.HTTPHeader}, {"gre", s.GRE}, {"sit", s.SIT}, {"real_site", s.RealSite},
 		{"sni_spoof", s.SNISpoof}, {"ip_spoof", s.IPSpoof}, {"anti_freeze", s.AntiFreeze},
+		{"website_bridge", s.WebsiteBridge}, {"outbound_proxy", s.OutboundProxy},
 	} {
 		if f.val != "" && f.val != "on" && f.val != "off" {
 			return fmt.Errorf("%s must be on or off, got %q", f.name, f.val)
+		}
+	}
+	if s.OutboundProxy == "on" {
+		if s.OutboundProxyPort < 1 || s.OutboundProxyPort > 65535 {
+			return errors.New("outbound proxy port must be from 1 to 65535")
+		}
+		if s.OutboundProxyMode != "" && s.OutboundProxyMode != "split" && s.OutboundProxyMode != "all" {
+			return fmt.Errorf("outbound proxy mode must be split or all, got %q", s.OutboundProxyMode)
+		}
+		if s.Mux != "on" && s.Mode != "reverse" {
+			return errors.New("website outbound proxy requires shared connections (mux = on) or reverse mode")
 		}
 	}
 	if net.ParseIP(s.PeerIP) == nil {
@@ -479,6 +539,28 @@ func buildEdgeConf(s *EdgeSpec, l edgeLayout, confDir string, now time.Time) str
 		w("\n# Pass each user's real address on; the service must be set to expect it.\n")
 		w("proxy_protocol = %s\n", s.ProxyProtocol)
 	}
+	if s.WebsiteBridge == "on" {
+		w("\n# Dedicated Website Bridge settings\n")
+		w("website_bridge = on\n")
+		if s.WebsiteDomains != "" {
+			w("website_domains = %s\n", s.WebsiteDomains)
+		}
+	}
+	if s.OutboundProxy == "on" {
+		w("outbound_proxy = on\n")
+		if s.OutboundProxyPort > 0 {
+			w("outbound_proxy_port = %d\n", s.OutboundProxyPort)
+		}
+		if s.OutboundProxyMode != "" {
+			w("outbound_proxy_mode = %s\n", s.OutboundProxyMode)
+		}
+		if s.OutboundIranDomains != "" {
+			w("outbound_iran_domains = %s\n", s.OutboundIranDomains)
+		}
+		if s.OutboundBypassDomains != "" {
+			w("outbound_bypass_domains = %s\n", s.OutboundBypassDomains)
+		}
+	}
 	w("\n# on = every user session shares a few long-lived connections.\n")
 	w("mux = %s\n", s.Mux)
 	if s.Mux == "on" {
@@ -581,6 +663,29 @@ func EncodePairingCode(p *PairingData) string {
 		fmt.Fprintf(&extra, "max_conn=%s\n", mc)
 		v = max(v, 10)
 	}
+	if p.WebsiteBridge == "on" {
+		extra.WriteString("website_bridge=on\n")
+		if wd := cleanDomainCSV(p.WebsiteDomains); wd != "" {
+			fmt.Fprintf(&extra, "website_domains=%s\n", wd)
+		}
+		v = max(v, 10)
+	}
+	if p.OutboundProxy == "on" {
+		extra.WriteString("outbound_proxy=on\n")
+		if pp := strings.TrimSpace(p.OutboundProxyPort); pp != "" {
+			fmt.Fprintf(&extra, "outbound_proxy_port=%s\n", pp)
+		}
+		if pm := strings.TrimSpace(p.OutboundProxyMode); pm != "" {
+			fmt.Fprintf(&extra, "outbound_proxy_mode=%s\n", pm)
+		}
+		if id := cleanDomainCSV(p.OutboundIranDomains); id != "" {
+			fmt.Fprintf(&extra, "outbound_iran_domains=%s\n", id)
+		}
+		if bd := cleanDomainCSV(p.OutboundBypassDomains); bd != "" {
+			fmt.Fprintf(&extra, "outbound_bypass_domains=%s\n", bd)
+		}
+		v = max(v, 10)
+	}
 	mux, links := p.Mux, p.MuxLinks
 	if mux == "" {
 		mux = "off"
@@ -651,7 +756,11 @@ func edgePairingCode(confDir, name string) (string, error) {
 		RealSite: kv["real_site"], CoverSite: kv["cover_site"], ProxyProtocol: kv["proxy_protocol"],
 		SNISpoof: kv["sni_spoof"], SpoofSNI: kv["spoof_sni"], IPSpoof: kv["ip_spoof"], SpoofIP: kv["spoof_ip"],
 		AntiFreeze: kv["anti_freeze"], MaxConn: kv["max_conn"],
-		Secret: strings.TrimSpace(string(secret)),
+		WebsiteBridge: kv["website_bridge"], WebsiteDomains: kv["website_domains"],
+		OutboundProxy: kv["outbound_proxy"], OutboundProxyPort: kv["outbound_proxy_port"],
+		OutboundProxyMode: kv["outbound_proxy_mode"], OutboundIranDomains: kv["outbound_iran_domains"],
+		OutboundBypassDomains: kv["outbound_bypass_domains"],
+		Secret:                strings.TrimSpace(string(secret)),
 	}), nil
 }
 
@@ -968,6 +1077,14 @@ type EditSpec struct {
 	AntiFreeze  string `json:"anti_freeze,omitempty"`  // "on" or "off"
 	IPv6        *bool  `json:"ipv6,omitempty"`         // true for IPv6 bridge, false for IPv4
 	Mux         string `json:"mux,omitempty"`          // "on" or "off"
+
+	WebsiteBridge         string `json:"website_bridge,omitempty"`
+	WebsiteDomains        string `json:"website_domains,omitempty"`
+	OutboundProxy         string `json:"outbound_proxy,omitempty"`
+	OutboundProxyPort     int    `json:"outbound_proxy_port,omitempty"`
+	OutboundProxyMode     string `json:"outbound_proxy_mode,omitempty"`
+	OutboundIranDomains   string `json:"outbound_iran_domains,omitempty"`
+	OutboundBypassDomains string `json:"outbound_bypass_domains,omitempty"`
 }
 
 func setConfKey(text, key, val string) string {
@@ -1176,37 +1293,73 @@ func EditEdge(spec EditSpec, confDir string) (EdgeResult, error) {
 			pp = ""
 		}
 
+		wb := spec.WebsiteBridge
+		if wb == "" {
+			wb = kv["website_bridge"]
+		}
+		wd := spec.WebsiteDomains
+		if wd == "" {
+			wd = kv["website_domains"]
+		}
+		op := spec.OutboundProxy
+		if op == "" {
+			op = kv["outbound_proxy"]
+		}
+		opp := spec.OutboundProxyPort
+		if opp == 0 {
+			opp = curCfg.OutboundProxyPort
+		}
+		opm := spec.OutboundProxyMode
+		if opm == "" {
+			opm = kv["outbound_proxy_mode"]
+		}
+		oid := spec.OutboundIranDomains
+		if oid == "" {
+			oid = kv["outbound_iran_domains"]
+		}
+		obd := spec.OutboundBypassDomains
+		if obd == "" {
+			obd = kv["outbound_bypass_domains"]
+		}
+
 		es := EdgeSpec{
-			Name:          spec.Name,
-			Mode:          mode,
-			Transport:     transport,
-			ServerName:    spec.ServerName,
-			WSPath:        kv["ws_path"],
-			CDN:           spec.CDN,
-			AltHost:       spec.AltHost,
-			CleanIPs:      spec.CleanIPs,
-			UTLS:          spec.UTLS,
-			TLSFragment:   spec.TLSFragment,
-			HTTPHeader:    spec.HTTPHeader,
-			HTTPHost:      spec.HTTPHost,
-			RealSite:      spec.RealSite,
-			GRE:           spec.GRE,
-			SIT:           spec.SIT,
-			SNISpoof:      spec.SNISpoof,
-			SpoofSNI:      spec.SpoofSNI,
-			IPSpoof:       spec.IPSpoof,
-			SpoofIP:       spec.SpoofIP,
-			AntiFreeze:    spec.AntiFreeze,
-			ProxyProtocol: pp,
-			Mux:           mux,
-			MuxLinks:      muxLinks,
-			Pool:          pool,
-			PeerIP:        peerIP,
-			LocalIP:       localIP,
-			IPv6:          useV6,
-			LinkPort:      linkPort,
-			UserPorts:     uPorts,
-			ServicePorts:  sPorts,
+			Name:                  spec.Name,
+			Mode:                  mode,
+			Transport:             transport,
+			ServerName:            spec.ServerName,
+			WSPath:                kv["ws_path"],
+			CDN:                   spec.CDN,
+			AltHost:               spec.AltHost,
+			CleanIPs:              spec.CleanIPs,
+			UTLS:                  spec.UTLS,
+			TLSFragment:           spec.TLSFragment,
+			HTTPHeader:            spec.HTTPHeader,
+			HTTPHost:              spec.HTTPHost,
+			RealSite:              spec.RealSite,
+			GRE:                   spec.GRE,
+			SIT:                   spec.SIT,
+			SNISpoof:              spec.SNISpoof,
+			SpoofSNI:              spec.SpoofSNI,
+			IPSpoof:               spec.IPSpoof,
+			SpoofIP:               spec.SpoofIP,
+			AntiFreeze:            spec.AntiFreeze,
+			ProxyProtocol:         pp,
+			Mux:                   mux,
+			MuxLinks:              muxLinks,
+			Pool:                  pool,
+			PeerIP:                peerIP,
+			LocalIP:               localIP,
+			IPv6:                  useV6,
+			LinkPort:              linkPort,
+			UserPorts:             uPorts,
+			ServicePorts:          sPorts,
+			WebsiteBridge:         wb,
+			WebsiteDomains:        wd,
+			OutboundProxy:         op,
+			OutboundProxyPort:     opp,
+			OutboundProxyMode:     opm,
+			OutboundIranDomains:   oid,
+			OutboundBypassDomains: obd,
 		}
 		es.normalise()
 		if err := es.check(); err != nil {
@@ -1384,6 +1537,35 @@ func EditEdge(spec EditSpec, confDir string) (EdgeResult, error) {
 		default:
 			return res, fmt.Errorf("real user IP (proxy_protocol) must be off, v1 or v2, got %q", spec.ProxyProtocol)
 		}
+	}
+	if spec.WebsiteBridge == "on" || spec.WebsiteBridge == "off" {
+		text = setConfKey(text, "website_bridge", spec.WebsiteBridge)
+	}
+	if spec.WebsiteDomains != "" || curCfg.WebsiteBridge || spec.WebsiteBridge == "on" {
+		if spec.WebsiteDomains != "" {
+			text = setConfKey(text, "website_domains", cleanDomainCSV(spec.WebsiteDomains))
+		}
+	}
+	if spec.OutboundProxy == "on" || spec.OutboundProxy == "off" {
+		text = setConfKey(text, "outbound_proxy", spec.OutboundProxy)
+	}
+	if spec.OutboundProxyPort > 0 {
+		if spec.OutboundProxyPort < 1 || spec.OutboundProxyPort > 65535 {
+			return res, errors.New("outbound proxy port must be from 1 to 65535")
+		}
+		text = setConfKey(text, "outbound_proxy_port", strconv.Itoa(spec.OutboundProxyPort))
+	}
+	if spec.OutboundProxyMode != "" {
+		if spec.OutboundProxyMode != "split" && spec.OutboundProxyMode != "all" {
+			return res, fmt.Errorf("outbound proxy mode must be split or all, got %q", spec.OutboundProxyMode)
+		}
+		text = setConfKey(text, "outbound_proxy_mode", spec.OutboundProxyMode)
+	}
+	if spec.OutboundIranDomains != "" {
+		text = setConfKey(text, "outbound_iran_domains", cleanDomainCSV(spec.OutboundIranDomains))
+	}
+	if spec.OutboundBypassDomains != "" {
+		text = setConfKey(text, "outbound_bypass_domains", cleanDomainCSV(spec.OutboundBypassDomains))
 	}
 	muxNow := curCfg.Mux
 	if spec.Mux != "" {
@@ -2158,5 +2340,181 @@ func ImportTunnel(snap TunnelSnapshot, confDir string, overwrite bool, newLocalI
 	if cfg.Role == engine.RoleEdge {
 		res.Code, _ = edgePairingCode(confDir, snap.Name)
 	}
+	return res, nil
+}
+
+// OutboundRouteProbe is one target checked through the Website Bridge's local outbound proxy.
+type OutboundRouteProbe struct {
+	Target        string `json:"target"`
+	Label         string `json:"label"`
+	ExpectedRoute string `json:"expected_route"`
+	ActualRoute   string `json:"actual_route"`
+	ExitIP        string `json:"exit_ip,omitempty"`
+	LatencyMS     int64  `json:"latency_ms"`
+	OK            bool   `json:"ok"`
+	Error         string `json:"error,omitempty"`
+}
+
+// OutboundTestResult is the complete report from testing a Website Bridge's local outbound proxy.
+type OutboundTestResult struct {
+	OK        bool                 `json:"ok"`
+	Name      string               `json:"name"`
+	ProxyAddr string               `json:"proxy_addr"`
+	ProxyMode string               `json:"proxy_mode"`
+	IranIP    string               `json:"iran_ip,omitempty"`
+	ForeignIP string               `json:"foreign_ip,omitempty"`
+	Probes    []OutboundRouteProbe `json:"probes"`
+	Error     string               `json:"error,omitempty"`
+}
+
+// TestOutboundProxy verifies the local smart outbound proxy on the Foreign server
+// by sending test requests for Iran-routed traffic, Direct-bypassed traffic (Telegram),
+// and an optional custom host.
+func TestOutboundProxy(confDir, name, customHost string) (OutboundTestResult, error) {
+	if confDir == "" {
+		confDir = defaultTunnelsDir
+	}
+	res := OutboundTestResult{Name: name}
+	if err := validTunnelName(name); err != nil {
+		return res, err
+	}
+	cfg, err := engine.LoadConfig(filepath.Join(confDir, name+".conf"))
+	if err != nil {
+		return res, fmt.Errorf("tunnel %q not found on this server", name)
+	}
+	_ = cfg.Validate()
+	if !cfg.OutboundProxy {
+		return res, fmt.Errorf("outbound proxy is not enabled on %q", name)
+	}
+	port := cfg.OutboundProxyPort
+	if port <= 0 {
+		port = 18080
+	}
+	proxyAddr := fmt.Sprintf("127.0.0.1:%d", port)
+	res.ProxyAddr = proxyAddr
+	res.ProxyMode = cfg.OutboundProxyMode
+	res.ForeignIP = cfg.LocalIP
+	res.IranIP = cfg.PeerIP
+
+	// 1. Deterministic Iran Tunnel Self-Check (http://portbridge-iran-check.ir/)
+	iranProbe := OutboundRouteProbe{
+		Target:        engine.OutboundCheckHost,
+		Label:         "Iran Tunnel Exit Verification (Gateway / SMS Route)",
+		ExpectedRoute: "iran",
+	}
+	t0 := time.Now()
+	proxyURL, _ := url.Parse("http://" + proxyAddr)
+	hc := &http.Client{
+		Timeout: 8 * time.Second,
+		Transport: &http.Transport{
+			Proxy:             http.ProxyURL(proxyURL),
+			DisableKeepAlives: true,
+		},
+	}
+	resp, err := hc.Get("http://" + engine.OutboundCheckHost + "/")
+	iranProbe.LatencyMS = time.Since(t0).Milliseconds()
+	if err != nil {
+		iranProbe.Error = err.Error()
+	} else {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		_ = resp.Body.Close()
+		iranProbe.ActualRoute = resp.Header.Get("X-PortBridge-Route")
+		var parsed struct {
+			OK     bool   `json:"ok"`
+			Route  string `json:"route"`
+			IranIP string `json:"iran_ip"`
+		}
+		if json.Unmarshal(body, &parsed) == nil && parsed.OK {
+			iranProbe.OK = true
+			if parsed.Route != "" {
+				iranProbe.ActualRoute = parsed.Route
+			}
+			if parsed.IranIP != "" {
+				iranProbe.ExitIP = parsed.IranIP
+				res.IranIP = parsed.IranIP
+			}
+		} else if resp.StatusCode == http.StatusOK {
+			iranProbe.OK = true
+		} else {
+			iranProbe.Error = strings.TrimSpace(string(body))
+			if iranProbe.Error == "" {
+				iranProbe.Error = fmt.Sprintf("HTTP %d", resp.StatusCode)
+			}
+		}
+	}
+	if iranProbe.ExitIP == "" && iranProbe.OK {
+		iranProbe.ExitIP = res.IranIP
+	}
+	res.Probes = append(res.Probes, iranProbe)
+
+	// Helper to test HTTP CONNECT through the local proxy
+	probeConnect := func(hostPort, label string) OutboundRouteProbe {
+		h := hostPort
+		if sh, _, err := net.SplitHostPort(hostPort); err == nil {
+			h = sh
+		} else {
+			hostPort = net.JoinHostPort(hostPort, "443")
+		}
+		exp := "direct"
+		if engine.ShouldRouteViaIran(h, cfg) {
+			exp = "iran"
+		}
+		p := OutboundRouteProbe{
+			Target:        hostPort,
+			Label:         label,
+			ExpectedRoute: exp,
+		}
+		start := time.Now()
+		c, err := net.DialTimeout("tcp", proxyAddr, 5*time.Second)
+		if err != nil {
+			p.LatencyMS = time.Since(start).Milliseconds()
+			p.Error = fmt.Sprintf("connecting to local proxy %s: %v", proxyAddr, err)
+			return p
+		}
+		defer c.Close()
+		_ = c.SetDeadline(time.Now().Add(8 * time.Second))
+		_, _ = fmt.Fprintf(c, "CONNECT %s HTTP/1.1\r\nHost: %s\r\n\r\n", hostPort, hostPort)
+		br := bufio.NewReader(c)
+		httpResp, err := http.ReadResponse(br, &http.Request{Method: http.MethodConnect})
+		p.LatencyMS = time.Since(start).Milliseconds()
+		if err != nil {
+			p.Error = err.Error()
+			return p
+		}
+		defer httpResp.Body.Close()
+		p.ActualRoute = httpResp.Header.Get("X-PortBridge-Route")
+		if httpResp.StatusCode == http.StatusOK {
+			p.OK = true
+			if p.ActualRoute == "iran" {
+				p.ExitIP = res.IranIP
+			} else {
+				p.ExitIP = res.ForeignIP
+			}
+		} else {
+			b, _ := io.ReadAll(io.LimitReader(httpResp.Body, 512))
+			p.Error = strings.TrimSpace(string(b))
+			if p.Error == "" {
+				p.Error = httpResp.Status
+			}
+		}
+		return p
+	}
+
+	// 2. Direct Bypass Check (api.telegram.org:443)
+	res.Probes = append(res.Probes, probeConnect("api.telegram.org:443", "Telegram API Direct Bypass (api.telegram.org)"))
+
+	// 3. Optional Custom Host Check (or default Iranian gateway domain check)
+	ch := strings.TrimSpace(customHost)
+	if ch != "" {
+		ch = strings.TrimPrefix(strings.TrimPrefix(ch, "https://"), "http://")
+		if idx := strings.IndexByte(ch, '/'); idx >= 0 {
+			ch = ch[:idx]
+		}
+		if ch != "" {
+			res.Probes = append(res.Probes, probeConnect(ch, "Custom Domain Check ("+ch+")"))
+		}
+	}
+
+	res.OK = true
 	return res, nil
 }

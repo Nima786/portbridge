@@ -82,6 +82,15 @@ type PairingData struct {
 	SIT        string
 	AntiFreeze string
 	MaxConn    string
+
+	// Website Bridge & Smart Outbound Proxy settings.
+	WebsiteBridge         string
+	WebsiteDomains        string
+	OutboundProxy         string
+	OutboundProxyPort     string
+	OutboundProxyMode     string
+	OutboundIranDomains   string
+	OutboundBypassDomains string
 }
 
 // pairingVersionMax is the newest code this build understands. The menu keeps
@@ -147,6 +156,14 @@ func decodePairingCode(code string) (*PairingData, error) {
 		SIT:           kv["sit"],
 		AntiFreeze:    kv["anti_freeze"],
 		MaxConn:       kv["max_conn"],
+
+		WebsiteBridge:         kv["website_bridge"],
+		WebsiteDomains:        kv["website_domains"],
+		OutboundProxy:         kv["outbound_proxy"],
+		OutboundProxyPort:     kv["outbound_proxy_port"],
+		OutboundProxyMode:     kv["outbound_proxy_mode"],
+		OutboundIranDomains:   kv["outbound_iran_domains"],
+		OutboundBypassDomains: kv["outbound_bypass_domains"],
 	}
 
 	if v, err := strconv.Atoi(p.Version); err == nil && v > pairingVersionMax {
@@ -835,6 +852,33 @@ func newAgentHandler(token, confDir string, allowUpdates func() bool) *http.Serv
 			return
 		}
 		writeJSONReply(w, http.StatusOK, map[string]any{"ok": true, "output": out})
+	})
+
+	// POST /api/tunnel/test-outbound: verify the local smart outbound proxy on a Website Bridge.
+	mux.HandleFunc("/api/tunnel/test-outbound", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, `{"error":"method not allowed"}`, http.StatusMethodNotAllowed)
+			return
+		}
+		if !checkAgentAuth(r, token) {
+			http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
+			return
+		}
+		var req struct {
+			Name       string `json:"name"`
+			CustomHost string `json:"custom_host"`
+		}
+		if err := json.NewDecoder(io.LimitReader(r.Body, 4096)).Decode(&req); err != nil || req.Name == "" {
+			writeJSONReply(w, http.StatusBadRequest, OutboundTestResult{Error: "name required"})
+			return
+		}
+		res, err := TestOutboundProxy(confDir, req.Name, req.CustomHost)
+		if err != nil {
+			res.Error = err.Error()
+			writeJSONReply(w, http.StatusUnprocessableEntity, res)
+			return
+		}
+		writeJSONReply(w, http.StatusOK, res)
 	})
 
 	// GET or POST /api/tune: inspect or toggle BBR speed tuning on this server.

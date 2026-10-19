@@ -266,8 +266,15 @@
 
   // ------------------------------------------------------------------- tabs
 
-  const TABS = ['servers', 'tunnels', 'dns', 'settings'];
+  const TABS = ['servers', 'tunnels', 'websites', 'dns', 'settings'];
   let cfLoadedOnce = false;
+
+  function isWebsiteBridge(t) {
+    if (!t) return false;
+    const ei = t.edge && t.edge.info ? t.edge.info : null;
+    const oi = t.origin && t.origin.info ? t.origin.info : null;
+    return !!((ei && ei.website_bridge) || (oi && oi.website_bridge));
+  }
 
   function selectTab(name, focus) {
     currentTab = name;
@@ -329,6 +336,8 @@
       cs.hidden = totalServers === 0;
     }
 
+    const vpnTunnels = tunnelsCache.filter((t) => !isWebsiteBridge(t));
+    const webBridges = tunnelsCache.filter((t) => isWebsiteBridge(t));
     const totalTunnels = tunnelsCache.length;
     let runningTunnels = 0;
     let activeUsers = 0;
@@ -358,8 +367,13 @@
 
     const ct = $('count-tunnels');
     if (ct) {
-      ct.textContent = String(totalTunnels);
-      ct.hidden = totalTunnels === 0;
+      ct.textContent = String(vpnTunnels.length);
+      ct.hidden = vpnTunnels.length === 0;
+    }
+    const cw = $('count-websites');
+    if (cw) {
+      cw.textContent = String(webBridges.length);
+      cw.hidden = webBridges.length === 0;
     }
   }
 
@@ -368,7 +382,7 @@
     try {
       if (currentTab === 'servers') {
         await Promise.all([loadServers(), loadTunnels()]);
-      } else if (currentTab === 'tunnels') {
+      } else if (currentTab === 'tunnels' || currentTab === 'websites') {
         await Promise.all([loadTunnels(), loadServers()]);
       } else if (currentTab === 'dns') {
         await Promise.all([loadServers(), loadCloudflare(false)]);
@@ -980,13 +994,18 @@
   }
 
   function renderTunnels(list) {
+    const vpnList = (list || []).filter((t) => !isWebsiteBridge(t));
+    const webList = (list || []).filter((t) => isWebsiteBridge(t));
     const box = $('tunnel-list');
-    if (!list.length) {
-      box.replaceChildren(h('p', { class: 'empty' },
-        'No tunnels yet. Click "+ New Tunnel", or drag a Relay server onto a Foreign server on the Servers tab.'));
-      return;
+    if (box) {
+      if (!vpnList.length) {
+        box.replaceChildren(h('p', { class: 'empty' },
+          'No VPN tunnels yet. Click "+ New Tunnel", or drag a Relay server onto a Foreign server on the Servers tab.'));
+      } else {
+        box.replaceChildren(...vpnList.map(tunnelCard));
+      }
     }
-    box.replaceChildren(...list.map(tunnelCard));
+    renderWebsiteBridges(webList);
   }
 
   const PATH_WORDS = {
@@ -3841,6 +3860,692 @@
 
   for (const el of document.querySelectorAll('#restore-dialog input[type="radio"]')) {
     el.addEventListener('change', () => syncChoiceCards($('restore-dialog')));
+  }
+
+  // --------------------------------------------------------- website bridges
+
+  const DEFAULT_IRAN_DOMAINS = '.ir, shaparak.ir, zarinpal.com, kavenegar.com, melipayamak.com, sms.ir, farazsms.com, ippanel.com, payping.ir, zibal.ir, idpay.ir, nextpay.org, vandar.io, jibit.ir, asanpardakht.com, sadadpsp.ir, behpardakht.com, sep.ir, pep.co.ir, sizpay.ir, parsiangp.com';
+  const DEFAULT_BYPASS_DOMAINS = 'telegram.org, api.telegram.org, t.me, wordpress.org, api.wordpress.org, github.com, googleapis.com, gstatic.com, cloudflare.com, stripe.com, paypal.com';
+
+  let wbMode = 'create';
+  let editingWebsiteBridge = null;
+  let activeOutboundTestTarget = null;
+
+  function renderWebsiteBridges(list) {
+    const box = $('website-list');
+    if (!box) return;
+    if (!list.length) {
+      box.replaceChildren(
+        h('div', { class: 'card empty-card' },
+          h('h3', null, 'No Website Bridges Configured Yet'),
+          h('p', { class: 'muted' },
+            'Host WordPress, WooCommerce, CyberPanel, LiteSpeed Enterprise, or Nginx websites on a fast Foreign VPS while giving visitors and Iranian payment/SMS gateways a public Iran VPS IP — without blocking Telegram or international APIs.'),
+          h('div', { class: 'actions left' },
+            h('button', { type: 'button', class: 'primary', onclick: () => openNewWebsiteBridge() }, '+ New Website Bridge'))));
+      return;
+    }
+    box.replaceChildren(...list.map(websiteCard));
+  }
+
+  function websiteCard(t) {
+    const e = t.edge, o = t.origin;
+    const ei = e ? e.info : null, oi = o ? o.info : null;
+    const any = ei || oi || {};
+    const reverse = any.mode === 'reverse';
+    const shortLink = shortLinkLabel(any);
+    const linkPort = (ei && ei.link_port) || (oi && oi.link_port) || 0;
+    const userPorts = ei && ei.user_ports && ei.user_ports.length ? ei.user_ports : (oi ? oi.service_ports : [80, 443]);
+    const servicePorts = (oi && oi.service_ports && oi.service_ports.length) ? oi.service_ports : userPorts;
+    const live = (ei && ei.live) || (oi && oi.live) || null;
+
+    let overall = ['ok', 'Running'];
+    const halves = [e, o].filter(Boolean);
+    if (halves.some((x) => !x.info.running)) overall = ['bad', 'Stopped'];
+    else if (live && live.path_state === 'blocked') overall = ['bad', 'Blocked'];
+    else if (halves.some((x) => x.info.problem)) overall = ['warn', 'Warning'];
+    else if (live && live.path_state === 'degraded') overall = ['warn', 'Degraded'];
+    else if (!e || !o) overall = ['unknown', 'Unpaired'];
+
+    const relayName = e ? (e.server_name || e.address) : (oi && oi.peer_ip ? oi.peer_ip : 'Not in panel');
+    const foreignName = o ? (o.server_name || o.address) : (ei && ei.peer_ip ? ei.peer_ip : 'Not in panel');
+    const relayAddr = e && e.address ? e.address : (oi && oi.peer_ip ? oi.peer_ip : '—');
+    const foreignAddr = o && o.address ? o.address : (ei && ei.peer_ip ? ei.peer_ip : '—');
+    const mainPort = ports(userPorts || servicePorts) || '80, 443';
+    const domains = (ei && ei.website_domains) || (oi && oi.website_domains) || '';
+    const outboundOn = !!((ei && ei.outbound_proxy) || (oi && oi.outbound_proxy));
+    const outboundPort = (oi && oi.outbound_proxy_port) || (ei && ei.outbound_proxy_port) || 18080;
+    const outboundMode = (oi && oi.outbound_proxy_mode) || (ei && ei.outbound_proxy_mode) || 'split';
+    const pp = (ei && ei.proxy_protocol) || (oi && oi.proxy_protocol) || 'off';
+
+    const edgeLive = ei && ei.live ? ei.live : null;
+    const uniqueUsers = (edgeLive && typeof edgeLive.active_users === 'number')
+      ? (Number(edgeLive.active_users) || 0)
+      : (live && typeof live.active_users === 'number' ? (Number(live.active_users) || 0) : 0);
+    const activeConns = live ? (Number(live.active_sessions) || 0) : 0;
+    const visitorBadgeText = `${uniqueUsers} ${uniqueUsers === 1 ? 'visitor' : 'visitors'} · ${activeConns} ${activeConns === 1 ? 'req' : 'reqs'}`;
+
+    const tunKey = `wb:${t.name}:${e ? e.server_id : ''}:${o ? o.server_id : ''}`;
+    const headingId = 'wb-head-' + t.name + (e ? e.server_id : '') + (o ? o.server_id : '');
+    const isOpen = expandedTunnels.has(tunKey);
+
+    const proxySummary = outboundOn
+      ? `127.0.0.1:${outboundPort} (${outboundMode === 'all' ? 'All via Iran' : 'Smart Split'})`
+      : 'Disabled';
+
+    const detailsGrid = h('div', { class: 'tunnel-details-grid' },
+      h('div', { class: 'detail-item detail-relay' },
+        h('span', { class: 'detail-label' }, 'Iran Entry Server (Public Website IP)'),
+        h('span', { class: 'detail-primary' }, `${relayName} (${relayAddr})`),
+        h('span', { class: 'detail-sub mono' }, `Visitors & Bank Callbacks → :${mainPort}`)),
+      h('div', { class: 'detail-item detail-foreign' },
+        h('span', { class: 'detail-label' }, 'Foreign Hosting Server (LiteSpeed / WordPress)'),
+        h('span', { class: 'detail-primary' }, `${foreignName} (${foreignAddr})`),
+        h('span', { class: 'detail-sub mono' }, `Web Server :${ports(servicePorts) || '80, 443'} · Real Visitor IP: ${pp !== 'off' ? 'PROXY ' + pp : 'Off'}`)),
+      h('div', { class: 'detail-item' },
+        h('span', { class: 'detail-label' }, 'Smart Outbound Proxy (Banks / SMS / Telegram)'),
+        h('span', { class: 'detail-primary mono' }, proxySummary),
+        h('span', { class: 'detail-sub' }, outboundOn
+          ? (outboundMode === 'all'
+              ? 'All proxy requests exit via Iran IP except Direct Bypass list (Telegram)'
+              : '.ir & Iranian Banks/SMS → Iran IP · Telegram & International → Direct Foreign IP')
+          : 'Enable in Edit to route Iranian bank/SMS calls via Iran IP')),
+      h('div', { class: 'detail-item' },
+        h('span', { class: 'detail-label' }, 'Website Domains & Multiplexed Link'),
+        h('span', { class: 'detail-primary' }, domains || 'All SNI / Host domains on web ports'),
+        h('span', { class: 'detail-sub' }, `${reverse ? 'Reverse' : 'Direct'} · ${shortLink} (:${linkPort}) · ${live ? `${live.links || 0}/${live.link_target || any.mux_links || 8} Mux trunks` : 'Shared Mux'}`)));
+
+    const problems = halves.filter((x) => x.info.problem).map((x) => `${x.server_name}: ${sentence(x.info.problem)}`);
+    if (live && live.path_note && live.path_state !== 'ok') problems.push(sentence(live.path_note));
+
+    const bodyEl = h('div', { class: 'tunnel-body', hidden: !isOpen },
+      detailsGrid,
+      problems.map((p) => h('p', { class: 'problem' }, p)),
+      t.stale ? h('p', { class: 'muted small' }, 'One of the servers cannot be reached right now, so these stats may be cached.') : null,
+      websiteActions(t, halves));
+
+    const ah = t.auto_heal || {};
+    let ahBadge = null;
+    if (ah.state === 'probing' || ah.state === 'switching') {
+      ahBadge = h('span', { class: 'badge badge-autoheal is-healing' }, 'Auto-Healing…');
+    } else if (ah.enabled) {
+      ahBadge = h('span', { class: 'badge badge-autoheal is-on' }, 'Auto-Heal: ON');
+    }
+
+    const toggleBtn = h('button', {
+      type: 'button',
+      class: 'tunnel-summary',
+      'aria-expanded': String(isOpen),
+      'data-focus': `wb-toggle-${tunKey}`,
+    },
+      h('div', { class: 'tunnel-summary-left' },
+        h('span', { class: 'state ' + overall[0] }, overall[1]),
+        h('span', { class: 'tunnel-summary-name', id: headingId }, t.name),
+        domains ? h('span', { class: 'badge badge-transport' }, domains) : null,
+        h('span', { class: 'tunnel-summary-route' },
+          `${relayName} ↔ ${foreignName}`,
+          h('span', { class: 'tunnel-summary-port mono' }, `:${mainPort}`))),
+      h('div', { class: 'tunnel-summary-right' },
+        ahBadge,
+        outboundOn ? h('span', { class: 'badge badge-transport mono' }, `Proxy 127.0.0.1:${outboundPort}`) : null,
+        live ? h('span', { class: 'badge badge-users' }, visitorBadgeText) : null,
+        h('span', { class: 'tunnel-chevron', 'aria-hidden': 'true' }, '▾')));
+
+    const card = h('article', { class: 'card tunnel' + (isOpen ? ' is-open' : ''), 'aria-labelledby': headingId },
+      toggleBtn,
+      bodyEl);
+
+    toggleBtn.addEventListener('click', () => {
+      const nowOpen = !expandedTunnels.has(tunKey);
+      if (nowOpen) expandedTunnels.add(tunKey);
+      else expandedTunnels.delete(tunKey);
+      card.classList.toggle('is-open', nowOpen);
+      toggleBtn.setAttribute('aria-expanded', String(nowOpen));
+      bodyEl.hidden = !nowOpen;
+    });
+
+    return card;
+  }
+
+  function websiteActions(t, halves) {
+    const target = { name: t.name, edge: t.edge ? t.edge.server_id : '', origin: t.origin ? t.origin.server_id : '' };
+    const key = `wb-${t.name}-${target.edge}-${target.origin}`;
+    const allRunning = halves.length > 0 && halves.every((x) => x.info.running);
+    const service = (action, doing) => async (ev) => {
+      const btn = ev.currentTarget;
+      const orig = btn.textContent;
+      btn.disabled = true;
+      btn.classList.add('is-loading');
+      btn.textContent = `${doing}…`;
+      setStatus(`${doing} ${t.name}...`);
+      try {
+        const res = await api('POST', '/api/tunnels/service', { ...target, action });
+        const bad = (res.results || []).filter((r) => !r.ok);
+        setStatus(bad.length ? '' : `${t.name}: done.`);
+        if (bad.length) showResults(`${t.name}: action incomplete`, res.results);
+        lastTunnels = '';
+        await refresh();
+      } catch (e) {
+        setStatus(e.message, true);
+      } finally {
+        btn.classList.remove('is-loading');
+        btn.textContent = orig;
+        btn.disabled = false;
+      }
+    };
+    const ahOn = !!(t.auto_heal && t.auto_heal.enabled);
+    return h('div', { class: 'actions left tunnel-actions' },
+      h('button', {
+        type: 'button',
+        class: 'primary',
+        'data-focus': key + '-wpsetup',
+        onclick: () => openWPSetupDialog(t)
+      }, 'WordPress & LiteSpeed Setup'),
+      target.origin
+        ? h('button', {
+            type: 'button',
+            'data-focus': key + '-outtest',
+            onclick: () => openOutboundTestDialog(t, target)
+          }, 'Test Outbound Routing')
+        : null,
+      target.edge && target.origin
+        ? h('button', {
+            type: 'button',
+            class: ahOn ? 'btn-autoheal is-on' : 'btn-autoheal',
+            'data-focus': key + '-autoheal',
+            onclick: () => openTunnelAutoHeal(t)
+          }, ahOn ? 'Auto-Heal (ON)' : 'Auto-Heal & Failover')
+        : null,
+      target.edge ? h('button', { type: 'button', 'data-focus': key + '-edit', onclick: () => openEditWebsiteBridge(t) }, 'Edit') : null,
+      h('button', { type: 'button', 'data-focus': key + '-diag', onclick: () => openTunnelDiag(t, target) }, 'Diagnose & Speed Test'),
+      h('button', { type: 'button', 'data-focus': key + '-logs', onclick: () => openTunnelLogs(t, target) }, 'Logs'),
+      h('button', { type: 'button', 'data-focus': key + '-restart', onclick: service('restart', 'Restarting') }, 'Restart'),
+      allRunning
+        ? h('button', { type: 'button', 'data-focus': key + '-stop', onclick: service('stop', 'Stopping') }, 'Stop')
+        : h('button', { type: 'button', 'data-focus': key + '-start', onclick: service('start', 'Starting') }, 'Start'),
+      h('button', { type: 'button', class: 'danger-text', 'data-focus': key + '-delete', onclick: () => confirmDeleteTunnel(t, target) }, 'Delete'));
+  }
+
+  function syncWebsiteDialogUI() {
+    const outOn = $('wb-outbound') ? $('wb-outbound').checked : true;
+    if ($('wb-outbound-box')) $('wb-outbound-box').hidden = !outOn;
+    if ($('wb-port-preview') && $('wb-proxy-port')) {
+      $('wb-port-preview').textContent = $('wb-proxy-port').value || '18080';
+    }
+    syncChoiceCards($('website-dialog'));
+  }
+
+  if ($('wb-outbound')) $('wb-outbound').addEventListener('change', syncWebsiteDialogUI);
+  if ($('wb-proxy-port')) $('wb-proxy-port').addEventListener('input', syncWebsiteDialogUI);
+
+  async function openNewWebsiteBridge() {
+    if (!serversCache.length) {
+      try { await loadServers(); } catch (_) {}
+    }
+    const relays = serversCache.filter((s) => s.group === 'relay');
+    const foreigns = serversCache.filter((s) => s.group === 'foreign');
+    if (!relays.length || !foreigns.length) {
+      setStatus('Add at least one Relay (Iran) server and one Foreign server before creating a Website Bridge.', true);
+      selectTab('servers', false);
+      return;
+    }
+    wbMode = 'create';
+    editingWebsiteBridge = null;
+    $('wb-title').textContent = 'New Website Bridge';
+    $('wb-sub').textContent = 'Forward visitors from an Iran VPS IP to your Foreign web server (LiteSpeed / CyberPanel / WordPress / Nginx), and give WordPress a smart local outbound proxy for Iranian banks & SMS gateways while keeping Telegram direct.';
+    $('wb-submit').textContent = 'Create Website Bridge';
+
+    $('wb-relay').replaceChildren(...relays.map(serverOption));
+    $('wb-foreign').replaceChildren(...foreigns.map(serverOption));
+    $('wb-create-servers').hidden = false;
+    $('wb-name-wrap').hidden = false;
+    $('wb-create-transport').hidden = false;
+    $('wb-autoheal-wrap').hidden = false;
+
+    $('wb-name').value = '';
+    $('wb-domains').value = '';
+    $('wb-ports').value = '80,443';
+    $('wb-linkport').value = '8443';
+    setRadio('wb-proxy', 'v1');
+    $('wb-outbound').checked = true;
+    $('wb-proxy-port').value = '18080';
+    setRadio('wb-proxy-mode', 'split');
+    $('wb-iran-domains').value = DEFAULT_IRAN_DOMAINS;
+    $('wb-bypass-domains').value = DEFAULT_BYPASS_DOMAINS;
+    setRadio('wb-mode', 'direct');
+    $('wb-link').value = 'website';
+    $('wb-sni').value = 'www.bing.com';
+    if ($('wb-ipv6')) $('wb-ipv6').checked = false;
+    $('wb-mux-links').value = '8';
+    $('wb-max-conn').value = '4000';
+    $('wb-autoheal').checked = true;
+    $('wb-error').textContent = '';
+    $('wb-ports-result').replaceChildren();
+
+    syncWebsiteDialogUI();
+    openDialog($('website-dialog'));
+    $('wb-name').focus();
+  }
+
+  function openEditWebsiteBridge(t) {
+    wbMode = 'edit';
+    editingWebsiteBridge = t;
+    const e = t.edge, o = t.origin;
+    const ei = e ? e.info : null, oi = o ? o.info : null;
+    const any = ei || oi || {};
+    const servicePorts = (oi && oi.service_ports && oi.service_ports.length) ? oi.service_ports : (ei && ei.user_ports ? ei.user_ports : [80, 443]);
+    const linkPort = (ei && ei.link_port) || (oi && oi.link_port) || 8443;
+    const pp = (ei && ei.proxy_protocol) || (oi && oi.proxy_protocol) || 'v1';
+    const outOn = !!((ei && ei.outbound_proxy) || (oi && oi.outbound_proxy));
+    const outPort = (oi && oi.outbound_proxy_port) || (ei && ei.outbound_proxy_port) || 18080;
+    const outMode = (oi && oi.outbound_proxy_mode) || (ei && ei.outbound_proxy_mode) || 'split';
+    const iranDoms = (oi && oi.outbound_iran_domains) || (ei && ei.outbound_iran_domains) || DEFAULT_IRAN_DOMAINS;
+    const bypassDoms = (oi && oi.outbound_bypass_domains) || (ei && ei.outbound_bypass_domains) || DEFAULT_BYPASS_DOMAINS;
+    const muxVal = (ei && ei.mux_links) || (oi && oi.mux_links) || 8;
+    const maxConnVal = (ei && ei.max_conn) || (oi && oi.max_conn) || 4000;
+
+    $('wb-title').textContent = `Edit Website Bridge: ${t.name}`;
+    const where = [e && e.server_name, o && o.server_name].filter(Boolean).join(' ↔ ');
+    $('wb-sub').textContent = `Update web ports, visitor IP forwarding, or Smart Outbound Proxy domains across ${where}.`;
+    $('wb-submit').textContent = 'Save & Apply Website Bridge';
+
+    $('wb-create-servers').hidden = true;
+    $('wb-name-wrap').hidden = true;
+    $('wb-create-transport').hidden = true;
+    $('wb-autoheal-wrap').hidden = true;
+
+    $('wb-name').value = t.name;
+    $('wb-domains').value = (ei && ei.website_domains) || (oi && oi.website_domains) || '';
+    $('wb-ports').value = (servicePorts || [80, 443]).join(',');
+    $('wb-linkport').value = String(linkPort);
+    setRadio('wb-proxy', ['off', 'v1', 'v2'].includes(pp) ? pp : 'v1');
+    $('wb-outbound').checked = outOn;
+    $('wb-proxy-port').value = String(outPort);
+    setRadio('wb-proxy-mode', outMode === 'all' ? 'all' : 'split');
+    $('wb-iran-domains').value = iranDoms;
+    $('wb-bypass-domains').value = bypassDoms;
+    $('wb-mux-links').value = String(muxVal);
+    $('wb-max-conn').value = String(maxConnVal);
+    $('wb-error').textContent = '';
+    $('wb-ports-result').replaceChildren();
+
+    syncWebsiteDialogUI();
+    openDialog($('website-dialog'));
+    $('wb-domains').focus();
+  }
+
+  if ($('new-website-btn')) {
+    $('new-website-btn').addEventListener('click', () => openNewWebsiteBridge());
+  }
+  if ($('wb-cancel')) {
+    $('wb-cancel').addEventListener('click', () => $('website-dialog').close());
+  }
+
+  if ($('wb-check-ports')) {
+    $('wb-check-ports').addEventListener('click', async () => {
+      const webPorts = $('wb-ports').value.trim();
+      const linkPort = Number($('wb-linkport').value || 0);
+      const outOn = $('wb-outbound').checked;
+      const outPort = Number($('wb-proxy-port').value || 18080);
+      const out = $('wb-ports-result');
+      if (!portList.test(webPorts) || !linkPort) {
+        out.replaceChildren(h('li', { class: 'bad' }, 'Enter valid Web Ports (e.g. 80,443) and Internal Tunnel Bridge Port first.'));
+        return;
+      }
+      let relayId = '', foreignId = '', mode = 'direct', ownTag = '';
+      if (wbMode === 'edit' && editingWebsiteBridge) {
+        const t = editingWebsiteBridge;
+        relayId = t.edge ? t.edge.server_id : '';
+        foreignId = t.origin ? t.origin.server_id : '';
+        const any = (t.edge && t.edge.info) || (t.origin && t.origin.info) || {};
+        mode = any.mode || 'direct';
+        ownTag = `PortBridge tunnel "${t.name}"`;
+      } else {
+        relayId = $('wb-relay').value;
+        foreignId = $('wb-foreign').value;
+        mode = radio('wb-mode') || 'direct';
+      }
+      out.replaceChildren(h('li', null, 'Checking web & proxy ports on both servers...'));
+      const relayPorts = webPorts + (mode === 'reverse' ? ',' + linkPort : '');
+      const foreignPorts = webPorts + (mode === 'direct' ? ',' + linkPort : '') + (outOn && outPort ? ',' + outPort : '');
+      const checkOne = async (srvId, list, role) => {
+        if (!srvId) return [];
+        const srv = serverById(srvId);
+        const sName = (srv && (srv.name || srv.address)) || srvId;
+        try {
+          const res = await api('POST', '/api/ports', { server: srvId, ports: list });
+          return (res.ports || []).map((p) => {
+            const isSelf = ownTag && p.by === ownTag;
+            const by = p.by ? ` (${p.by.replace(/^PortBridge /, '')})` : '';
+            if (role === 'foreign' && outOn && p.port === outPort) {
+              const ok = p.state === 'free' || isSelf;
+              return h('li', { class: ok ? 'good' : 'bad' },
+                `${sName} — Local Outbound Proxy 127.0.0.1:${p.port}: ${ok ? 'available' : 'already in use' + by}`);
+            }
+            if (p.port === linkPort && ((role === 'relay' && mode === 'reverse') || (role === 'foreign' && mode === 'direct'))) {
+              const ok = p.state === 'free' || isSelf;
+              return h('li', { class: ok ? 'good' : 'bad' },
+                `${sName} — Bridge Port ${p.port}: ${ok ? 'available' : 'already in use' + by}`);
+            }
+            if (role === 'foreign') {
+              const ok = p.state !== 'free';
+              return h('li', { class: ok ? 'good' : 'warn' },
+                `${sName} — Web Server Port ${p.port}: ${ok ? 'web server listening' + by + ' (ready)' : 'nothing listening on port ' + p.port + ' yet (make sure LiteSpeed / Nginx is running)'}`);
+            }
+            const ok = p.state === 'free' || isSelf;
+            return h('li', { class: ok ? 'good' : 'bad' },
+              `${sName} — Public Web Port ${p.port}: ${ok ? 'available on Iran server' : 'already in use' + by}`);
+          });
+        } catch (e) {
+          return [h('li', { class: 'warn' }, `${sName}: could not check ports (${e.message})`)];
+        }
+      };
+      const [a, b] = await Promise.all([checkOne(relayId, relayPorts, 'relay'), checkOne(foreignId, foreignPorts, 'foreign')]);
+      out.replaceChildren(...a, ...b);
+    });
+  }
+
+  if ($('website-form')) {
+    $('website-form').addEventListener('submit', async (ev) => {
+      ev.preventDefault();
+      const err = $('wb-error');
+      err.textContent = '';
+      const fail = (msg, el) => { err.textContent = msg; if (el) el.focus(); };
+
+      const webPorts = $('wb-ports').value.trim();
+      const linkPort = Number($('wb-linkport').value || 0);
+      const domains = $('wb-domains').value.trim();
+      const proxyProto = radio('wb-proxy') || 'v1';
+      const outOn = $('wb-outbound').checked;
+      const outPort = Number($('wb-proxy-port').value || 18080);
+      const outMode = radio('wb-proxy-mode') || 'split';
+      const iranDoms = $('wb-iran-domains').value.trim();
+      const bypassDoms = $('wb-bypass-domains').value.trim();
+      const muxLinks = Number($('wb-mux-links').value || 8);
+      const maxConn = Number($('wb-max-conn').value || 4000);
+
+      if (!portList.test(webPorts)) return fail('Enter valid Web Ports separated by commas (e.g. 80,443).', $('wb-ports'));
+      if (!(linkPort >= 1 && linkPort <= 65535)) return fail('Internal Tunnel Bridge Port must be between 1 and 65535.', $('wb-linkport'));
+      const webPortNums = webPorts.split(',').map((x) => Number(x.trim()));
+      if (webPortNums.includes(linkPort)) {
+        return fail(`Internal Tunnel Bridge Port (${linkPort}) cannot be one of the Web Ports (${webPorts}). Use e.g. 8443.`, $('wb-linkport'));
+      }
+      if (outOn) {
+        if (!(outPort >= 1024 && outPort <= 65535)) return fail('Local Outbound Proxy Port must be between 1024 and 65535.', $('wb-proxy-port'));
+        if (webPortNums.includes(outPort) || outPort === linkPort) {
+          return fail('Local Outbound Proxy Port must be different from the Web Ports and Bridge Port.', $('wb-proxy-port'));
+        }
+      }
+      if (!(muxLinks >= 1 && muxLinks <= 16)) return fail('Parallel Multiplexed Trunks must be between 1 and 16.', $('wb-mux-links'));
+      if (!(maxConn >= 10 && maxConn <= 100000)) return fail('Max Concurrent HTTP/HTTPS Requests must be between 10 and 100000.', $('wb-max-conn'));
+
+      const btn = $('wb-submit');
+      btn.disabled = true;
+      try {
+        if (wbMode === 'edit' && editingWebsiteBridge) {
+          const t = editingWebsiteBridge;
+          const res = await api('POST', '/api/tunnels/edit', {
+            name: t.name,
+            edge: t.edge ? t.edge.server_id : '',
+            origin: t.origin ? t.origin.server_id : '',
+            service_ports: webPorts,
+            user_ports: webPorts,
+            link_port: linkPort,
+            proxy_protocol: proxyProto,
+            mux: 'on',
+            mux_links: muxLinks,
+            max_conn: maxConn,
+            website_domains: domains,
+            outbound_proxy: outOn ? 'on' : 'off',
+            outbound_proxy_port: outPort,
+            outbound_proxy_mode: outMode,
+            outbound_iran_domains: iranDoms,
+            outbound_bypass_domains: bypassDoms,
+          });
+          $('website-dialog').close();
+          followJob(res.job, `Updating Website Bridge "${t.name}"`,
+            `Website Bridge "${t.name}" has been updated and restarted on both servers.`,
+            'Could not update Website Bridge.');
+        } else {
+          const name = $('wb-name').value.trim();
+          if (!/^[A-Za-z0-9_-]{1,40}$/.test(name)) {
+            btn.disabled = false;
+            return fail('Enter a Bridge Name using letters, numbers, dashes, or underscores (e.g. uk-wordpress).', $('wb-name'));
+          }
+          const relay = $('wb-relay').value;
+          const foreign = $('wb-foreign').value;
+          if (!relay || !foreign || relay === foreign) {
+            btn.disabled = false;
+            return fail('Choose an Iran Entry Server and a Foreign Hosting Server.');
+          }
+          const link = $('wb-link').value || 'website';
+          const sni = $('wb-sni').value.trim() || 'www.bing.com';
+          const res = await api('POST', '/api/tunnels', {
+            name,
+            relay,
+            foreign,
+            mode: radio('wb-mode') || 'direct',
+            link,
+            server_name: sni,
+            spoof_sni: link === 'sni-spoof' ? sni : '',
+            stealth: true,
+            real_site: true,
+            shared: true,
+            shared_links: muxLinks,
+            max_conn: maxConn,
+            service_ports: webPorts,
+            user_ports: webPorts,
+            link_port: linkPort,
+            proxy_protocol: proxyProto,
+            ipv6: !!($('wb-ipv6') && $('wb-ipv6').checked),
+            auto_heal: $('wb-autoheal').checked,
+            website_bridge: true,
+            website_domains: domains,
+            outbound_proxy: outOn,
+            outbound_proxy_port: outPort,
+            outbound_proxy_mode: outMode,
+            outbound_iran_domains: iranDoms,
+            outbound_bypass_domains: bypassDoms,
+          });
+          $('website-dialog').close();
+          selectTab('websites', false);
+          followJob(res.job, `Creating Website Bridge "${name}"`,
+            `Website Bridge "${name}" is active! Click "WordPress & LiteSpeed Setup" on its card for your wp-config.php snippet.`,
+            'Could not create Website Bridge.');
+        }
+      } catch (e) {
+        fail(e.message);
+      } finally {
+        btn.disabled = false;
+      }
+    });
+  }
+
+  function openWPSetupDialog(t) {
+    const e = t.edge, o = t.origin;
+    const ei = e ? e.info : null, oi = o ? o.info : null;
+    const relayAddr = (e && e.address) || (ei && ei.local_ip) || (oi && oi.peer_ip) || '<Iran-Server-IP>';
+    const foreignAddr = (o && o.address) || (oi && oi.local_ip) || '<Foreign-Server-IP>';
+    const outPort = (oi && oi.outbound_proxy_port) || (ei && ei.outbound_proxy_port) || 18080;
+    const domains = (ei && ei.website_domains) || (oi && oi.website_domains) || 'yourdomain.ir';
+    const bypassRaw = (oi && oi.outbound_bypass_domains) || (ei && ei.outbound_bypass_domains) || DEFAULT_BYPASS_DOMAINS;
+    const wpBypassList = ['localhost', '127.0.0.1', '*.telegram.org', 'api.telegram.org', 't.me', '*.wordpress.org', 'api.wordpress.org'];
+    for (const part of bypassRaw.split(',')) {
+      const d = part.trim();
+      if (d && !wpBypassList.includes(d)) wpBypassList.push(d);
+    }
+
+    $('wp-setup-title').textContent = `WordPress, CyberPanel & LiteSpeed Setup — ${t.name}`;
+    $('wp-dns-desc').textContent = `Point your domain(s) (${domains}) to your Iran Entry Server IP so visitors and Iranian bank callbacks connect through Iran:`;
+    $('wp-dns-box').replaceChildren(
+      h('p', null,
+        h('strong', null, 'DNS A Record: '),
+        `Point `,
+        h('code', null, domains),
+        ` (and `,
+        h('code', null, 'www'),
+        `) → `,
+        h('code', null, relayAddr),
+        ` (with Cloudflare Proxy OFF / Grey Cloud for `,
+        h('code', null, '.ir'),
+        ` bank callbacks, or keep your SSL certs on CyberPanel/LiteSpeed on ${foreignAddr}).`));
+
+    const wpConfigCode = [
+      `/* === PortBridge Smart Outbound Proxy (${t.name}) ===`,
+      ` * Routes Iranian banks, Shaparak & SMS gateways through Iran IP (${relayAddr})`,
+      ` * while Telegram & international APIs connect directly from Foreign VPS (${foreignAddr}).`,
+      ` */`,
+      `define( 'WP_PROXY_HOST', '127.0.0.1' );`,
+      `define( 'WP_PROXY_PORT', '${outPort}' );`,
+      `define( 'WP_PROXY_BYPASS_HOSTS', '${wpBypassList.slice(0, 12).join(', ')}' );`,
+    ].join('\n');
+
+    const muPluginCode = [
+      `<?php`,
+      `/**`,
+      ` * Plugin Name: PortBridge Smart Iran/Direct Outbound Proxy`,
+      ` * Description: Routes Iranian bank & SMS gateway cURL calls via PortBridge (127.0.0.1:${outPort}) while keeping Telegram direct.`,
+      ` * Save as: wp-content/mu-plugins/portbridge-proxy.php`,
+      ` */`,
+      `add_action( 'http_api_curl', function( $handle, $r, $url ) {`,
+      `    $host = strtolower( (string) parse_url( $url, PHP_URL_HOST ) );`,
+      `    if ( ! $host || $host === 'localhost' || $host === '127.0.0.1' ) {`,
+      `        return;`,
+      `    }`,
+      `    // Telegram and international bypass hosts connect directly from Foreign VPS:`,
+      `    if ( str_ends_with( $host, 'telegram.org' ) || $host === 't.me' ) {`,
+      `        curl_setopt( $handle, CURLOPT_PROXY, '' );`,
+      `        return;`,
+      `    }`,
+      `    // All other requests go through PortBridge Smart Splitter on 127.0.0.1:${outPort}:`,
+      `    curl_setopt( $handle, CURLOPT_PROXY, '127.0.0.1:${outPort}' );`,
+      `    curl_setopt( $handle, CURLOPT_PROXYTYPE, CURLPROXY_HTTP );`,
+      `}, 10, 3 );`,
+    ].join('\n');
+
+    $('wp-config-snippet').textContent = wpConfigCode;
+    $('wp-muplugin-snippet').textContent = muPluginCode;
+
+    $('wp-litespeed-steps').replaceChildren(
+      h('li', null,
+        'Open your CyberPanel / LiteSpeed WebAdmin Console at ',
+        h('code', null, `https://${foreignAddr}:7080`),
+        '.'),
+      h('li', null,
+        'Go to ',
+        h('strong', null, 'Configuration → Server → General'),
+        ' and set ',
+        h('strong', null, 'Use Client IP in Header'),
+        ' to ',
+        h('code', null, 'Trusted IP Only'),
+        '.'),
+      h('li', null,
+        'Go to ',
+        h('strong', null, 'Configuration → Server → Security → Access Control'),
+        ' and in ',
+        h('strong', null, 'Allowed List'),
+        ', add ',
+        h('code', null, `127.0.0.1T, ${relayAddr}T`),
+        ' (with the trailing ',
+        h('code', null, 'T'),
+        ' for Trusted Proxy), then click ',
+        h('strong', null, 'Graceful Restart'),
+        '.'));
+
+    openDialog($('wp-setup-dialog'));
+  }
+
+  if ($('wp-copy-config')) {
+    $('wp-copy-config').addEventListener('click', async () => {
+      try {
+        await navigator.clipboard.writeText($('wp-config-snippet').textContent);
+        setStatus('Copied wp-config.php snippet to clipboard.');
+      } catch (_) {}
+    });
+  }
+  if ($('wp-copy-muplugin')) {
+    $('wp-copy-muplugin').addEventListener('click', async () => {
+      try {
+        await navigator.clipboard.writeText($('wp-muplugin-snippet').textContent);
+        setStatus('Copied mu-plugin PHP code to clipboard.');
+      } catch (_) {}
+    });
+  }
+  if ($('wp-setup-close')) {
+    $('wp-setup-close').addEventListener('click', () => $('wp-setup-dialog').close());
+  }
+
+  async function runOutboundTest(customHost) {
+    if (!activeOutboundTestTarget) return;
+    $('obt-loading').hidden = false;
+    $('obt-error').textContent = '';
+    $('obt-rerun').disabled = true;
+    $('obt-test-custom').disabled = true;
+    try {
+      const res = await api('POST', '/api/tunnels/test-outbound', {
+        ...activeOutboundTestTarget,
+        custom_host: customHost || '',
+      });
+      const r = res.result || {};
+      const probes = r.probes || [];
+      const cards = probes.map((p, idx) => {
+        const ok = !!p.ok;
+        const routeCode = p.actual_route || p.expected_route || '';
+        const routeBadge = routeCode === 'iran'
+          ? 'Routed via Iran VPS IP'
+          : (routeCode === 'direct' ? 'Routed Directly via Foreign VPS IP' : (routeCode || '—'));
+        return h('div', { class: 'diag-card' },
+          h('div', { class: 'diag-head' },
+            h('strong', null, `${idx + 1}. ${p.label || p.target}`),
+            h('span', { class: 'state ' + (ok ? 'ok' : 'bad') }, ok ? 'Verified' : 'Failed')),
+          h('p', { class: 'muted small mono' }, `Target: ${p.target} · Proxy: ${r.proxy_addr || '127.0.0.1:18080'} (${r.proxy_mode || 'split'})`),
+          h('ul', { class: 'diag-list' },
+            h('li', { class: ok ? 'good' : 'bad' },
+              h('strong', null, 'Route Taken: '),
+              routeBadge),
+            p.exit_ip
+              ? h('li', { class: 'good' },
+                  h('strong', null, routeCode === 'iran' ? 'Verified Iran Exit IP: ' : 'Verified Foreign Exit IP: '),
+                  h('code', null, p.exit_ip))
+              : null,
+            typeof p.latency_ms === 'number'
+              ? h('li', null,
+                  h('strong', null, 'Round-Trip Latency: '),
+                  `${p.latency_ms} ms`)
+              : null,
+            p.error
+              ? h('li', { class: 'bad' },
+                  h('strong', null, 'Error: '),
+                  p.error)
+              : null));
+      });
+      $('obt-results').replaceChildren(...cards);
+    } catch (e) {
+      $('obt-error').textContent = e.message;
+    } finally {
+      $('obt-loading').hidden = true;
+      $('obt-rerun').disabled = false;
+      $('obt-test-custom').disabled = false;
+    }
+  }
+
+  function openOutboundTestDialog(t, target) {
+    activeOutboundTestTarget = target;
+    $('obt-title').textContent = `Test Smart Outbound Proxy — ${t.name}`;
+    $('obt-custom-host').value = '';
+    $('obt-results').replaceChildren();
+    $('obt-error').textContent = '';
+    openDialog($('outbound-test-dialog'));
+    runOutboundTest('');
+  }
+
+  if ($('obt-rerun')) {
+    $('obt-rerun').addEventListener('click', () => runOutboundTest($('obt-custom-host').value.trim()));
+  }
+  if ($('obt-test-custom')) {
+    $('obt-test-custom').addEventListener('click', () => runOutboundTest($('obt-custom-host').value.trim()));
+  }
+  if ($('obt-close')) {
+    $('obt-close').addEventListener('click', () => $('outbound-test-dialog').close());
   }
 
   // ------------------------------------------------------------------- start

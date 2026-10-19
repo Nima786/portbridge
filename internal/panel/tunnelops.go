@@ -146,6 +146,14 @@ type createRequest struct {
 	ProxyProtocol string `json:"proxy_protocol"`
 	RelayIP       string `json:"relay_ip"` // optional: the relay's address users connect to
 	AutoHeal      bool   `json:"auto_heal"`
+
+	WebsiteBridge         bool   `json:"website_bridge"`
+	WebsiteDomains        string `json:"website_domains"`
+	OutboundProxy         bool   `json:"outbound_proxy"`
+	OutboundProxyPort     int    `json:"outbound_proxy_port"`
+	OutboundProxyMode     string `json:"outbound_proxy_mode"`
+	OutboundIranDomains   string `json:"outbound_iran_domains"`
+	OutboundBypassDomains string `json:"outbound_bypass_domains"`
 }
 
 func firstIP(list []string) string {
@@ -178,6 +186,24 @@ func (p *Panel) toSpec(r createRequest) (agent.EdgeSpec, error) {
 	}
 	s := agent.EdgeSpec{Name: strings.TrimSpace(r.Name), Mode: r.Mode, Pool: pool, MaxConn: r.MaxConn,
 		ServicePorts: r.ServicePorts, UserPorts: r.UserPorts, LinkPort: r.LinkPort, ProxyProtocol: r.ProxyProtocol}
+	if r.WebsiteBridge {
+		s.WebsiteBridge = "on"
+		s.WebsiteDomains = strings.TrimSpace(r.WebsiteDomains)
+		r.Shared = true
+	}
+	if r.OutboundProxy {
+		s.OutboundProxy = "on"
+		s.OutboundProxyPort = r.OutboundProxyPort
+		if s.OutboundProxyPort <= 0 {
+			s.OutboundProxyPort = 18080
+		}
+		s.OutboundProxyMode = strings.TrimSpace(r.OutboundProxyMode)
+		if s.OutboundProxyMode == "" {
+			s.OutboundProxyMode = "split"
+		}
+		s.OutboundIranDomains = strings.TrimSpace(r.OutboundIranDomains)
+		s.OutboundBypassDomains = strings.TrimSpace(r.OutboundBypassDomains)
+	}
 	if r.Relay == "" || r.Foreign == "" || r.Relay == r.Foreign {
 		return s, errors.New("choose a relay (Iran) server and a different, foreign server")
 	}
@@ -415,6 +441,9 @@ func (p *Panel) checkForeignPorts(ctx context.Context, j *job, foreignID string,
 	if s.Mode == "direct" {
 		ask = append(ask, s.LinkPort)
 	}
+	if s.OutboundProxy == "on" && s.OutboundProxyPort > 0 {
+		ask = append(ask, s.OutboundProxyPort)
+	}
 	st, err := p.portsThere(ctx, foreignID, ask)
 	if err != nil {
 		j.say("Could not ask the foreign server about its ports first (%s); it checks them itself.", plainAgentError(err))
@@ -427,6 +456,12 @@ func (p *Panel) checkForeignPorts(ctx context.Context, j *job, foreignID string,
 				s.LinkPort, byWhom(ps.By)))
 		}
 	}
+	if s.OutboundProxy == "on" && s.OutboundProxyPort > 0 {
+		if ps := st[s.OutboundProxyPort]; ps.State == "busy" || ps.State == "reserved" {
+			problems = append(problems, fmt.Sprintf("the outbound local proxy port, %d, is already used on the foreign server%s",
+				s.OutboundProxyPort, byWhom(ps.By)))
+		}
+	}
 	for _, n := range intsOf(s.ServicePorts) {
 		ps := st[n]
 		switch {
@@ -434,7 +469,11 @@ func (p *Panel) checkForeignPorts(ctx context.Context, j *job, foreignID string,
 			problems = append(problems, fmt.Sprintf("service port %d on the foreign server is used by %s, so it cannot also be your service",
 				n, strings.TrimPrefix(ps.By, "PortBridge ")))
 		case ps.State == "free":
-			j.say("Note: nothing is listening on port %d on the foreign server yet. Make sure your service (Xray) is running there.", n)
+			if s.WebsiteBridge == "on" {
+				j.say("Note: nothing is listening on port %d on the foreign server yet. Make sure your web server (LiteSpeed / CyberPanel / Nginx) is running there.", n)
+			} else {
+				j.say("Note: nothing is listening on port %d on the foreign server yet. Make sure your service (Xray) is running there.", n)
+			}
 		}
 	}
 	if len(problems) > 0 {
@@ -677,21 +716,27 @@ func (p *Panel) tunnelCode(edgeID, name string) (string, error) {
 
 // editTunnelRequest is what the "Edit tunnel" dialog sends.
 type editTunnelRequest struct {
-	Name          string `json:"name"`
-	Edge          string `json:"edge"`
-	Origin        string `json:"origin"`
-	ServicePorts  string `json:"service_ports"`
-	UserPorts     string `json:"user_ports"`
-	LinkPort      int    `json:"link_port"`
-	ProxyProtocol string `json:"proxy_protocol"`
-	Mux           string `json:"mux"`
-	Pool          int    `json:"pool"`
-	MuxLinks      int    `json:"mux_links"`
-	MaxConn       int    `json:"max_conn"`
-	SpareTTL      string `json:"spare_ttl"`
-	Drain         string `json:"drain"`
-	PeerIP        string `json:"peer_ip"`
-	Firewall      string `json:"firewall"`
+	Name                  string `json:"name"`
+	Edge                  string `json:"edge"`
+	Origin                string `json:"origin"`
+	ServicePorts          string `json:"service_ports"`
+	UserPorts             string `json:"user_ports"`
+	LinkPort              int    `json:"link_port"`
+	ProxyProtocol         string `json:"proxy_protocol"`
+	Mux                   string `json:"mux"`
+	Pool                  int    `json:"pool"`
+	MuxLinks              int    `json:"mux_links"`
+	MaxConn               int    `json:"max_conn"`
+	SpareTTL              string `json:"spare_ttl"`
+	Drain                 string `json:"drain"`
+	PeerIP                string `json:"peer_ip"`
+	Firewall              string `json:"firewall"`
+	WebsiteDomains        string `json:"website_domains"`
+	OutboundProxy         string `json:"outbound_proxy"`
+	OutboundProxyPort     int    `json:"outbound_proxy_port"`
+	OutboundProxyMode     string `json:"outbound_proxy_mode"`
+	OutboundIranDomains   string `json:"outbound_iran_domains"`
+	OutboundBypassDomains string `json:"outbound_bypass_domains"`
 }
 
 func (p *Panel) startEditTunnel(r editTunnelRequest) (string, error) {
@@ -710,19 +755,25 @@ func (p *Panel) editTunnel(j *job, r editTunnelRequest) error {
 	defer cancel()
 
 	spec := agent.EditSpec{
-		Name:          strings.TrimSpace(r.Name),
-		UserPorts:     strings.TrimSpace(r.UserPorts),
-		ServicePorts:  strings.TrimSpace(r.ServicePorts),
-		LinkPort:      r.LinkPort,
-		ProxyProtocol: strings.TrimSpace(r.ProxyProtocol),
-		Mux:           strings.TrimSpace(r.Mux),
-		Pool:          r.Pool,
-		MuxLinks:      r.MuxLinks,
-		MaxConn:       r.MaxConn,
-		SpareTTL:      strings.TrimSpace(r.SpareTTL),
-		Drain:         strings.TrimSpace(r.Drain),
-		PeerIP:        strings.TrimSpace(r.PeerIP),
-		Firewall:      strings.TrimSpace(r.Firewall),
+		Name:                  strings.TrimSpace(r.Name),
+		UserPorts:             strings.TrimSpace(r.UserPorts),
+		ServicePorts:          strings.TrimSpace(r.ServicePorts),
+		LinkPort:              r.LinkPort,
+		ProxyProtocol:         strings.TrimSpace(r.ProxyProtocol),
+		Mux:                   strings.TrimSpace(r.Mux),
+		Pool:                  r.Pool,
+		MuxLinks:              r.MuxLinks,
+		MaxConn:               r.MaxConn,
+		SpareTTL:              strings.TrimSpace(r.SpareTTL),
+		Drain:                 strings.TrimSpace(r.Drain),
+		PeerIP:                strings.TrimSpace(r.PeerIP),
+		Firewall:              strings.TrimSpace(r.Firewall),
+		WebsiteDomains:        strings.TrimSpace(r.WebsiteDomains),
+		OutboundProxy:         strings.TrimSpace(r.OutboundProxy),
+		OutboundProxyPort:     r.OutboundProxyPort,
+		OutboundProxyMode:     strings.TrimSpace(r.OutboundProxyMode),
+		OutboundIranDomains:   strings.TrimSpace(r.OutboundIranDomains),
+		OutboundBypassDomains: strings.TrimSpace(r.OutboundBypassDomains),
 	}
 
 	if r.Edge == "" && r.Origin != "" {
@@ -1769,6 +1820,29 @@ func (p *Panel) testSpoofSupport(parent context.Context, relayID, foreignID, spo
 		rep.Mode = "filtered"
 		rep.Summary = fmt.Sprintf("Neither datacenter allows forged source IPs (%s was dropped by the datacenter routers). Switch to \"Decoy Whitelisted SNI Spoof\" above — it works on all VPS providers without IP spoofing.",
 			spoofIP)
+	}
+	return rep, nil
+}
+
+func (p *Panel) testOutboundTunnel(parent context.Context, t tunnelTarget, customHost string) (agent.OutboundTestResult, error) {
+	if t.Origin == "" {
+		return agent.OutboundTestResult{}, errors.New("the Foreign hosting server is not in the panel for this Website Bridge")
+	}
+	ctx, cancel := context.WithTimeout(parent, 45*time.Second)
+	defer cancel()
+	var rep agent.OutboundTestResult
+	_, err := p.callJSON(ctx, t.Origin, "/api/tunnel/test-outbound", map[string]string{
+		"name":        t.Name,
+		"custom_host": strings.TrimSpace(customHost),
+	}, &rep)
+	if err != nil {
+		if errors.Is(err, errTooOld) {
+			return agent.OutboundTestResult{}, fmt.Errorf("%s is running an older PortBridge release; update it first to test Website Outbound Proxy routing", p.serverName(t.Origin))
+		}
+		return agent.OutboundTestResult{}, err
+	}
+	if !rep.OK && rep.Error != "" {
+		return agent.OutboundTestResult{}, errors.New(rep.Error)
 	}
 	return rep, nil
 }
