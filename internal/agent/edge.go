@@ -55,6 +55,7 @@ type EdgeSpec struct {
 	Mux           string `json:"mux,omitempty"`
 	MuxLinks      int    `json:"mux_links,omitempty"`
 	Pool          int    `json:"pool,omitempty"`
+	MaxConn       int    `json:"max_conn,omitempty"`
 
 	PeerIP       string `json:"peer_ip"`        // the foreign server, as the link reaches it
 	LocalIP      string `json:"local_ip"`       // this server, as the link reaches it
@@ -237,6 +238,12 @@ func (s *EdgeSpec) check() error {
 	}
 	if s.MuxLinks < 1 || s.MuxLinks > 16 {
 		return errors.New("the number of shared connections must be from 1 to 16")
+	}
+	if s.Pool < 1 || s.Pool > 10000 {
+		return errors.New("connection pool size must be from 1 to 10000")
+	}
+	if s.MaxConn != 0 && (s.MaxConn < 1 || s.MaxConn > 100000) {
+		return errors.New("max_conn must be from 1 to 100000")
 	}
 	switch s.ProxyProtocol {
 	case "", "off", "v1", "v2":
@@ -477,8 +484,12 @@ func buildEdgeConf(s *EdgeSpec, l edgeLayout, confDir string, now time.Time) str
 	if s.Mux == "on" {
 		w("mux_links = %d\n", s.MuxLinks)
 	}
+	maxConn := s.MaxConn
+	if maxConn <= 0 {
+		maxConn = 2000
+	}
 	w("\npool_size = %d\n", s.Pool)
-	w("max_conn = 2000\n")
+	w("max_conn = %d\n", maxConn)
 	w("max_pending = 512\n")
 	w("spare_ttl = 10m\n")
 	w("park_timeout = 15m\n")
@@ -566,6 +577,10 @@ func EncodePairingCode(p *PairingData) string {
 		extra.WriteString("anti_freeze=on\n")
 		v = max(v, 10)
 	}
+	if mc := strings.TrimSpace(p.MaxConn); mc != "" && mc != "2000" {
+		fmt.Fprintf(&extra, "max_conn=%s\n", mc)
+		v = max(v, 10)
+	}
 	mux, links := p.Mux, p.MuxLinks
 	if mux == "" {
 		mux = "off"
@@ -635,8 +650,8 @@ func edgePairingCode(confDir, name string) (string, error) {
 		HTTPHeader: kv["http_header"], HTTPHost: kv["http_host"], GRE: kv["gre"], SIT: kv["sit"],
 		RealSite: kv["real_site"], CoverSite: kv["cover_site"], ProxyProtocol: kv["proxy_protocol"],
 		SNISpoof: kv["sni_spoof"], SpoofSNI: kv["spoof_sni"], IPSpoof: kv["ip_spoof"], SpoofIP: kv["spoof_ip"],
-		AntiFreeze: kv["anti_freeze"],
-		Secret:     strings.TrimSpace(string(secret)),
+		AntiFreeze: kv["anti_freeze"], MaxConn: kv["max_conn"],
+		Secret: strings.TrimSpace(string(secret)),
 	}), nil
 }
 
@@ -1028,6 +1043,8 @@ func EditEdge(spec EditSpec, confDir string) (EdgeResult, error) {
 	case "rollback":
 		if spec.OldConf != "" {
 			_ = writeFileAtomic(confFile, []byte(spec.OldConf), 0o600)
+			_ = host.FirewallApply(spec.Name)
+			_ = host.Restart(spec.Name)
 		}
 		res.OK = true
 		return res, nil
@@ -1368,13 +1385,33 @@ func EditEdge(spec EditSpec, confDir string) (EdgeResult, error) {
 			return res, fmt.Errorf("real user IP (proxy_protocol) must be off, v1 or v2, got %q", spec.ProxyProtocol)
 		}
 	}
-	if spec.MuxLinks > 0 && (curCfg.Mux || spec.Mux == "on") {
-		if spec.MuxLinks < 1 || spec.MuxLinks > 16 {
+	muxNow := curCfg.Mux
+	if spec.Mux != "" {
+		switch spec.Mux {
+		case "on":
+			muxNow = true
+			text = setConfKey(text, "mux", "on")
+		case "off":
+			muxNow = false
+			text = setConfKey(text, "mux", "off")
+		default:
+			return res, fmt.Errorf("mux must be on or off, got %q", spec.Mux)
+		}
+	}
+	if muxNow {
+		links := spec.MuxLinks
+		if links == 0 {
+			links = curCfg.MuxLinks
+		}
+		if links == 0 {
+			links = 4
+		}
+		if links < 1 || links > 16 {
 			return res, errors.New("the number of shared connections must be from 1 to 16")
 		}
-		text = setConfKey(text, "mux_links", strconv.Itoa(spec.MuxLinks))
+		text = setConfKey(text, "mux_links", strconv.Itoa(links))
 	}
-	if spec.Pool > 0 && (!curCfg.Mux || spec.Mux == "off") {
+	if spec.Pool > 0 {
 		if spec.Pool < 1 || spec.Pool > 10000 {
 			return res, errors.New("connection pool size must be from 1 to 10000")
 		}
@@ -1386,7 +1423,7 @@ func EditEdge(spec EditSpec, confDir string) (EdgeResult, error) {
 		}
 		text = setConfKey(text, "max_conn", strconv.Itoa(spec.MaxConn))
 	}
-	if ttl := strings.TrimSpace(spec.SpareTTL); ttl != "" && (!curCfg.Mux || spec.Mux == "off") {
+	if ttl := strings.TrimSpace(spec.SpareTTL); ttl != "" && !muxNow {
 		if d, err := time.ParseDuration(ttl); err != nil || d < 5*time.Second || d > 24*time.Hour {
 			return res, errors.New("spare connection lifetime (spare_ttl) must be a duration between 5s and 24h, such as 60s or 2m")
 		}

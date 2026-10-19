@@ -887,24 +887,74 @@
         </label>
       </fieldset>
 
-      <!-- STEP 4: Connection Sharing -->
+      <!-- STEP 4: Connection Sharing & User Capacity -->
       <fieldset class="step-section">
         <legend class="step-header">
           <span class="step-num">4</span>
           <span>
-            <span class="step-title">Connection Pooling &amp; Multiplexing</span>
-            <span class="step-sub">Choose how user sessions are carried across the tunnel link.</span>
+            <span class="step-title">Connection Pooling, Multiplexing &amp; User Capacity</span>
+            <span class="step-sub">Pick your expected concurrent user count to auto-tune connection mode &amp; limits, or customize below (1 active user ≈ 15–30 TCP streams).</span>
           </span>
         </legend>
+
+        <div class="capacity-label-row">
+          <span class="capacity-subhead">Expected Concurrent Users (Auto-Tune Preset)</span>
+        </div>
+        <div class="choice-grid cols-4 load-preset-grid">
+          <label class="choice-card compact">
+            <input type="radio" name="tn-load" value="light" checked>
+            <div class="choice-body">
+              <div class="choice-top">
+                <strong>1 – 30 Users</strong>
+                <span class="pill-tag">Light</span>
+              </div>
+              <span class="choice-desc">Personal or small group (~500 streams).</span>
+            </div>
+          </label>
+          <label class="choice-card compact">
+            <input type="radio" name="tn-load" value="medium">
+            <div class="choice-body">
+              <div class="choice-top">
+                <strong>30 – 150 Users</strong>
+                <span class="pill-tag tag-accent">Medium</span>
+              </div>
+              <span class="choice-desc">Shared VPS (~2,500 streams). Auto-enables Mux.</span>
+            </div>
+          </label>
+          <label class="choice-card compact">
+            <input type="radio" name="tn-load" value="heavy">
+            <div class="choice-body">
+              <div class="choice-top">
+                <strong>150 – 500+ Users</strong>
+                <span class="pill-tag tag-good">High Load</span>
+              </div>
+              <span class="choice-desc">Busy server (~6,000+ streams). Multi-pipe Mux.</span>
+            </div>
+          </label>
+          <label class="choice-card compact">
+            <input type="radio" name="tn-load" value="custom">
+            <div class="choice-body">
+              <div class="choice-top">
+                <strong>Custom</strong>
+                <span class="pill-tag">Manual</span>
+              </div>
+              <span class="choice-desc">Set mode and exact numbers manually.</span>
+            </div>
+          </label>
+        </div>
+
+        <div class="capacity-label-row">
+          <span class="capacity-subhead">Connection Mode</span>
+        </div>
         <div class="choice-grid cols-2">
           <label class="choice-card">
             <input type="radio" name="tn-shared" value="one" checked>
             <div class="choice-body">
               <div class="choice-top">
                 <strong>Dedicated Connection Pool</strong>
-                <span class="pill-tag">Low Latency</span>
+                <span class="pill-tag">1 – 40 Users</span>
               </div>
-              <span class="choice-desc">Keeps pre-warmed spare connections ready and assigns one per user session.</span>
+              <span class="choice-desc">Keeps pre-warmed spare connections ready and assigns 1 bridge socket per user TCP stream. Lowest single-user latency on clean links.</span>
             </div>
           </label>
           <label class="choice-card">
@@ -912,15 +962,32 @@
             <div class="choice-body">
               <div class="choice-top">
                 <strong>Multiplexed Shared Links (Mux)</strong>
-                <span class="pill-tag tag-accent">High Capacity</span>
+                <span class="pill-tag tag-accent">40 – 500+ Users &amp; Stealth</span>
               </div>
-              <span class="choice-desc">Combines all user traffic over a fixed number of persistent connections; fewer handshakes to detect.</span>
+              <span class="choice-desc">Packs thousands of user streams inside a few persistent carrier pipes (0-RTT open). Prevents ISP connection-rate throttling and TLS handshake spikes.</span>
             </div>
           </label>
         </div>
-        <div id="tn-opt-links" class="sub-panel" hidden>
-          <label for="tn-links-n">Number of Shared Mux Connections <span class="muted">(1 to 16)</span></label>
-          <input id="tn-links-n" type="number" min="1" max="16" value="4" inputmode="numeric">
+
+        <div class="sub-panel capacity-numbers-box">
+          <div class="row2">
+            <div id="tn-pool-wrap">
+              <label for="tn-pool">Connection Pool Size <span class="muted">(Idle Pre-warmed Spares)</span></label>
+              <span class="field-hint">Spare idle connections kept ready for instant bursts (1 to 10,000 — not the total user limit)</span>
+              <input id="tn-pool" type="number" min="1" max="10000" value="30" inputmode="numeric">
+            </div>
+            <div id="tn-opt-links" hidden>
+              <label for="tn-links-n">Number of Shared Mux Connections <span class="muted">(1 to 16)</span></label>
+              <span class="field-hint">Parallel persistent pipes carrying multiplexed user streams (4–8 for medium, 12–16 for heavy, 2–4 for Raw/ICMP)</span>
+              <input id="tn-links-n" type="number" min="1" max="16" value="4" inputmode="numeric">
+            </div>
+            <div>
+              <label for="tn-max-conn">Max Concurrent User Sessions</label>
+              <span class="field-hint">Total active TCP streams allowed (2,000 ≈ 80 users · 4,000 ≈ 150 users · 8,000 ≈ 400+ users)</span>
+              <input id="tn-max-conn" type="number" min="1" max="100000" value="2000" inputmode="numeric">
+            </div>
+          </div>
+          <p id="tn-capacity-hint" class="muted small hint-box capacity-rec-note"></p>
         </div>
       </fieldset>
 
@@ -1146,23 +1213,102 @@
         <legend class="step-header">
           <span class="step-num">2</span>
           <span>
-            <span class="step-title">Connection Pool, Multiplexing &amp; Capacity</span>
-            <span class="step-sub">Tune spare connection pool size, shared Mux links, and session limits.</span>
+            <span class="step-title">Connection Pool, Multiplexing &amp; User Capacity</span>
+            <span class="step-sub">Switch between Dedicated Pool and Shared Mux, pick a user load preset, or fine-tune connection limits (1 active user ≈ 15–30 TCP streams).</span>
           </span>
         </legend>
-        <div class="row2">
-          <div id="et-pool-wrap">
-            <label for="et-pool">Connection Pool Size <span class="muted">(Pre-warmed Spares)</span></label>
-            <input id="et-pool" type="number" min="1" max="10000" value="25" inputmode="numeric">
+
+        <div class="capacity-label-row">
+          <span class="capacity-subhead">Expected Concurrent Users (Quick Preset)</span>
+        </div>
+        <div class="choice-grid cols-4 load-preset-grid">
+          <label class="choice-card compact">
+            <input type="radio" name="et-load" value="light">
+            <div class="choice-body">
+              <div class="choice-top">
+                <strong>1 – 30 Users</strong>
+                <span class="pill-tag">Light</span>
+              </div>
+              <span class="choice-desc">Personal or small group (~500 streams).</span>
+            </div>
+          </label>
+          <label class="choice-card compact">
+            <input type="radio" name="et-load" value="medium">
+            <div class="choice-body">
+              <div class="choice-top">
+                <strong>30 – 150 Users</strong>
+                <span class="pill-tag tag-accent">Medium</span>
+              </div>
+              <span class="choice-desc">Shared VPS (~2,500 streams). Uses Shared Mux.</span>
+            </div>
+          </label>
+          <label class="choice-card compact">
+            <input type="radio" name="et-load" value="heavy">
+            <div class="choice-body">
+              <div class="choice-top">
+                <strong>150 – 500+ Users</strong>
+                <span class="pill-tag tag-good">High Load</span>
+              </div>
+              <span class="choice-desc">Busy server (~6,000+ streams). Multi-pipe Mux.</span>
+            </div>
+          </label>
+          <label class="choice-card compact">
+            <input type="radio" name="et-load" value="custom" checked>
+            <div class="choice-body">
+              <div class="choice-top">
+                <strong>Custom</strong>
+                <span class="pill-tag">Manual</span>
+              </div>
+              <span class="choice-desc">Set mode and exact numbers manually.</span>
+            </div>
+          </label>
+        </div>
+
+        <div class="capacity-label-row">
+          <span class="capacity-subhead">Connection Mode</span>
+        </div>
+        <div class="choice-grid cols-2">
+          <label class="choice-card">
+            <input type="radio" name="et-shared" value="one" checked>
+            <div class="choice-body">
+              <div class="choice-top">
+                <strong>Dedicated Connection Pool</strong>
+                <span class="pill-tag">1 – 40 Users</span>
+              </div>
+              <span class="choice-desc">1 bridge socket per user TCP stream with pre-warmed spares. Best for low user counts on clean links.</span>
+            </div>
+          </label>
+          <label class="choice-card">
+            <input type="radio" name="et-shared" value="shared">
+            <div class="choice-body">
+              <div class="choice-top">
+                <strong>Multiplexed Shared Links (Mux)</strong>
+                <span class="pill-tag tag-accent">40 – 500+ Users &amp; Stealth</span>
+              </div>
+              <span class="choice-desc">Packs all user traffic over a fixed number of persistent connections; avoids ISP connection-rate throttling.</span>
+            </div>
+          </label>
+        </div>
+
+        <div class="sub-panel capacity-numbers-box">
+          <div class="row2">
+            <div id="et-pool-wrap">
+              <label for="et-pool">Connection Pool Size <span class="muted">(Idle Pre-warmed Spares)</span></label>
+              <span class="field-hint">Spare idle connections kept ready for instant bursts (1 to 10,000 — not the total user limit)</span>
+              <input id="et-pool" type="number" min="1" max="10000" value="25" inputmode="numeric">
+            </div>
+            <div id="et-mux-wrap" hidden>
+              <label for="et-mux-links">Shared Mux Connections <span class="muted">(1 to 16)</span></label>
+              <span class="field-hint">Parallel persistent pipes carrying multiplexed user streams (4–8 for medium, 12–16 for heavy, 2–4 for Raw/ICMP)</span>
+              <input id="et-mux-links" type="number" min="1" max="16" value="4" inputmode="numeric">
+            </div>
+            <div>
+              <label for="et-max-conn">Max Concurrent User Sessions</label>
+              <span class="field-hint">Total active TCP streams allowed (2,000 ≈ 80 users · 4,000 ≈ 150 users · 8,000 ≈ 400+ users)</span>
+              <input id="et-max-conn" type="number" min="1" max="100000" value="2000" inputmode="numeric">
+            </div>
           </div>
-          <div id="et-mux-wrap" hidden>
-            <label for="et-mux-links">Shared Mux Connections <span class="muted">(1 to 16)</span></label>
-            <input id="et-mux-links" type="number" min="1" max="16" value="4" inputmode="numeric">
-          </div>
-          <div>
-            <label for="et-max-conn">Max Concurrent User Sessions</label>
-            <input id="et-max-conn" type="number" min="1" max="100000" value="2000" inputmode="numeric">
-          </div>
+          <p id="et-capacity-hint" class="muted small hint-box capacity-rec-note"></p>
         </div>
       </fieldset>
 

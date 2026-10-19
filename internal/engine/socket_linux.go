@@ -27,8 +27,22 @@ const hasKernelCopy = true
 // writes two of these values only to have them overwritten a moment later. Every
 // connection on both servers passes through here, so the difference shows up in
 // the processor time per user.
+func underlyingTCPConn(c net.Conn) (*net.TCPConn, bool) {
+	for c != nil {
+		if tc, ok := c.(*net.TCPConn); ok {
+			return tc, true
+		}
+		w, ok := c.(interface{ NetConn() net.Conn })
+		if !ok {
+			return nil, false
+		}
+		c = w.NetConn()
+	}
+	return nil, false
+}
+
 func tuneSocket(c net.Conn) {
-	tc, ok := c.(*net.TCPConn)
+	tc, ok := underlyingTCPConn(c)
 	if !ok {
 		return
 	}
@@ -61,7 +75,7 @@ func socketAlive(c net.Conn) bool {
 			return false
 		}
 	}
-	tc, ok := c.(*net.TCPConn)
+	tc, ok := underlyingTCPConn(c)
 	if !ok {
 		return true
 	}
@@ -83,9 +97,9 @@ func socketAlive(c net.Conn) bool {
 			// Something arrived on a connection that is only waiting. The far
 			// side has nothing to say to a parked connection unprompted, so a
 			// byte here is a refusal (wrong password, clocks apart, the two
-			// ends disagreeing about shared connections) that was sent just
-			// before it hung up. Treating that as alive left refused
-			// connections filling the pool as if they were ready.
+			// ends disagreeing about shared connections) or TLS close_notify
+			// that was sent just before it hung up. Treating that as alive left
+			// refused or closed connections filling the pool as if they were ready.
 			alive = false
 		}
 		return true // always done: never block waiting for readability
@@ -96,14 +110,13 @@ func socketAlive(c net.Conn) bool {
 // pendingByte reads the one byte waiting on a connection that socketAlive found
 // dead, if there is one, so the reason the far side gave can be reported.
 func pendingByte(c net.Conn) (byte, bool) {
-	tc, ok := c.(*net.TCPConn)
-	if !ok {
+	if _, ok := underlyingTCPConn(c); !ok {
 		return 0, false
 	}
-	_ = tc.SetReadDeadline(time.Now().Add(50 * time.Millisecond))
-	defer func() { _ = tc.SetReadDeadline(time.Time{}) }()
+	_ = c.SetReadDeadline(time.Now().Add(50 * time.Millisecond))
+	defer func() { _ = c.SetReadDeadline(time.Time{}) }()
 	var b [1]byte
-	n, err := tc.Read(b[:])
+	n, err := c.Read(b[:])
 	if n == 1 && (err == nil) {
 		return b[0], true
 	}

@@ -136,6 +136,8 @@ type createRequest struct {
 
 	Shared      bool `json:"shared"`
 	SharedLinks int  `json:"shared_links"`
+	Pool        int  `json:"pool"`
+	MaxConn     int  `json:"max_conn"`
 
 	ServicePorts string `json:"service_ports"`
 	UserPorts    string `json:"user_ports"`
@@ -170,7 +172,11 @@ func addressesOf(v serverView) (v4, v6 string) {
 
 // toSpec turns the form into the menu's answers, checking it makes sense.
 func (p *Panel) toSpec(r createRequest) (agent.EdgeSpec, error) {
-	s := agent.EdgeSpec{Name: strings.TrimSpace(r.Name), Mode: r.Mode, Pool: 25,
+	pool := r.Pool
+	if pool <= 0 {
+		pool = 25
+	}
+	s := agent.EdgeSpec{Name: strings.TrimSpace(r.Name), Mode: r.Mode, Pool: pool, MaxConn: r.MaxConn,
 		ServicePorts: r.ServicePorts, UserPorts: r.UserPorts, LinkPort: r.LinkPort, ProxyProtocol: r.ProxyProtocol}
 	if r.Relay == "" || r.Foreign == "" || r.Relay == r.Foreign {
 		return s, errors.New("choose a relay (Iran) server and a different, foreign server")
@@ -678,6 +684,7 @@ type editTunnelRequest struct {
 	UserPorts     string `json:"user_ports"`
 	LinkPort      int    `json:"link_port"`
 	ProxyProtocol string `json:"proxy_protocol"`
+	Mux           string `json:"mux"`
 	Pool          int    `json:"pool"`
 	MuxLinks      int    `json:"mux_links"`
 	MaxConn       int    `json:"max_conn"`
@@ -708,6 +715,7 @@ func (p *Panel) editTunnel(j *job, r editTunnelRequest) error {
 		ServicePorts:  strings.TrimSpace(r.ServicePorts),
 		LinkPort:      r.LinkPort,
 		ProxyProtocol: strings.TrimSpace(r.ProxyProtocol),
+		Mux:           strings.TrimSpace(r.Mux),
 		Pool:          r.Pool,
 		MuxLinks:      r.MuxLinks,
 		MaxConn:       r.MaxConn,
@@ -788,6 +796,26 @@ func (p *Panel) editTunnel(j *job, r editTunnelRequest) error {
 		j.say("Note from %s: %s", relay, w)
 	}
 
+	j.say("Applying firewall rules and restarting %s...", relay)
+	var commit agent.EdgeResult
+	cstatus, cerr := p.callJSON(ctx, r.Edge, "/api/tunnel/edit-edge", agent.EditSpec{
+		Name:    spec.Name,
+		Stage:   "commit",
+		OldConf: prep.OldConf,
+	}, &commit)
+	if cerr != nil {
+		return fmt.Errorf("%s could not finish restarting: %s", relay, plainAgentError(cerr))
+	}
+	if !commit.OK {
+		if commit.Error == "" {
+			commit.Error = fmt.Sprintf("HTTP %d", cstatus)
+		}
+		return fmt.Errorf("%s could not restart on the new settings: %s", relay, commit.Error)
+	}
+	for _, w := range commit.Warnings {
+		j.say("Note from %s: %s", relay, w)
+	}
+
 	j.say("Applying updated configuration to %s...", foreign)
 	var upd struct {
 		OK       bool     `json:"ok"`
@@ -817,38 +845,6 @@ func (p *Panel) editTunnel(j *job, r editTunnelRequest) error {
 		j.say("Note from %s: %s", foreign, w)
 	}
 	j.say("%s updated and restarted.", foreign)
-
-	j.say(" Applying firewall rules and restarting %s...", relay)
-	var commit agent.EdgeResult
-	cstatus, cerr := p.callJSON(ctx, r.Edge, "/api/tunnel/edit-edge", agent.EditSpec{
-		Name:    spec.Name,
-		Stage:   "commit",
-		OldConf: prep.OldConf,
-	}, &commit)
-	if cerr != nil {
-		return fmt.Errorf("%s could not finish restarting: %s", relay, plainAgentError(cerr))
-	}
-	if !commit.OK {
-		if commit.Error == "" {
-			commit.Error = fmt.Sprintf("HTTP %d", cstatus)
-		}
-		return fmt.Errorf("%s could not restart on the new settings: %s", relay, commit.Error)
-	}
-	for _, w := range commit.Warnings {
-		j.say("Note from %s: %s", relay, w)
-	}
-
-	// Because Origin was restarted before Edge committed its restart, any
-	// reverse-mode connections Origin dialed during the commit window landed on
-	// the old Edge process that just exited. Restart Origin once more now that
-	// the new Edge listener is up so the tunnel works immediately.
-	var reSync struct {
-		OK bool `json:"ok"`
-	}
-	_, _ = p.callJSON(ctx, r.Origin, "/api/tunnel/service", map[string]string{
-		"name":   spec.Name,
-		"action": "restart",
-	}, &reSync)
 
 	j.say("Tunnel %q is updated and running on both servers.", spec.Name)
 	p.refreshOne(r.Edge)

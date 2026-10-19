@@ -235,6 +235,10 @@ func newFragmentConn(c net.Conn, size int, delay time.Duration) net.Conn {
 	}
 }
 
+func (fc *fragmentConn) NetConn() net.Conn {
+	return fc.Conn
+}
+
 func (fc *fragmentConn) Write(b []byte) (int, error) {
 	var writeErr error
 	var totalWritten int

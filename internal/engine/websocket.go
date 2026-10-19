@@ -217,6 +217,10 @@ type wsConn struct {
 	wmu sync.Mutex // frames must not interleave
 }
 
+func (w *wsConn) NetConn() net.Conn {
+	return w.Conn
+}
+
 func (w *wsConn) isEarlyAuthed() bool {
 	return w.earlyAuthed
 }

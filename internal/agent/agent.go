@@ -81,6 +81,7 @@ type PairingData struct {
 	SpoofIP    string
 	SIT        string
 	AntiFreeze string
+	MaxConn    string
 }
 
 // pairingVersionMax is the newest code this build understands. The menu keeps
@@ -145,6 +146,7 @@ func decodePairingCode(code string) (*PairingData, error) {
 		SpoofIP:       kv["spoof_ip"],
 		SIT:           kv["sit"],
 		AntiFreeze:    kv["anti_freeze"],
+		MaxConn:       kv["max_conn"],
 	}
 
 	if v, err := strconv.Atoi(p.Version); err == nil && v > pairingVersionMax {

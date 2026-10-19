@@ -455,8 +455,8 @@ func (e *edge) serve(ctx context.Context, user net.Conn, targetPort uint16) erro
 			atomic.AddInt64(&e.st.retries, 1)
 			e.health.activationFailed(err)
 			// One dead spare is seldom alone. Check the rest now, in parallel,
-			// rather than finding them one at a time at four seconds each.
-			if e.pool != nil && isTimeout(err) && attempt < tries {
+			// rather than finding them one at a time.
+			if e.pool != nil && attempt < tries {
 				e.pool.verifyAll(ctx)
 			}
 			continue

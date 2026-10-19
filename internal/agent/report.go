@@ -161,10 +161,9 @@ func tunnelInfo(path string, host agentHost) TunnelInfo {
 	if cfg.ProxyProtocol != 0 {
 		ti.ProxyProtocol = "v" + strconv.Itoa(cfg.ProxyProtocol)
 	}
+	ti.PoolSize = cfg.PoolSize
 	if cfg.Mux {
 		ti.MuxLinks = cfg.MuxLinks
-	} else {
-		ti.PoolSize = cfg.PoolSize
 	}
 	if _, port, err := net.SplitHostPort(cfg.TunnelAddr); err == nil {
 		ti.LinkPort, _ = strconv.Atoi(port)

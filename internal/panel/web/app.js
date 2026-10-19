@@ -1227,6 +1227,101 @@
 
   let editingTunnel = null;
 
+  function editTunnelLinkKey(any) {
+    if (!any) return 'website';
+    if (any.gre) return 'gre';
+    if (any.sit) return 'sit';
+    if (any.ip_spoof) return 'ip-spoof';
+    if (any.anti_freeze) return 'split';
+    if (any.sni_spoof && !any.cdn) return 'sni-spoof';
+    if (any.cdn && any.transport === 'grpc') return 'grpc-cdn';
+    if (any.cdn && any.alt_target) return 'website-cdn-backup';
+    if (any.cdn) return 'cdn';
+    if (['grpc', 'kcp', 'icmp', 'faketcp', 'plain'].includes(any.transport)) return any.transport;
+    return 'website';
+  }
+
+  function recommendCapacityFor(linkKey, loadPreset) {
+    const preset = ['light', 'medium', 'heavy'].includes(loadPreset) ? loadPreset : 'light';
+    const isRawKCP = ['icmp', 'faketcp', 'ip-spoof'].includes(linkKey);
+    const isCDN = ['cdn', 'website-cdn-backup', 'grpc-cdn'].includes(linkKey);
+    const isMuxFirst = ['split', 'grpc', 'kcp'].includes(linkKey);
+
+    if (isRawKCP) {
+      if (preset === 'heavy') return { shared: true, muxLinks: 4, pool: 100, maxConn: 8000 };
+      if (preset === 'medium') return { shared: true, muxLinks: 2, pool: 50, maxConn: 4000 };
+      return { shared: true, muxLinks: 2, pool: 25, maxConn: 2000 };
+    }
+    if (isCDN) {
+      if (preset === 'heavy') return { shared: true, muxLinks: 8, pool: 100, maxConn: 8000 };
+      if (preset === 'medium') return { shared: true, muxLinks: 6, pool: 50, maxConn: 4000 };
+      return { shared: true, muxLinks: 4, pool: 25, maxConn: 2000 };
+    }
+    if (isMuxFirst) {
+      if (preset === 'heavy') return { shared: true, muxLinks: 16, pool: 120, maxConn: 8000 };
+      if (preset === 'medium') return { shared: true, muxLinks: 8, pool: 60, maxConn: 4000 };
+      return { shared: true, muxLinks: 4, pool: 30, maxConn: 2000 };
+    }
+    // Standard direct links: website, sni-spoof, plain, gre, sit
+    if (preset === 'heavy') return { shared: true, muxLinks: 16, pool: 120, maxConn: 8000 };
+    if (preset === 'medium') return { shared: true, muxLinks: 8, pool: 60, maxConn: 4000 };
+    return { shared: false, muxLinks: 4, pool: 30, maxConn: 2000 };
+  }
+
+  function detectCapacityPreset(linkKey, isShared, poolSize, muxLinks, maxConn) {
+    for (const p of ['light', 'medium', 'heavy']) {
+      const rec = recommendCapacityFor(linkKey, p);
+      if (rec.shared === isShared && rec.maxConn === maxConn) {
+        if (isShared && rec.muxLinks === muxLinks) return p;
+        if (!isShared && (rec.pool === poolSize || (p === 'light' && poolSize === 25))) return p;
+      }
+    }
+    return 'custom';
+  }
+
+  function describeCapacityAdvice(linkKey, isShared, poolSize, muxLinks, maxConn) {
+    const isRawKCP = ['icmp', 'faketcp', 'ip-spoof'].includes(linkKey);
+    const isCDN = ['cdn', 'website-cdn-backup', 'grpc-cdn'].includes(linkKey);
+    const sessions = (maxConn || 2000).toLocaleString();
+    if (isRawKCP) {
+      if (!isShared) {
+        return `⚠ Note: Raw packet modes (ICMP, FakeTCP, IP-Spoof) work best with Multiplexed Shared Links (Mux) using 2–4 links to avoid raw-socket contention.`;
+      }
+      return `✓ Recommended for raw packet transport: ${muxLinks || 2} Multiplexed Shared Link(s) carry up to ${sessions} concurrent user sessions smoothly without raw-socket overhead.`;
+    }
+    if (isCDN) {
+      if (!isShared) {
+        return `⚠ Note: Opening ${poolSize || 25} separate pool connections through a CDN can trigger Cloudflare rate limits. Multiplexed Shared Links (4–8 links) is recommended for CDN tunnels.`;
+      }
+      return `✓ Recommended for CDN transport: ${muxLinks || 4} Multiplexed Shared links avoid Cloudflare connection-rate limits while serving up to ${sessions} concurrent sessions.`;
+    }
+    if (isShared) {
+      return `✓ Multiplexed Shared Links (${muxLinks || 4} parallel trunks, up to ${sessions} sessions): All users share ${muxLinks || 4} persistent encrypted connections — best for 30–500+ concurrent users because it prevents connection spikes and avoids head-of-line blocking.`;
+    }
+    return `✓ Dedicated Connection Pool (${poolSize || 30} pre-warmed spare links, up to ${sessions} sessions): Each user session gets its own dedicated bridge connection — lowest latency for 1–30 users on clean links. For 30+ concurrent users, switch to Multiplexed Shared Links (Mux).`;
+  }
+
+  function currentEditLinkKey() {
+    if (!editingTunnel) return 'website';
+    const e = editingTunnel.edge, o = editingTunnel.origin;
+    const any = (e && e.info) || (o && o.info) || {};
+    return editTunnelLinkKey(any);
+  }
+
+  function syncEditTunnelCapacityUI() {
+    const isMux = radio('et-shared') === 'shared';
+    if ($('et-pool-wrap')) $('et-pool-wrap').hidden = isMux;
+    if ($('et-mux-wrap')) $('et-mux-wrap').hidden = !isMux;
+    if ($('et-spare-ttl-wrap')) $('et-spare-ttl-wrap').hidden = isMux;
+    if ($('et-capacity-hint')) {
+      const poolSize = Number(($('et-pool') && $('et-pool').value) || 30);
+      const muxLinks = Number(($('et-mux-links') && $('et-mux-links').value) || 4);
+      const maxConn = Number(($('et-max-conn') && $('et-max-conn').value) || 2000);
+      $('et-capacity-hint').textContent = describeCapacityAdvice(currentEditLinkKey(), isMux, poolSize, muxLinks, maxConn);
+    }
+    syncChoiceCards($('edit-tunnel-dialog'));
+  }
+
   function openEditTunnel(t) {
     editingTunnel = t;
     const e = t.edge, o = t.origin;
@@ -1236,6 +1331,9 @@
     const userPorts = (ei && ei.user_ports && ei.user_ports.length) ? ei.user_ports : servicePorts;
     const linkPort = (ei && ei.link_port) || (oi && oi.link_port) || 443;
     const isMux = !!any.mux;
+    const poolVal = (ei && ei.pool_size) || (oi && oi.pool_size) || 30;
+    const muxVal = (ei && ei.mux_links) || (oi && oi.mux_links) || 4;
+    const maxConnVal = (ei && ei.max_conn) || (oi && oi.max_conn) || 2000;
 
     $('et-title').textContent = `Edit Tunnel: ${t.name}`;
     const where = [e && e.server_name, o && o.server_name].filter(Boolean).join(' ↔ ');
@@ -1247,11 +1345,12 @@
     $('et-users').value = (userPorts || []).join(',') === (servicePorts || []).join(',') ? '' : (userPorts || []).join(',');
     $('et-linkport').value = String(linkPort);
 
-    $('et-pool-wrap').hidden = isMux;
-    $('et-mux-wrap').hidden = !isMux;
-    $('et-pool').value = String((ei && ei.pool_size) || (oi && oi.pool_size) || 25);
-    $('et-mux-links').value = String((ei && ei.mux_links) || (oi && oi.mux_links) || 4);
-    $('et-max-conn').value = String((ei && ei.max_conn) || (oi && oi.max_conn) || 2000);
+    setRadio('et-shared', isMux ? 'shared' : 'one');
+    $('et-pool').value = String(poolVal);
+    $('et-mux-links').value = String(muxVal);
+    $('et-max-conn').value = String(maxConnVal);
+    const linkKey = editTunnelLinkKey(any);
+    setRadio('et-load', detectCapacityPreset(linkKey, isMux, Number(poolVal), Number(muxVal), Number(maxConnVal)));
 
     const pp = (ei && ei.proxy_protocol) || (oi && oi.proxy_protocol) || 'off';
     setRadio('et-proxy', ['off', 'v1', 'v2'].includes(pp) ? pp : 'off');
@@ -1261,10 +1360,11 @@
 
     if ($('et-peer-ip')) $('et-peer-ip').value = (ei && ei.peer_ip) || (oi && oi.peer_ip) || '';
     if ($('et-peer-wrap')) $('et-peer-wrap').hidden = !!(any.gre || any.sit);
-    if ($('et-spare-ttl-wrap')) $('et-spare-ttl-wrap').hidden = isMux;
     if ($('et-spare-ttl')) $('et-spare-ttl').value = (ei && ei.spare_ttl) || (oi && oi.spare_ttl) || '1m0s';
     if ($('et-drain')) $('et-drain').value = (ei && ei.drain) || (oi && oi.drain) || '10s';
     if ($('et-advanced')) $('et-advanced').open = false;
+
+    syncEditTunnelCapacityUI();
 
     $('et-error').textContent = '';
     $('et-ports-result').replaceChildren();
@@ -1272,6 +1372,37 @@
     $('et-progress').hidden = true;
     openDialog($('edit-tunnel-dialog'));
     $('et-service').focus();
+  }
+
+  for (const el of document.querySelectorAll('input[name="et-load"]')) {
+    el.addEventListener('change', () => {
+      const preset = radio('et-load');
+      if (preset && preset !== 'custom') {
+        const rec = recommendCapacityFor(currentEditLinkKey(), preset);
+        setRadio('et-shared', rec.shared ? 'shared' : 'one');
+        if ($('et-pool')) $('et-pool').value = String(rec.pool);
+        if ($('et-mux-links')) $('et-mux-links').value = String(rec.muxLinks);
+        if ($('et-max-conn')) $('et-max-conn').value = String(rec.maxConn);
+      }
+      syncEditTunnelCapacityUI();
+    });
+  }
+  for (const el of document.querySelectorAll('input[name="et-shared"]')) {
+    el.addEventListener('change', () => {
+      setRadio('et-load', 'custom');
+      syncEditTunnelCapacityUI();
+    });
+  }
+  for (const id of ['et-pool', 'et-mux-links', 'et-max-conn']) {
+    if ($(id)) {
+      $(id).addEventListener('input', () => {
+        setRadio('et-load', 'custom');
+        syncEditTunnelCapacityUI();
+      });
+    }
+  }
+  for (const el of document.querySelectorAll('input[name="et-proxy"]')) {
+    el.addEventListener('change', () => syncChoiceCards($('edit-tunnel-dialog')));
   }
 
   $('et-cancel').addEventListener('click', () => $('edit-tunnel-dialog').close());
@@ -1421,13 +1552,14 @@
     const servicePorts = $('et-service').value.trim();
     const userPorts = $('et-users').value.trim();
     const linkPort = Number($('et-linkport').value || 0);
+    const isMux = radio('et-shared') === 'shared';
     const poolSize = Number($('et-pool').value || 0);
     const muxLinks = Number($('et-mux-links').value || 0);
     const maxConn = Number($('et-max-conn').value || 0);
     const proxyProto = radio('et-proxy') || 'off';
     const firewall = $('et-firewall').checked ? 'on' : 'off';
     const peerIP = $('et-peer-ip') ? $('et-peer-ip').value.trim() : '';
-    const spareTTL = ($('et-spare-ttl') && !$('et-spare-ttl-wrap').hidden) ? $('et-spare-ttl').value.trim() : '';
+    const spareTTL = ($('et-spare-ttl') && !isMux) ? $('et-spare-ttl').value.trim() : '';
     const drain = $('et-drain') ? $('et-drain').value.trim() : '';
 
     if (!portList.test(servicePorts)) return fail('Enter the Foreign Inbound Port(s), separated by commas.', $('et-service'));
@@ -1436,6 +1568,9 @@
       return fail('The number of User Listen Ports must match the number of Inbound Ports.', $('et-users'));
     }
     if (!(linkPort >= 1 && linkPort <= 65535)) return fail('Tunnel Bridge Port must be between 1 and 65535.', $('et-linkport'));
+    if (!isMux && !(poolSize >= 1 && poolSize <= 10000)) return fail('Connection Pool Size must be between 1 and 10000.', $('et-pool'));
+    if (isMux && !(muxLinks >= 1 && muxLinks <= 16)) return fail('Shared Mux Connections must be between 1 and 16.', $('et-mux-links'));
+    if (!(maxConn >= 1 && maxConn <= 100000)) return fail('Max Concurrent User Sessions must be between 1 and 100000.', $('et-max-conn'));
 
     const body = {
       name: t.name,
@@ -1444,8 +1579,9 @@
       service_ports: servicePorts,
       user_ports: userPorts || servicePorts,
       link_port: linkPort,
-      pool: !$('et-pool-wrap').hidden ? poolSize : 0,
-      mux_links: !$('et-mux-wrap').hidden ? muxLinks : 0,
+      mux: isMux ? 'on' : 'off',
+      pool: !isMux ? poolSize : 0,
+      mux_links: isMux ? muxLinks : 0,
       max_conn: maxConn,
       spare_ttl: spareTTL,
       drain,
@@ -2451,6 +2587,19 @@
     });
   }
 
+  function currentCreateLinkKey() {
+    if ($('tn-gre') && $('tn-gre').checked) return 'gre';
+    return radio('tn-link') || 'website';
+  }
+
+  function applyCreateLoadPreset(preset) {
+    const rec = recommendCapacityFor(currentCreateLinkKey(), preset);
+    setRadio('tn-shared', rec.shared ? 'shared' : 'one');
+    if ($('tn-pool')) $('tn-pool').value = String(rec.pool);
+    if ($('tn-links-n')) $('tn-links-n').value = String(rec.muxLinks);
+    if ($('tn-max-conn')) $('tn-max-conn').value = String(rec.maxConn);
+  }
+
   function showTunnelOptions() {
     const mode = radio('tn-mode');
     const gre = $('tn-gre').checked;
@@ -2487,16 +2636,53 @@
       hasIPv6(serverById($('tn-relay').value)) && hasIPv6(serverById($('tn-foreign').value));
     $('tn-ipv6-row').hidden = !v6ok;
     if (!v6ok) $('tn-ipv6').checked = false;
-    if (!sharingTouched) setRadio('tn-shared', ['kcp', 'icmp', 'faketcp', 'ip-spoof', 'split', 'cdn', 'website-cdn-backup', 'grpc', 'grpc-cdn'].includes(link) ? 'shared' : 'one');
-    $('tn-opt-links').hidden = radio('tn-shared') !== 'shared';
+
+    const loadPreset = radio('tn-load') || 'light';
+    if (!sharingTouched && loadPreset !== 'custom') {
+      applyCreateLoadPreset(loadPreset);
+    }
+    const isShared = radio('tn-shared') === 'shared';
+    if ($('tn-pool-wrap')) $('tn-pool-wrap').hidden = isShared;
+    $('tn-opt-links').hidden = !isShared;
+    if ($('tn-capacity-hint')) {
+      const poolSize = Number(($('tn-pool') && $('tn-pool').value) || 30);
+      const muxLinks = Number(($('tn-links-n') && $('tn-links-n').value) || 4);
+      const maxConn = Number(($('tn-max-conn') && $('tn-max-conn').value) || 2000);
+      $('tn-capacity-hint').textContent = describeCapacityAdvice(currentCreateLinkKey(), isShared, poolSize, muxLinks, maxConn);
+    }
     syncChoiceCards($('tunnel-dialog'));
   }
 
   for (const el of document.querySelectorAll('#tunnel-form input[name="tn-mode"], #tunnel-form input[name="tn-link"], #tn-gre, #tn-webheader, #tn-snispoof, #tn-relay, #tn-foreign')) {
     el.addEventListener('change', showTunnelOptions);
   }
+  for (const el of document.querySelectorAll('input[name="tn-load"]')) {
+    el.addEventListener('change', () => {
+      const preset = radio('tn-load');
+      if (preset && preset !== 'custom') {
+        sharingTouched = false;
+        applyCreateLoadPreset(preset);
+      } else {
+        sharingTouched = true;
+      }
+      showTunnelOptions();
+    });
+  }
   for (const el of document.querySelectorAll('input[name="tn-shared"]')) {
-    el.addEventListener('change', () => { sharingTouched = true; showTunnelOptions(); });
+    el.addEventListener('change', () => {
+      sharingTouched = true;
+      setRadio('tn-load', 'custom');
+      showTunnelOptions();
+    });
+  }
+  for (const id of ['tn-pool', 'tn-links-n', 'tn-max-conn']) {
+    if ($(id)) {
+      $(id).addEventListener('input', () => {
+        sharingTouched = true;
+        setRadio('tn-load', 'custom');
+        showTunnelOptions();
+      });
+    }
   }
 
   if ($('tn-spoofsni-preset')) {
@@ -2750,11 +2936,17 @@
     if (cand.domain) {
       $('tn-domain').value = cand.domain;
     }
-    sharingTouched = true;
-    setRadio('tn-shared', cand.shared ? 'shared' : 'one');
-    if (cand.shared && $('tn-links-n')) {
-      const isRawKCP = cand.link === 'icmp' || cand.link === 'faketcp' || cand.ip_spoof;
-      $('tn-links-n').value = isRawKCP ? '2' : '4';
+    const preset = radio('tn-load') || 'light';
+    if (preset === 'custom') {
+      sharingTouched = true;
+      setRadio('tn-shared', cand.shared ? 'shared' : 'one');
+      if (cand.shared && $('tn-links-n')) {
+        const isRawKCP = cand.link === 'icmp' || cand.link === 'faketcp' || cand.ip_spoof;
+        $('tn-links-n').value = isRawKCP ? '2' : '4';
+      }
+    } else {
+      sharingTouched = false;
+      applyCreateLoadPreset(preset);
     }
     if (cand.port && ['cdn', 'website-cdn-backup', 'grpc-cdn'].includes(cand.link)) {
       $('tn-linkport').value = String(cand.port);
@@ -2991,6 +3183,7 @@
     $('tunnel-form').hidden = false;
     $('tn-progress').hidden = true;
     sharingTouched = false;
+    setRadio('tn-load', 'light');
     showTunnelOptions();
     openDialog($('tunnel-dialog'));
     $('tn-name').focus();
@@ -3036,6 +3229,8 @@
       ipv6: $('tn-ipv6').checked,
       shared,
       shared_links: shared ? Number($('tn-links-n').value || 4) : 0,
+      pool: !shared ? Number(($('tn-pool') && $('tn-pool').value) || 30) : 0,
+      max_conn: Number(($('tn-max-conn') && $('tn-max-conn').value) || 2000),
       service_ports: $('tn-service').value.trim(),
       user_ports: $('tn-users').value.trim(),
       link_port: Number($('tn-linkport').value || 0),
@@ -3246,7 +3441,9 @@
     }
     if (!(r.link_port >= 1 && r.link_port <= 65535)) return fail('Tunnel Bridge Port must be between 1 and 65535.', $('tn-linkport'));
     if (['cdn', 'website-cdn-backup', 'grpc-cdn'].includes(r.link) && !r.domain) return fail('Enter your CDN domain.', $('tn-domain'));
+    if (!r.shared && !(r.pool >= 1 && r.pool <= 10000)) return fail('Connection Pool Size must be between 1 and 10000.', $('tn-pool'));
     if (r.shared && !(r.shared_links >= 1 && r.shared_links <= 16)) return fail('Number of shared Mux connections must be between 1 and 16.', $('tn-links-n'));
+    if (!(r.max_conn >= 1 && r.max_conn <= 100000)) return fail('Max Concurrent User Sessions must be between 1 and 100000.', $('tn-max-conn'));
     const btn = ev.target.querySelector('button[type=submit]');
     btn.disabled = true;
     try {

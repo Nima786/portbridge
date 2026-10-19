@@ -172,8 +172,12 @@ func buildOriginConf(p *PairingData, secretFile, certFile, keyFile string) strin
 	if p.Mux == "on" {
 		fmt.Fprintf(&b, "mux_links = %s\n", p.MuxLinks)
 	}
+	maxConn := strings.TrimSpace(p.MaxConn)
+	if maxConn == "" {
+		maxConn = "2000"
+	}
 	fmt.Fprintf(&b, "\npool_size = %s\n", p.Pool)
-	fmt.Fprintf(&b, "max_conn = 2000\nmax_pending = 512\nspare_ttl = 10m\npark_timeout = 15m\ndrain = 5s\n")
+	fmt.Fprintf(&b, "max_conn = %s\nmax_pending = 512\nspare_ttl = 10m\npark_timeout = 15m\ndrain = 5s\n", maxConn)
 	fmt.Fprintf(&b, "\nsecret_file = %s\n", secretFile)
 
 	return b.String()

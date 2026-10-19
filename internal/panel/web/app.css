@@ -1171,6 +1171,33 @@ legend.step-header + * { clear: both; }
 }
 .choice-grid.cols-2 { grid-template-columns: repeat(2, 1fr); }
 .choice-grid.cols-3 { grid-template-columns: repeat(3, 1fr); }
+.choice-grid.cols-4 { grid-template-columns: repeat(4, 1fr); }
+
+.capacity-label-row {
+  margin-top: .65rem;
+  margin-bottom: .15rem;
+}
+.capacity-label-row:first-of-type {
+  margin-top: 0;
+}
+.capacity-subhead {
+  font-size: .82rem;
+  font-weight: 650;
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: .04em;
+}
+.capacity-numbers-box {
+  margin-top: .75rem;
+}
+.capacity-numbers-box .row2 label {
+  margin-top: 0;
+  font-weight: 650;
+}
+.capacity-rec-note {
+  margin: .65rem 0 0;
+  line-height: 1.42;
+}
 
 label.choice-card {
   display: flex;
@@ -1967,6 +1994,7 @@ select.cf-server-pick {
 @media (max-width: 960px) {
   .summary-strip { grid-template-columns: repeat(2, 1fr); }
   .tunnel-details-grid { grid-template-columns: repeat(2, 1fr); }
+  .choice-grid.cols-4 { grid-template-columns: repeat(2, 1fr); }
   .ports-grid { grid-template-columns: 1fr; }
   .cf-filter-bar { grid-template-columns: 1fr 1fr; }
   .cf-filter-search { grid-column: 1 / -1; }
@@ -2016,7 +2044,7 @@ button.btn-autoheal.is-on {
 @media (max-width: 760px) {
   .columns { grid-template-columns: 1fr; }
   .row, .row2 { grid-template-columns: 1fr; }
-  .choice-grid.cols-2, .choice-grid.cols-3 { grid-template-columns: 1fr; }
+  .choice-grid.cols-2, .choice-grid.cols-3, .choice-grid.cols-4 { grid-template-columns: 1fr; }
   .cf-filter-bar { grid-template-columns: 1fr; }
   .probe-cdn-row { grid-template-columns: 1fr; }
   .top-inner { padding: .55rem .85rem; gap: .5rem; }

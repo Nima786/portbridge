@@ -148,6 +148,10 @@ func newPrefixConn(c net.Conn, prefix []byte) net.Conn {
 	}
 }
 
+func (p *prefixConn) NetConn() net.Conn {
+	return p.Conn
+}
+
 func (p *prefixConn) Read(b []byte) (int, error) {
 	if len(p.pre) > 0 {
 		n := copy(b, p.pre)

@@ -212,3 +212,83 @@ func TestDeletingSaysWhatToDoByHand(t *testing.T) {
 		t.Fatalf("no plain instructions for the server that could not be reached: %+v", foreign)
 	}
 }
+
+func TestTunnelCapacityAndMuxSwitchingOnBothServers(t *testing.T) {
+	p, foreignID, foreignDir := twoServers(t)
+
+	// 1. Create a Dedicated Pool tunnel with custom Pool (45) and MaxConn (3500).
+	req := newTunnel("cap")
+	req.Shared = false
+	req.Pool = 45
+	req.MaxConn = 3500
+	if v := waitJob(t, p, mustCreate(t, p, req)); v.Error != "" {
+		t.Fatalf("create failed: %s", v.Error)
+	}
+
+	edge, origin := agent.TunnelsReport(p.tunnelsDir), agent.TunnelsReport(foreignDir)
+	if len(edge) != 1 || len(origin) != 1 {
+		t.Fatalf("expected 1 tunnel on both ends, got %d and %d", len(edge), len(origin))
+	}
+	if edge[0].Mux || edge[0].PoolSize != 45 || edge[0].MaxConn != 3500 {
+		t.Fatalf("edge capacity mismatch after create: mux=%v pool=%d max_conn=%d", edge[0].Mux, edge[0].PoolSize, edge[0].MaxConn)
+	}
+	if origin[0].Mux || origin[0].PoolSize != 45 || origin[0].MaxConn != 3500 {
+		t.Fatalf("origin capacity mismatch after create: mux=%v pool=%d max_conn=%d", origin[0].Mux, origin[0].PoolSize, origin[0].MaxConn)
+	}
+
+	// 2. Edit the tunnel to switch from Dedicated Pool (mux=off) to Shared Mux (mux=on, mux_links=8, max_conn=6000).
+	editJob1, err := p.startEditTunnel(editTunnelRequest{
+		Name:         "cap",
+		Edge:         "this",
+		Origin:       foreignID,
+		ServicePorts: "39001",
+		UserPorts:    "29311",
+		LinkPort:     2217,
+		Mux:          "on",
+		MuxLinks:     8,
+		MaxConn:      6000,
+		Firewall:     "on",
+	})
+	if err != nil {
+		t.Fatalf("startEditTunnel (to mux) failed: %v", err)
+	}
+	if v := waitJob(t, p, editJob1); v.Error != "" {
+		t.Fatalf("edit to mux failed: %s\n%s", v.Error, strings.Join(v.Lines, "\n"))
+	}
+
+	edge, origin = agent.TunnelsReport(p.tunnelsDir), agent.TunnelsReport(foreignDir)
+	if !edge[0].Mux || edge[0].MuxLinks != 8 || edge[0].MaxConn != 6000 {
+		t.Fatalf("edge did not switch to mux=on (links=8, max=6000): %+v", edge[0])
+	}
+	if !origin[0].Mux || origin[0].MuxLinks != 8 || origin[0].MaxConn != 6000 {
+		t.Fatalf("origin did not switch to mux=on (links=8, max=6000): %+v", origin[0])
+	}
+
+	// 3. Edit the tunnel back to Dedicated Pool (mux=off, pool=80, max_conn=2500).
+	editJob2, err := p.startEditTunnel(editTunnelRequest{
+		Name:         "cap",
+		Edge:         "this",
+		Origin:       foreignID,
+		ServicePorts: "39001",
+		UserPorts:    "29311",
+		LinkPort:     2217,
+		Mux:          "off",
+		Pool:         80,
+		MaxConn:      2500,
+		Firewall:     "on",
+	})
+	if err != nil {
+		t.Fatalf("startEditTunnel (to pool) failed: %v", err)
+	}
+	if v := waitJob(t, p, editJob2); v.Error != "" {
+		t.Fatalf("edit to pool failed: %s\n%s", v.Error, strings.Join(v.Lines, "\n"))
+	}
+
+	edge, origin = agent.TunnelsReport(p.tunnelsDir), agent.TunnelsReport(foreignDir)
+	if edge[0].Mux || edge[0].PoolSize != 80 || edge[0].MaxConn != 2500 {
+		t.Fatalf("edge did not switch back to mux=off (pool=80, max=2500): %+v", edge[0])
+	}
+	if origin[0].Mux || origin[0].PoolSize != 80 || origin[0].MaxConn != 2500 {
+		t.Fatalf("origin did not switch back to mux=off (pool=80, max=2500): %+v", origin[0])
+	}
+}
