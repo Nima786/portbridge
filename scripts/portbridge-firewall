@@ -763,7 +763,10 @@ cmd_sweep() {
             [[ "$iface" =~ ^(pbg|pbs)[0-9a-f]{8}$ ]] || continue
             case "$used" in *" $iface "*) continue ;; esac
             if ip link del "$iface" 2>/dev/null; then
-                echo "removed the private link $iface, which no tunnel uses"
+                case "$iface" in
+                    pbg*) echo "removed the GRE link $iface, which no tunnel uses" ;;
+                    *) echo "removed the 6in4 link $iface, which no tunnel uses" ;;
+                esac
                 removed=$((removed + 1))
             fi
         done
