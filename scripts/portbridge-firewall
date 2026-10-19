@@ -467,7 +467,7 @@ sit_pair() {
     else
         lo=$mine hi=$other
     fi
-    digest=$(printf '%s' "sit:$lo-$hi" | sha256sum)
+    digest=$(printf '%s' "$lo-sit-$hi" | sha256sum)
     h8=${digest:0:8}
     g1=${digest:0:4}
     g2=${digest:4:4}

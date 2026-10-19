@@ -91,6 +91,8 @@ func TestSplitConnRotatesLegsSeamlessly(t *testing.T) {
 		t.Fatal("timed out waiting for server splitConn")
 	}
 	defer serverConn.Close()
+	_ = clientConn.SetDeadline(time.Now().Add(15 * time.Second))
+	_ = serverConn.SetDeadline(time.Now().Add(15 * time.Second))
 	go func() {
 		for off := 0; off < len(s2cWant); off += 4096 {
 			end := min(off+4096, len(s2cWant))
