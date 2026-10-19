@@ -927,23 +927,27 @@ button.tunnel-summary:active:not(:disabled) {
 .tunnel-summary-route {
   display: inline-flex;
   align-items: center;
-  gap: .45rem;
+  flex-wrap: wrap;
+  gap: .35rem .45rem;
   font-size: .88rem;
   color: var(--muted);
   font-weight: 500;
   min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
 }
 .tunnel-summary-port {
+  display: inline-block;
+  width: auto;
+  max-width: 100%;
+  flex: 0 0 auto;
   font-size: .8rem;
   font-weight: 700;
-  padding: .08rem .45rem;
+  padding: .08rem .48rem;
   border-radius: 6px;
   background: var(--well);
   border: 1px solid var(--line);
   color: var(--text);
+  white-space: normal;
+  word-break: break-word;
 }
 
 .tunnel-summary-right {
@@ -2061,8 +2065,27 @@ button.btn-autoheal.is-on {
   .dialog-header, .dialog-body, .dialog-footer { padding-left: 1rem; padding-right: 1rem; }
   .facts-list { grid-template-columns: 1fr; gap: .2rem; }
   .facts-list dd { margin-bottom: .5rem; }
-  button.tunnel-summary { padding: .75rem .9rem; gap: .5rem; }
-  .tunnel-summary-left { gap: .45rem; }
+  button.tunnel-summary {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    padding: .75rem .9rem;
+    gap: .45rem .5rem;
+  }
+  .tunnel-summary-left {
+    display: contents;
+  }
+  .tunnel-summary-name {
+    margin-right: auto;
+  }
+  .tunnel-summary-right {
+    margin-left: auto;
+  }
+  .tunnel-summary-route {
+    order: 4;
+    flex: 1 1 100%;
+    width: 100%;
+  }
   .badge-transport { display: none; }
   .tunnel-body { padding: 0 .9rem .95rem; }
   .tunnel-details-grid { grid-template-columns: 1fr; gap: .5rem; margin-top: .75rem; }
