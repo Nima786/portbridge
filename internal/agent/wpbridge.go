@@ -62,9 +62,18 @@ func syncWebsiteBridgeOrigin(cfg *engine.Config, oldCfg *engine.Config, confDir 
 		return nil
 	}
 
+	if err := syncCPSecurityNeverBlock(name, cfg); err != nil {
+		log.Printf("[%s] updating CP-Security never-block list: %v", name, err)
+	}
+
 	if cfg == nil || !cfg.WebsiteBridge {
 		cleanupWebsiteBridgeOrigin(name, oldCfg, confDir)
 		return nil
+	}
+
+	wantProxyProto := cfg.ProxyProtocol > 0 || anyOtherWebsiteProxyProto(confDir, name)
+	if err := syncLiteSpeedProxyProtocol(wantProxyProto); err != nil {
+		log.Printf("[%s] updating LiteSpeed PROXY protocol settings: %v", name, err)
 	}
 
 	domains := parseWebsiteDomains(cfg.WebsiteDomains)
@@ -111,11 +120,23 @@ func syncWebsiteBridgeOrigin(cfg *engine.Config, oldCfg *engine.Config, confDir 
 }
 
 // cleanupWebsiteBridgeOrigin removes /etc/hosts loopback entries, wp-config.php
-// proxy constants, and the PortBridge mu-plugin when a Website Bridge tunnel is
-// deleted or disabled on the Foreign (Origin) server.
+// proxy constants, the PortBridge mu-plugin, CP-Security relay entry, and
+// LiteSpeed PROXY protocol entry when a Website Bridge tunnel is deleted or
+// disabled on the Foreign (Origin) server.
 func cleanupWebsiteBridgeOrigin(name string, oldCfg *engine.Config, confDir string) {
 	if !wpBridgeEnabled(confDir) || name == "" {
 		return
+	}
+	if confDir != "" {
+		if _, err := os.Stat(filepath.Join(confDir, name+".conf")); os.IsNotExist(err) {
+			if err := syncCPSecurityNeverBlock(name, nil); err != nil {
+				log.Printf("[%s] cleaning CP-Security never-block list: %v", name, err)
+			}
+		}
+	}
+	wantProxyProto := anyOtherWebsiteProxyProto(confDir, name)
+	if err := syncLiteSpeedProxyProtocol(wantProxyProto); err != nil {
+		log.Printf("[%s] cleaning LiteSpeed PROXY protocol settings: %v", name, err)
 	}
 	var oldDomains []string
 	if oldCfg != nil {
@@ -809,4 +830,265 @@ func copyFileOwner(refPath string, targetPath string) {
 		return
 	}
 	_ = exec.Command("chown", "--reference="+refPath, targetPath).Run()
+}
+
+// anyOtherWebsiteProxyProto checks whether any other tunnel in confDir is an
+// active Origin Website Bridge with proxy_protocol enabled.
+func anyOtherWebsiteProxyProto(confDir, excludeName string) bool {
+	if confDir == "" {
+		return false
+	}
+	entries, err := os.ReadDir(confDir)
+	if err != nil {
+		return false
+	}
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".conf") {
+			continue
+		}
+		tName := strings.TrimSuffix(e.Name(), ".conf")
+		if tName == excludeName {
+			continue
+		}
+		c, err := engine.LoadConfig(filepath.Join(confDir, e.Name()))
+		if err != nil || c == nil {
+			continue
+		}
+		if c.Role == engine.RoleOrigin && c.WebsiteBridge && c.ProxyProtocol > 0 {
+			return true
+		}
+	}
+	return false
+}
+
+// syncCPSecurityNeverBlock keeps /etc/cp-security/never-block.list (if CP-Security
+// is installed on the Foreign server) in sync with the tunnel's Relay IP so the
+// attack blocker never bans the Iran relay.
+func syncCPSecurityNeverBlock(tunnelName string, cfg *engine.Config) error {
+	if tunnelName == "" {
+		return nil
+	}
+	neverFile := filepath.Join(wpRoot(), "etc", "cp-security", "never-block.list")
+	data, err := os.ReadFile(neverFile)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+
+	relayIP := ""
+	if cfg != nil && cfg.Role == engine.RoleOrigin {
+		relayIP = strings.TrimSpace(cfg.PeerIP)
+		if cfg.GRE && strings.TrimSpace(cfg.GRERemote) != "" {
+			relayIP = strings.TrimSpace(cfg.GRERemote)
+		} else if cfg.SIT && strings.TrimSpace(cfg.SITRemote) != "" {
+			relayIP = strings.TrimSpace(cfg.SITRemote)
+		}
+	}
+
+	lines := strings.Split(strings.ReplaceAll(string(data), "\r\n", "\n"), "\n")
+	tagNeedle := "portbridge " + strings.ToLower(tunnelName) + ")"
+	targetLine := ""
+	if relayIP != "" {
+		targetLine = fmt.Sprintf("%s | Iran relay (PortBridge %s)", relayIP, tunnelName)
+	}
+
+	var kept []string
+	changed := false
+	alreadyPresent := false
+
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if idx := strings.IndexByte(trimmed, '|'); idx >= 0 {
+			addrPart := strings.TrimSpace(trimmed[:idx])
+			labelPart := strings.ToLower(strings.TrimSpace(trimmed[idx+1:]))
+			if strings.Contains(labelPart, tagNeedle) {
+				if targetLine != "" && addrPart == relayIP && !alreadyPresent {
+					kept = append(kept, targetLine)
+					if line != targetLine {
+						changed = true
+					}
+					alreadyPresent = true
+				} else {
+					changed = true
+				}
+				continue
+			}
+		}
+		kept = append(kept, line)
+	}
+
+	if targetLine != "" && !alreadyPresent {
+		insertIdx := 0
+		for insertIdx < len(kept) {
+			t := strings.TrimSpace(kept[insertIdx])
+			if strings.HasPrefix(t, "#") {
+				insertIdx++
+				continue
+			}
+			break
+		}
+		updated := make([]string, 0, len(kept)+1)
+		updated = append(updated, kept[:insertIdx]...)
+		updated = append(updated, targetLine)
+		updated = append(updated, kept[insertIdx:]...)
+		kept = updated
+		changed = true
+	}
+
+	if !changed {
+		return nil
+	}
+
+	newContent := strings.Join(kept, "\n")
+	if !strings.HasSuffix(newContent, "\n") {
+		newContent += "\n"
+	}
+	if err := writeFilePreservingOwner(neverFile, []byte(newContent), 0o644); err != nil {
+		return err
+	}
+
+	if wpBridgeRootOverride == "" && runtime.GOOS == "linux" {
+		if _, err := os.Stat("/opt/cp-security/cpsec"); err == nil {
+			_ = exec.Command("python3", "-c", "import sys; sys.path.insert(0, '/opt/cp-security'); from cpsec import access; access.apply()").Run()
+		}
+	}
+	return nil
+}
+
+// syncLiteSpeedProxyProtocol automatically configures LiteSpeed Enterprise
+// (/usr/local/lsws/conf/httpd_config.xml) on the Foreign server so it accepts
+// PROXY protocol v1/v2 headers from 127.0.0.1 on HTTP (:80) and HTTPS (:443)
+// when a Website Bridge tunnel has proxy_protocol enabled, and cleans up the
+// entry when no Website Bridge tunnel uses proxy_protocol.
+func syncLiteSpeedProxyProtocol(enable bool) error {
+	xmlPath := filepath.Join(wpRoot(), "usr", "local", "lsws", "conf", "httpd_config.xml")
+	data, err := os.ReadFile(xmlPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+
+	orig := string(data)
+	content := strings.ReplaceAll(orig, "\r\n", "\n")
+	changed := false
+
+	if enable {
+		if strings.Contains(content, "<useIpInProxyHeader>0</useIpInProxyHeader>") {
+			content = strings.Replace(content, "<useIpInProxyHeader>0</useIpInProxyHeader>", "<useIpInProxyHeader>2</useIpInProxyHeader>", 1)
+			changed = true
+		}
+
+		// Ensure 127.0.0.1T is trusted in <accessControl><allow>...</allow></accessControl>.
+		if allowStart := strings.Index(content, "<allow>"); allowStart >= 0 {
+			if allowEnd := strings.Index(content[allowStart:], "</allow>"); allowEnd >= 0 {
+				allowBody := content[allowStart+len("<allow>") : allowStart+allowEnd]
+				if !strings.Contains(allowBody, "127.0.0.1T") {
+					trimmedBody := strings.TrimSpace(allowBody)
+					var newBody string
+					if trimmedBody == "" {
+						newBody = "ALL, 127.0.0.1T"
+					} else {
+						newBody = trimmedBody + ", 127.0.0.1T"
+					}
+					content = content[:allowStart+len("<allow>")] + "\n" + newBody + "\n      " + content[allowStart+allowEnd:]
+					changed = true
+				}
+			}
+		}
+
+		// Ensure <proxyProtocol> inside <tuning> contains 127.0.0.1.
+		if ppStart := strings.Index(content, "<proxyProtocol>"); ppStart >= 0 {
+			if ppEnd := strings.Index(content[ppStart:], "</proxyProtocol>"); ppEnd >= 0 {
+				ppBody := content[ppStart+len("<proxyProtocol>") : ppStart+ppEnd]
+				items := splitCSVTokens(ppBody)
+				if !stringSliceContains(items, "127.0.0.1") {
+					items = append(items, "127.0.0.1")
+					newPP := "<proxyProtocol>" + strings.Join(items, ", ") + "</proxyProtocol>"
+					content = content[:ppStart] + newPP + content[ppStart+ppEnd+len("</proxyProtocol>"):]
+					changed = true
+				}
+			}
+		} else if tuneIdx := strings.Index(content, "<tuning>"); tuneIdx >= 0 {
+			insertAt := tuneIdx + len("<tuning>")
+			if insertAt < len(content) && content[insertAt] == '\n' {
+				insertAt++
+			}
+			content = content[:insertAt] + "    <proxyProtocol>127.0.0.1</proxyProtocol>\n" + content[insertAt:]
+			changed = true
+		}
+	} else {
+		if ppStart := strings.Index(content, "<proxyProtocol>"); ppStart >= 0 {
+			if ppEnd := strings.Index(content[ppStart:], "</proxyProtocol>"); ppEnd >= 0 {
+				ppBody := content[ppStart+len("<proxyProtocol>") : ppStart+ppEnd]
+				items := splitCSVTokens(ppBody)
+				var remaining []string
+				removed := false
+				for _, it := range items {
+					if it == "127.0.0.1" {
+						removed = true
+						continue
+					}
+					remaining = append(remaining, it)
+				}
+				if removed {
+					if len(remaining) == 0 {
+						lineStart := ppStart
+						for lineStart > 0 && (content[lineStart-1] == ' ' || content[lineStart-1] == '\t') {
+							lineStart--
+						}
+						lineEnd := ppStart + ppEnd + len("</proxyProtocol>")
+						if lineEnd < len(content) && content[lineEnd] == '\n' {
+							lineEnd++
+						}
+						content = content[:lineStart] + content[lineEnd:]
+					} else {
+						newPP := "<proxyProtocol>" + strings.Join(remaining, ", ") + "</proxyProtocol>"
+						content = content[:ppStart] + newPP + content[ppStart+ppEnd+len("</proxyProtocol>"):]
+					}
+					changed = true
+				}
+			}
+		}
+	}
+
+	if !changed {
+		return nil
+	}
+
+	if err := writeFilePreservingOwner(xmlPath, []byte(content), 0o644); err != nil {
+		return err
+	}
+
+	if wpBridgeRootOverride == "" && runtime.GOOS == "linux" {
+		if _, err := os.Stat("/usr/local/lsws/bin/lswsctrl"); err == nil {
+			_ = exec.Command("/usr/local/lsws/bin/lswsctrl", "restart").Run()
+		}
+	}
+	return nil
+}
+
+func splitCSVTokens(s string) []string {
+	var out []string
+	for _, p := range strings.FieldsFunc(s, func(r rune) bool {
+		return r == ',' || r == ' ' || r == '\t' || r == '\n' || r == '\r'
+	}) {
+		t := strings.TrimSpace(p)
+		if t != "" {
+			out = append(out, t)
+		}
+	}
+	return out
+}
+
+func stringSliceContains(list []string, target string) bool {
+	for _, it := range list {
+		if it == target {
+			return true
+		}
+	}
+	return false
 }

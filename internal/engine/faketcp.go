@@ -76,22 +76,41 @@ func installFakeTCPRSTDrop(port uint16, matchDest bool) func() {
 	if port == 0 || os.Geteuid() != 0 {
 		return func() {}
 	}
-	flagName := "--sport"
+	outFlag := "--sport"
+	inFlag := "--dport"
 	if matchDest {
-		flagName = "--dport"
+		outFlag = "--dport"
+		inFlag = "--sport"
 	}
 	portStr := strconv.Itoa(int(port))
-	checkCmd := exec.Command("iptables", "-C", "OUTPUT", "-p", "tcp", flagName, portStr, "--tcp-flags", "RST", "RST", "-j", "DROP")
-	if checkCmd.Run() == nil {
-		// Rule was already installed externally (e.g. by portbridge-firewall).
-		return func() {}
+	addedRST := false
+	if exec.Command("iptables", "-C", "OUTPUT", "-p", "tcp", outFlag, portStr, "--tcp-flags", "RST", "RST", "-j", "DROP").Run() != nil {
+		if exec.Command("iptables", "-I", "OUTPUT", "1", "-p", "tcp", outFlag, portStr, "--tcp-flags", "RST", "RST", "-j", "DROP").Run() == nil {
+			addedRST = true
+		}
 	}
-	addCmd := exec.Command("iptables", "-I", "OUTPUT", "1", "-p", "tcp", flagName, portStr, "--tcp-flags", "RST", "RST", "-j", "DROP")
-	if addCmd.Run() != nil {
-		return func() {}
+	addedPreRaw := false
+	if exec.Command("iptables", "-t", "raw", "-C", "PREROUTING", "-p", "tcp", inFlag, portStr, "-j", "CT", "--notrack").Run() != nil {
+		if exec.Command("iptables", "-t", "raw", "-I", "PREROUTING", "1", "-p", "tcp", inFlag, portStr, "-j", "CT", "--notrack").Run() == nil {
+			addedPreRaw = true
+		}
+	}
+	addedOutRaw := false
+	if exec.Command("iptables", "-t", "raw", "-C", "OUTPUT", "-p", "tcp", outFlag, portStr, "-j", "CT", "--notrack").Run() != nil {
+		if exec.Command("iptables", "-t", "raw", "-I", "OUTPUT", "1", "-p", "tcp", outFlag, portStr, "-j", "CT", "--notrack").Run() == nil {
+			addedOutRaw = true
+		}
 	}
 	return func() {
-		_ = exec.Command("iptables", "-D", "OUTPUT", "-p", "tcp", flagName, portStr, "--tcp-flags", "RST", "RST", "-j", "DROP").Run()
+		if addedRST {
+			_ = exec.Command("iptables", "-D", "OUTPUT", "-p", "tcp", outFlag, portStr, "--tcp-flags", "RST", "RST", "-j", "DROP").Run()
+		}
+		if addedPreRaw {
+			_ = exec.Command("iptables", "-t", "raw", "-D", "PREROUTING", "-p", "tcp", inFlag, portStr, "-j", "CT", "--notrack").Run()
+		}
+		if addedOutRaw {
+			_ = exec.Command("iptables", "-t", "raw", "-D", "OUTPUT", "-p", "tcp", outFlag, portStr, "-j", "CT", "--notrack").Run()
+		}
 	}
 }
 
@@ -417,9 +436,10 @@ func (c *fakeTCPPacketConn) WriteTo(p []byte, addr net.Addr) (int, error) {
 		}
 	} else {
 		pktIdx := c.txPkts.Add(1)
-		// Rotate the dialer's outer TCP source port every 12 packets (~14 KB)
-		// so stateful ISP byte-counters per TCP 5-tuple never reach their freeze cap.
-		if pktIdx > 1 && (pktIdx%12) == 1 {
+		// Rotate the dialer's outer TCP source port every 512 packets (~650 KB)
+		// so stateful ISP byte-counters per TCP 5-tuple do not freeze long flows
+		// while avoiding excessive port churn during multi-megabyte uploads.
+		if pktIdx > 1 && (pktIdx%512) == 1 {
 			newPort := randomEphemeralPort()
 			c.outerPort.Store(uint32(newPort))
 			newSeq := randomUint32()

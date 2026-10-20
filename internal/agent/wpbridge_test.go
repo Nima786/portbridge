@@ -39,6 +39,42 @@ func TestWebsiteBridgeOriginLifecycle(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	cpSecDir := filepath.Join(tmpRoot, "etc", "cp-security")
+	if err := os.MkdirAll(cpSecDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	neverFile := filepath.Join(cpSecDir, "never-block.list")
+	origNever := "# Never block list\n88.218.16.186 | Iran relay (PortBridge test)\n173.245.48.0/20 | Cloudflare\n"
+	if err := os.WriteFile(neverFile, []byte(origNever), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	lswsConfDir := filepath.Join(tmpRoot, "usr", "local", "lsws", "conf")
+	if err := os.MkdirAll(lswsConfDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	lswsXMLFile := filepath.Join(lswsConfDir, "httpd_config.xml")
+	origXML := strings.Join([]string{
+		`<?xml version="1.0" encoding="UTF-8"?>`,
+		`<httpServerConfig>`,
+		`  <useIpInProxyHeader>0</useIpInProxyHeader>`,
+		`  <tuning>`,
+		`    <maxConnections>10000</maxConnections>`,
+		`  </tuning>`,
+		`  <security>`,
+		`    <accessControl>`,
+		`      <allow>`,
+		`ALL, 127.0.0.1T`,
+		`      </allow>`,
+		`    </accessControl>`,
+		`  </security>`,
+		`</httpServerConfig>`,
+		``,
+	}, "\n")
+	if err := os.WriteFile(lswsXMLFile, []byte(origXML), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
 	wpBridgeRootOverride = tmpRoot
 	wpBridgeHostsOverride = hostsFile
 	defer func() {
@@ -51,6 +87,7 @@ func TestWebsiteBridgeOriginLifecycle(t *testing.T) {
 		Role:                  engine.RoleOrigin,
 		PeerIP:                "94.184.11.46",
 		LocalIP:               "185.139.7.48",
+		ProxyProtocol:         1,
 		WebsiteBridge:         true,
 		WebsiteDomains:        "test.homplast.com",
 		OutboundProxy:         true,
@@ -73,6 +110,26 @@ func TestWebsiteBridgeOriginLifecycle(t *testing.T) {
 	}
 	if !strings.Contains(string(hostsAfter), "127.0.0.1 test.homplast.com www.test.homplast.com # portbridge-website-loopback:test") {
 		t.Fatalf("expected loopback entry in hosts, got:\n%s", string(hostsAfter))
+	}
+
+	// Verify CP-Security never-block.list replaced stale 88.218.16.186 with 94.184.11.46
+	neverAfter, err := os.ReadFile(neverFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(neverAfter), "94.184.11.46 | Iran relay (PortBridge test)") ||
+		strings.Contains(string(neverAfter), "88.218.16.186") {
+		t.Fatalf("expected never-block.list to have 94.184.11.46 and remove stale 88.218.16.186, got:\n%s", string(neverAfter))
+	}
+
+	// Verify LiteSpeed httpd_config.xml updated useIpInProxyHeader=2 and proxyProtocol=127.0.0.1
+	xmlAfter, err := os.ReadFile(lswsXMLFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(xmlAfter), "<useIpInProxyHeader>2</useIpInProxyHeader>") ||
+		!strings.Contains(string(xmlAfter), "<proxyProtocol>127.0.0.1</proxyProtocol>") {
+		t.Fatalf("expected httpd_config.xml to enable useIpInProxyHeader=2 and proxyProtocol=127.0.0.1, got:\n%s", string(xmlAfter))
 	}
 
 	// Verify wp-config.php injection
@@ -116,6 +173,22 @@ func TestWebsiteBridgeOriginLifecycle(t *testing.T) {
 	}
 	if string(hostsCleaned) != origHosts {
 		t.Fatalf("expected hosts file restored to:\n%q\ngot:\n%q", origHosts, string(hostsCleaned))
+	}
+
+	neverCleaned, err := os.ReadFile(neverFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(neverCleaned), "PortBridge test") {
+		t.Fatalf("expected PortBridge test removed from never-block.list, got:\n%s", string(neverCleaned))
+	}
+
+	xmlCleaned, err := os.ReadFile(lswsXMLFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(xmlCleaned), "<proxyProtocol>") {
+		t.Fatalf("expected <proxyProtocol> removed from httpd_config.xml on cleanup, got:\n%s", string(xmlCleaned))
 	}
 
 	wpCleaned, err := os.ReadFile(wpConfigPath)
