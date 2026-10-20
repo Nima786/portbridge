@@ -4093,6 +4093,8 @@
     $('wb-title').textContent = 'New Website Bridge';
     $('wb-sub').textContent = 'Forward visitors from an Iran VPS IP to your Foreign web server (LiteSpeed / CyberPanel / WordPress / Nginx), and give WordPress a smart local outbound proxy for Iranian banks & SMS gateways while keeping Telegram direct.';
     $('wb-submit').textContent = 'Create Website Bridge';
+    if ($('wb-step1-title')) $('wb-step1-title').textContent = 'Servers, Bridge Name & Website Domains';
+    if ($('wb-step4-title')) $('wb-step4-title').textContent = 'Inter-Server Link & Multiplexed Web Capacity';
 
     $('wb-relay').replaceChildren(...relays.map(serverOption));
     $('wb-foreign').replaceChildren(...foreigns.map(serverOption));
@@ -4147,6 +4149,8 @@
     const where = [e && e.server_name, o && o.server_name].filter(Boolean).join(' ↔ ');
     $('wb-sub').textContent = `Update web ports, visitor IP forwarding, or Smart Outbound Proxy domains across ${where}.`;
     $('wb-submit').textContent = 'Save & Apply Website Bridge';
+    if ($('wb-step1-title')) $('wb-step1-title').textContent = 'Website Domains';
+    if ($('wb-step4-title')) $('wb-step4-title').textContent = 'Multiplexed Web Capacity';
 
     $('wb-create-servers').hidden = true;
     $('wb-name-wrap').hidden = true;

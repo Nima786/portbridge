@@ -1803,7 +1803,7 @@
         <div class="step-header">
           <span class="step-num">1</span>
           <div>
-            <h3>Servers, Bridge Name &amp; Website Domains</h3>
+            <h3 id="wb-step1-title">Servers, Bridge Name &amp; Website Domains</h3>
             <p class="muted small">One Website Bridge can serve unlimited domains on the same Foreign web server via automatic TLS SNI &amp; Host routing.</p>
           </div>
         </div>
@@ -1854,9 +1854,9 @@
           </div>
         </div>
 
-        <div class="port-check-row">
+        <div class="port-check-bar">
           <button type="button" id="wb-check-ports">Check Web &amp; Bridge Ports on Both Servers</button>
-          <ul id="wb-ports-result" class="port-results" aria-live="polite"></ul>
+          <ul id="wb-ports-result" class="ports-result" aria-live="polite"></ul>
         </div>
 
         <label>Visitor Real IP Forwarding (PROXY Protocol)</label>
@@ -1952,7 +1952,7 @@
         <legend class="step-header">
           <span class="step-num">4</span>
           <span>
-            <span class="step-title">Inter-Server Link &amp; Multiplexed Web Capacity</span>
+            <span id="wb-step4-title" class="step-title">Inter-Server Link &amp; Multiplexed Web Capacity</span>
             <span class="step-sub">Website Bridges always use Shared Multiplexed Links (Mux) so hundreds of parallel CSS/JS/image requests load over persistent encrypted trunks with zero handshake delay.</span>
           </span>
         </legend>

@@ -345,6 +345,8 @@ legend { padding: 0 .4rem; font-weight: 650; }
 
 .row { display: grid; grid-template-columns: 1fr 9rem; gap: .85rem; }
 .row2 { display: grid; grid-template-columns: 1fr 1fr; gap: .85rem; }
+.row > *, .row2 > * { min-width: 0; }
+.row2:has(> [hidden]) { grid-template-columns: 1fr; }
 
 .actions {
   display: flex;
@@ -1089,6 +1091,7 @@ dialog > form, dialog > div {
 .dialog-body {
   padding: 1.2rem 1.4rem;
   overflow-y: auto;
+  overflow-x: hidden;
   flex: 1 1 auto;
 }
 
@@ -1108,6 +1111,7 @@ dialog > form, dialog > div {
   background: var(--well);
   padding: 1rem 1.1rem;
   margin: 0 0 1rem;
+  min-width: 0;
 }
 fieldset.step-section, fieldset.step-box {
   padding-top: .75rem;
@@ -1127,7 +1131,7 @@ legend.step-header {
   width: 100%;
   margin-bottom: .75rem;
 }
-legend.step-header + * { clear: both; }
+legend.step-header ~ * { clear: both; }
 
 .step-num {
   width: 1.65rem;
