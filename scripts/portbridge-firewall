@@ -319,12 +319,35 @@ gre_used_by_others() {
     return 1
 }
 
+any_gre_used() {
+    local f
+    for f in "$CONF_DIR"/*.conf; do
+        [ -e "$f" ] || continue
+        [ "$(read_conf "$f" gre)" = on ] && return 0
+    done
+    return 1
+}
+
+unload_unused_gre_module() {
+    any_gre_used && return 0
+    if have ip && ip -o link show 2>/dev/null | awk -F': ' '{print $2}' | sed 's/@.*//' | grep -qE '^pbg[0-9a-f]{8}$'; then
+        return 0
+    fi
+    modprobe -r ip_gre gre 2>/dev/null || true
+}
+
 # link_release <name> - takes the link down unless another tunnel still needs it.
 link_release() {
     local name=$1
     gre_conf "$name"
-    [ -n "$GRE_LOCAL" ] && [ -n "$GRE_REMOTE" ] || return 0
-    gre_pair "$GRE_LOCAL" "$GRE_REMOTE" || return 0
+    if [ -z "$GRE_LOCAL" ] || [ -z "$GRE_REMOTE" ]; then
+        unload_unused_gre_module
+        return 0
+    fi
+    if ! gre_pair "$GRE_LOCAL" "$GRE_REMOTE"; then
+        unload_unused_gre_module
+        return 0
+    fi
     if gre_used_by_others "$name"; then
         return 0
     fi
@@ -332,6 +355,7 @@ link_release() {
         ip link del "$GRE_IFACE" 2>/dev/null && echo "private GRE link $GRE_IFACE removed"
     fi
     gre_firewall_close
+    unload_unused_gre_module
     return 0
 }
 
@@ -404,9 +428,11 @@ cmd_gre_check() {
     local err probe=pbgchk$$
     if err=$(ip tunnel add "$probe" mode gre local 127.0.0.1 remote 192.0.2.1 ttl 64 2>&1); then
         ip link del "$probe" 2>/dev/null
+        unload_unused_gre_module
         echo "this server can make GRE links"
         return 0
     fi
+    unload_unused_gre_module
     echo "$err"
     gre_unsupported_hint
     exit 1
@@ -527,11 +553,34 @@ sit_used_by_others() {
     return 1
 }
 
+any_sit_used() {
+    local f
+    for f in "$CONF_DIR"/*.conf; do
+        [ -e "$f" ] || continue
+        [ "$(read_conf "$f" sit)" = on ] && return 0
+    done
+    return 1
+}
+
+unload_unused_sit_module() {
+    any_sit_used && return 0
+    if have ip && ip -o link show 2>/dev/null | awk -F': ' '{print $2}' | sed 's/@.*//' | grep -qE '^pbs[0-9a-f]{8}$'; then
+        return 0
+    fi
+    modprobe -r sit 2>/dev/null || true
+}
+
 sit_release() {
     local name=$1
     sit_conf "$name"
-    [ -n "$SIT_LOCAL" ] && [ -n "$SIT_REMOTE" ] || return 0
-    sit_pair "$SIT_LOCAL" "$SIT_REMOTE" || return 0
+    if [ -z "$SIT_LOCAL" ] || [ -z "$SIT_REMOTE" ]; then
+        unload_unused_sit_module
+        return 0
+    fi
+    if ! sit_pair "$SIT_LOCAL" "$SIT_REMOTE"; then
+        unload_unused_sit_module
+        return 0
+    fi
     if sit_used_by_others "$name"; then
         return 0
     fi
@@ -539,6 +588,7 @@ sit_release() {
         ip link del "$SIT_IFACE" 2>/dev/null && echo "private 6in4 link $SIT_IFACE removed"
     fi
     sit_firewall_close
+    unload_unused_sit_module
     return 0
 }
 
@@ -597,9 +647,11 @@ cmd_sit_check() {
     local err probe=pbschk$$
     if err=$(ip tunnel add "$probe" mode sit local 127.0.0.1 remote 192.0.2.1 ttl 64 2>&1); then
         ip link del "$probe" 2>/dev/null
+        unload_unused_sit_module
         echo "this server can make 6in4 (SIT) links"
         return 0
     fi
+    unload_unused_sit_module
     echo "$err"
     sit_unsupported_hint
     exit 1
@@ -772,6 +824,9 @@ cmd_sweep() {
         done
     fi
 
+    unload_unused_gre_module
+    unload_unused_sit_module
+
     if [ "$removed" -gt 0 ]; then
         echo "swept $removed leftover rule(s) and link(s) of tunnels that no longer exist"
     elif [ "$mode" != quiet ]; then
@@ -805,6 +860,7 @@ cmd_remove() {
     # is still using it.
     link_release "$name"
     sit_release "$name"
+    cmd_sweep quiet
 }
 
 cmd_status() {
