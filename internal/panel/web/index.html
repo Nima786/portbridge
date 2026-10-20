@@ -2059,8 +2059,8 @@
         <div class="step-header">
           <span class="step-num">2</span>
           <div>
-            <h3>Add to <code>wp-config.php</code> (WordPress HTTP API + Telegram Bypass)</h3>
-            <p class="muted small">Paste these lines into your site's <code>wp-config.php</code> (above <code>/* That's all, stop editing! */</code>). WordPress will send outbound calls to PortBridge's local Smart Proxy on <code>127.0.0.1</code>.</p>
+            <h3><code>wp-config.php</code> + Loopback (Auto-Managed on Foreign Server)</h3>
+            <p class="muted small">PortBridge automatically adds this block to your site's <code>wp-config.php</code> and adds a local <code>127.0.0.1</code> loopback entry in <code>/etc/hosts</code> when the Website Bridge is created, and removes them cleanly when the tunnel is deleted.</p>
           </div>
         </div>
         <pre id="wp-config-snippet" class="log-view"></pre>
@@ -2073,8 +2073,8 @@
         <div class="step-header">
           <span class="step-num">3</span>
           <div>
-            <h3>Optional Must-Use Plugin for Direct PHP <code>curl_init()</code> Gateways</h3>
-            <p class="muted small">Some Iranian bank/SMS plugins call PHP <code>curl_init()</code> directly instead of WordPress's HTTP API. Save this file as <code>wp-content/mu-plugins/portbridge-proxy.php</code> to route all PHP cURL requests through the Smart Proxy automatically.</p>
+            <h3>Smart Proxy &amp; Plugin Update Guard (<code>wp-content/mu-plugins/portbridge-smart-proxy.php</code>)</h3>
+            <p class="muted small">Automatically installed into <code>wp-content/mu-plugins/portbridge-smart-proxy.php</code> (and removed on tunnel deletion). Ensures only Iranian banks/SMS gateways use the Iran proxy while keeping all international plugin/theme updates, licenses, and Telegram direct.</p>
           </div>
         </div>
         <pre id="wp-muplugin-snippet" class="log-view"></pre>

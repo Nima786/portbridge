@@ -309,6 +309,9 @@ func applyPairingWarn(p *PairingData, confDir string, warns *[]string) error {
 		if errors.Is(err, errNoSystemd) {
 			// The files are in place; only the starting is left to the owner.
 			log.Printf("[%s] %v", p.Name, err)
+			if notes := syncWebsiteBridgeOrigin(cfg, nil, confDir); len(notes) > 0 && warns != nil {
+				*warns = append(*warns, notes...)
+			}
 			return nil
 		}
 		_ = host.Disable(p.Name)
@@ -325,6 +328,10 @@ func applyPairingWarn(p *PairingData, confDir string, warns *[]string) error {
 		_ = host.FirewallSweep()
 		_ = host.Reload()
 		return err
+	}
+
+	if notes := syncWebsiteBridgeOrigin(cfg, nil, confDir); len(notes) > 0 && warns != nil {
+		*warns = append(*warns, notes...)
 	}
 
 	return nil
@@ -376,6 +383,7 @@ func deleteTunnel(name string, confDir string) error {
 	secretFile := filepath.Join(confDir, name+".secret")
 	certFile := filepath.Join(confDir, name+".crt")
 	keyFile := filepath.Join(confDir, name+".key")
+	oldCfg, _ := engine.LoadConfig(confFile)
 
 	// Stopped before anything is removed, so the service is not left running on
 	// settings that have gone.
@@ -397,6 +405,7 @@ func deleteTunnel(name string, confDir string) error {
 	if err := host.FirewallSweep(); err != nil {
 		log.Printf("[%s] sweeping leftovers: %v", name, err)
 	}
+	cleanupWebsiteBridgeOrigin(name, oldCfg, confDir)
 	return nil
 }
 

@@ -1712,6 +1712,10 @@ func EditEdge(spec EditSpec, confDir string) (EdgeResult, error) {
 		return res, err
 	}
 
+	if wpNotes := syncWebsiteBridgeOrigin(newCfg, curCfg, confDir); len(wpNotes) > 0 {
+		res.Warnings = append(res.Warnings, wpNotes...)
+	}
+
 	res.OK = true
 	res.Code = code
 	return res, nil

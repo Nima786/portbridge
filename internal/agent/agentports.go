@@ -413,6 +413,7 @@ func updatePairingData(p *PairingData, confDir string, warns *[]string) error {
 	if err != nil {
 		return fmt.Errorf("there is no tunnel named %q on this server to change", p.Name)
 	}
+	oldCfg, _ := engine.LoadConfig(confFile)
 	oldSecret, err := os.ReadFile(secretFile)
 	if err != nil {
 		return fmt.Errorf("the tunnel %q has no password file here", p.Name)
@@ -471,6 +472,9 @@ func updatePairingData(p *PairingData, confDir string, warns *[]string) error {
 	if err := host.Restart(p.Name); err != nil {
 		if errors.Is(err, errNoSystemd) {
 			log.Printf("[%s] %v", p.Name, err)
+			if wpNotes := syncWebsiteBridgeOrigin(cfg, oldCfg, confDir); len(wpNotes) > 0 && warns != nil {
+				*warns = append(*warns, wpNotes...)
+			}
 			return nil
 		}
 		restore()
@@ -479,6 +483,9 @@ func updatePairingData(p *PairingData, confDir string, warns *[]string) error {
 	if err := confirmRunning(host, p.Name); err != nil {
 		restore()
 		return fmt.Errorf("%w; the old settings were put back", err)
+	}
+	if wpNotes := syncWebsiteBridgeOrigin(cfg, oldCfg, confDir); len(wpNotes) > 0 && warns != nil {
+		*warns = append(*warns, wpNotes...)
 	}
 	return nil
 }
