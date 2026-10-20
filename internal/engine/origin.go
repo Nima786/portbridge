@@ -789,6 +789,55 @@ func (o *origin) handleActivated(tunnel net.Conn, a arrival) {
 		_ = tunnel.Close()
 		return
 	}
+	if o.cfg.WebsiteBridge && strings.TrimSpace(o.cfg.WebsiteDomains) != "" {
+		if err := tunnel.SetWriteDeadline(time.Now().Add(activateWriteTimeout)); err != nil {
+			_ = tunnel.Close()
+			return
+		}
+		if _, err := tunnel.Write([]byte{msgAck}); err != nil {
+			_ = tunnel.Close()
+			return
+		}
+		_ = tunnel.SetWriteDeadline(time.Time{})
+
+		scratch := headPool.Get().(*[]byte)
+		_ = tunnel.SetReadDeadline(time.Now().Add(5 * time.Second))
+		n, rerr := tunnel.Read(*scratch)
+		_ = tunnel.SetReadDeadline(time.Time{})
+		var head []byte
+		if n > 0 {
+			head = make([]byte, n)
+			copy(head, (*scratch)[:n])
+		}
+		headPool.Put(scratch)
+
+		if len(head) == 0 || !o.cfg.AllowsWebsitePayload(head) {
+			_ = tunnel.Close()
+			_ = rerr
+			return
+		}
+
+		svc, err := o.dialAndTellService(inboundAddr, a)
+		if err != nil {
+			atomic.AddInt64(&o.st.failedSessions, 1)
+			o.logDial.printf("cannot reach the local service at %s: %v", inboundAddr, err)
+			_ = tunnel.Close()
+			return
+		}
+		_ = svc.SetWriteDeadline(time.Now().Add(activateWriteTimeout))
+		_, werr := svc.Write(head)
+		_ = svc.SetWriteDeadline(time.Time{})
+		if werr != nil {
+			_ = svc.Close()
+			_ = tunnel.Close()
+			return
+		}
+		if err := relay(svc, tunnel); err != nil {
+			o.logRelay.printf("a session was cut short taking data from the tunnel: %v", err)
+		}
+		return
+	}
+
 	svc, err := o.dialAndTellService(inboundAddr, a)
 	if err != nil {
 		atomic.AddInt64(&o.st.failedSessions, 1)

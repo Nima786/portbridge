@@ -415,6 +415,22 @@ func (e *edge) serve(ctx context.Context, user net.Conn, targetPort uint16) erro
 		// Do not spend a tunnel connection on it, and do not log it.
 		return fmt.Errorf("%w: %v", errUserWentAway, err)
 	}
+	if e.cfg.WebsiteBridge && strings.TrimSpace(e.cfg.WebsiteDomains) != "" {
+		if len(head) == 0 {
+			scratch := headPool.Get().(*[]byte)
+			_ = user.SetReadDeadline(time.Now().Add(3 * time.Second))
+			n, err = user.Read(*scratch)
+			_ = user.SetReadDeadline(time.Time{})
+			if n > 0 {
+				head = make([]byte, n)
+				copy(head, (*scratch)[:n])
+			}
+			headPool.Put(scratch)
+		}
+		if !e.cfg.AllowsWebsitePayload(head) {
+			return errUserWentAway
+		}
+	}
 
 	// When the route is known not to be carrying data, trying six times over
 	// just makes the user wait longer for the same answer: it used to take about
