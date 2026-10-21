@@ -402,6 +402,12 @@ func runUpdate(req UpdateRequest, workDir string, token ...string) UpdateResult 
 		res.OK = true
 		return res
 	}
+	// Only published releases are installed. A made-up version name could
+	// never be checked against GitHub's checksums, so anything sent along with
+	// it would go in unchecked.
+	if !IsReleaseVersion(req.Version) {
+		return fail("%q is not a release version; only published releases (like v1.2.3) can be installed", req.Version)
+	}
 	archive := req.Archive
 	if req.Upload != "" {
 		a, err := assembleUpload(workDir, req)
@@ -411,6 +417,10 @@ func runUpdate(req UpdateRequest, workDir string, token ...string) UpdateResult 
 		archive = a
 	}
 	if req.PullURL != "" && len(archive) == 0 {
+		// The token is sent with the download, so it must not travel in the clear.
+		if !strings.HasPrefix(strings.ToLower(req.PullURL), "https://") {
+			return fail("the panel's download address must be https://")
+		}
 		tok := ""
 		if len(token) > 0 {
 			tok = token[0]
@@ -429,7 +439,7 @@ func runUpdate(req UpdateRequest, workDir string, token ...string) UpdateResult 
 			return fail("%v", err)
 		}
 		archive = a
-	} else if IsReleaseVersion(req.Version) {
+	} else {
 		// Sent by the panel: checked against GitHub too, whenever GitHub can be
 		// reached from here.
 		if want, err := publishedChecksum(req.Version, runtime.GOARCH); err == nil && sha256Hex(archive) != want {

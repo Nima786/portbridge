@@ -215,6 +215,7 @@ type wsConn struct {
 	closed  bool
 
 	wmu sync.Mutex // frames must not interleave
+	rmu sync.Mutex // one reader of br at a time: Read and Close must not race
 }
 
 func (w *wsConn) NetConn() net.Conn {
@@ -230,6 +231,11 @@ func (w *wsConn) earlyPurpose() byte {
 }
 
 func (w *wsConn) Read(p []byte) (int, error) {
+	// br has a single reader at a time. Without this, tearing a shared link down
+	// (Close drains br) while readLoop is mid-frame would have two goroutines in
+	// the same bufio.Reader, which can panic and take the whole process down.
+	w.rmu.Lock()
+	defer w.rmu.Unlock()
 	for {
 		if len(w.readBuf) > 0 {
 			n := copy(p, w.readBuf)
@@ -397,8 +403,13 @@ const wsDrainTime = 250 * time.Millisecond
 // into a polite one.
 func (w *wsConn) Close() error {
 	if wsDrainTime > 0 {
+		// Nudge any in-flight Read off the wire so it lets go of the reader,
+		// then take it ourselves before draining: the two must never read br
+		// at the same time.
 		_ = w.Conn.SetReadDeadline(time.Now().Add(wsDrainTime))
+		w.rmu.Lock()
 		_, _ = io.Copy(io.Discard, w.br)
+		w.rmu.Unlock()
 	}
 	return w.Conn.Close()
 }

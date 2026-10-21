@@ -187,23 +187,41 @@ purge_own() {
 # which carried no tag. Only ever used on the side that accepts, where the port
 # belongs to this tunnel; on the side that dials the same number may be somebody
 # else's service.
+#
+# Old versions made exactly three kinds of rule for a port: a drop with no
+# source, and allows from this machine and from the other server. Only those are
+# matched. A plain "allow everyone to this port" rule, or an allow from some
+# other address, is the server owner's own and is left alone: deleting it would
+# close the port on servers whose firewall drops by default.
 purge_legacy() {
-    local tool=$1 port=$2 rule
+    local tool=$1 port=$2 peer=${3-} rule src_re
     have "$tool" || return 0
+    if [ "$tool" = ip6tables ]; then
+        src_re='::1/128'
+    else
+        src_re='127\.0\.0\.1/32'
+    fi
+    if [ -n "$peer" ]; then
+        # The peer as the listing prints it, dots escaped for the pattern.
+        src_re="$src_re|$(printf '%s' "$peer" | sed 's/[.]/\\./g')(/32|/128)?"
+    fi
     "$tool" -S INPUT 2>/dev/null |
-        grep -E -- "^-A INPUT( -s [^ ]+)? -p (tcp|udp) -m (tcp|udp) --dport $port -j (ACCEPT|DROP)$" |
+        grep -E -- "^-A INPUT( -s ($src_re) -p (tcp|udp) -m (tcp|udp) --dport $port -j ACCEPT| -p (tcp|udp) -m (tcp|udp) --dport $port -j DROP)$" |
         while read -r rule; do
             delete_rule "$tool" "$rule"
         done
 }
 
+# purge_everything <name> - removes this tunnel's own rules, and those older
+# versions left without a tag. The untagged ones are only looked for while this
+# tunnel's firewall is on: with it off, any rule on the port is the owner's.
 purge_everything() {
     local name=$1
     purge_own iptables "$name"
     purge_own ip6tables "$name"
-    if [ "$LISTENS" = yes ]; then
-        purge_legacy iptables "$TPORT"
-        purge_legacy ip6tables "$TPORT"
+    if [ "$LISTENS" = yes ] && [ "$ENABLED" != off ]; then
+        purge_legacy iptables "$TPORT" "$PEER"
+        purge_legacy ip6tables "$TPORT" "$PEER"
     fi
 }
 
@@ -328,11 +346,31 @@ any_gre_used() {
     return 1
 }
 
+# links_of_kind_in_use <kind> <fallback>... - is there any link of this kind
+# (gre, sit, ...) other than the kernel's own placeholder ones? That covers ours
+# and, just as much, links the server's owner made for themselves: a 6in4 IPv6
+# tunnel from a tunnel broker, or a GRE link of their own. Unloading the driver
+# would delete every one of them. When it cannot be told, it says yes.
+links_of_kind_in_use() {
+    local kind=$1 out iface fb
+    shift
+    have ip || return 0
+    out=$(ip -o link show type "$kind" 2>/dev/null) || return 0
+    while read -r iface; do
+        [ -n "$iface" ] || continue
+        for fb in "$@"; do
+            [ "$iface" = "$fb" ] && continue 2
+        done
+        return 0
+    done < <(printf '%s\n' "$out" | awk -F': ' 'NF > 1 {print $2}' | sed 's/@.*//')
+    return 1
+}
+
 unload_unused_gre_module() {
     any_gre_used && return 0
-    if have ip && ip -o link show 2>/dev/null | awk -F': ' '{print $2}' | sed 's/@.*//' | grep -qE '^pbg[0-9a-f]{8}$'; then
-        return 0
-    fi
+    links_of_kind_in_use gre gre0 && return 0
+    links_of_kind_in_use gretap gretap0 && return 0
+    links_of_kind_in_use erspan erspan0 && return 0
     modprobe -r ip_gre gre 2>/dev/null || true
 }
 
@@ -564,9 +602,7 @@ any_sit_used() {
 
 unload_unused_sit_module() {
     any_sit_used && return 0
-    if have ip && ip -o link show 2>/dev/null | awk -F': ' '{print $2}' | sed 's/@.*//' | grep -qE '^pbs[0-9a-f]{8}$'; then
-        return 0
-    fi
+    links_of_kind_in_use sit sit0 && return 0
     modprobe -r sit 2>/dev/null || true
 }
 

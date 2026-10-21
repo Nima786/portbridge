@@ -979,11 +979,20 @@ func orDefault(s, d string) string {
 func (p *Panel) handleBackupCreate(w http.ResponseWriter, r *http.Request, _ authed) {
 	var req struct {
 		Passphrase string `json:"passphrase"`
+		// AllowUnencrypted must be set on purpose for a backup with no password.
+		// Such a file holds every server's control token, the Cloudflare tokens
+		// and the panel's own private key in the clear, so it is never made by
+		// accident.
+		AllowUnencrypted bool `json:"allow_unencrypted"`
 	}
 	if !decodeJSON(w, r, &req) {
 		return
 	}
 	pass := strings.TrimSpace(req.Passphrase)
+	if pass == "" && !req.AllowUnencrypted {
+		writeErr(w, http.StatusBadRequest, "This backup holds every server token, your Cloudflare tokens and the panel's private key. Set a password to encrypt it, or confirm you want an unencrypted file.")
+		return
+	}
 	if pass != "" && len(pass) < 6 {
 		writeErr(w, http.StatusBadRequest, "Backup password must be at least 6 characters (or leave empty for an unencrypted backup).")
 		return

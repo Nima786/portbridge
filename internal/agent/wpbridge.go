@@ -367,8 +367,37 @@ func findWordPressDirs(domains []string, fallbackAll bool) []string {
 	return out
 }
 
+// errWPSymlink is returned when a path inside a WordPress folder that this
+// agent (running as root) is about to read, write or change the owner of is a
+// symbolic link. The folder belongs to the site's user, so a link there could
+// point anywhere, for example at /etc, and following it as root would hand
+// that user ownership of system files.
+var errWPSymlink = fmt.Errorf("refusing to follow a symbolic link inside a WordPress folder")
+
+// refuseSymlinks returns errWPSymlink if any of the given paths exists and is a
+// symbolic link. Paths that do not exist are fine; they will be created as
+// ordinary files or folders.
+func refuseSymlinks(paths ...string) error {
+	for _, p := range paths {
+		st, err := os.Lstat(p)
+		if err != nil {
+			continue
+		}
+		if st.Mode()&os.ModeSymlink != 0 {
+			return fmt.Errorf("%w: %s", errWPSymlink, p)
+		}
+	}
+	return nil
+}
+
 func applyWordPressProxy(wpDir string, cfg *engine.Config) error {
 	wpConfigPath := filepath.Join(wpDir, "wp-config.php")
+	contentDir := filepath.Join(wpDir, "wp-content")
+	muDir := filepath.Join(contentDir, "mu-plugins")
+	muFile := filepath.Join(muDir, "portbridge-smart-proxy.php")
+	if err := refuseSymlinks(wpConfigPath, contentDir, muDir, muFile); err != nil {
+		return err
+	}
 	rawBytes, err := os.ReadFile(wpConfigPath)
 	if err != nil {
 		return err
@@ -390,13 +419,16 @@ func applyWordPressProxy(wpDir string, cfg *engine.Config) error {
 		}
 	}
 
-	muDir := filepath.Join(wpDir, "wp-content", "mu-plugins")
 	if err := os.MkdirAll(muDir, 0o755); err != nil {
 		return fmt.Errorf("creating mu-plugins directory: %w", err)
 	}
+	// Checked again now that the folders exist: one could have been swapped
+	// for a link while they were being created.
+	if err := refuseSymlinks(contentDir, muDir, muFile); err != nil {
+		return err
+	}
 	copyFileOwner(wpConfigPath, muDir)
 
-	muFile := filepath.Join(muDir, "portbridge-smart-proxy.php")
 	muContent := buildWPMUPlugin(cfg)
 	existingMU, err := os.ReadFile(muFile)
 	if err != nil || string(existingMU) != muContent {
@@ -413,6 +445,11 @@ func applyWordPressProxy(wpDir string, cfg *engine.Config) error {
 
 func removeWordPressProxy(wpDir string, tunnelName string) {
 	wpConfigPath := filepath.Join(wpDir, "wp-config.php")
+	if err := refuseSymlinks(wpConfigPath, filepath.Join(wpDir, "wp-content"),
+		filepath.Join(wpDir, "wp-content", "mu-plugins")); err != nil {
+		log.Printf("[%s] leaving %s alone: %v", tunnelName, wpDir, err)
+		return
+	}
 	if rawBytes, err := os.ReadFile(wpConfigPath); err == nil {
 		st, statErr := os.Stat(wpConfigPath)
 		mode := os.FileMode(0o640)
@@ -825,11 +862,17 @@ func writeFilePreservingOwner(path string, data []byte, defaultPerm os.FileMode)
 	return nil
 }
 
+// copyFileOwner gives targetPath the same owner and group as refPath.
+//
+// -h makes chown change a symbolic link itself rather than whatever it points
+// at. The target sits in a folder the site's user controls, so without it a
+// link swapped in at the right moment would let that user take ownership of
+// any file on the server.
 func copyFileOwner(refPath string, targetPath string) {
 	if runtime.GOOS != "linux" {
 		return
 	}
-	_ = exec.Command("chown", "--reference="+refPath, targetPath).Run()
+	_ = exec.Command("chown", "-h", "--reference="+refPath, "--", targetPath).Run()
 }
 
 // anyOtherWebsiteProxyProto checks whether any other tunnel in confDir is an

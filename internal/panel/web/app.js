@@ -3609,7 +3609,20 @@
     if ($('backup-err')) $('backup-err').textContent = '';
     try {
       const passphrase = $('backup-pass') ? $('backup-pass').value.trim() : '';
-      const res = await api('POST', '/api/backup/create', { passphrase });
+      let allowUnencrypted = false;
+      if (!passphrase) {
+        allowUnencrypted = confirm(
+          'Download an UNENCRYPTED backup?\n\n' +
+          'It will contain every server\'s access token, your Cloudflare API ' +
+          'tokens and the panel\'s private key in plain text. Anyone who gets ' +
+          'the file can control your servers.\n\n' +
+          'Set a backup password to encrypt it instead, or press OK to download ' +
+          'it unencrypted anyway.');
+        if (!allowUnencrypted) {
+          throw new Error('Backup cancelled. Set a password to encrypt it, or confirm the unencrypted download.');
+        }
+      }
+      const res = await api('POST', '/api/backup/create', { passphrase, allow_unencrypted: allowUnencrypted });
       const text = JSON.stringify(res.backup, null, 2) + '\n';
       const blob = new Blob([text], { type: 'application/json' });
       const url = URL.createObjectURL(blob);

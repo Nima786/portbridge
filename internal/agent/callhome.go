@@ -151,6 +151,11 @@ var (
 func configureCallHome(panelURL, fingerprint, token, confDir string, h http.Handler) error {
 	panelURL = strings.TrimSpace(panelURL)
 	fingerprint = strings.TrimSpace(fingerprint)
+	if panelURL != "" && panelURL != "off" {
+		if err := validatePanelCallback(panelURL, fingerprint); err != nil {
+			return err
+		}
+	}
 
 	if confDir == "" || confDir == defaultTunnelsDir {
 		if ac, err := readAgentConfig(defaultAgentConf); err == nil {
@@ -192,6 +197,37 @@ func configureCallHome(panelURL, fingerprint, token, confDir string, h http.Hand
 // CallHome is callHome, for the panel's tests.
 func CallHome(ctx context.Context, panelURL, fingerprint, token string, h http.Handler) {
 	callHome(ctx, panelURL, fingerprint, token, h)
+}
+
+// validatePanelCallback checks a panel address list and fingerprint before they
+// are saved or used.
+//
+// Both end up as lines in agent.conf, so a line break in either would let the
+// sender add settings of their own, such as switching on remote updates. Every
+// address must also be https: the agent sends its token on every call and runs
+// whatever the panel asks, so a plain http address would hand control of this
+// server to anyone on the path.
+func validatePanelCallback(panelURLs, fingerprint string) error {
+	if strings.ContainsAny(panelURLs, "\r\n") || strings.ContainsAny(fingerprint, "\r\n") {
+		return errors.New("the panel address and fingerprint must be on one line")
+	}
+	urls := splitPanelURLs(panelURLs)
+	if len(urls) == 0 {
+		return errors.New("no panel address was given")
+	}
+	for _, raw := range urls {
+		u, err := url.Parse(raw)
+		if err != nil || u.Scheme != "https" || u.Host == "" || u.User != nil {
+			return fmt.Errorf("the panel address %q must be an https:// address", raw)
+		}
+	}
+	for _, r := range fingerprint {
+		ok := r == ':' || (r >= '0' && r <= '9') || (r >= 'a' && r <= 'f') || (r >= 'A' && r <= 'F')
+		if !ok {
+			return errors.New("the panel fingerprint may only contain hex digits and colons")
+		}
+	}
+	return nil
 }
 
 func splitPanelURLs(raw string) []string {

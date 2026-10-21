@@ -162,6 +162,10 @@ latest_tag() {
 
 # fetch_release <tag> - downloads the prebuilt archive and checks it against the
 # checksums published with the release before anything in it is trusted.
+# Returns 1 when the release could not be downloaded at all, and 2 when it was
+# downloaded but could not be verified. Only the first may fall back to building
+# from source: a download that fails its check may have been tampered with, and
+# quietly building something else instead would hide that.
 fetch_release() {
     local tag=$1 name url want got
     [ -n "$tag" ] || return 1
@@ -170,13 +174,13 @@ fetch_release() {
     curl -fsSL --max-time 120 -o "$TMP/pb.tar.gz" "$url/$name" || return 1
     if ! curl -fsSL --max-time 30 -o "$TMP/checksums.txt" "$url/checksums.txt"; then
         warn "  Could not get the release's checksums, so the download cannot be verified."
-        return 1
+        return 2
     fi
     want=$(awk -v n="./$name" -v m="$name" '$2 == n || $2 == m {print $1; exit}' "$TMP/checksums.txt")
     got=$(sha256sum "$TMP/pb.tar.gz" | awk '{print $1}')
     if [ -z "$want" ] || [ "$want" != "$got" ]; then
         warn "  The download does not match its published checksum. Not using it."
-        return 1
+        return 2
     fi
     mkdir -p "$TMP/rel"
     tar -xzf "$TMP/pb.tar.gz" -C "$TMP/rel" || return 1
@@ -261,15 +265,23 @@ say "  Release $WANTED"
 if [ -n "$FROM_DIR" ]; then
     use_from_dir || die "Could not use the copy in $FROM_DIR."
     ok "  Using the copy that was sent here"
-elif fetch_release "$WANTED"; then
-    ok "  Downloaded a prebuilt copy, checksum verified"
-elif build_from_source "$WANTED"; then
-    ok "  Built from source"
 else
-    die "Could not download or build PortBridge $WANTED.
+    fetch_release "$WANTED"
+    fetched=$?
+    if [ "$fetched" -eq 0 ]; then
+        ok "  Downloaded a prebuilt copy, checksum verified"
+    elif [ "$fetched" -eq 2 ]; then
+        die "PortBridge $WANTED was downloaded but could not be verified, so it was not installed.
+Nothing on this server was changed. Try again later; if it keeps happening,
+the download may be being tampered with on the way."
+    elif build_from_source "$WANTED"; then
+        ok "  Built from source"
+    else
+        die "Could not download or build PortBridge $WANTED.
 This server may not be able to reach GitHub. Options:
   - install Go (apt install golang-go) and run this again, or
   - copy the portbridge binary across by hand to $BIN"
+    fi
 fi
 
 # ------------------------------------------------------------------- stage it all

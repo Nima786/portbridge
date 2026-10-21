@@ -1110,7 +1110,10 @@ func newAgentHandler(token, confDir string, allowUpdates func() bool) *http.Serv
 			writeJSONReply(w, http.StatusBadRequest, map[string]any{"ok": false, "error": "invalid request"})
 			return
 		}
-		_ = configureCallHome(req.PanelURL, req.PanelFingerprint, token, confDir, mux)
+		if err := configureCallHome(req.PanelURL, req.PanelFingerprint, token, confDir, mux); err != nil {
+			writeJSONReply(w, http.StatusBadRequest, map[string]any{"ok": false, "error": err.Error()})
+			return
+		}
 		writeJSONReply(w, http.StatusOK, map[string]any{"ok": true})
 	})
 
@@ -1552,8 +1555,10 @@ func CmdAgent(args []string) error {
 	// reaches the agent there.
 	allow := updatesAllowedByConfig(*confPath)
 	if ac, err := readAgentConfig(*confPath); err == nil && ac.PanelURL != "" {
-		_ = configureCallHome(ac.PanelURL, ac.PanelFingerprint, *token, defaultTunnelsDir,
-			newAgentHandler(*token, defaultTunnelsDir, allow))
+		if err := configureCallHome(ac.PanelURL, ac.PanelFingerprint, *token, defaultTunnelsDir,
+			newAgentHandler(*token, defaultTunnelsDir, allow)); err != nil {
+			log.Printf("not calling the panel: %v", err)
+		}
 	}
 
 	return runAgentServer(*listen, *token, *cert, *key, defaultTunnelsDir, allow)

@@ -137,6 +137,12 @@ const (
 	// How long to wait to queue an end-of-session marker before concluding the
 	// link is stuck.
 	muxOrderedWait = 30 * time.Second
+
+	// At most one reset per stream per this long, so a window of data for a
+	// closed stream cannot flood the control queue. The cap bounds the memory
+	// the dedup table can use on a very busy link.
+	muxResetDedup    = 10 * time.Second
+	muxResetDedupMax = 4096
 )
 
 var (
@@ -761,6 +767,34 @@ type carrier struct {
 
 	// onDone is told once, when the link finishes, how long it lived and why.
 	onDone func(age time.Duration, err error)
+
+	// recentReset remembers streams a reset was just sent for, so the far end
+	// sending a whole window of data for a stream this side has already closed
+	// draws one reset, not one per frame. Without this a cancelled large
+	// download could fill the control queue and take the whole link down.
+	recentReset map[uint32]int64
+}
+
+// resetStream tells the far end a stream is gone, but at most once in a short
+// while per stream, so a backlog of data for a closed stream cannot flood the
+// control queue.
+func (c *carrier) resetStream(id uint32) {
+	now := time.Now().UnixNano()
+	c.mu.Lock()
+	if c.recentReset == nil {
+		c.recentReset = make(map[uint32]int64)
+	}
+	last, seen := c.recentReset[id]
+	if seen && now-last < int64(muxResetDedup) {
+		c.mu.Unlock()
+		return
+	}
+	if len(c.recentReset) >= muxResetDedupMax {
+		c.recentReset = make(map[uint32]int64)
+	}
+	c.recentReset[id] = now
+	c.mu.Unlock()
+	c.sendControl(muxFrame{typ: muxReset, id: id})
 }
 
 // markSuspect notes that a session on this link failed to start, steers new
@@ -1143,7 +1177,7 @@ func (c *carrier) handle(typ byte, id uint32, payload []byte) error {
 			// More sessions arriving than are being picked up. Refuse this one
 			// rather than hold up the whole link.
 			c.forget(id)
-			c.sendControl(muxFrame{typ: muxReset, id: id})
+			c.resetStream(id)
 		}
 		return nil
 
@@ -1151,14 +1185,16 @@ func (c *carrier) handle(typ byte, id uint32, payload []byte) error {
 		s := c.lookup(id)
 		if s == nil {
 			// Data for a session this side has already finished with. Normal
-			// when both ends close at once; tell the far side and move on.
-			c.sendControl(muxFrame{typ: muxReset, id: id})
+			// when both ends close at once; tell the far side and move on. The
+			// far end may still have a whole window in flight, so this is
+			// rate-limited per stream rather than answered frame by frame.
+			c.resetStream(id)
 			return nil
 		}
 		if err := s.deliver(payload); err != nil {
 			s.kill(err)
 			c.forget(id)
-			c.sendControl(muxFrame{typ: muxReset, id: id})
+			c.resetStream(id)
 		}
 		return nil
 

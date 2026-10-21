@@ -84,6 +84,15 @@ func readAgentConfig(path string) (agentConfig, error) {
 }
 
 func writeAgentConfig(path string, ac agentConfig) error {
+	// Every value is written as one "key = value" line. A line break inside one
+	// would add a setting nobody asked for (allow_updates, a new token), so the
+	// whole write is refused rather than risk it.
+	for _, v := range []string{ac.Listen, ac.Token, ac.CertFile, ac.KeyFile,
+		ac.PanelURL, ac.PanelFingerprint, ac.AllowUpdates} {
+		if strings.ContainsAny(v, "\r\n") {
+			return errors.New("an agent setting contained a line break; nothing was written")
+		}
+	}
 	var b strings.Builder
 	b.WriteString("# PortBridge Management Agent configuration\n")
 	fmt.Fprintf(&b, "listen = %s\ntoken = %s\n", ac.Listen, ac.Token)
@@ -227,6 +236,10 @@ func agentSetup(confPath string, port int, panelURL, panelFP, allowUpdates strin
 	case "off":
 		ac.PanelURL, ac.PanelFingerprint = "", ""
 	default:
+		if err := validatePanelCallback(panelURL, panelFP); err != nil {
+			_, _ = hostRun("systemctl", "start", agentUnit)
+			return res, err
+		}
 		ac.PanelURL, ac.PanelFingerprint = panelURL, panelFP
 	}
 	if allowUpdates != "" {
