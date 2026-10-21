@@ -3332,6 +3332,7 @@
         const cdnDomain = $('ah-cdn').value.trim();
         await api('POST', '/api/tunnels/autoheal', {
           name: autoHealTunnel.name,
+          edge: autoHealTunnel.edge ? autoHealTunnel.edge.server_id : '',
           enabled,
           cdn_domain: cdnDomain,
         });
@@ -3341,7 +3342,9 @@
           : 'Auto-Heal disabled for this tunnel.';
         lastTunnels = '';
         await refresh();
-        const updated = tunnelsCache.find((x) => x.name === autoHealTunnel.name);
+        const wantEdge = autoHealTunnel.edge ? autoHealTunnel.edge.server_id : '';
+        const updated = tunnelsCache.find((x) => x.name === autoHealTunnel.name &&
+          (x.edge ? x.edge.server_id : '') === wantEdge);
         if (updated) {
           autoHealTunnel = updated;
           renderAutoHealModal(updated);
@@ -3372,6 +3375,7 @@
         if ($('ah-enabled').checked || cdnDomain) {
           await api('POST', '/api/tunnels/autoheal', {
             name: t.name,
+            edge,
             enabled: $('ah-enabled').checked,
             cdn_domain: cdnDomain,
           });

@@ -883,7 +883,10 @@ func (p *Panel) handleProbeSpoofTest(w http.ResponseWriter, r *http.Request, _ a
 
 func (p *Panel) handleSetTunnelAutoHeal(w http.ResponseWriter, r *http.Request, _ authed) {
 	var req struct {
-		Name      string `json:"name"`
+		Name string `json:"name"`
+		// Edge is the relay server the tunnel is on. Two pairs of servers can
+		// each have a tunnel with the same name, so it says which one is meant.
+		Edge      string `json:"edge"`
 		Enabled   bool   `json:"enabled"`
 		CDNDomain string `json:"cdn_domain"`
 	}
@@ -895,7 +898,7 @@ func (p *Panel) handleSetTunnelAutoHeal(w http.ResponseWriter, r *http.Request, 
 		writeErr(w, http.StatusBadRequest, capitalise(err.Error())+".")
 		return
 	}
-	if err := p.healer.setConfig(name, req.Enabled, req.CDNDomain); err != nil {
+	if err := p.healer.setConfig(strings.TrimSpace(req.Edge), name, req.Enabled, req.CDNDomain); err != nil {
 		writeErr(w, http.StatusBadRequest, capitalise(err.Error())+".")
 		return
 	}

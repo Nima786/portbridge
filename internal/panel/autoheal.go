@@ -28,6 +28,17 @@ const (
 	autoHealInterval  = 20 * time.Second
 	autoHealCooldown  = 2 * time.Minute
 	autoHealThreshold = 2 // consecutive unhealthy checks (~40s) before probing & switching
+
+	// After a failed attempt the next one waits twice as long as the last, so a
+	// path that is down does not have the whole benchmark and two servers' worth
+	// of config changes repeated every 20 seconds.
+	autoHealBackoffBase = 2 * time.Minute
+	autoHealBackoffMax  = 30 * time.Minute
+
+	// How many tunnels may be healed at the same time. A wide outage makes many
+	// tunnels unhealthy at once; healing them all together would benchmark and
+	// reconfigure every server at the same moment.
+	autoHealMaxParallel = 2
 )
 
 type tunnelHealRuntime struct {
@@ -37,28 +48,195 @@ type tunnelHealRuntime struct {
 	lastHeal  time.Time
 	lastNote  string
 	running   bool
+
+	// failures counts failed heals in a row; nextTry is the earliest the next
+	// automatic attempt may start.
+	failures int
+	nextTry  time.Time
 }
 
 type autoHealer struct {
 	p  *Panel
 	mu sync.Mutex
 	rt map[string]*tunnelHealRuntime
+
+	// slots bounds the heals running at once; serverMu keeps two heals from
+	// working on the same server at the same time.
+	slots    chan struct{}
+	serverMu map[string]*sync.Mutex
 }
 
 func newAutoHealer(p *Panel) *autoHealer {
 	return &autoHealer{
-		p:  p,
-		rt: map[string]*tunnelHealRuntime{},
+		p:        p,
+		rt:       map[string]*tunnelHealRuntime{},
+		slots:    make(chan struct{}, autoHealMaxParallel),
+		serverMu: map[string]*sync.Mutex{},
 	}
 }
 
-func (ah *autoHealer) runtimeOf(name string) *tunnelHealRuntime {
-	r := ah.rt[name]
+func (ah *autoHealer) runtimeOf(key string) *tunnelHealRuntime {
+	r := ah.rt[key]
 	if r == nil {
 		r = &tunnelHealRuntime{state: "monitoring"}
-		ah.rt[name] = r
+		ah.rt[key] = r
 	}
 	return r
+}
+
+// healBackoff is how long to wait after the given number of failed heals in a
+// row: 2 minutes, then 4, 8, 16, and never more than 30.
+func healBackoff(failures int) time.Duration {
+	if failures < 1 {
+		return 0
+	}
+	d := autoHealBackoffBase
+	for i := 1; i < failures && d < autoHealBackoffMax; i++ {
+		d *= 2
+	}
+	if d > autoHealBackoffMax {
+		d = autoHealBackoffMax
+	}
+	return d
+}
+
+// lockServers takes a lock on each server, always in the same order so two heals
+// can never wait on each other, and returns the function that lets go.
+func (ah *autoHealer) lockServers(ids ...string) func() {
+	uniq := make([]string, 0, len(ids))
+	for _, id := range ids {
+		if id != "" && !slices.Contains(uniq, id) {
+			uniq = append(uniq, id)
+		}
+	}
+	slices.Sort(uniq)
+	locks := make([]*sync.Mutex, 0, len(uniq))
+	ah.mu.Lock()
+	for _, id := range uniq {
+		m := ah.serverMu[id]
+		if m == nil {
+			m = &sync.Mutex{}
+			ah.serverMu[id] = m
+		}
+		locks = append(locks, m)
+	}
+	ah.mu.Unlock()
+	for _, m := range locks {
+		m.Lock()
+	}
+	return func() {
+		for i := len(locks) - 1; i >= 0; i-- {
+			locks[i].Unlock()
+		}
+	}
+}
+
+// Auto-Heal settings are kept per tunnel, and a tunnel name is only unique on one
+// server: two different pairs of servers can each have a tunnel called "main".
+// The settings are therefore kept under "<relay server id>/<name>". Settings from
+// before that were kept under the bare name; they still count while only one
+// tunnel has that name, and are moved to the new key as soon as they can be.
+
+// healKeyFor is where a tunnel's Auto-Heal settings are kept.
+func healKeyFor(edgeID, name string) string {
+	if edgeID == "" {
+		return name
+	}
+	return edgeID + "/" + name
+}
+
+func edgeIDOf(tv tunnelView) string {
+	if tv.Edge == nil {
+		return ""
+	}
+	return tv.Edge.ServerID
+}
+
+// healableNameCounts says how many tunnels, with both halves in the panel, carry
+// each name. Only those can be healed, so only those can be confused.
+func healableNameCounts(tunnels []tunnelView) map[string]int {
+	counts := map[string]int{}
+	for _, tv := range tunnels {
+		if tv.Edge != nil && tv.Origin != nil {
+			counts[tv.Name]++
+		}
+	}
+	return counts
+}
+
+// resolveHealConfig finds a tunnel's settings: under its own key, or else under
+// the bare name from before, when that name belongs to just this one tunnel.
+func resolveHealConfig(st State, edgeID, name string, counts map[string]int) (AutoHealConfig, bool) {
+	if c, ok := st.AutoHeal[healKeyFor(edgeID, name)]; ok {
+		return c, true
+	}
+	if c, ok := st.AutoHeal[name]; ok && counts[name] <= 1 {
+		return c, true
+	}
+	return AutoHealConfig{}, false
+}
+
+// moveLegacyHealKey gives a tunnel's old bare-name settings its own key, when the
+// name is not shared with another tunnel. Called inside a store update.
+func moveLegacyHealKey(st *State, edgeID, name string, counts map[string]int) {
+	ck := healKeyFor(edgeID, name)
+	if ck == name || st.AutoHeal == nil || counts[name] > 1 {
+		return
+	}
+	if _, has := st.AutoHeal[ck]; has {
+		return
+	}
+	if c, ok := st.AutoHeal[name]; ok {
+		st.AutoHeal[ck] = c
+		delete(st.AutoHeal, name)
+	}
+}
+
+// migrateLegacyKeys moves every tunnel's old bare-name settings to its own key.
+func (ah *autoHealer) migrateLegacyKeys(tunnels []tunnelView) {
+	st := ah.p.store.get()
+	if len(st.AutoHeal) == 0 {
+		return
+	}
+	counts := healableNameCounts(tunnels)
+	need := false
+	for _, tv := range tunnels {
+		if tv.Edge == nil || tv.Origin == nil {
+			continue
+		}
+		if _, ok := st.AutoHeal[tv.Name]; ok && counts[tv.Name] <= 1 && healKeyFor(edgeIDOf(tv), tv.Name) != tv.Name {
+			need = true
+			break
+		}
+	}
+	if !need {
+		return
+	}
+	_ = ah.p.store.update(func(s *State) error {
+		for _, tv := range tunnels {
+			if tv.Edge != nil && tv.Origin != nil {
+				moveLegacyHealKey(s, edgeIDOf(tv), tv.Name, counts)
+			}
+		}
+		return nil
+	})
+}
+
+// forget drops a deleted tunnel's Auto-Heal settings and live state.
+func (ah *autoHealer) forget(edgeID, name string) {
+	counts := healableNameCounts(pairTunnels(ah.p.fleet.views()))
+	_ = ah.p.store.update(func(st *State) error {
+		delete(st.AutoHeal, healKeyFor(edgeID, name))
+		// The old bare-name entry is this tunnel's only if no other tunnel
+		// still has the name.
+		if counts[name] == 0 {
+			delete(st.AutoHeal, name)
+		}
+		return nil
+	})
+	ah.mu.Lock()
+	delete(ah.rt, healKeyFor(edgeID, name))
+	ah.mu.Unlock()
 }
 
 // extractTunnelCDNDomain returns the CDN domain configured on a tunnel (either
@@ -87,17 +265,19 @@ func extractTunnelCDNDomain(ti agent.TunnelInfo) string {
 // attachViews populates AutoHeal on each tunnelView for the UI.
 func (ah *autoHealer) attachViews(tunnels []tunnelView) {
 	st := ah.p.store.get()
+	counts := healableNameCounts(tunnels)
 	ah.mu.Lock()
 	defer ah.mu.Unlock()
 	for i := range tunnels {
 		name := tunnels[i].Name
-		cfg := st.AutoHeal[name]
+		edgeID := edgeIDOf(tunnels[i])
+		cfg, _ := resolveHealConfig(st, edgeID, name, counts)
 		if cfg.CDNDomain == "" && tunnels[i].Edge != nil {
 			if dom := extractTunnelCDNDomain(tunnels[i].Edge.Info); dom != "" {
 				cfg.CDNDomain = dom
 			}
 		}
-		if r := ah.rt[name]; r != nil {
+		if r := ah.rt[healKeyFor(edgeID, name)]; r != nil {
 			cfg.State = r.state
 			cfg.FailCount = r.failCount
 			if !r.lastCheck.IsZero() {
@@ -121,14 +301,34 @@ func (ah *autoHealer) attachViews(tunnels []tunnelView) {
 }
 
 // setConfig enables/disables Auto-Heal or updates its optional CDN failover domain.
-func (ah *autoHealer) setConfig(name string, enabled bool, cdnDomain string) error {
+// edgeID says which relay server's tunnel is meant; when empty, the name alone
+// must pick out exactly one tunnel.
+func (ah *autoHealer) setConfig(edgeID, name string, enabled bool, cdnDomain string) error {
 	cdnDomain = strings.TrimSpace(cdnDomain)
 	if cdnDomain != "" && !engine.HostnameRe.MatchString(cdnDomain) {
 		return fmt.Errorf("%q is not a valid domain name", cdnDomain)
 	}
+	tunnels := pairTunnels(ah.p.fleet.views())
+	counts := healableNameCounts(tunnels)
+	if edgeID == "" {
+		var found []string
+		for _, tv := range tunnels {
+			if tv.Name == name && tv.Edge != nil && tv.Origin != nil {
+				found = append(found, tv.Edge.ServerID)
+			}
+		}
+		switch len(found) {
+		case 1:
+			edgeID = found[0]
+		case 0:
+		default:
+			return fmt.Errorf("more than one tunnel is called %q; open Auto-Heal from the tunnel's own card", name)
+		}
+	}
+	key := healKeyFor(edgeID, name)
 	if cdnDomain == "" {
-		for _, tv := range pairTunnels(ah.p.fleet.views()) {
-			if tv.Name == name && tv.Edge != nil {
+		for _, tv := range tunnels {
+			if tv.Name == name && edgeIDOf(tv) == edgeID && tv.Edge != nil {
 				if dom := extractTunnelCDNDomain(tv.Edge.Info); dom != "" {
 					cdnDomain = dom
 				}
@@ -140,7 +340,8 @@ func (ah *autoHealer) setConfig(name string, enabled bool, cdnDomain string) err
 		if st.AutoHeal == nil {
 			st.AutoHeal = map[string]AutoHealConfig{}
 		}
-		c := st.AutoHeal[name]
+		moveLegacyHealKey(st, edgeID, name, counts)
+		c := st.AutoHeal[key]
 		c.Enabled = enabled
 		if cdnDomain != "" || !enabled {
 			c.CDNDomain = cdnDomain
@@ -148,20 +349,22 @@ func (ah *autoHealer) setConfig(name string, enabled bool, cdnDomain string) err
 		if enabled && c.State == "" {
 			c.State = "monitoring"
 		}
-		st.AutoHeal[name] = c
+		st.AutoHeal[key] = c
 		return nil
 	})
 	if err != nil {
 		return err
 	}
 	ah.mu.Lock()
-	r := ah.runtimeOf(name)
+	r := ah.runtimeOf(key)
 	if enabled {
 		if !r.running {
 			r.state = "monitoring"
 		}
 	} else {
 		r.failCount = 0
+		r.failures = 0
+		r.nextTry = time.Time{}
 		r.state = ""
 		r.lastNote = ""
 	}
@@ -184,30 +387,33 @@ func (ah *autoHealer) run(ctx context.Context) {
 }
 
 func (ah *autoHealer) checkAll(ctx context.Context) {
-	st := ah.p.store.get()
-	if len(st.AutoHeal) == 0 {
+	if len(ah.p.store.get().AutoHeal) == 0 {
 		return
 	}
 	tunnels := pairTunnels(ah.p.fleet.views())
+	ah.migrateLegacyKeys(tunnels)
+	st := ah.p.store.get()
+	counts := healableNameCounts(tunnels)
 	for _, tv := range tunnels {
-		cfg, ok := st.AutoHeal[tv.Name]
+		cfg, ok := resolveHealConfig(st, edgeIDOf(tv), tv.Name, counts)
 		if !ok || !cfg.Enabled {
 			continue
 		}
+		key := healKeyFor(edgeIDOf(tv), tv.Name)
 		if cfg.CDNDomain == "" && tv.Edge != nil {
 			if dom := extractTunnelCDNDomain(tv.Edge.Info); dom != "" {
 				cfg.CDNDomain = dom
 				_ = ah.p.store.update(func(s *State) error {
-					c := s.AutoHeal[tv.Name]
-					if c.CDNDomain == "" {
+					c, has := s.AutoHeal[key]
+					if has && c.CDNDomain == "" {
 						c.CDNDomain = dom
-						s.AutoHeal[tv.Name] = c
+						s.AutoHeal[key] = c
 					}
 					return nil
 				})
 			}
 		}
-		ah.evaluateTunnel(ctx, tv, cfg)
+		ah.evaluateTunnel(ctx, tv, key, cfg)
 	}
 }
 
@@ -256,12 +462,12 @@ func tunnelUnhealthyReason(tv tunnelView) (bool, string) {
 	return false, ""
 }
 
-func (ah *autoHealer) evaluateTunnel(ctx context.Context, tv tunnelView, cfg AutoHealConfig) {
+func (ah *autoHealer) evaluateTunnel(ctx context.Context, tv tunnelView, key string, cfg AutoHealConfig) {
 	unhealthy, reason := tunnelUnhealthyReason(tv)
 	now := time.Now()
 
 	ah.mu.Lock()
-	r := ah.runtimeOf(tv.Name)
+	r := ah.runtimeOf(key)
 	r.lastCheck = now
 	if r.running {
 		ah.mu.Unlock()
@@ -269,6 +475,10 @@ func (ah *autoHealer) evaluateTunnel(ctx context.Context, tv tunnelView, cfg Aut
 	}
 	if !unhealthy {
 		r.failCount = 0
+		// The path works again, whether by a heal or by itself: start the
+		// back-off over.
+		r.failures = 0
+		r.nextTry = time.Time{}
 		if !r.lastHeal.IsZero() && now.Sub(r.lastHeal) < autoHealCooldown {
 			r.state = "cooldown"
 		} else {
@@ -293,15 +503,34 @@ func (ah *autoHealer) evaluateTunnel(ctx context.Context, tv tunnelView, cfg Aut
 		return
 	}
 
+	// A heal that just failed is not repeated straight away.
+	if now.Before(r.nextTry) {
+		r.state = "backoff"
+		r.lastNote = fmt.Sprintf("The last attempt failed; trying again in %s (%s)",
+			r.nextTry.Sub(now).Round(time.Second), reason)
+		ah.mu.Unlock()
+		return
+	}
+	// Only a few tunnels are healed at a time; the rest wait for the next check.
+	select {
+	case ah.slots <- struct{}{}:
+	default:
+		r.state = "queued"
+		r.lastNote = fmt.Sprintf("Waiting for other tunnels being healed to finish (%s)", reason)
+		ah.mu.Unlock()
+		return
+	}
+
 	r.running = true
 	r.state = "probing"
 	r.lastNote = "Benchmarking alternative tunnel modes..."
 	ah.mu.Unlock()
 
 	go func() {
+		defer func() { <-ah.slots }()
 		hctx, cancel := context.WithTimeout(ctx, 4*time.Minute)
 		defer cancel()
-		_ = ah.healTunnel(hctx, nil, tv.Name, tv.Edge.ServerID, tv.Origin.ServerID, cfg.CDNDomain, reason, false)
+		_ = ah.healTunnel(hctx, nil, key, tv.Name, tv.Edge.ServerID, tv.Origin.ServerID, cfg.CDNDomain, reason, false)
 	}()
 }
 
@@ -314,12 +543,15 @@ func (ah *autoHealer) startManualHeal(name, edgeID, originID, cdnDomain string) 
 		return "", errors.New("both the Relay (Iran) and Foreign servers must be in the panel to switch tunnel modes")
 	}
 	cdnDomain = strings.TrimSpace(cdnDomain)
+	tunnels := pairTunnels(ah.p.fleet.views())
+	ah.migrateLegacyKeys(tunnels)
+	key := healKeyFor(edgeID, name)
 	if cdnDomain == "" {
-		st := ah.p.store.get()
-		cdnDomain = st.AutoHeal[name].CDNDomain
+		cfg, _ := resolveHealConfig(ah.p.store.get(), edgeID, name, healableNameCounts(tunnels))
+		cdnDomain = cfg.CDNDomain
 	}
 	ah.mu.Lock()
-	r := ah.runtimeOf(name)
+	r := ah.runtimeOf(key)
 	if r.running {
 		ah.mu.Unlock()
 		return "", errors.New("Auto-Heal is already running for this tunnel")
@@ -332,7 +564,7 @@ func (ah *autoHealer) startManualHeal(name, edgeID, originID, cdnDomain string) 
 	return ah.p.startJob(func(j *job) (string, error) {
 		ctx, cancel := context.WithTimeout(context.Background(), 4*time.Minute)
 		defer cancel()
-		err := ah.healTunnel(ctx, j, name, edgeID, originID, cdnDomain, "manual trigger", true)
+		err := ah.healTunnel(ctx, j, key, name, edgeID, originID, cdnDomain, "manual trigger", true)
 		return "", err
 	}), nil
 }
@@ -481,7 +713,7 @@ func (ah *autoHealer) chooseFailoverLinkPort(ctx context.Context, relayID, forei
 	return ask[0]
 }
 
-func (ah *autoHealer) healTunnel(ctx context.Context, j *job, name, relayID, foreignID, cdnDomain, reason string, force bool) (retErr error) {
+func (ah *autoHealer) healTunnel(ctx context.Context, j *job, key, name, relayID, foreignID, cdnDomain, reason string, force bool) (retErr error) {
 	say := func(format string, args ...any) {
 		msg := fmt.Sprintf(format, args...)
 		if j != nil {
@@ -495,8 +727,9 @@ func (ah *autoHealer) healTunnel(ctx context.Context, j *job, name, relayID, for
 	ev.Reason = reason
 
 	defer func() {
+		var note string
 		ah.mu.Lock()
-		r := ah.runtimeOf(name)
+		r := ah.runtimeOf(key)
 		r.running = false
 		r.lastCheck = time.Now()
 		if retErr != nil {
@@ -504,13 +737,25 @@ func (ah *autoHealer) healTunnel(ctx context.Context, j *job, name, relayID, for
 			r.lastNote = retErr.Error()
 			ev.Success = false
 			ev.Error = retErr.Error()
+			// Each failure in a row doubles the wait before the next
+			// automatic attempt.
+			r.failures++
+			r.nextTry = time.Now().Add(healBackoff(r.failures))
 		} else {
 			r.failCount = 0
-			r.lastHeal = time.Now()
+			r.failures = 0
+			r.nextTry = time.Time{}
 			r.state = "monitoring"
-			r.lastNote = fmt.Sprintf("Switched to %s (Score %d/100)", ev.ToDesc, ev.Score)
+			if ev.ToDesc == "" {
+				// It came back by itself before anything was changed.
+				r.lastNote = "Tunnel link is healthy"
+			} else {
+				r.lastHeal = time.Now()
+				r.lastNote = fmt.Sprintf("Switched to %s (Score %d/100)", ev.ToDesc, ev.Score)
+			}
 			ev.Success = true
 		}
+		note = r.lastNote
 		ah.mu.Unlock()
 
 		if ev.FromDesc != "" || ev.Error != "" {
@@ -518,18 +763,21 @@ func (ah *autoHealer) healTunnel(ctx context.Context, j *job, name, relayID, for
 				if st.AutoHeal == nil {
 					st.AutoHeal = map[string]AutoHealConfig{}
 				}
-				c := st.AutoHeal[name]
+				c := st.AutoHeal[key]
 				c.LastHeal = ev.At
-				c.LastNote = r.lastNote
+				c.LastNote = note
 				c.History = append([]AutoHealEvent{ev}, c.History...)
 				if len(c.History) > 20 {
 					c.History = c.History[:20]
 				}
-				st.AutoHeal[name] = c
+				st.AutoHeal[key] = c
 				return nil
 			})
 		}
 	}()
+
+	// Only one heal at a time may be working on a given server.
+	defer ah.lockServers(relayID, foreignID)()
 
 	// Refresh both servers first so we have fresh tunnel info and addresses.
 	ah.p.refreshOne(relayID)
@@ -537,7 +785,9 @@ func (ah *autoHealer) healTunnel(ctx context.Context, j *job, name, relayID, for
 
 	var tv *tunnelView
 	for _, item := range pairTunnels(ah.p.fleet.views()) {
-		if item.Name == name {
+		// The relay is part of the match: another pair of servers may have a
+		// tunnel with the same name.
+		if item.Name == name && edgeIDOf(item) == relayID {
 			copyItem := item
 			tv = &copyItem
 			break
@@ -555,10 +805,10 @@ func (ah *autoHealer) healTunnel(ctx context.Context, j *job, name, relayID, for
 				if st.AutoHeal == nil {
 					st.AutoHeal = map[string]AutoHealConfig{}
 				}
-				c := st.AutoHeal[name]
+				c := st.AutoHeal[key]
 				if c.CDNDomain == "" {
 					c.CDNDomain = dom
-					st.AutoHeal[name] = c
+					st.AutoHeal[key] = c
 				}
 				return nil
 			})
@@ -586,7 +836,7 @@ func (ah *autoHealer) healTunnel(ctx context.Context, j *job, name, relayID, for
 	say("Best working path found: %s (%s, score %d/100).", best.Label, best.Summary, best.Score)
 
 	ah.mu.Lock()
-	if r := ah.rt[name]; r != nil {
+	if r := ah.rt[key]; r != nil {
 		r.state = "switching"
 		r.lastNote = fmt.Sprintf("Switching to %s...", best.Label)
 	}
@@ -651,33 +901,49 @@ func (ah *autoHealer) healTunnel(ctx context.Context, j *job, name, relayID, for
 	}
 	realSite := !best.CDN && (best.Transport == "tls" || best.Transport == "grpc")
 
+	// A CDN backup route the owner set up is kept where it can still work: on a
+	// direct website-style link. It cannot be combined with showing the real
+	// website to strangers (the CDN's own connection carries no proof), so that
+	// is left off for the tunnel that keeps the backup.
+	altHost := ""
+	switch best.Transport {
+	case "tls", "wss", "h2", "grpc":
+		// (IPv6 between the servers cannot be combined with a CDN route.)
+		if curInfo.AltHost != "" && !best.CDN && !best.IPv6 && best.Mode == "direct" {
+			altHost = curInfo.AltHost
+			realSite = false
+		}
+	}
+
 	spec := agent.EditSpec{
-		Name:        name,
-		Mode:        best.Mode,
-		Transport:   best.Transport,
-		LinkPort:    linkPort,
-		PeerIP:      peerIP,
-		LocalIP:     localIP,
-		IPv6:        &ipv6Flag,
-		ServerName:  serverName,
-		CDN:         onOff(best.CDN),
-		AltHost:     "",
-		CleanIPs:    "",
-		UTLS:        onOff(best.Stealth),
-		TLSFragment: onOff(best.Stealth),
-		HTTPHeader:  onOff(best.WebHeader),
-		HTTPHost:    httpHost,
-		RealSite:    onOff(realSite),
-		SNISpoof:    onOff(best.SNISpoof),
-		SpoofSNI:    best.SpoofSNI,
-		IPSpoof:     onOff(best.IPSpoof),
-		SpoofIP:     best.SpoofIP,
-		GRE:         "off",
-		SIT:         "off",
-		AntiFreeze:  onOff(best.AntiFreeze),
-		Mux:         muxMode,
-		MuxLinks:    muxLinks,
-		Pool:        curInfo.PoolSize,
+		Name:       name,
+		Mode:       best.Mode,
+		Transport:  best.Transport,
+		LinkPort:   linkPort,
+		PeerIP:     peerIP,
+		LocalIP:    localIP,
+		IPv6:       &ipv6Flag,
+		ServerName: serverName,
+		CDN:        onOff(best.CDN),
+		AltHost:    altHost,
+		CleanIPs:   "",
+		// The tunnel's own clean addresses are kept when it stays on a CDN link.
+		KeepCleanIPs: best.CDN,
+		UTLS:         onOff(best.Stealth),
+		TLSFragment:  onOff(best.Stealth),
+		HTTPHeader:   onOff(best.WebHeader),
+		HTTPHost:     httpHost,
+		RealSite:     onOff(realSite),
+		SNISpoof:     onOff(best.SNISpoof),
+		SpoofSNI:     best.SpoofSNI,
+		IPSpoof:      onOff(best.IPSpoof),
+		SpoofIP:      best.SpoofIP,
+		GRE:          "off",
+		SIT:          "off",
+		AntiFreeze:   onOff(best.AntiFreeze),
+		Mux:          muxMode,
+		MuxLinks:     muxLinks,
+		Pool:         curInfo.PoolSize,
 	}
 
 	ev.Candidate = best.ID
@@ -687,66 +953,9 @@ func (ah *autoHealer) healTunnel(ctx context.Context, j *job, name, relayID, for
 	relayName := ah.p.serverName(relayID)
 	foreignName := ah.p.serverName(foreignID)
 
-	say("Preparing new configuration (%s on port %d) on %s...", ev.ToDesc, linkPort, relayName)
-	spec.Stage = "prepare"
-	var prep agent.EdgeResult
-	status, err := ah.p.callJSON(ctx, relayID, "/api/tunnel/edit-edge", spec, &prep)
-	if err != nil {
-		return fmt.Errorf("%s could not prepare new mode: %s", relayName, plainAgentError(err))
+	if err := switchBothHalves(ctx, ah.p.callJSON, say, name, relayID, foreignID, relayName, foreignName, ev.ToDesc, linkPort, spec); err != nil {
+		return err
 	}
-	if !prep.OK {
-		if prep.Error == "" {
-			prep.Error = fmt.Sprintf("HTTP %d", status)
-		}
-		return fmt.Errorf("%s rejected new mode: %s", relayName, prep.Error)
-	}
-
-	say("Applying new mode to %s (using active control channel)...", foreignName)
-	var upd struct {
-		OK       bool     `json:"ok"`
-		Error    string   `json:"error"`
-		Warnings []string `json:"warnings"`
-	}
-	_, uerr := ah.p.callJSON(ctx, foreignID, "/api/tunnel/update", map[string]string{"code": prep.Code}, &upd)
-	if uerr == nil && !upd.OK {
-		uerr = errors.New(upd.Error)
-	}
-	if uerr != nil {
-		reason := plainAgentError(uerr)
-		say("%s could not apply new mode (%s); rolling back %s...", foreignName, reason, relayName)
-		var rb agent.EdgeResult
-		_, _ = ah.p.callJSON(ctx, relayID, "/api/tunnel/edit-edge", agent.EditSpec{
-			Name:    name,
-			Stage:   "rollback",
-			OldConf: prep.OldConf,
-		}, &rb)
-		return fmt.Errorf("%s could not switch modes: %s (rolled back cleanly)", foreignName, reason)
-	}
-
-	say("Committing firewall rules and restarting %s...", relayName)
-	var commit agent.EdgeResult
-	cstatus, cerr := ah.p.callJSON(ctx, relayID, "/api/tunnel/edit-edge", agent.EditSpec{
-		Name:    name,
-		Stage:   "commit",
-		OldConf: prep.OldConf,
-	}, &commit)
-	if cerr != nil {
-		return fmt.Errorf("%s could not finish restarting: %s", relayName, plainAgentError(cerr))
-	}
-	if !commit.OK {
-		if commit.Error == "" {
-			commit.Error = fmt.Sprintf("HTTP %d", cstatus)
-		}
-		return fmt.Errorf("%s could not restart on new mode: %s", relayName, commit.Error)
-	}
-
-	var reSync struct {
-		OK bool `json:"ok"`
-	}
-	_, _ = ah.p.callJSON(ctx, foreignID, "/api/tunnel/service", map[string]string{
-		"name":   name,
-		"action": "restart",
-	}, &reSync)
 
 	say("Tunnel %q switched from [%s] to [%s] (Score %d/100) and is now running on both servers!", name, ev.FromDesc, ev.ToDesc, best.Score)
 	ah.p.refreshOne(relayID)

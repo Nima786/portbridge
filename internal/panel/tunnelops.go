@@ -500,7 +500,7 @@ func (p *Panel) startCreate(r createRequest) (string, error) {
 			return "", err
 		}
 		if r.AutoHeal {
-			_ = p.healer.setConfig(spec.Name, true, strings.TrimSpace(r.Domain))
+			_ = p.healer.setConfig(r.Relay, spec.Name, true, strings.TrimSpace(r.Domain))
 		}
 		return "", nil
 	}), nil
@@ -659,10 +659,7 @@ func (p *Panel) deleteTunnel(t tunnelTarget) []halfOutcome {
 		}
 		out = append(out, o)
 	}
-	_ = p.store.update(func(st *State) error {
-		delete(st.AutoHeal, t.Name)
-		return nil
-	})
+	p.healer.forget(t.Edge, t.Name)
 	logf("deleted tunnel %q", t.Name)
 	return out
 }

@@ -1057,26 +1057,31 @@ type EditSpec struct {
 	OldConf       string `json:"old_conf,omitempty"`
 
 	// Optional transport / mode replacement fields:
-	Mode        string `json:"mode,omitempty"`         // "direct" or "reverse"
-	Transport   string `json:"transport,omitempty"`    // "plain", "tls", "wss", "grpc", "kcp", "icmp", "faketcp"
-	ServerName  string `json:"server_name,omitempty"`  // SNI / domain
-	CDN         string `json:"cdn,omitempty"`          // "on" or "off"
-	AltHost     string `json:"alt_host,omitempty"`     // CDN backup domain
-	CleanIPs    string `json:"clean_ips,omitempty"`    // Clean Cloudflare IPs
-	UTLS        string `json:"utls,omitempty"`         // "on" or "off"
-	TLSFragment string `json:"tls_fragment,omitempty"` // "on" or "off"
-	HTTPHeader  string `json:"http_header,omitempty"`  // "on" or "off"
-	HTTPHost    string `json:"http_host,omitempty"`    // HTTP host header
-	RealSite    string `json:"real_site,omitempty"`    // "on" or "off"
-	GRE         string `json:"gre,omitempty"`          // "on" or "off"
-	SIT         string `json:"sit,omitempty"`          // "on" or "off"
-	SNISpoof    string `json:"sni_spoof,omitempty"`    // "on" or "off"
-	SpoofSNI    string `json:"spoof_sni,omitempty"`    // whitelisted SNI hostname
-	IPSpoof     string `json:"ip_spoof,omitempty"`     // "on" or "off"
-	SpoofIP     string `json:"spoof_ip,omitempty"`     // whitelisted IPv4 address
-	AntiFreeze  string `json:"anti_freeze,omitempty"`  // "on" or "off"
-	IPv6        *bool  `json:"ipv6,omitempty"`         // true for IPv6 bridge, false for IPv4
-	Mux         string `json:"mux,omitempty"`          // "on" or "off"
+	Mode       string `json:"mode,omitempty"`        // "direct" or "reverse"
+	Transport  string `json:"transport,omitempty"`   // "plain", "tls", "wss", "grpc", "kcp", "icmp", "faketcp"
+	ServerName string `json:"server_name,omitempty"` // SNI / domain
+	CDN        string `json:"cdn,omitempty"`         // "on" or "off"
+	AltHost    string `json:"alt_host,omitempty"`    // CDN backup domain
+	CleanIPs   string `json:"clean_ips,omitempty"`   // Clean Cloudflare IPs
+	// KeepCleanIPs carries the tunnel's existing clean addresses over to a CDN
+	// link when CleanIPs is empty. A mode switch by Auto-Heal sets it, so a
+	// switch does not throw the list away; the Edit form leaves it off, so
+	// clearing the list there still works.
+	KeepCleanIPs bool   `json:"keep_clean_ips,omitempty"`
+	UTLS         string `json:"utls,omitempty"`         // "on" or "off"
+	TLSFragment  string `json:"tls_fragment,omitempty"` // "on" or "off"
+	HTTPHeader   string `json:"http_header,omitempty"`  // "on" or "off"
+	HTTPHost     string `json:"http_host,omitempty"`    // HTTP host header
+	RealSite     string `json:"real_site,omitempty"`    // "on" or "off"
+	GRE          string `json:"gre,omitempty"`          // "on" or "off"
+	SIT          string `json:"sit,omitempty"`          // "on" or "off"
+	SNISpoof     string `json:"sni_spoof,omitempty"`    // "on" or "off"
+	SpoofSNI     string `json:"spoof_sni,omitempty"`    // whitelisted SNI hostname
+	IPSpoof      string `json:"ip_spoof,omitempty"`     // "on" or "off"
+	SpoofIP      string `json:"spoof_ip,omitempty"`     // whitelisted IPv4 address
+	AntiFreeze   string `json:"anti_freeze,omitempty"`  // "on" or "off"
+	IPv6         *bool  `json:"ipv6,omitempty"`         // true for IPv6 bridge, false for IPv4
+	Mux          string `json:"mux,omitempty"`          // "on" or "off"
 
 	WebsiteBridge         string `json:"website_bridge,omitempty"`
 	WebsiteDomains        string `json:"website_domains,omitempty"`
@@ -1322,6 +1327,11 @@ func EditEdge(spec EditSpec, confDir string) (EdgeResult, error) {
 			obd = kv["outbound_bypass_domains"]
 		}
 
+		cleanIPs := spec.CleanIPs
+		if cleanIPs == "" && spec.KeepCleanIPs && spec.CDN == "on" {
+			cleanIPs = strings.ReplaceAll(kv["clean_ips"], " ", "")
+		}
+
 		es := EdgeSpec{
 			Name:                  spec.Name,
 			Mode:                  mode,
@@ -1330,7 +1340,7 @@ func EditEdge(spec EditSpec, confDir string) (EdgeResult, error) {
 			WSPath:                kv["ws_path"],
 			CDN:                   spec.CDN,
 			AltHost:               spec.AltHost,
-			CleanIPs:              spec.CleanIPs,
+			CleanIPs:              cleanIPs,
 			UTLS:                  spec.UTLS,
 			TLSFragment:           spec.TLSFragment,
 			HTTPHeader:            spec.HTTPHeader,
