@@ -229,3 +229,13 @@ func TestH2TrailersEndTheStream(t *testing.T) {
 		t.Fatal("Read hung after the server's trailers ended the stream")
 	}
 }
+
+// The default stream window of 64 KB caps one stream at about 6.5 Mbit/s on an
+// 80 ms link, whatever the link can carry. What this end offers must be far more.
+func TestH2OffersALargeStreamWindow(t *testing.T) {
+	f := newH2Flow()
+	f.settings(h2OurSettings())
+	if f.stream < 16<<20 {
+		t.Fatalf("a peer that read our settings would let us send only %d bytes before credit", f.stream)
+	}
+}

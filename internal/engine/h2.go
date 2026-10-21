@@ -174,7 +174,7 @@ func h2Dial(c net.Conn, cfg *Config) (net.Conn, error) {
 	}
 
 	// 2. Send initial SETTINGS frame
-	if err := writeH2Frame(c, h2FrameSettings, 0, 0, nil); err != nil {
+	if err := writeH2Frame(c, h2FrameSettings, 0, 0, h2OurSettings()); err != nil {
 		return nil, err
 	}
 
@@ -357,7 +357,7 @@ func h2Accept(c net.Conn, cfg *Config) (net.Conn, error) {
 	}
 
 	// 2. Send server SETTINGS
-	if err := writeH2Frame(c, h2FrameSettings, 0, 0, nil); err != nil {
+	if err := writeH2Frame(c, h2FrameSettings, 0, 0, h2OurSettings()); err != nil {
 		return nil, err
 	}
 
@@ -818,4 +818,20 @@ func (h *h2Conn) onFrame(fType, flags byte, streamID uint32, payload []byte) (en
 		return true
 	}
 	return false
+}
+
+// h2StreamWindow is the stream window this end offers the other. The protocol's
+// default is 65535 bytes, which on a link with a 80 ms round trip caps one stream
+// at about 6.5 Mbit/s however fast the link is: the sender must wait for credit
+// every 64 KB. Credit is returned the moment data arrives, so a large window
+// costs nothing.
+const h2StreamWindow = 1 << 30
+
+// h2OurSettings is the SETTINGS payload sent at the start of the connection:
+// INITIAL_WINDOW_SIZE (0x4).
+func h2OurSettings() []byte {
+	b := make([]byte, 6)
+	binary.BigEndian.PutUint16(b[:2], 0x4)
+	binary.BigEndian.PutUint32(b[2:], h2StreamWindow)
+	return b
 }
