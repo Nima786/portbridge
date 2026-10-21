@@ -228,15 +228,24 @@ func (u *updater) start() string {
 }
 
 func (u *updater) updateAll(j *job) error {
+	// Always asked afresh. The answer kept from the last check can be hours old,
+	// and a release made since would then be missed: the screen offers it (it
+	// can see a server already on it) but the update itself used the old answer
+	// and found nothing to do.
+	j.say("Looking for the newest version...")
+	u.check(context.Background())
 	u.mu.Lock()
 	latest := u.latest
 	u.mu.Unlock()
-	if latest == "" {
-		j.say("Looking for the newest version...")
-		u.check(context.Background())
-		u.mu.Lock()
-		latest = u.latest
-		u.mu.Unlock()
+	// A server already running a newer release shows that one exists, even if
+	// GitHub could not be asked.
+	for _, v := range u.p.fleet.views() {
+		if v.This || v.Overview == nil {
+			continue
+		}
+		if agent.IsReleaseVersion(v.Overview.Version) && (latest == "" || compareVersions(latest, v.Overview.Version) < 0) {
+			latest = v.Overview.Version
+		}
 	}
 	target := engine.Version
 	panelNeedsUpdate := false
