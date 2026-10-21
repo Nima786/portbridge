@@ -76,6 +76,21 @@ type pool struct {
 	// verifying is set while a check of every spare is under way, so a burst of
 	// failing users starts one check between them rather than one each.
 	verifying int32
+
+	// checking is how many spares are out of the pool being tested right now
+	// (guarded by mu). They still hold a place: refilling counts them, or it
+	// would build replacements for spares that are about to come back, and the
+	// ones coming back healthy would be thrown away to make room.
+	checking int
+}
+
+// finishCheck gives back the place a spare held while it was being tested.
+func (p *pool) finishCheck() {
+	p.mu.Lock()
+	if p.checking > 0 {
+		p.checking--
+	}
+	p.mu.Unlock()
 }
 
 func newPool(maxSize int, maxAge, waitForOffer time.Duration, dial func() (net.Conn, error)) *pool {
@@ -109,7 +124,7 @@ func (p *pool) offer(c net.Conn) bool {
 			// That waiter gave up already; try the next one.
 		}
 	}
-	if len(p.items) >= p.maxSize {
+	if len(p.items)+p.checking >= p.maxSize {
 		p.mu.Unlock()
 		return false
 	}
@@ -232,7 +247,7 @@ func (p *pool) maintain(ctx context.Context) {
 		var failures int32
 		if p.dial != nil {
 			p.mu.Lock()
-			needed := p.maxSize - len(p.items)
+			needed := p.maxSize - len(p.items) - p.checking
 			p.mu.Unlock()
 
 			if needed > 0 {
@@ -315,7 +330,7 @@ func (p *pool) maintain(ctx context.Context) {
 // own connection rather than waiting.
 func (p *pool) offerLocal(c net.Conn) bool {
 	p.mu.Lock()
-	if len(p.items) >= p.maxSize {
+	if len(p.items)+p.checking >= p.maxSize {
 		p.mu.Unlock()
 		return false
 	}
@@ -431,6 +446,7 @@ func (p *pool) checkSpares(ctx context.Context, older, timeout time.Duration, al
 		p.items[i] = parked{}
 	}
 	p.items = kept
+	p.checking += len(due)
 	atomic.StoreInt64(&p.statParked, int64(len(p.items)))
 	p.mu.Unlock()
 
@@ -443,6 +459,7 @@ func (p *pool) checkSpares(ctx context.Context, older, timeout time.Duration, al
 		wg.Add(1)
 		go func(it parked) {
 			defer wg.Done()
+			defer p.finishCheck()
 			if ctx.Err() != nil {
 				_ = it.conn.Close()
 				return

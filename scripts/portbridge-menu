@@ -129,7 +129,7 @@ read_conf() {
     local f
     f=$(conf_of "$1")
     [ -f "$f" ] || return 1
-    sed -nE "s/^[[:space:]]*$2[[:space:]]*=[[:space:]]*\"?([^\"#]*)\"?[[:space:]]*$/\1/p" "$f" |
+    sed -nE "s/^[[:space:]]*$2[[:space:]]*=[[:space:]]*[\"']?([^\"'#]*)[\"']?[[:space:]]*$/\1/p" "$f" |
         tail -1 | sed -E 's/[[:space:]]+$//'
 }
 
@@ -163,7 +163,7 @@ sed_escape() {
 read_file_key() {
     local f=$1 k=$2
     [ -f "$f" ] || return 1
-    sed -nE "s/^[[:space:]]*${k}[[:space:]]*=[[:space:]]*\"?([^\"#]*)\"?[[:space:]]*$/\1/p" "$f" |
+    sed -nE "s/^[[:space:]]*${k}[[:space:]]*=[[:space:]]*[\"']?([^\"'#]*)[\"']?[[:space:]]*$/\1/p" "$f" |
         tail -1 | sed -E 's/[[:space:]]+$//'
 }
 
@@ -394,6 +394,17 @@ choose() {
     done
 }
 
+# is_ssh_port <port> - is this a port SSH answers on? Asked of the SSH server's
+# own settings and of what is listening, since either can be changed.
+is_ssh_port() {
+    local port=$1 p
+    for p in $( { sshd -T 2>/dev/null | awk '$1 == "port" {print $2}'; \
+        ss -Hltnp 2>/dev/null | awk '/"sshd"/ {n = split($4, a, ":"); print a[n]}'; } | sort -u); do
+        [ "$p" = "$port" ] && return 0
+    done
+    return 1
+}
+
 ask_port() {
     local prompt=$1 def=$2 skip_name=${3-} p owner
     while :; do
@@ -405,6 +416,10 @@ ask_port() {
         owner=$(port_owner "$p" || true)
         if [ -n "$owner" ] && [ "$owner" != "$skip_name" ]; then
             err "  Port $p is already used by tunnel '$owner'. Pick another."
+            continue
+        fi
+        if is_ssh_port "$p"; then
+            err "  Port $p is where SSH answers on this server. A tunnel on it could lock you out. Pick another."
             continue
         fi
         if port_in_use_by_system "$p" "${5-tcp}"; then
@@ -466,6 +481,46 @@ DG_CDN=off
 # DG_ALTHOST is the domain to fall back to through a CDN when the foreign
 # server's own address stops being reachable. Empty means no second route.
 DG_ALTHOST=""
+
+# ask_site_name <prompt> <default> - a name for the link to claim, checked as the
+# other server will check it when it joins: letters, digits, dots and dashes. A
+# typo caught here costs a retype; caught later it costs a finished tunnel whose
+# other half refuses its code.
+ask_site_name() {
+    local v
+    while :; do
+        v=$(ask "$1" "$2")
+        [ -n "$v" ] || v=$2
+        if valid_hostname "$v"; then
+            printf '%s' "$v"
+            return 0
+        fi
+        err "  That is not a site name. Use letters, digits, dots and dashes, like www.bing.com."
+    done
+}
+
+# ask_clean_ips <prompt> - a comma-separated list of addresses, or nothing.
+ask_clean_ips() {
+    local v part ok parts
+    while :; do
+        v=$(ask "$1" "")
+        v=${v// /}
+        [ -n "$v" ] || return 0
+        ok=1
+        IFS=, read -ra parts <<<"$v"
+        for part in "${parts[@]}"; do
+            if [[ "$part" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] || [[ "$part" =~ ^[0-9A-Fa-f:]+:[0-9A-Fa-f:]*$ ]]; then
+                continue
+            fi
+            ok=0
+        done
+        if [ "$ok" -eq 1 ]; then
+            printf '%s' "$v"
+            return 0
+        fi
+        err "  Those must be IP addresses separated by commas, like 104.16.12.34, 172.67.45.67."
+    done
+}
 
 # ask_domain - reads a domain name, rejecting anything that is not one.
 ask_domain() {
@@ -814,7 +869,7 @@ ask_disguise() {
             info "While it is connecting straight to your foreign server it will claim"
             info "to be some ordinary site instead of your domain, because your domain"
             info "points at the CDN and naming it there would not add up."
-            DG_SERVERNAME=$(ask "Name to claim on the direct route" "www.bing.com")
+            DG_SERVERNAME=$(ask_site_name "Name to claim on the direct route" "www.bing.com")
             [ -n "$DG_SERVERNAME" ] || DG_SERVERNAME=www.bing.com
             say ""
             info "Direct: claims $DG_SERVERNAME. Falling back: $domain$DG_WSPATH."
@@ -832,7 +887,7 @@ ask_disguise() {
             info "Clean Cloudflare IPs (optional): If Cloudflare default Anycast IPs are"
             info "blocked or throttled by your ISP, enter one or more verified clean IPs"
             info "(comma-separated, e.g. 104.16.12.34, 172.67.45.67). Leave blank to resolve via DNS."
-            DG_CLEAN_IPS=$(ask "Clean Cloudflare IPs" "")
+            DG_CLEAN_IPS=$(ask_clean_ips "Clean Cloudflare IPs")
         fi
 
         say ""
@@ -876,7 +931,7 @@ ask_disguise() {
             info "Clean Cloudflare IPs (optional): If Cloudflare default Anycast IPs are"
             info "blocked or throttled by your ISP, enter one or more verified clean IPs"
             info "(comma-separated, e.g. 104.16.12.34, 172.67.45.67). Leave blank to resolve via DNS."
-            DG_CLEAN_IPS=$(ask "Clean Cloudflare IPs" "")
+            DG_CLEAN_IPS=$(ask_clean_ips "Clean Cloudflare IPs")
             say ""
             warn "Three things to set on Cloudflare for gRPC mode:"
             warn "  - Network -> gRPC must be turned ON."
@@ -888,7 +943,7 @@ ask_disguise() {
             say ""
             info "The direct gRPC stream will claim to be a website/API service."
             info "Any believable name works (e.g. www.google.com, www.bing.com)."
-            DG_SERVERNAME=$(ask "Name for it to claim" "www.google.com")
+            DG_SERVERNAME=$(ask_site_name "Name for it to claim" "www.google.com")
             [ -n "$DG_SERVERNAME" ] || DG_SERVERNAME=www.google.com
             say ""
             info "Stealth evasion: Use Chrome TLS fingerprint (uTLS) and ClientHello TCP"
@@ -902,7 +957,7 @@ ask_disguise() {
         say ""
         info "The link will claim to be a website. Any believable name works, and it"
         info "does not need to be a domain you own or one that really exists."
-        DG_SERVERNAME=$(ask "Name for it to claim" "www.bing.com")
+        DG_SERVERNAME=$(ask_site_name "Name for it to claim" "www.bing.com")
         [ -n "$DG_SERVERNAME" ] || DG_SERVERNAME=www.bing.com
         say ""
         info "Stealth evasion: Use Chrome TLS fingerprint (uTLS) and ClientHello TCP"
@@ -954,7 +1009,7 @@ ask_real_site() {
         else
             warn "Could not automatically reach https://${DG_SERVERNAME:-www.bing.com}."
             info "Enter a cover site that is accessible from this server."
-            DG_SERVERNAME=$(ask "Accessible cover site" "${DG_SERVERNAME:-www.bing.com}")
+            DG_SERVERNAME=$(ask_site_name "Accessible cover site" "${DG_SERVERNAME:-www.bing.com}")
         fi
     fi
 

@@ -33,8 +33,9 @@ const (
 var icmpMagic = [3]byte{'P', 'B', 'I'}
 
 type icmpClientMeta struct {
-	id  uint16
-	seq uint32
+	lastSeen atomic.Int64 // unix nano of the last packet from this client
+	id       uint16
+	seq      uint32
 }
 
 type icmpRxPkt struct {
@@ -74,6 +75,7 @@ type icmpPacketConn struct {
 	seq            atomic.Uint32
 	mask           [icmpInnerHeaderLen]byte
 	clients        sync.Map // string(ip:port) -> *icmpClientMeta
+	newClients     atomic.Uint32
 }
 
 func deriveICMPMask(secret []byte) [icmpInnerHeaderLen]byte {
@@ -403,16 +405,35 @@ func (c *icmpPacketConn) ReadFrom(p []byte) (int, net.Addr, error) {
 		if c.isServer {
 			key := uaddr.String()
 			val, loaded := c.clients.LoadOrStore(key, &icmpClientMeta{id: icmpID, seq: uint32(icmpSeq)})
+			meta := val.(*icmpClientMeta)
+			meta.lastSeen.Store(time.Now().UnixNano())
 			if loaded {
-				meta := val.(*icmpClientMeta)
 				meta.id = icmpID
 				atomic.StoreUint32(&meta.seq, uint32(icmpSeq))
+			} else if c.newClients.Add(1)%64 == 0 {
+				// Every reconnect arrives from a new port; clear out the long-gone
+				// ones so the table cannot only grow.
+				c.pruneIdleClients()
 			}
 		}
 
 		copied := copy(p, payload)
 		return copied, uaddr, nil
 	}
+}
+
+// clientIdleLimit is how long a client may stay silent before its state is
+// forgotten; if it does come back it is treated as new.
+const clientIdleLimit = 15 * time.Minute
+
+func (c *icmpPacketConn) pruneIdleClients() {
+	cutoff := time.Now().Add(-clientIdleLimit).UnixNano()
+	c.clients.Range(func(k, v any) bool {
+		if m, ok := v.(*icmpClientMeta); ok && m.lastSeen.Load() < cutoff {
+			c.clients.Delete(k)
+		}
+		return true
+	})
 }
 
 func (c *icmpPacketConn) WriteTo(p []byte, addr net.Addr) (int, error) {

@@ -280,6 +280,8 @@ func extractHTTPHostHeader(b []byte) (host string, isHTTP bool) {
 	}
 
 	lines := strings.Split(s, "\n")
+	found := ""
+	seen := false
 	for i := 1; i < len(lines); i++ {
 		line := strings.TrimRight(lines[i], "\r")
 		if line == "" {
@@ -290,8 +292,17 @@ func extractHTTPHostHeader(b []byte) (host string, isHTTP bool) {
 			continue
 		}
 		if strings.EqualFold(strings.TrimSpace(k), "Host") {
-			return strings.TrimSpace(v), true
+			if seen {
+				// Two Host headers: the filter and the web server behind it
+				// could each read a different one. Refuse rather than guess.
+				return "", true
+			}
+			seen = true
+			found = strings.TrimSpace(v)
 		}
+	}
+	if seen {
+		return found, true
 	}
 	return "", true
 }

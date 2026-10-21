@@ -44,6 +44,7 @@ const (
 
 	strangerMaxBytes = 10 * 1024 * 1024 // 10MB limit per stranger session
 	strangerTimeout  = 30 * time.Second // 30s idle timeout
+	strangerMaxLife  = 3 * time.Minute  // and the whole exchange ends by then
 	sniffTimeout     = 5 * time.Second
 )
 
@@ -258,8 +259,19 @@ func forwardStranger(client net.Conn, coverTarget string, prefix []byte) {
 			}
 		}
 
-		_ = client.SetDeadline(time.Now().Add(strangerTimeout))
-		_ = cover.SetDeadline(time.Now().Add(strangerTimeout))
+		// However slowly a stranger trickles bytes, the whole exchange ends at a
+		// fixed time: refreshing the idle limit on every byte alone would let
+		// one byte every 29 seconds hold a slot for ever.
+		hard := time.Now().Add(strangerMaxLife)
+		soon := func() time.Time {
+			d := time.Now().Add(strangerTimeout)
+			if d.After(hard) {
+				return hard
+			}
+			return d
+		}
+		_ = client.SetDeadline(soon())
+		_ = cover.SetDeadline(soon())
 
 		var wg sync.WaitGroup
 		wg.Add(2)
@@ -269,14 +281,14 @@ func forwardStranger(client net.Conn, coverTarget string, prefix []byte) {
 			buf := make([]byte, 16*1024)
 			var total int64
 			for {
-				_ = src.SetReadDeadline(time.Now().Add(strangerTimeout))
+				_ = src.SetReadDeadline(soon())
 				n, rerr := src.Read(buf)
 				if n > 0 {
 					total += int64(n)
 					if total > strangerMaxBytes {
 						break
 					}
-					_ = dst.SetWriteDeadline(time.Now().Add(strangerTimeout))
+					_ = dst.SetWriteDeadline(soon())
 					if _, werr := dst.Write(buf[:n]); werr != nil {
 						break
 					}

@@ -319,6 +319,14 @@ func writeFileAtomic(path string, data []byte, perm os.FileMode) error {
 		os.Remove(name)
 		return err
 	}
+	// Flushed to disk before the rename: after a power cut the file is then
+	// either the old one or the new one, never an empty one the panel would
+	// refuse to start with.
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		os.Remove(name)
+		return err
+	}
 	if err := tmp.Close(); err != nil {
 		os.Remove(name)
 		return err

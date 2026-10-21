@@ -209,10 +209,16 @@ func sameOrigin(r *http.Request) bool {
 	return true
 }
 
+// clientIP is who a request counts as coming from, for the login limit. An IPv6
+// address stands for its whole /64: whoever holds one has the other 2^64 in it,
+// and counting them separately would give a guesser as many tries as they like.
 func clientIP(r *http.Request) string {
 	host, _, err := net.SplitHostPort(r.RemoteAddr)
 	if err != nil {
 		return r.RemoteAddr
+	}
+	if ip := net.ParseIP(host); ip != nil && ip.To4() == nil {
+		return ip.Mask(net.CIDRMask(64, 128)).String() + "/64"
 	}
 	return host
 }
@@ -300,13 +306,16 @@ func (p *Panel) handleLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	ip := clientIP(r)
-	if locked, wait := p.sessions.locked(ip); locked {
+	if ok, wait := p.sessions.admit(ip); !ok {
 		writeErr(w, http.StatusTooManyRequests, lockedMessage(wait))
 		return
 	}
-	if !p.checkLogin(strings.TrimSpace(req.User), req.Password) {
+	good := p.checkLogin(strings.TrimSpace(req.User), req.Password)
+	if !good {
 		time.Sleep(failureDelay)
-		p.sessions.failed(ip)
+	}
+	p.sessions.finish(ip, good)
+	if !good {
 		logf("wrong login from %s", ip)
 		if locked, wait := p.sessions.locked(ip); locked {
 			writeErr(w, http.StatusTooManyRequests, lockedMessage(wait))
@@ -315,7 +324,6 @@ func (p *Panel) handleLogin(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusUnauthorized, "Wrong username or password.")
 		return
 	}
-	p.sessions.succeeded(ip)
 	id, s := p.sessions.create(p.store.get().Admin.User)
 	setSessionCookie(w, id)
 	logf("logged in from %s", ip)
@@ -342,14 +350,17 @@ func (p *Panel) handleAccount(w http.ResponseWriter, r *http.Request, a authed) 
 		return
 	}
 	ip := clientIP(r)
-	if locked, wait := p.sessions.locked(ip); locked {
+	if ok, wait := p.sessions.admit(ip); !ok {
 		writeErr(w, http.StatusTooManyRequests, lockedMessage(wait))
 		return
 	}
 	admin := p.store.get().Admin
-	if !p.checkLogin(admin.User, req.Current) {
+	good := p.checkLogin(admin.User, req.Current)
+	if !good {
 		time.Sleep(failureDelay)
-		p.sessions.failed(ip)
+	}
+	p.sessions.finish(ip, good)
+	if !good {
 		writeErr(w, http.StatusForbidden, "The current password is wrong.")
 		return
 	}

@@ -23,6 +23,11 @@ ExecStart=/usr/local/bin/portbridge run -config /etc/portbridge/tunnels/%i.conf
 
 Restart=always
 RestartSec=3
+# A tunnel that keeps failing waits longer between tries, up to a minute, instead
+# of re-running its firewall step every three seconds for ever. systemd older
+# than 254 does not know these two lines and ignores them.
+RestartSteps=5
+RestartMaxDelaySec=60
 
 # Each session needs two connections plus headroom, so the default limit is
 # nowhere near enough at the capacities this is designed for.

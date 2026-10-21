@@ -15,14 +15,17 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/Nima786/portbridge/internal/agent"
 )
 
 type hubCall struct {
-	req   agent.HubRequest
-	reply chan agent.HubReply
+	req     agent.HubRequest
+	reply   chan agent.HubReply
+	server  string      // the server this was meant for
+	dropped atomic.Bool // the caller gave up; it must not be run later
 }
 
 type hub struct {
@@ -88,20 +91,32 @@ func (h *hub) handlePoll(w http.ResponseWriter, r *http.Request) {
 	q := h.queue(id)
 	timer := time.NewTimer(agent.HubPollWait)
 	defer timer.Stop()
-	select {
-	case call := <-q:
-		h.mu.Lock()
-		h.waiting[call.req.ID] = call
-		h.mu.Unlock()
-		// A request can carry a whole release, which takes a while to send.
-		if len(call.req.Body) > 1<<20 {
-			agent.ExtendDeadlines(w, 15*time.Minute)
+wait:
+	for {
+		select {
+		case call := <-q:
+			// The caller may have given up while this sat in the queue (the panel
+			// said "did not answer in time"). Running it now would apply a change
+			// the user was told had failed, possibly after they tried again.
+			if call.dropped.Load() {
+				continue
+			}
+			h.mu.Lock()
+			h.waiting[call.req.ID] = call
+			h.mu.Unlock()
+			// A request can carry a whole release, which takes a while to send.
+			if len(call.req.Body) > 1<<20 {
+				agent.ExtendDeadlines(w, 15*time.Minute)
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(call.req)
+			break wait
+		case <-timer.C:
+			w.WriteHeader(http.StatusNoContent)
+			break wait
+		case <-r.Context().Done():
+			break wait
 		}
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(call.req)
-	case <-timer.C:
-		w.WriteHeader(http.StatusNoContent)
-	case <-r.Context().Done():
 	}
 	h.mu.Lock()
 	h.lastPoll[id] = time.Now()
@@ -113,7 +128,8 @@ func (h *hub) handleReply(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, `{"error":"method not allowed"}`, http.StatusMethodNotAllowed)
 		return
 	}
-	if h.who(r) == "" {
+	from := h.who(r)
+	if from == "" {
 		http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
 		return
 	}
@@ -126,7 +142,13 @@ func (h *hub) handleReply(w http.ResponseWriter, r *http.Request) {
 	}
 	h.mu.Lock()
 	call := h.waiting[rep.ID]
-	delete(h.waiting, rep.ID)
+	// Only the server a request was sent to may answer it. Another server that
+	// somehow learned its number must not be able to answer in its place.
+	if call != nil && call.server == from {
+		delete(h.waiting, rep.ID)
+	} else {
+		call = nil
+	}
 	h.mu.Unlock()
 	if call != nil {
 		select {
@@ -145,8 +167,9 @@ func (h *hub) do(ctx context.Context, serverID, method, path string, body []byte
 		return 0, nil, errNotCalling
 	}
 	call := &hubCall{
-		req:   agent.HubRequest{ID: newID(12), Method: method, Path: path, Body: body},
-		reply: make(chan agent.HubReply, 1),
+		req:    agent.HubRequest{ID: newID(12), Method: method, Path: path, Body: body},
+		reply:  make(chan agent.HubReply, 1),
+		server: serverID,
 	}
 	select {
 	case h.queue(serverID) <- call:
@@ -157,6 +180,8 @@ func (h *hub) do(ctx context.Context, serverID, method, path string, body []byte
 	case rep := <-call.reply:
 		return rep.Status, rep.Body, nil
 	case <-ctx.Done():
+		// Whether it is still queued or already handed out, it is not wanted now.
+		call.dropped.Store(true)
 		h.mu.Lock()
 		delete(h.waiting, call.req.ID)
 		h.mu.Unlock()

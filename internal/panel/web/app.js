@@ -770,6 +770,10 @@
     clearSecrets();
     $('add-dialog').close();
   });
+  // However the window is closed, Escape included, the password or key typed in
+  // it is gone. Otherwise it would still be sitting in the form for the next
+  // server the window is opened for.
+  $('add-dialog').addEventListener('close', clearSecrets);
   $('add-back').addEventListener('click', () => {
     $('add-progress').hidden = true;
     $('add-form').hidden = false;
@@ -892,6 +896,10 @@
 
   // ---------------------------------------------------------- following a job
 
+  let followJobGen = 0;
+  let followEditGen = 0;
+  let followTunnelGen = 0;
+
   function followJob(id, title, okText, failText) {
     $('job-title').textContent = title;
     $('job-log').replaceChildren();
@@ -902,6 +910,10 @@
     $('job-title').focus();
     let seen = 0;
     let restartTries = 0;
+    // Only the newest follower may write to the dialog: an older one still
+    // waiting on its job would otherwise mix its lines and its final result
+    // into this one's.
+    const gen = ++followJobGen;
     const syncMe = async () => {
       try {
         const me = await api('GET', '/api/me');
@@ -913,11 +925,14 @@
       } catch (_) {}
     };
     const poll = async () => {
+      if (gen !== followJobGen) return;
       let job;
       try {
         job = await api('GET', '/api/jobs/' + encodeURIComponent(id));
+        if (gen !== followJobGen) return;
         restartTries = 0;
       } catch (e) {
+        if (gen !== followJobGen) return;
         if (e.status === 401) return;
         if (e.status === 404 && restartTries < 25) {
           restartTries++;
@@ -1630,11 +1645,15 @@
     $('et-back').hidden = true;
     $('et-progress-title').focus();
     let seen = 0;
+    const gen = ++followEditGen; // an older follower must not write into this one's dialog
     const poll = async () => {
+      if (gen !== followEditGen) return;
       let job;
       try {
         job = await api('GET', '/api/jobs/' + encodeURIComponent(id));
+        if (gen !== followEditGen) return;
       } catch (e) {
+        if (gen !== followEditGen) return;
         if (e.status === 401) return;
         $('et-result').textContent = e.message;
         $('et-result').className = 'bad';
@@ -3488,11 +3507,15 @@
     $('tn-back').hidden = true;
     $('tn-progress-title').focus();
     let seen = 0;
+    const gen = ++followTunnelGen; // an older follower must not write into this one's dialog
     const poll = async () => {
+      if (gen !== followTunnelGen) return;
       let job;
       try {
         job = await api('GET', '/api/jobs/' + encodeURIComponent(id));
+        if (gen !== followTunnelGen) return;
       } catch (e) {
+        if (gen !== followTunnelGen) return;
         if (e.status === 401) return;
         $('tn-result').textContent = e.message;
         $('tn-result').className = 'bad';
@@ -3821,6 +3844,7 @@
       if ($('restore-loading-wrap')) {
         $('restore-loading-wrap').hidden = false;
       }
+      let restored = false;
       try {
         const options = {
           passphrase: $('restore-pass') ? $('restore-pass').value.trim() : '',
@@ -3863,14 +3887,18 @@
         await refresh();
         await loadSettings();
         setStatus('Backup restored successfully.');
+        restored = true;
       } catch (e) {
         $('restore-error').textContent = e.message;
       } finally {
         if ($('restore-loading-wrap')) $('restore-loading-wrap').hidden = true;
         if ($('restore-close')) $('restore-close').disabled = false;
         btn.classList.remove('is-loading');
-        btn.disabled = false;
-        btn.textContent = 'Restore Backup Now';
+        // A finished restore is not offered again from the same window: running
+        // it twice re-seeds and redeploys everything a second time. Opening the
+        // dialog afresh starts over.
+        btn.disabled = restored;
+        btn.textContent = restored ? 'Restore complete' : 'Restore Backup Now';
       }
     });
   }

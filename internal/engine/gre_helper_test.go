@@ -50,6 +50,9 @@ exit 0
 // be deleted by giving its comment without the quotes.
 const fakeIptables = `#!/usr/bin/env bash
 R="$FAKE_STATE/rules"; [ "$(basename "$0")" = ip6tables ] && R="$FAKE_STATE/rules6"; touch "$R"
+# The helper asks iptables to wait for its lock (-w 5); the real one then does
+# the same thing, so it is simply ignored here.
+if [ "$1" = "-w" ]; then shift 2; fi
 echo "iptables $*" >> "$FAKE_STATE/log"
 cmd=$1; shift
 shift # the chain

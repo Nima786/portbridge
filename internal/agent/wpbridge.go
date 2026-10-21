@@ -62,6 +62,14 @@ func syncWebsiteBridgeOrigin(cfg *engine.Config, oldCfg *engine.Config, confDir 
 		return nil
 	}
 
+	// A tunnel that is not a Website Bridge, and was not one before, has set up
+	// nothing here. Touching LiteSpeed (and restarting it) or every WordPress
+	// site on the server because an unrelated tunnel was made would be a
+	// web-server outage for no reason.
+	if (cfg == nil || !cfg.WebsiteBridge) && (oldCfg == nil || !oldCfg.WebsiteBridge) {
+		return nil
+	}
+
 	if err := syncCPSecurityNeverBlock(name, cfg); err != nil {
 		log.Printf("[%s] updating CP-Security never-block list: %v", name, err)
 	}
@@ -125,6 +133,12 @@ func syncWebsiteBridgeOrigin(cfg *engine.Config, oldCfg *engine.Config, confDir 
 // disabled on the Foreign (Origin) server.
 func cleanupWebsiteBridgeOrigin(name string, oldCfg *engine.Config, confDir string) {
 	if !wpBridgeEnabled(confDir) || name == "" {
+		return
+	}
+	// Deleting an ordinary tunnel must leave the web server alone: it never
+	// set anything up. (When the old settings could not be read, clean up
+	// anyway, as before.)
+	if oldCfg != nil && !oldCfg.WebsiteBridge {
 		return
 	}
 	if confDir != "" {

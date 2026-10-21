@@ -28,6 +28,7 @@ const (
 var fakeTCPMagic = [3]byte{'P', 'B', 'F'}
 
 type fakeTCPPeerState struct {
+	lastSeen  atomic.Int64 // unix nano of the last frame from this peer
 	seq       atomic.Uint32
 	peerSeq   atomic.Uint32
 	outerPort atomic.Uint32
@@ -51,6 +52,7 @@ type fakeTCPPacketConn struct {
 	peerSeq    atomic.Uint32
 	mask       [fakeTCPInnerHeaderLen]byte
 	peers      sync.Map // string(ip:virtualPort) -> *fakeTCPPeerState
+	newPeers   atomic.Uint32
 	rstCleanup func()
 	closeOnce  sync.Once
 }
@@ -364,7 +366,13 @@ func (c *fakeTCPPacketConn) ReadFrom(p []byte) (int, net.Addr, error) {
 			key := uaddr.String()
 			val, loaded := c.peers.LoadOrStore(key, &fakeTCPPeerState{})
 			st := val.(*fakeTCPPeerState)
+			st.lastSeen.Store(time.Now().UnixNano())
 			if !loaded {
+				// Every reconnect arrives as a new virtual port, so without
+				// clearing out the long-gone ones the table only ever grows.
+				if c.newPeers.Add(1)%64 == 0 {
+					c.pruneIdlePeers()
+				}
 				st.seq.Store(randomUint32())
 				if !c.localIP.IsUnspecified() {
 					st.localIP = c.localIP
@@ -381,6 +389,21 @@ func (c *fakeTCPPacketConn) ReadFrom(p []byte) (int, net.Addr, error) {
 		copied := copy(p, payload)
 		return copied, uaddr, nil
 	}
+}
+
+// peerIdleLimit is how long a remote peer may stay silent before its state is
+// forgotten. A session that quiet is long over; if the peer does come back it is
+// simply treated as new.
+const peerIdleLimit = 15 * time.Minute
+
+func (c *fakeTCPPacketConn) pruneIdlePeers() {
+	cutoff := time.Now().Add(-peerIdleLimit).UnixNano()
+	c.peers.Range(func(k, v any) bool {
+		if st, ok := v.(*fakeTCPPeerState); ok && st.lastSeen.Load() < cutoff {
+			c.peers.Delete(k)
+		}
+		return true
+	})
 }
 
 func (c *fakeTCPPacketConn) WriteTo(p []byte, addr net.Addr) (int, error) {

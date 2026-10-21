@@ -1053,7 +1053,10 @@ func (p *Panel) handleBackupRestore(w http.ResponseWriter, r *http.Request, a au
 	// keep the current browser session logged in under the restored username.
 	if req.Options.RestoreCredentials {
 		curUser := p.store.get().Admin.User
-		if curUser != "" && (a.s == nil || curUser != a.s.user) {
+		if curUser != "" {
+			// The login may now be different, so everyone who was logged in under
+			// the old one is logged out; this browser gets a fresh session.
+			p.sessions.endAll()
 			id, s := p.sessions.create(curUser)
 			setSessionCookie(w, id)
 			writeJSON(w, http.StatusOK, map[string]any{

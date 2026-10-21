@@ -57,8 +57,10 @@ const (
 	// given up on after this. Once the answer has started it may take far
 	// longer (transferTime), since it can carry a whole release.
 	hubAnswerWait = HubPollWait + 20*time.Second
-	hubBackoffMin = 2 * time.Second
-	hubBackoffMax = time.Minute
+	// hubMaxParallel is how many panel requests an agent runs at the same time.
+	hubMaxParallel = 8
+	hubBackoffMin  = 2 * time.Second
+	hubBackoffMax  = time.Minute
 	// HubBodyLimit is the most one request or answer through the hub may be:
 	// room for a release, base64-encoded, and a little more.
 	HubBodyLimit = MaxReleaseSize*4/3 + 1<<20
@@ -262,6 +264,7 @@ func callHome(ctx context.Context, panelURL, fingerprint, token string, h http.H
 	logs := newCallHomeLog()
 	backoff := time.Duration(0)
 	idx := 0
+	hubSlots := make(chan struct{}, hubMaxParallel)
 	log.Printf("[agent] calling the panel at %s", strings.Join(urls, ", "))
 	for ctx.Err() == nil {
 		curURL := urls[idx]
@@ -293,7 +296,16 @@ func callHome(ctx context.Context, panelURL, fingerprint, token string, h http.H
 		if req == nil {
 			continue // nothing to do this time
 		}
+		// At most a few requests run at once. The panel could otherwise keep
+		// handing out work faster than it is done, each one held in memory
+		// with its whole body, until the agent runs out of room.
+		select {
+		case hubSlots <- struct{}{}:
+		case <-ctx.Done():
+			return
+		}
 		go func(r HubRequest, c *http.Client, u string) {
+			defer func() { <-hubSlots }()
 			rep := runHubRequest(r, token, h)
 			if err := hubReply(ctx, c, u, token, rep); err != nil {
 				log.Printf("[agent] could not give the panel its answer: %v", err)

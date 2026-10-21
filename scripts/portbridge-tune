@@ -70,8 +70,12 @@ cmd_apply() {
         warn "This kernel has no BBR, so the rest of the tuning is applied without it."
     fi
 
-    # fq pairs with BBR. fq_codel is the sensible fallback.
-    if grep -qw fq /proc/sys/net/core/default_qdisc 2>/dev/null; then qd=fq; else qd=fq; fi
+    # fq pairs with BBR. fq_codel is the sensible fallback when the kernel has
+    # no fq (it is a module on some, so try loading it before giving up).
+    qd=fq_codel
+    if grep -qw fq /proc/sys/net/core/default_qdisc 2>/dev/null || modprobe sch_fq 2>/dev/null; then
+        qd=fq
+    fi
 
     cat >"$CONF" <<EOF
 $MARK
@@ -98,7 +102,6 @@ net.core.netdev_max_backlog = 16384
 # Reuse closed connections quickly. A busy tunnel opens and closes a lot of them.
 net.ipv4.tcp_fin_timeout = 15
 net.ipv4.tcp_tw_reuse = 1
-net.ipv4.ip_local_port_range = 10240 65535
 
 # Saves a round trip on repeat connections where both ends support it.
 net.ipv4.tcp_fastopen = 3
@@ -111,7 +114,14 @@ net.ipv4.tcp_slow_start_after_idle = 0
 fs.file-max = 2097152
 EOF
 
-    sysctl --system >/dev/null 2>&1 || sysctl -p "$CONF" >/dev/null 2>&1
+    # Load the file itself: that reports on its own settings, where "--system"
+    # reads every sysctl file on the machine and fails on any other one.
+    local sysout tuned=yes
+    if ! sysout=$(sysctl -p "$CONF" 2>&1); then
+        tuned=partly
+        warn "Some of the settings were refused by this server (common in containers and on some low-cost plans):"
+        printf '%s\n' "$sysout" | grep -iE 'error|cannot|denied|unknown' | sed 's/^/  /' >&2
+    fi
 
     if [ "$cc" = bbr ] && [ "$(current net.ipv4.tcp_congestion_control)" != bbr ]; then
         warn "BBR was requested but did not take effect. The kernel may not support it."
@@ -121,7 +131,11 @@ EOF
         printf 'tcp_bbr\n' >/etc/modules-load.d/portbridge-bbr.conf
     fi
 
-    ok "Tuning applied, and it stays after a reboot."
+    if [ "$tuned" = yes ]; then
+        ok "Tuning applied, and it stays after a reboot."
+    else
+        warn "Tuning was only partly applied; the settings listed above were not accepted."
+    fi
     say ""
     cmd_status
 }

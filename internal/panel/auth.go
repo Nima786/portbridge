@@ -127,6 +127,10 @@ type savedSession struct {
 type failures struct {
 	times       []time.Time
 	lockedUntil time.Time
+	// inflight is how many attempts from this address are being checked right
+	// now. They count as tries already spent, so a burst sent all at once cannot
+	// get more guesses than the same tries one after another.
+	inflight int
 }
 
 // sessions holds who is logged in, and who has been guessing.
@@ -295,6 +299,47 @@ func (s *sessions) locked(addr string) (bool, time.Duration) {
 	return false, 0
 }
 
+// admit says whether a login attempt from addr may be checked now, and if not,
+// for how long to wait. A permitted attempt must be ended with finish.
+func (s *sessions) admit(addr string) (bool, time.Duration) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	now := s.now()
+	f := s.failures[addr]
+	if f == nil {
+		f = &failures{}
+		s.failures[addr] = f
+	}
+	if wait := f.lockedUntil.Sub(now); wait > 0 {
+		return false, wait
+	}
+	recent := 0
+	for _, t := range f.times {
+		if now.Sub(t) < failureWindow {
+			recent++
+		}
+	}
+	if recent+f.inflight >= lockAfter {
+		return false, time.Minute
+	}
+	f.inflight++
+	return true, 0
+}
+
+// finish ends an attempt that admit allowed, recording whether it was right.
+func (s *sessions) finish(addr string, good bool) {
+	s.mu.Lock()
+	if f := s.failures[addr]; f != nil && f.inflight > 0 {
+		f.inflight--
+	}
+	s.mu.Unlock()
+	if good {
+		s.succeeded(addr)
+	} else {
+		s.failed(addr)
+	}
+}
+
 func (s *sessions) failed(addr string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -319,7 +364,7 @@ func (s *sessions) failed(addr string) {
 	// without end.
 	if len(s.failures) > 10000 {
 		for a, g := range s.failures {
-			if len(g.times) == 0 && now.After(g.lockedUntil) {
+			if len(g.times) == 0 && g.inflight == 0 && now.After(g.lockedUntil) {
 				delete(s.failures, a)
 			}
 		}

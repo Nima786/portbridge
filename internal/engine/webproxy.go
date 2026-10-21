@@ -586,5 +586,36 @@ func isBlockedOutboundIP(ip net.IP) bool {
 	if ip == nil {
 		return true
 	}
-	return ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() || ip.IsUnspecified()
+	if ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() || ip.IsUnspecified() {
+		return true
+	}
+	// Ranges that are not "private" to Go's helper but are no more public: a
+	// provider's carrier-grade NAT space, benchmarking and special-purpose
+	// blocks, multicast, and reserved space.
+	for _, n := range blockedOutboundNets {
+		if n.Contains(ip) {
+			return true
+		}
+	}
+	return false
 }
+
+var blockedOutboundNets = func() []*net.IPNet {
+	var out []*net.IPNet
+	for _, c := range []string{
+		"100.64.0.0/10",   // carrier-grade NAT
+		"192.0.0.0/24",    // IETF protocol assignments
+		"192.0.2.0/24",    // documentation
+		"198.18.0.0/15",   // benchmarking
+		"198.51.100.0/24", // documentation
+		"203.0.113.0/24",  // documentation
+		"224.0.0.0/4",     // multicast
+		"240.0.0.0/4",     // reserved
+		"64:ff9b::/96",    // NAT64 (can embed any IPv4 address)
+	} {
+		if _, n, err := net.ParseCIDR(c); err == nil {
+			out = append(out, n)
+		}
+	}
+	return out
+}()

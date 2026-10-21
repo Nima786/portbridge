@@ -33,6 +33,17 @@ set -uo pipefail
 
 CONF_DIR=${PORTBRIDGE_CONF_DIR:-/etc/portbridge/tunnels}
 
+# Every tunnel's unit runs this at start, and at boot they all start together.
+# Without -w, the second one to ask iptables for its lock fails at once instead
+# of waiting, and what it was going to do (often the rule that lets the other
+# server in) is simply not done. Only used where the installed iptables knows -w.
+if command -v iptables >/dev/null 2>&1 && command iptables -w 5 -S >/dev/null 2>&1; then
+    iptables() { command iptables -w 5 "$@"; }
+fi
+if command -v ip6tables >/dev/null 2>&1 && command ip6tables -w 5 -S >/dev/null 2>&1; then
+    ip6tables() { command ip6tables -w 5 "$@"; }
+fi
+
 die() {
     echo "portbridge-firewall: $*" >&2
     exit 1
@@ -60,7 +71,7 @@ EOF
 
 # read_conf <file> <key> -> value, or empty
 read_conf() {
-    sed -nE "s/^[[:space:]]*$2[[:space:]]*=[[:space:]]*\"?([^\"#]*)\"?[[:space:]]*$/\1/p" "$1" |
+    sed -nE "s/^[[:space:]]*$2[[:space:]]*=[[:space:]]*[\"']?([^\"'#]*)[\"']?[[:space:]]*$/\1/p" "$1" |
         tail -1 | sed -E 's/[[:space:]]+$//'
 }
 
@@ -729,6 +740,31 @@ cmd_sit_test() {
     exit 1
 }
 
+# is_ssh_port <port> - is this a port SSH answers on? Asked of the SSH server's
+# own settings and of what is listening, since either can be changed.
+is_ssh_port() {
+    local port=$1 p
+    for p in $( { sshd -T 2>/dev/null | awk '$1 == "port" {print $2}'; \
+        ss -Hltnp 2>/dev/null | awk '/"sshd"/ {n = split($4, a, ":"); print a[n]}'; } | sort -u); do
+        [ "$p" = "$port" ] && return 0
+    done
+    return 1
+}
+
+# confirm_allowed <tool> <name> <source> - the rule that lets the other server in
+# must really be there. The drop goes in first and the allow above it; if the
+# allow could not be added (an address that does not resolve, a failed command)
+# the drop would be left shutting the other server out, so it is taken away again.
+confirm_allowed() {
+    local tool=$1 name=$2 src=$3
+    have "$tool" || return 0
+    rule_spec "$name" ACCEPT "$src"
+    "$tool" -C INPUT "${RULE[@]}" 2>/dev/null && return 0
+    purge_everything "$name"
+    echo "could not allow $src through to port $TPORT, so port $TPORT is left OPEN rather than shutting the other server out" >&2
+    return 1
+}
+
 firewall_apply() {
     local name=$1
     load "$name" || exit 1
@@ -751,6 +787,13 @@ firewall_apply() {
     fi
     if [ -z "$PEER" ]; then
         echo "tunnel $name has no peer address recorded, so port $TPORT is left open" >&2
+        return 0
+    fi
+    # Locking the port that SSH answers on would cut the owner off from their own
+    # server. Never done, whatever the settings say.
+    if is_ssh_port "$TPORT"; then
+        purge_everything "$name"
+        echo "port $TPORT is this server's SSH port, so it is NOT locked down (that would lock you out)" >&2
         return 0
     fi
 
@@ -783,6 +826,7 @@ firewall_apply() {
         add_rule ip6tables "$name" ACCEPT "$PEER"
         add_rule iptables "$name" DROP
         add_rule iptables "$name" ACCEPT 127.0.0.1
+        confirm_allowed ip6tables "$name" "$PEER" || return 0
     else
         add_rule iptables "$name" DROP
         add_rule iptables "$name" ACCEPT 127.0.0.1
@@ -795,6 +839,7 @@ firewall_apply() {
         if have ip6tables; then
             add_rule ip6tables "$name" DROP
         fi
+        confirm_allowed iptables "$name" "$PEER" || return 0
     fi
 
     echo "tunnel port $TPORT ($PROTO) is restricted to $PEER"

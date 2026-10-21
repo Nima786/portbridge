@@ -2,6 +2,7 @@ package engine
 
 import (
 	"bufio"
+	"bytes"
 	"crypto/rand"
 	"crypto/sha1"
 	"encoding/base64"
@@ -300,8 +301,8 @@ func (w *wsConn) readFrame() ([]byte, byte, error) {
 			return nil, 0, err
 		}
 	}
-	payload := make([]byte, length)
-	if _, err := io.ReadFull(w.br, payload); err != nil {
+	payload, err := readWSPayload(w.br, length)
+	if err != nil {
 		return nil, 0, err
 	}
 	if masked {
@@ -310,6 +311,30 @@ func (w *wsConn) readFrame() ([]byte, byte, error) {
 		}
 	}
 	return payload, opcode, nil
+}
+
+// wsPreallocMax is the most a frame's payload is given room for before any of it
+// has arrived.
+const wsPreallocMax = 64 << 10
+
+// readWSPayload reads a frame's payload. A small one is read into room made for
+// it. For a bigger one, room is made only as the bytes actually arrive: the
+// length is stated by the other end before it has proved who it is, and a
+// stranger claiming 64 MB must not be given 64 MB for sending nothing.
+func readWSPayload(r io.Reader, length uint64) ([]byte, error) {
+	if length <= wsPreallocMax {
+		p := make([]byte, length)
+		if _, err := io.ReadFull(r, p); err != nil {
+			return nil, err
+		}
+		return p, nil
+	}
+	var buf bytes.Buffer
+	buf.Grow(wsPreallocMax)
+	if _, err := io.CopyN(&buf, r, int64(length)); err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
 }
 
 func (w *wsConn) Write(p []byte) (int, error) {

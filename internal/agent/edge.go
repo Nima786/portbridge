@@ -1117,6 +1117,48 @@ func setConfKey(text, key, val string) string {
 	return strings.Join(lines, "\n")
 }
 
+// dropConfKey removes every line that sets key.
+func dropConfKey(text, key string) string {
+	lines := strings.Split(text, "\n")
+	out := lines[:0]
+	for _, l := range lines {
+		t := strings.TrimSpace(l)
+		if t != "" && !strings.HasPrefix(t, "#") {
+			if k, _, ok := strings.Cut(t, "="); ok && strings.TrimSpace(k) == key {
+				continue
+			}
+		}
+		out = append(out, l)
+	}
+	return strings.Join(out, "\n")
+}
+
+// fileBackup remembers a file as it was, to put it back if a change fails.
+type fileBackup struct {
+	path    string
+	data    []byte
+	mode    os.FileMode
+	existed bool
+}
+
+func backupFile(path string) fileBackup {
+	b := fileBackup{path: path}
+	if st, err := os.Stat(path); err == nil && !st.IsDir() {
+		if data, err := os.ReadFile(path); err == nil {
+			b.existed, b.data, b.mode = true, data, st.Mode().Perm()
+		}
+	}
+	return b
+}
+
+func (b fileBackup) restore() {
+	if b.existed {
+		_ = writeFileAtomic(b.path, b.data, b.mode)
+	} else {
+		_ = os.Remove(b.path)
+	}
+}
+
 func replaceAddrPort(addr string, port int) string {
 	p := strconv.Itoa(port)
 	if h, _, err := net.SplitHostPort(addr); err == nil {
@@ -2307,6 +2349,11 @@ func ImportTunnel(snap TunnelSnapshot, confDir string, overwrite bool, newLocalI
 
 	confText := snap.Conf
 	confPath := func(ext string) string { return filepath.ToSlash(filepath.Join(confDir, snap.Name+ext)) }
+	// Every setting that names a file or the tunnel itself is pinned to this
+	// tunnel's own place in confDir. The text comes from outside, and a setting
+	// like status_file would otherwise make the engine write wherever it says.
+	confText = dropConfKey(confText, "status_file")
+	confText = setConfKey(confText, "name", snap.Name)
 	confText = setConfKey(confText, "secret_file", confPath(".secret"))
 	if strings.Contains(confText, "cert_file") {
 		confText = setConfKey(confText, "cert_file", confPath(".crt"))
@@ -2316,14 +2363,31 @@ func ImportTunnel(snap TunnelSnapshot, confDir string, overwrite bool, newLocalI
 		confText = setConfKey(confText, "local_ip", newLocalIP)
 	}
 
+	// What is there now, so that when the restored settings turn out to be
+	// unusable the tunnel that was running is put back, not left broken.
+	saved := []fileBackup{backupFile(secretFile), backupFile(certFile), backupFile(keyFile), backupFile(confFile)}
+	putBack := func() {
+		for _, b := range saved {
+			b.restore()
+		}
+	}
+
 	if err := writeFileAtomic(secretFile, []byte(strings.TrimSpace(snap.Secret)+"\n"), 0o600); err != nil {
+		putBack()
 		return res, err
 	}
 	if snap.CertPEM != "" && snap.KeyPEM != "" {
-		_ = writeFileAtomic(certFile, []byte(snap.CertPEM), 0o644)
-		_ = writeFileAtomic(keyFile, []byte(snap.KeyPEM), 0o600)
+		if err := writeFileAtomic(certFile, []byte(snap.CertPEM), 0o644); err != nil {
+			putBack()
+			return res, fmt.Errorf("saving the certificate: %w", err)
+		}
+		if err := writeFileAtomic(keyFile, []byte(snap.KeyPEM), 0o600); err != nil {
+			putBack()
+			return res, fmt.Errorf("saving the certificate key: %w", err)
+		}
 	}
 	if err := writeFileAtomic(confFile, []byte(confText), 0o600); err != nil {
+		putBack()
 		return res, err
 	}
 
@@ -2338,6 +2402,7 @@ func ImportTunnel(snap TunnelSnapshot, confDir string, overwrite bool, newLocalI
 		err = cfg.LoadSecret()
 	}
 	if err != nil {
+		putBack()
 		return res, fmt.Errorf("restored tunnel config invalid: %w", err)
 	}
 
