@@ -637,6 +637,19 @@
     $('confirm-no').focus();
   }
 
+  // Resolves true only if the person accepts the fingerprint shown.
+  function confirmHostKey(address, fingerprint) {
+    return new Promise((resolve) => {
+      let ok = false;
+      $('confirm-dialog').addEventListener('close', () => resolve(ok), { once: true });
+      openConfirm(`Is this the right server?`,
+        `${address} shows this SSH fingerprint: ${fingerprint}. ` +
+        'If you can, compare it with the one on the server (ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub, or the other ssh_host_*_key.pub files). ' +
+        'Your password or key is only sent to a server that shows exactly this.',
+        'Yes, continue', async () => { ok = true; });
+    });
+  }
+
   $('confirm-no').addEventListener('click', () => $('confirm-dialog').close());
   $('confirm-yes').addEventListener('click', async () => {
     const btn = $('confirm-yes');
@@ -833,6 +846,12 @@
     const btn = ev.target.querySelector('button[type=submit]');
     btn.disabled = true;
     try {
+      // The server's SSH fingerprint is shown first, and the password or key is
+      // only sent to a server that shows exactly that one.
+      const hostAddr = updating ? addMode.server.address : address;
+      const fp = await api('POST', '/api/servers/hostkey', { address: hostAddr, ssh_port: port });
+      if (!(await confirmHostKey(hostAddr, fp.host_key))) return;
+      body.host_key = fp.host_key;
       const path = updating ? `/api/servers/${encodeURIComponent(addMode.server.id)}/ssh-update` : '/api/servers';
       const res = await api('POST', path, body);
       startJob(res.job);
@@ -2329,7 +2348,7 @@
   async function saveCFToken(name, token, errEl, btnEl, closeDlg) {
     if (!token) {
       if (errEl) errEl.textContent = 'Paste your Cloudflare API token.';
-      return;
+      return false;
     }
     if (errEl) errEl.textContent = '';
     if (btnEl) btnEl.disabled = true;
@@ -2339,8 +2358,10 @@
       cfLoadedOnce = false;
       await loadCloudflare(true);
       setStatus('Cloudflare API token verified and encrypted.');
+      return true;
     } catch (e) {
       if (errEl) errEl.textContent = e.message;
+      return false;
     } finally {
       if (btnEl) btnEl.disabled = false;
     }
@@ -2349,14 +2370,15 @@
   if ($('cf-inline-token-form')) {
     $('cf-inline-token-form').addEventListener('submit', async (ev) => {
       ev.preventDefault();
-      await saveCFToken(
+      const saved = await saveCFToken(
         $('cf-inline-name').value.trim(),
         $('cf-inline-token').value.trim(),
         $('cf-inline-error'),
         $('cf-inline-submit'),
         null
       );
-      $('cf-inline-token').value = '';
+      // Kept on a failure, so a typo in the name does not mean pasting it again.
+      if (saved) $('cf-inline-token').value = '';
     });
   }
 

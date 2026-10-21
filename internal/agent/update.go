@@ -249,6 +249,8 @@ const (
 	maxPartSize = 1 << 20
 	maxParts    = MaxReleaseSize / PartSize
 	uploadTTL   = time.Hour
+
+	maxUploadsHeld = 4
 )
 
 var uploadIDRe = regexp.MustCompile(`^[A-Za-z0-9_-]{8,64}$`)
@@ -284,6 +286,20 @@ func savePart(workDir string, p UpdatePart) error {
 	}
 	clearOldUploads(workDir)
 	dir := uploadDir(workDir, p.Upload)
+	// Only a few releases are held at once, so a stream of made-up upload names
+	// cannot fill the disk, each with up to a full release of parts.
+	if _, err := os.Stat(dir); err != nil {
+		held := 0
+		entries, _ := os.ReadDir(workDir)
+		for _, e := range entries {
+			if e.IsDir() && strings.HasPrefix(e.Name(), "upload-") {
+				held++
+			}
+		}
+		if held >= maxUploadsHeld {
+			return errors.New("too many releases are being sent at once; try again shortly")
+		}
+	}
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return err
 	}

@@ -748,6 +748,11 @@ func (p *Panel) startEditTunnel(r editTunnelRequest) (string, error) {
 }
 
 func (p *Panel) editTunnel(j *job, r editTunnelRequest) error {
+	// An Auto-Heal switch works on the same servers' settings files. The two
+	// must not take turns in the middle of each other's prepare and commit.
+	if p.healer != nil {
+		defer p.healer.lockServers(r.Edge, r.Origin)()
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 3*tunnelOpTimeout)
 	defer cancel()
 
@@ -1338,7 +1343,46 @@ func (p *Panel) startProbeSession(parent context.Context, relayID, foreignID, cd
 	return sess, nil
 }
 
+// checkProbeStep refuses a probe step that does not point at a server of the
+// fleet: the step comes back from the browser, so it is checked again rather
+// than trusted. A server made to dial an address outside the fleet could be
+// used to reach things on its network.
+func (p *Panel) checkProbeStep(dialerID, secret string, spec engine.ProbeCandidateSpec) error {
+	if _, ok := p.viewOf(dialerID); !ok {
+		return errors.New("that server is not in the panel")
+	}
+	if secret == "" {
+		return errors.New("the probe has no secret")
+	}
+	host, portStr, err := net.SplitHostPort(spec.TargetAddr)
+	if err != nil || host == "" {
+		return errors.New("the probe target is not an address and port")
+	}
+	if port, err := strconv.Atoi(portStr); err != nil || port < 1 || port > 65535 {
+		return errors.New("the probe target port is not valid")
+	}
+	if net.ParseIP(host) == nil {
+		// A name is only for the CDN checks.
+		if spec.CDN {
+			return nil
+		}
+		return errors.New("the probe target is not one of the panel's servers")
+	}
+	for _, v := range p.fleet.views() {
+		v4, v6 := serverAddresses(v)
+		for _, a := range []string{v4, v6, v.Address} {
+			if a != "" && net.ParseIP(a) != nil && net.ParseIP(a).Equal(net.ParseIP(host)) {
+				return nil
+			}
+		}
+	}
+	return errors.New("the probe target is not one of the panel's servers")
+}
+
 func (p *Panel) runProbeStep(parent context.Context, dialerID, secret string, spec engine.ProbeCandidateSpec) (engine.ProbeCandidateResult, error) {
+	if err := p.checkProbeStep(dialerID, secret, spec); err != nil {
+		return engine.ProbeCandidateResult{}, err
+	}
 	dctx, dcancel := context.WithTimeout(parent, 15*time.Second)
 	defer dcancel()
 	var drep probeDialReply

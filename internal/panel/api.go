@@ -82,6 +82,7 @@ func (p *Panel) routes() http.Handler {
 	mux.HandleFunc("POST /api/updates", p.withAuth(p.handleStartUpdate))
 	mux.HandleFunc("POST /api/updates/check", p.withAuth(p.handleCheckUpdates))
 	mux.HandleFunc("POST /api/servers/{id}/ssh-update", p.withAuth(p.handleSSHUpdate))
+	mux.HandleFunc("POST /api/servers/hostkey", p.withAuth(p.handleHostKey))
 	mux.HandleFunc("GET /api/panel", p.withAuth(p.handlePanelInfo))
 
 	mux.HandleFunc("GET /api/cf/accounts", p.withAuth(p.handleGetCFAccounts))
@@ -416,6 +417,24 @@ func (p *Panel) handleAddServer(w http.ResponseWriter, r *http.Request, _ authed
 	writeJSON(w, http.StatusAccepted, map[string]string{"job": id})
 }
 
+// handleHostKey shows the SSH fingerprint a server offers, without logging in,
+// so it can be confirmed before any password or key is sent.
+func (p *Panel) handleHostKey(w http.ResponseWriter, r *http.Request, _ authed) {
+	var req struct {
+		Address string `json:"address"`
+		SSHPort int    `json:"ssh_port"`
+	}
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	fp, err := fetchHostKey(strings.TrimSpace(req.Address), req.SSHPort)
+	if err != nil {
+		writeErr(w, http.StatusBadGateway, capitalise(err.Error())+".")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"host_key": fp})
+}
+
 func (p *Panel) handleJob(w http.ResponseWriter, r *http.Request, _ authed) {
 	p.jobsMu.Lock()
 	j := p.jobs[r.PathValue("id")]
@@ -684,6 +703,10 @@ func (p *Panel) handleSSHUpdate(w http.ResponseWriter, r *http.Request, _ authed
 	}
 	if req.Password == "" && strings.TrimSpace(req.PrivateKey) == "" {
 		writeErr(w, http.StatusBadRequest, "Give the server's password, or its private key.")
+		return
+	}
+	if srv.HostKey == "" && strings.TrimSpace(req.HostKey) == "" {
+		writeErr(w, http.StatusBadRequest, "Confirm the server's SSH fingerprint first.")
 		return
 	}
 	id := p.startJob(func(j *job) (string, error) { return srv.ID, p.sshUpdate(j, srv, req) })

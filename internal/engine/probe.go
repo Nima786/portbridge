@@ -276,6 +276,12 @@ func (pl *ProbeListener) serveTCP() {
 			case <-pl.closed:
 				return
 			default:
+				if errors.Is(err, net.ErrClosed) {
+					return
+				}
+				// A listener that keeps failing (out of file descriptors,
+				// say) must not turn this loop into a busy spin.
+				time.Sleep(50 * time.Millisecond)
 				continue
 			}
 		}
@@ -414,6 +420,10 @@ func (pl *ProbeListener) servePacketLn(ln net.Listener) {
 			case <-pl.closed:
 				return
 			default:
+				if errors.Is(err, net.ErrClosed) {
+					return
+				}
+				time.Sleep(50 * time.Millisecond)
 				continue
 			}
 		}

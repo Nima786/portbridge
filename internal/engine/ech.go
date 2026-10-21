@@ -124,6 +124,9 @@ func resolveECHConfigList(cfg *Config, peerAddr net.Addr) ([]byte, error) {
 	if cfg.ECHConfig != "" {
 		raw, err := base64.StdEncoding.DecodeString(strings.TrimSpace(cfg.ECHConfig))
 		if err != nil || len(raw) == 0 {
+			if err == nil {
+				return nil, errors.New("ech_config is empty")
+			}
 			return nil, fmt.Errorf("decoding ech_config: %w", err)
 		}
 		return raw, nil

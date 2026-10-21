@@ -21,6 +21,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"strconv"
 	"strings"
@@ -44,6 +45,11 @@ type addRequest struct {
 	PrivateKey  string `json:"private_key"`
 	Passphrase  string `json:"passphrase"`
 	AllowUpdate bool   `json:"allow_update"`
+	// HostKey is the SSH fingerprint the person saw and confirmed for this
+	// address (from /api/servers/hostkey). The login only goes through to a
+	// server that shows exactly this key, so a man in the middle cannot collect
+	// the password or key that is about to be sent.
+	HostKey string `json:"host_key"`
 }
 
 // job is one server being added, with what has happened so far.
@@ -55,6 +61,7 @@ type job struct {
 	err      string
 	serverID string
 	started  time.Time
+	addr     string // the address being added, for a job that adds a server
 }
 
 func (j *job) say(format string, args ...any) {
@@ -109,6 +116,10 @@ func (p *Panel) checkAddRequest(r *addRequest) error {
 	if r.Password == "" && strings.TrimSpace(r.PrivateKey) == "" {
 		return errors.New("give the server's password, or its private key")
 	}
+	r.HostKey = strings.TrimSpace(r.HostKey)
+	if r.HostKey == "" {
+		return errors.New("confirm the server's SSH fingerprint first")
+	}
 	if len(r.Name) > 64 {
 		return errors.New("the name can be at most 64 characters")
 	}
@@ -131,8 +142,16 @@ func (p *Panel) startAdd(r addRequest) (string, error) {
 		return "", err
 	}
 	id := newID(9)
-	j := &job{started: time.Now()}
+	j := &job{started: time.Now(), addr: strings.ToLower(r.Address)}
 	p.jobsMu.Lock()
+	// The same server is not added twice at once: both would pass the check
+	// that it is not in the panel yet.
+	for _, o := range p.jobs {
+		if o.addr == j.addr && !o.view().Done {
+			p.jobsMu.Unlock()
+			return "", fmt.Errorf("%s is already being added", r.Address)
+		}
+	}
 	p.jobs[id] = j
 	// Old finished jobs are forgotten.
 	for k, o := range p.jobs {
@@ -264,10 +283,13 @@ func (p *Panel) addServer(j *job, r addRequest) (string, error) {
 	cfg := &ssh.ClientConfig{
 		User: r.User,
 		Auth: methods,
-		// The key is recorded rather than checked: this is the first time the
-		// panel sees this server, as with a first ssh to it by hand.
+		// Only the key the person confirmed is accepted, and it is checked
+		// before any password or key is offered.
 		HostKeyCallback: func(_ string, _ net.Addr, key ssh.PublicKey) error {
 			hostKey = ssh.FingerprintSHA256(key)
+			if hostKey != r.HostKey {
+				return fmt.Errorf("its SSH fingerprint is %s, not the %s that was confirmed; nothing was sent", hostKey, r.HostKey)
+			}
 			return nil
 		},
 		Timeout: 20 * time.Second,
@@ -485,9 +507,9 @@ func remoteAgentSetup(rm *remote, extra string) (agent.AgentSetupResult, error) 
 	}
 	if jerr := json.Unmarshal([]byte(last), &res); jerr != nil {
 		if err != nil {
-			return res, fmt.Errorf("switching the agent on failed: %v: %s", err, out)
+			return res, fmt.Errorf("switching the agent on failed: %v: %s", err, redactToken(out))
 		}
-		return res, fmt.Errorf("the agent setup said something unexpected: %s", out)
+		return res, fmt.Errorf("the agent setup said something unexpected: %s", redactToken(out))
 	}
 	if !res.OK {
 		return res, fmt.Errorf("switching the agent on failed: %s", res.Error)
@@ -743,4 +765,49 @@ func lastLines(s string, n int) string {
 		l = l[len(l)-n:]
 	}
 	return strings.Join(l, "\n")
+}
+
+// errHostKeySeen stops fetchHostKey's connection once the key has been read.
+var errHostKeySeen = errors.New("host key seen")
+
+// fetchHostKey connects to an SSH server far enough to see its host key, and
+// stops there: no password or key is ever offered. The fingerprint is what the
+// person is asked to confirm before the real login.
+func fetchHostKey(address string, port int) (string, error) {
+	if port == 0 {
+		port = 22
+	}
+	if address == "" || strings.ContainsAny(address, " /\\@") || len(address) > 253 {
+		return "", errors.New("give the server's address: an IP address or a host name")
+	}
+	if port < 1 || port > 65535 {
+		return "", errors.New("the SSH port must be from 1 to 65535")
+	}
+	var seen string
+	cfg := &ssh.ClientConfig{
+		User: "root",
+		HostKeyCallback: func(_ string, _ net.Addr, key ssh.PublicKey) error {
+			seen = ssh.FingerprintSHA256(key)
+			// Stop here: the login is not attempted.
+			return errHostKeySeen
+		},
+		Timeout: 15 * time.Second,
+	}
+	_, err := ssh.Dial("tcp", net.JoinHostPort(address, strconv.Itoa(port)), cfg)
+	if seen != "" {
+		return seen, nil
+	}
+	if err == nil {
+		err = errors.New("no host key was offered")
+	}
+	return "", plainSSHError(err)
+}
+
+// tokenInOutput finds the agent token in the setup program's JSON output.
+var tokenInOutput = regexp.MustCompile(`"token"\s*:\s*"[^"]*"`)
+
+// redactToken hides the agent token if the setup output is quoted in an error,
+// which is shown on screen and written to the log.
+func redactToken(s string) string {
+	return tokenInOutput.ReplaceAllString(s, `"token":"(hidden)"`)
 }

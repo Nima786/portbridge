@@ -24,6 +24,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"net/netip"
 	"strconv"
 )
 
@@ -157,10 +158,20 @@ func Header(version int, a *Addrs) []byte {
 	}
 	src, dst := a.ips()
 	proto := "TCP4"
+	srcText, dstText := src.String(), dst.String()
 	if fam == 6 {
 		proto = "TCP6"
+		// An IPv4 address on one end of an IPv6 header must be written in
+		// IPv6 form (::ffff:a.b.c.d); net.IP prints it as plain IPv4, which a
+		// reader of TCP6 lines rejects.
+		if s, ok := netip.AddrFromSlice(src.To16()); ok {
+			srcText = s.String()
+		}
+		if d, ok := netip.AddrFromSlice(dst.To16()); ok {
+			dstText = d.String()
+		}
 	}
-	return []byte(fmt.Sprintf("PROXY %s %s %s %d %d\r\n", proto, src, dst, a.Src.Port, a.Dst.Port))
+	return []byte(fmt.Sprintf("PROXY %s %s %s %d %d\r\n", proto, srcText, dstText, a.Src.Port, a.Dst.Port))
 }
 
 // parseProxyProtocol reads the setting: off, v1 or v2.

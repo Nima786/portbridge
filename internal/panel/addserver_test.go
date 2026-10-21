@@ -311,11 +311,11 @@ func TestAServerIsNotAddedTwice(t *testing.T) {
 		s.Servers = append(s.Servers, Server{ID: "x", Name: "Aeza", Address: "203.0.113.7"})
 		return nil
 	})
-	r := addRequest{Group: GroupForeign, Address: "203.0.113.7", Password: "pw"}
+	r := addRequest{Group: GroupForeign, Address: "203.0.113.7", Password: "pw", HostKey: "SHA256:x"}
 	if err := p.checkAddRequest(&r); err == nil || !strings.Contains(err.Error(), "already in the panel") {
 		t.Fatalf("a second copy was not refused: %v", err)
 	}
-	r = addRequest{Group: GroupForeign, Address: " 203.0.113.8 ", Password: "pw"}
+	r = addRequest{Group: GroupForeign, Address: " 203.0.113.8 ", Password: "pw", HostKey: "SHA256:x"}
 	if err := p.checkAddRequest(&r); err != nil {
 		t.Fatalf("a new server was refused: %v", err)
 	}

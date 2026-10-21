@@ -245,12 +245,20 @@ func applyPairingWarn(p *PairingData, confDir string, warns *[]string) error {
 
 	confText := buildOriginConf(p, secretFile, certFile, keyFile)
 
-	// From here on, failure undoes what was written.
+	// From here on, failure undoes what was written. A certificate and key that
+	// were already there (put in place by hand, say) are not ours to delete.
+	_, certErr := os.Stat(certFile)
+	_, keyErr := os.Stat(keyFile)
+	certExisted, keyExisted := certErr == nil, keyErr == nil
 	undo := func() {
 		_ = os.Remove(confFile)
 		_ = os.Remove(secretFile)
-		_ = os.Remove(certFile)
-		_ = os.Remove(keyFile)
+		if !certExisted {
+			_ = os.Remove(certFile)
+		}
+		if !keyExisted {
+			_ = os.Remove(keyFile)
+		}
 	}
 
 	// The secret first, and never readable by anyone else.

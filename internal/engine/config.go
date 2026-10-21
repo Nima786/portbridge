@@ -862,6 +862,8 @@ func (c *Config) Validate() error {
 			return fmt.Errorf("real_site cannot be used with cdn = on: a CDN makes its own connection and cannot carry the proof")
 		case c.AltTarget != "":
 			return fmt.Errorf("real_site cannot be used with a CDN backup route (alt_target): the CDN's connection cannot carry the proof, so it would be shown the real website")
+		case len(c.CleanIPs) > 0:
+			return fmt.Errorf("real_site cannot be used with clean_ips: those addresses are a CDN's, whose connection cannot carry the proof, so it would be shown the real website")
 		}
 	}
 	if c.HTTPHost != "" && !HostnameRe.MatchString(c.HTTPHost) {

@@ -1,7 +1,11 @@
 package agent
 
 import (
+	"context"
+	"encoding/xml"
+	"errors"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"os/exec"
@@ -9,6 +13,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/Nima786/portbridge/internal/engine"
 )
@@ -219,6 +224,22 @@ func domainSliceContains(list []string, target string) bool {
 // bridged website domain(s) to 127.0.0.1 instead of hair-pinning through the
 // Iran server IP (which breaks WordPress's 10ms wp-cron.php loopback timeout and
 // REST API Site Health checks).
+// hostsLineHasTag reports whether a hosts line carries exactly this tag, so the
+// tag for tunnel "a" is not found in the line of tunnel "a2".
+func hostsLineHasTag(line, tag string) bool {
+	for rest := line; ; {
+		i := strings.Index(rest, tag)
+		if i < 0 {
+			return false
+		}
+		end := i + len(tag)
+		if end == len(rest) || rest[end] == ' ' || rest[end] == '\t' {
+			return true
+		}
+		rest = rest[end:]
+	}
+}
+
 func syncHostsLoopback(tunnelName string, activeDomains []string, oldDomains []string) error {
 	hostsFile := wpHostsPath()
 	data, err := os.ReadFile(hostsFile)
@@ -248,15 +269,16 @@ func syncHostsLoopback(tunnelName string, activeDomains []string, oldDomains []s
 
 	for _, line := range lines {
 		trimmed := strings.TrimSpace(line)
-		if strings.Contains(trimmed, tagExact) {
+		if hostsLineHasTag(trimmed, tagExact) {
 			changed = true
 			continue
 		}
 		if strings.Contains(trimmed, tagLegacy) && !strings.Contains(trimmed, "# portbridge-website-loopback:") {
-			// Legacy untagged loopback entry: remove if it matches any domain of this tunnel
-			// or if no domains were specified on cleanup.
+			// Legacy untagged loopback entry: removed only when it names a
+			// domain of this tunnel. With no domains known there is no telling
+			// whose it is, and it may belong to another tunnel, so it stays.
 			fields := strings.Fields(trimmed)
-			matched := len(matchDomainSet) == 0 && len(activeDomains) == 0
+			matched := false
 			for _, f := range fields {
 				if strings.HasPrefix(f, "#") {
 					break
@@ -665,9 +687,22 @@ func injectWPConfigProxyBlock(content string, block string) string {
 		for len(out) > 0 && strings.TrimSpace(out[len(out)-1]) == "" {
 			out = out[:len(out)-1]
 		}
+		// A file that ends with a closing PHP tag must get the block before
+		// it, or the block would be printed as page text.
+		closing := ""
+		if len(out) > 0 && strings.TrimSpace(out[len(out)-1]) == "?>" {
+			closing = out[len(out)-1]
+			out = out[:len(out)-1]
+			for len(out) > 0 && strings.TrimSpace(out[len(out)-1]) == "" {
+				out = out[:len(out)-1]
+			}
+		}
 		out = append(out, "")
 		out = append(out, blockLines...)
 		out = append(out, "")
+		if closing != "" {
+			out = append(out, closing, "")
+		}
 	}
 	return strings.Join(out, lineEnding)
 }
@@ -1040,21 +1075,9 @@ func syncLiteSpeedProxyProtocol(enable bool) error {
 		}
 
 		// Ensure 127.0.0.1T is trusted in <accessControl><allow>...</allow></accessControl>.
-		if allowStart := strings.Index(content, "<allow>"); allowStart >= 0 {
-			if allowEnd := strings.Index(content[allowStart:], "</allow>"); allowEnd >= 0 {
-				allowBody := content[allowStart+len("<allow>") : allowStart+allowEnd]
-				if !strings.Contains(allowBody, "127.0.0.1T") {
-					trimmedBody := strings.TrimSpace(allowBody)
-					var newBody string
-					if trimmedBody == "" {
-						newBody = "ALL, 127.0.0.1T"
-					} else {
-						newBody = trimmedBody + ", 127.0.0.1T"
-					}
-					content = content[:allowStart+len("<allow>")] + "\n" + newBody + "\n      " + content[allowStart+allowEnd:]
-					changed = true
-				}
-			}
+		if nc, ok := setLiteSpeedTrustedLoopback(content, true); ok {
+			content = nc
+			changed = true
 		}
 
 		// Ensure <proxyProtocol> inside <tuning> contains 127.0.0.1.
@@ -1078,6 +1101,10 @@ func syncLiteSpeedProxyProtocol(enable bool) error {
 			changed = true
 		}
 	} else {
+		if nc, ok := setLiteSpeedTrustedLoopback(content, false); ok {
+			content = nc
+			changed = true
+		}
 		if ppStart := strings.Index(content, "<proxyProtocol>"); ppStart >= 0 {
 			if ppEnd := strings.Index(content[ppStart:], "</proxyProtocol>"); ppEnd >= 0 {
 				ppBody := content[ppStart+len("<proxyProtocol>") : ppStart+ppEnd]
@@ -1116,16 +1143,129 @@ func syncLiteSpeedProxyProtocol(enable bool) error {
 		return nil
 	}
 
+	// A file that is no longer well-formed XML is never written.
+	if wellFormedXML(orig) && !wellFormedXML(content) {
+		return errors.New("the changed LiteSpeed configuration would not be valid XML; it was left as it was")
+	}
 	if err := writeFilePreservingOwner(xmlPath, []byte(content), 0o644); err != nil {
 		return err
 	}
 
 	if wpBridgeRootOverride == "" && runtime.GOOS == "linux" {
-		if _, err := os.Stat("/usr/local/lsws/bin/lswsctrl"); err == nil {
-			_ = exec.Command("/usr/local/lsws/bin/lswsctrl", "restart").Run()
+		// If LiteSpeed does not come back up on the changed file, the file is
+		// put back as it was and LiteSpeed restarted on that, rather than
+		// leaving the web server down.
+		const ctl = "/usr/local/lsws/bin/lswsctrl"
+		if pathExists(ctl) {
+			wasRunning := liteSpeedRunning(ctl)
+			_ = exec.Command(ctl, "restart").Run()
+			if wasRunning && !waitLiteSpeedRunning(ctl, 20*time.Second) {
+				_ = writeFilePreservingOwner(xmlPath, data, 0o644)
+				_ = exec.Command(ctl, "restart").Run()
+				return errors.New("LiteSpeed did not start with the changed configuration, so the file was put back")
+			}
 		}
 	}
 	return nil
+}
+
+func wellFormedXML(s string) bool {
+	dec := xml.NewDecoder(strings.NewReader(s))
+	// Whatever the file says its encoding is, only its structure is checked.
+	dec.CharsetReader = func(_ string, in io.Reader) (io.Reader, error) { return in, nil }
+	for {
+		if _, err := dec.Token(); err != nil {
+			return err == io.EOF
+		}
+	}
+}
+
+func liteSpeedRunning(ctl string) bool {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	out, _ := exec.CommandContext(ctx, ctl, "status").CombinedOutput()
+	return strings.Contains(string(out), "running") && !strings.Contains(string(out), "not running")
+}
+
+func waitLiteSpeedRunning(ctl string, d time.Duration) bool {
+	deadline := time.Now().Add(d)
+	for {
+		if liteSpeedRunning(ctl) {
+			return true
+		}
+		if time.Now().After(deadline) {
+			return false
+		}
+		time.Sleep(time.Second)
+	}
+}
+
+// setLiteSpeedTrustedLoopback adds (or takes away) 127.0.0.1T in the server-wide
+// access control list of a LiteSpeed configuration, the entry that lets it
+// believe PROXY protocol headers from this machine. Only the list in the
+// <security> section is touched, never an <allow> elsewhere (a virtual
+// host's, say). The second result says whether anything changed.
+func setLiteSpeedTrustedLoopback(content string, enable bool) (string, bool) {
+	secStart := strings.Index(content, "<security>")
+	if secStart < 0 {
+		return content, false
+	}
+	secEnd := strings.Index(content[secStart:], "</security>")
+	if secEnd < 0 {
+		return content, false
+	}
+	secEnd += secStart
+	acStart := strings.Index(content[secStart:secEnd], "<accessControl>")
+	if acStart < 0 {
+		return content, false
+	}
+	acStart += secStart
+	acEnd := strings.Index(content[acStart:secEnd], "</accessControl>")
+	if acEnd < 0 {
+		return content, false
+	}
+	acEnd += acStart
+	allowStart := strings.Index(content[acStart:acEnd], "<allow>")
+	if allowStart < 0 {
+		return content, false
+	}
+	allowStart += acStart
+	bodyStart := allowStart + len("<allow>")
+	allowEnd := strings.Index(content[bodyStart:acEnd], "</allow>")
+	if allowEnd < 0 {
+		return content, false
+	}
+	allowEnd += bodyStart
+	items := splitCSVTokens(content[bodyStart:allowEnd])
+	has := stringSliceContains(items, "127.0.0.1T")
+	if enable == has {
+		return content, false
+	}
+	if enable {
+		if len(items) == 0 {
+			// An empty list means everyone is allowed; keep it that way.
+			items = append(items, "ALL")
+		}
+		items = append(items, "127.0.0.1T")
+	} else {
+		var kept []string
+		for _, it := range items {
+			if it != "127.0.0.1T" {
+				kept = append(kept, it)
+			}
+		}
+		items = kept
+	}
+	body := ""
+	if len(items) > 0 {
+		body = "\n" + strings.Join(items, ", ") + "\n      "
+	}
+	return content[:bodyStart] + body + content[allowEnd:], true
+}
+
+func pathExists(p string) bool {
+	_, err := os.Stat(p)
+	return err == nil
 }
 
 func splitCSVTokens(s string) []string {

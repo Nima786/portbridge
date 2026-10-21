@@ -10,6 +10,12 @@
 
 set -uo pipefail
 
+# Everything below is one group, which the shell reads to its closing brace
+# before it runs any of it. Run as "curl ... | bash", a download cut off half
+# way then fails to parse and does nothing, instead of running the part that
+# arrived (which could be the middle of an install).
+{
+
 REPO=Nima786/portbridge
 BIN=/usr/local/bin/portbridge
 MENU=/usr/local/bin/portbridge-menu
@@ -319,14 +325,20 @@ if [ -f "$BIN" ] && [ "$(sha256sum "$BIN" | awk '{print $1}')" = "$(sha256sum "$
     ENGINE_CHANGED=no
 fi
 
-install -m 755 "$STAGE/portbridge" "$BIN"
-install -m 755 "$STAGE/portbridge-menu" "$MENU"
-install -m 755 "$STAGE/portbridge-firewall" "$FIREWALL"
-install -m 755 "$STAGE/portbridge-tune" "$TUNE"
-install -m 644 "$STAGE/portbridge@.service" "$UNIT"
-[ -f "$STAGE/portbridge-agent.service" ] && install -m 644 "$STAGE/portbridge-agent.service" "$AGENT_UNIT"
-[ -f "$STAGE/portbridge-panel.service" ] && install -m 644 "$STAGE/portbridge-panel.service" "$PANEL_UNIT"
-[ -f "$STAGE/install.sh" ] && install -D -m 755 "$STAGE/install.sh" "$SHARE_DIR/install.sh"
+install -m 755 "$STAGE/portbridge" "$BIN" || die "Could not install $BIN (is the disk full?). Run this again once that is fixed."
+install -m 755 "$STAGE/portbridge-menu" "$MENU" || die "Could not install $MENU. Run this again once that is fixed."
+install -m 755 "$STAGE/portbridge-firewall" "$FIREWALL" || die "Could not install $FIREWALL. Run this again once that is fixed."
+install -m 755 "$STAGE/portbridge-tune" "$TUNE" || die "Could not install $TUNE. Run this again once that is fixed."
+install -m 644 "$STAGE/portbridge@.service" "$UNIT" || die "Could not install $UNIT. Run this again once that is fixed."
+if [ -f "$STAGE/portbridge-agent.service" ]; then
+    install -m 644 "$STAGE/portbridge-agent.service" "$AGENT_UNIT" || die "Could not install $AGENT_UNIT."
+fi
+if [ -f "$STAGE/portbridge-panel.service" ]; then
+    install -m 644 "$STAGE/portbridge-panel.service" "$PANEL_UNIT" || die "Could not install $PANEL_UNIT."
+fi
+if [ -f "$STAGE/install.sh" ]; then
+    install -D -m 755 "$STAGE/install.sh" "$SHARE_DIR/install.sh" || warn "  Could not keep a copy of the installer in $SHARE_DIR."
+fi
 
 mkdir -p "$CONF_DIR" /etc/portbridge/agents /run/portbridge
 chmod 700 /etc/portbridge "$CONF_DIR" /etc/portbridge/agents
@@ -394,3 +406,5 @@ if [ "$NOMENU" = no ] && [ -t 0 ]; then
             ;;
     esac
 fi
+
+}

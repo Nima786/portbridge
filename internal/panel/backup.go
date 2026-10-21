@@ -532,22 +532,9 @@ func (p *Panel) RestoreBackup(ctx context.Context, raw []byte, opts RestoreOptio
 
 	res := &RestoreResult{OK: true}
 
-	// 1. Restore the panel's self-signed TLS identity so Reverse Hub agents
-	// pinning the panel's certificate fingerprint continue to trust it.
-	if opts.RestorePanelIdentity && payload.Source.CertPEM != "" && payload.Source.KeyPEM != "" {
-		certDir := filepath.Join(p.dir, "cert")
-		if err := os.MkdirAll(certDir, 0o700); err == nil {
-			crtPath := filepath.Join(certDir, "panel.crt")
-			keyPath := filepath.Join(certDir, "panel.key")
-			if _, err := tlsLoadPair(payload.Source.CertPEM, payload.Source.KeyPEM); err == nil {
-				_ = writeFileAtomic(crtPath, []byte(payload.Source.CertPEM), 0o644)
-				_ = writeFileAtomic(keyPath, []byte(payload.Source.KeyPEM), 0o600)
-				_ = p.loadSelfCert()
-			} else {
-				res.Warnings = append(res.Warnings, "Backup panel certificate was invalid and was skipped.")
-			}
-		}
-	}
+	// 1. (The panel's certificate is restored below, once the state itself has
+	// been saved, so a restore that fails halfway does not leave a new identity
+	// behind with the old state.)
 
 	// 2. Re-encrypt server tokens and Cloudflare tokens using this panel's secret.key
 	// and update state.json atomically.
@@ -671,6 +658,19 @@ func (p *Panel) RestoreBackup(ctx context.Context, raw []byte, opts RestoreOptio
 		return nil, fmt.Errorf("saving restored state: %w", err)
 	}
 
+	// Restore the panel's self-signed TLS identity so Reverse Hub agents
+	// pinning the panel's certificate fingerprint continue to trust it. Both
+	// halves are written or neither is, and a failure is reported.
+	if opts.RestorePanelIdentity && payload.Source.CertPEM != "" && payload.Source.KeyPEM != "" {
+		if _, err := tlsLoadPair(payload.Source.CertPEM, payload.Source.KeyPEM); err != nil {
+			res.Warnings = append(res.Warnings, "Backup panel certificate was invalid and was skipped.")
+		} else if err := p.writeCertPair(payload.Source.CertPEM, payload.Source.KeyPEM); err != nil {
+			res.Warnings = append(res.Warnings, "The panel's certificate could not be restored, so the current one is kept: "+err.Error())
+		} else if err := p.loadSelfCert(); err != nil {
+			res.Warnings = append(res.Warnings, "The restored panel certificate could not be loaded: "+err.Error())
+		}
+	}
+
 	res.ServersRestored = len(sealedServers)
 	res.CFAccountsRestored = len(sealedCF)
 	res.AutoHealRestored = autoHealCount
@@ -755,6 +755,30 @@ func (p *Panel) RestoreBackup(ctx context.Context, raw []byte, opts RestoreOptio
 	}
 
 	return res, nil
+}
+
+// writeCertPair replaces the panel's certificate and key together. If the
+// second write fails, the first is put back, so the two never disagree.
+func (p *Panel) writeCertPair(certPEM, keyPEM string) error {
+	certDir := filepath.Join(p.dir, "cert")
+	if err := os.MkdirAll(certDir, 0o700); err != nil {
+		return err
+	}
+	crtPath := filepath.Join(certDir, "panel.crt")
+	keyPath := filepath.Join(certDir, "panel.key")
+	oldCrt, crtErr := os.ReadFile(crtPath)
+	if err := writeFileAtomic(crtPath, []byte(certPEM), 0o644); err != nil {
+		return err
+	}
+	if err := writeFileAtomic(keyPath, []byte(keyPEM), 0o600); err != nil {
+		if crtErr == nil {
+			_ = writeFileAtomic(crtPath, oldCrt, 0o644)
+		} else {
+			_ = os.Remove(crtPath)
+		}
+		return err
+	}
+	return nil
 }
 
 func (p *Panel) updateRemotePeerForMigratedTunnel(ctx context.Context, payload *BackupPayload, snap agent.TunnelSnapshot, newCode, newLocalIP string) (bool, string) {

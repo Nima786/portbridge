@@ -463,19 +463,26 @@ func recvAuthPurpose(c net.Conn, secret []byte, guard *replayGuard) (byte, error
 		plainHdr[i] = maskedHdr[i] ^ mask[i]
 	}
 
-	if plainHdr[0] != protoVersion2 {
-		return 0, errAuthMAC
-	}
 	purpose := plainHdr[1]
 	padLen := int(plainHdr[10])
-	if padLen < 16 || padLen > 64 {
-		return 0, errAuthMAC
+	headerOK := plainHdr[0] == protoVersion2 && padLen >= 16 && padLen <= 64
+	if !headerOK {
+		// Something that is not our frame must not be told apart from a frame
+		// that is nearly right by how many bytes the server takes before it
+		// gives up on it. Almost any junk fails here, so stopping here would
+		// make "closes after 19 bytes" the signature of this server. Instead
+		// it takes in as many bytes as a real frame would carry, a length
+		// that only someone with the secret could predict.
+		padLen = 16 + int(mask[authV2HdrLen]%49)
 	}
 
 	// Read remaining padLen + 32 bytes (padding + mac)
 	remBuf := make([]byte, padLen+authMACLen)
 	if _, err := io.ReadFull(c, remBuf); err != nil {
 		return 0, err
+	}
+	if !headerOK {
+		return 0, errAuthMAC
 	}
 
 	padding := remBuf[:padLen]

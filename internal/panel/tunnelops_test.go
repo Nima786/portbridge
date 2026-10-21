@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/Nima786/portbridge/internal/agent"
+	"github.com/Nima786/portbridge/internal/engine"
 )
 
 // twoServers is a panel whose own server is a relay, managing one foreign server
@@ -380,5 +381,35 @@ func TestWebsiteBridgeCreateAndEditOnBothServers(t *testing.T) {
 		if side.ti.MuxLinks != 12 || side.ti.MaxConn != 6000 {
 			t.Fatalf("%s updated mux_links/max_conn mismatch: %+v", side.name, side.ti)
 		}
+	}
+}
+
+func TestAProbeStepMustPointAtAServerOfTheFleet(t *testing.T) {
+	p, _, _ := twoServers(t)
+	p.fleet.mu.Lock()
+	p.fleet.by["far"].overview = &agent.Overview{OK: true, Version: "v0.15.0", IPv4: []string{"203.0.113.20"}}
+	p.fleet.mu.Unlock()
+	good := engine.ProbeCandidateSpec{TargetAddr: "203.0.113.20:2053"}
+	if err := p.checkProbeStep("far", "s3cret", good); err != nil {
+		t.Fatalf("a step at a fleet server was refused: %v", err)
+	}
+	for name, c := range map[string]struct {
+		dialer, secret string
+		spec           engine.ProbeCandidateSpec
+	}{
+		"unknown dialer":    {"nobody", "s", good},
+		"no secret":         {"far", "", good},
+		"outside address":   {"far", "s", engine.ProbeCandidateSpec{TargetAddr: "10.0.0.5:22"}},
+		"loopback":          {"far", "s", engine.ProbeCandidateSpec{TargetAddr: "127.0.0.1:22", CDN: true}},
+		"name without CDN":  {"far", "s", engine.ProbeCandidateSpec{TargetAddr: "example.com:443"}},
+		"bad port":          {"far", "s", engine.ProbeCandidateSpec{TargetAddr: "203.0.113.20:0"}},
+		"not host and port": {"far", "s", engine.ProbeCandidateSpec{TargetAddr: "203.0.113.20"}},
+	} {
+		if err := p.checkProbeStep(c.dialer, c.secret, c.spec); err == nil {
+			t.Errorf("%s: accepted", name)
+		}
+	}
+	if err := p.checkProbeStep("far", "s", engine.ProbeCandidateSpec{TargetAddr: "cdn.example.com:443", CDN: true}); err != nil {
+		t.Errorf("a CDN name was refused: %v", err)
 	}
 }

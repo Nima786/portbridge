@@ -719,15 +719,27 @@ func (p *Panel) sshUpdate(j *job, s Server, r addRequest) error {
 	if r.SSHPort == 0 {
 		r.SSHPort = 22
 	}
+	confirmed := strings.TrimSpace(r.HostKey)
+	if s.HostKey == "" && confirmed == "" {
+		return errors.New("confirm the server's SSH fingerprint first")
+	}
 	cfg := &ssh.ClientConfig{
 		User: r.User,
 		Auth: methods,
 		// The key it had when it was added, so the login goes to that server and
-		// no other.
+		// no other. A server with no key on record (added by an old panel)
+		// needs the one the person confirmed.
 		HostKeyCallback: func(_ string, _ net.Addr, key ssh.PublicKey) error {
-			if s.HostKey != "" && ssh.FingerprintSHA256(key) != s.HostKey {
-				return fmt.Errorf("its SSH host key is not the one it had when it was added (%s, now %s); "+
-					"if it was reinstalled, remove it from the panel and add it again", s.HostKey, ssh.FingerprintSHA256(key))
+			got := ssh.FingerprintSHA256(key)
+			if s.HostKey != "" {
+				if got != s.HostKey {
+					return fmt.Errorf("its SSH host key is not the one it had when it was added (%s, now %s); "+
+						"if it was reinstalled, remove it from the panel and add it again", s.HostKey, got)
+				}
+				return nil
+			}
+			if got != confirmed {
+				return fmt.Errorf("its SSH fingerprint is %s, not the %s that was confirmed; nothing was sent", got, confirmed)
 			}
 			return nil
 		},
@@ -759,6 +771,17 @@ func (p *Panel) sshUpdate(j *job, s Server, r addRequest) error {
 	}
 	if _, err := remoteAgentSetup(rm, "-allow-updates on"); err != nil {
 		return err
+	}
+	if s.HostKey == "" {
+		// Remembered, so the next login to this server is checked against it.
+		_ = p.store.update(func(st *State) error {
+			for i := range st.Servers {
+				if st.Servers[i].ID == s.ID && st.Servers[i].HostKey == "" {
+					st.Servers[i].HostKey = confirmed
+				}
+			}
+			return nil
+		})
 	}
 	j.say("From now on it can be updated from the panel with one click. The SSH login was not kept.")
 	p.updates.mu.Lock()

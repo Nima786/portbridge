@@ -364,6 +364,11 @@ func validatePairing(p *PairingData) error {
 	if p.OutboundProxyMode != "" && p.OutboundProxyMode != "split" && p.OutboundProxyMode != "all" {
 		return fmt.Errorf("outbound_proxy_mode must be split or all, got %q", p.OutboundProxyMode)
 	}
+	if mc := strings.TrimSpace(p.MaxConn); mc != "" {
+		if n, err := strconv.Atoi(mc); err != nil || n < 1 || n > 100000 {
+			return fmt.Errorf("max_conn %q must be from 1 to 100000", p.MaxConn)
+		}
+	}
 	if n, err := strconv.Atoi(p.MuxLinks); err != nil || n < 1 || n > 64 {
 		return fmt.Errorf("mux links %q is not a sensible number", p.MuxLinks)
 	}

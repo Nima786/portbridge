@@ -742,15 +742,20 @@ func ScanWhitelistedSNIs(ctx context.Context, targetAddr string, candidates []st
 	if len(candidates) == 0 {
 		candidates = WhitelistedSNIs
 	}
+	// Blank entries are dropped first, so they do not show up as empty results.
+	cleaned := make([]string, 0, len(candidates))
+	for _, c := range candidates {
+		if s := strings.TrimSpace(c); s != "" {
+			cleaned = append(cleaned, s)
+		}
+	}
+	candidates = cleaned
 	results := make([]SNIScanResult, len(candidates))
 	var wg sync.WaitGroup
 	sem := make(chan struct{}, 6)
 
 	for i, rawSNI := range candidates {
 		sni := strings.TrimSpace(rawSNI)
-		if sni == "" {
-			continue
-		}
 		wg.Add(1)
 		go func(idx int, host string) {
 			defer wg.Done()

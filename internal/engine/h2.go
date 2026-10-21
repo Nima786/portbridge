@@ -9,6 +9,8 @@ import (
 	"net"
 	"sync"
 	"time"
+
+	"golang.org/x/net/http2/hpack"
 )
 
 // HTTP/2 and gRPC transport disguise.
@@ -196,6 +198,7 @@ func h2Dial(c net.Conn, cfg *Config) (net.Conn, error) {
 	}
 
 	// 5. Read server frames until Stream 1 headers arrive
+	flow := newH2Flow()
 	gotHeaders := false
 	for !gotHeaders {
 		fType, flags, streamID, payload, err := readH2Frame(c)
@@ -205,14 +208,24 @@ func h2Dial(c net.Conn, cfg *Config) (net.Conn, error) {
 		switch fType {
 		case h2FrameSettings:
 			if flags&h2FlagAck == 0 {
+				flow.settings(payload)
 				_ = writeH2Frame(c, h2FrameSettings, h2FlagAck, 0, nil)
 			}
+		case h2FrameWindowUpdate:
+			flow.windowUpdate(streamID, 1, payload)
 		case h2FrameHeaders:
 			if streamID == 1 {
 				gotHeaders = true
-				// Check for :status: 200 (0x88 in HPACK or literal with 200)
-				if !bytes.Contains(payload, []byte{0x88}) && !bytes.Contains(payload, []byte("200")) {
-					return nil, fmt.Errorf("%w: server did not return HTTP 200 (headers: %x)", errH2Handshake, payload)
+				block, err := h2HeaderBlock(c, flags, streamID, payload)
+				if err != nil {
+					return nil, fmt.Errorf("%w: %v", errH2Handshake, err)
+				}
+				status, err := h2ResponseStatus(block)
+				if err != nil {
+					return nil, fmt.Errorf("%w: reading the reply headers: %v", errH2Handshake, err)
+				}
+				if status != "200" {
+					return nil, fmt.Errorf("%w: server did not return HTTP 200 (it said %q)", errH2Handshake, status)
 				}
 			}
 		case h2FrameGoAway, h2FrameRSTStream:
@@ -224,7 +237,108 @@ func h2Dial(c net.Conn, cfg *Config) (net.Conn, error) {
 		return nil, err
 	}
 
-	return newH2Conn(c, 1, isGRPC), nil
+	return newH2Conn(c, 1, isGRPC, flow), nil
+}
+
+// h2HeaderBlock returns the whole header block of a HEADERS frame: without
+// the padding and priority fields, and joined with any CONTINUATION frames that
+// carry the rest of it.
+func h2HeaderBlock(c io.Reader, flags byte, streamID uint32, payload []byte) ([]byte, error) {
+	const (
+		flagPadded   = 0x8
+		flagPriority = 0x20
+	)
+	p := payload
+	if flags&flagPadded != 0 {
+		if len(p) < 1 || int(p[0]) >= len(p) {
+			return nil, errors.New("bad padding in the headers")
+		}
+		pad := int(p[0])
+		p = p[1 : len(p)-pad]
+	}
+	if flags&flagPriority != 0 {
+		if len(p) < 5 {
+			return nil, errors.New("short priority field in the headers")
+		}
+		p = p[5:]
+	}
+	block := append([]byte(nil), p...)
+	for n := 0; flags&h2FlagEndHeaders == 0; n++ {
+		if n >= 16 || len(block) > 64<<10 {
+			return nil, errors.New("the headers are too long")
+		}
+		fType, f, sid, more, err := readH2Frame(c)
+		if err != nil {
+			return nil, err
+		}
+		if fType != h2FrameContinuation || sid != streamID {
+			return nil, errors.New("the headers were cut short")
+		}
+		block = append(block, more...)
+		flags = f
+	}
+	return block, nil
+}
+
+// h2ResponseStatus reads :status out of a response header block.
+func h2ResponseStatus(block []byte) (string, error) {
+	status := ""
+	dec := hpack.NewDecoder(4096, func(f hpack.HeaderField) {
+		if f.Name == ":status" && status == "" {
+			status = f.Value
+		}
+	})
+	if _, err := dec.Write(block); err != nil {
+		return "", err
+	}
+	if err := dec.Close(); err != nil {
+		return "", err
+	}
+	if status == "" {
+		return "", errors.New("no :status in the reply")
+	}
+	return status, nil
+}
+
+// h2Flow is how much the other end has said it will take: the whole connection
+// and the one stream, each as a number of bytes that may still be sent.
+type h2Flow struct {
+	conn    int64
+	stream  int64
+	initial int64 // the stream window the other end started us with
+}
+
+func newH2Flow() h2Flow { return h2Flow{conn: 65535, stream: 65535, initial: 65535} }
+
+// settings applies the one setting that matters for sending: a changed initial
+// stream window moves the stream's window by the difference.
+func (f *h2Flow) settings(payload []byte) {
+	for ; len(payload) >= 6; payload = payload[6:] {
+		if binary.BigEndian.Uint16(payload[:2]) != 0x4 {
+			continue
+		}
+		v := int64(binary.BigEndian.Uint32(payload[2:6]))
+		if v > 0x7fffffff {
+			continue
+		}
+		f.stream += v - f.initial
+		f.initial = v
+	}
+}
+
+// windowUpdate adds credit given by the other end, for the connection (stream 0)
+// or for the stream this connection carries.
+func (f *h2Flow) windowUpdate(streamID, ours uint32, payload []byte) {
+	if len(payload) != 4 {
+		return
+	}
+	inc := int64(binary.BigEndian.Uint32(payload) & 0x7fffffff)
+	switch streamID {
+	case 0:
+		f.conn = min(f.conn+inc, 0x7fffffff)
+	case ours:
+		f.stream = min(f.stream+inc, 0x7fffffff)
+	}
 }
 
 // h2Accept handles the HTTP/2 connection preface and handshake as a server.
@@ -258,18 +372,32 @@ func h2Accept(c net.Conn, cfg *Config) (net.Conn, error) {
 	isGRPC := (cfg.Transport == TransportGRPC)
 	gotHeaders := false
 	var clientStreamID uint32 = 1
+	flow := newH2Flow()
 
 	for !gotHeaders {
-		fType, flags, streamID, _, err := readH2Frame(c)
+		fType, flags, streamID, payload, err := readH2Frame(c)
 		if err != nil {
 			return nil, fmt.Errorf("%w: reading client headers: %v", errH2Handshake, err)
 		}
 		switch fType {
 		case h2FrameSettings:
 			if flags&h2FlagAck == 0 {
+				flow.settings(payload)
 				_ = writeH2Frame(c, h2FrameSettings, h2FlagAck, 0, nil)
 			}
+		case h2FrameWindowUpdate:
+			// Credit for the connection; credit for the stream cannot be
+			// told apart yet, and the client opens stream 1 by convention.
+			flow.windowUpdate(streamID, 1, payload)
 		case h2FrameHeaders:
+			if streamID == 0 || streamID%2 == 0 {
+				return nil, fmt.Errorf("%w: bad stream number %d", errH2Handshake, streamID)
+			}
+			// The rest of the header block, if it comes in pieces, is read
+			// and set aside.
+			if _, err := h2HeaderBlock(c, flags, streamID, payload); err != nil {
+				return nil, fmt.Errorf("%w: %v", errH2Handshake, err)
+			}
 			clientStreamID = streamID
 			gotHeaders = true
 		case h2FrameGoAway, h2FrameRSTStream:
@@ -287,7 +415,7 @@ func h2Accept(c net.Conn, cfg *Config) (net.Conn, error) {
 		return nil, err
 	}
 
-	return newH2Conn(c, clientStreamID, isGRPC), nil
+	return newH2Conn(c, clientStreamID, isGRPC, flow), nil
 }
 
 // h2Conn wraps a TLS connection and streams bidirectional data over an HTTP/2 stream.
@@ -316,7 +444,24 @@ type h2Conn struct {
 	ctlOnce   sync.Once
 	done      chan struct{}
 	doneOnce  sync.Once
+
+	// What the other end will still take. A writer waits here for credit
+	// instead of sending past the window, which a strict HTTP/2 peer (a CDN's
+	// edge, say) answers by dropping the whole connection. Waiting happens
+	// outside writeMu, so the acknowledgements the reader owes can still go
+	// out while a writer is waiting.
+	dataMu sync.Mutex // one Write at a time, so their bytes never interleave
+	flowMu sync.Mutex
+	flow   h2Flow
+	flowCh chan struct{} // closed, and replaced, whenever the window or the state changes
+	dead   bool          // the connection is closed or the other end has gone
 }
+
+// h2StallLimit is how long a writer waits for the other end to make room before
+// giving up on the connection.
+const h2StallLimit = 2 * time.Minute
+
+var errH2Stalled = &net.OpError{Op: "write", Err: errors.New("the other end stopped accepting data")}
 
 // h2Reply is one acknowledgement waiting to be sent.
 type h2Reply struct {
@@ -329,13 +474,105 @@ type h2Reply struct {
 // pings cannot make this grow without limit.
 const h2MaxPendingReplies = 64
 
-func newH2Conn(c net.Conn, streamID uint32, isGRPC bool) *h2Conn {
-	return &h2Conn{
+func newH2Conn(c net.Conn, streamID uint32, isGRPC bool, flow h2Flow) *h2Conn {
+	h := &h2Conn{
 		Conn:     c,
 		streamID: streamID,
 		isGRPC:   isGRPC,
 		ctlWake:  make(chan struct{}, 1),
 		done:     make(chan struct{}),
+		flow:     flow,
+		flowCh:   make(chan struct{}),
+	}
+	return h
+}
+
+// changed wakes every writer waiting on the window. Called with flowMu held.
+func (h *h2Conn) changed() {
+	close(h.flowCh)
+	h.flowCh = make(chan struct{})
+}
+
+// markDead ends all waiting writers: the connection is gone.
+func (h *h2Conn) markDead() {
+	h.flowMu.Lock()
+	h.dead = true
+	h.changed()
+	h.flowMu.Unlock()
+}
+
+// credit applies what the other end sent about its windows.
+func (h *h2Conn) credit(fn func(f *h2Flow)) {
+	h.flowMu.Lock()
+	fn(&h.flow)
+	h.changed()
+	h.flowMu.Unlock()
+}
+
+// h2PollWait is how often a writer waiting for credit looks again at whether
+// it should be reading the connection itself.
+const h2PollWait = 20 * time.Millisecond
+
+// reserve waits until the other end will take at least one byte (more than
+// overhead bytes, if there is a fixed overhead per frame), and uses up as much
+// of the window as the frame needs, up to want bytes of data. It returns how
+// many bytes of data the next frame may carry.
+//
+// Credit only arrives as frames on the connection, and frames are only read by
+// Read. A caller that writes a lot before it reads (a speed test, a bulk
+// upload) would therefore wait for ever for credit nobody is reading. So a
+// waiting writer reads the connection itself whenever no reader is doing so;
+// anything it takes in that is kept for the next Read.
+func (h *h2Conn) reserve(want, overhead int) (int, error) {
+	start := time.Now()
+	for {
+		h.flowMu.Lock()
+		if h.dead {
+			h.flowMu.Unlock()
+			return 0, io.ErrClosedPipe
+		}
+		avail := min(h.flow.conn, h.flow.stream) - int64(overhead)
+		if avail > 0 {
+			n := int(min(int64(want), avail))
+			h.flow.conn -= int64(n + overhead)
+			h.flow.stream -= int64(n + overhead)
+			h.flowMu.Unlock()
+			return n, nil
+		}
+		wake := h.flowCh
+		h.flowMu.Unlock()
+
+		if time.Since(start) > h2StallLimit {
+			return 0, errH2Stalled
+		}
+		if h.readMu.TryLock() {
+			// Nobody is reading: read one frame here.
+			fType, flags, streamID, payload, err := readH2Frame(h.Conn)
+			if err != nil {
+				h.readMu.Unlock()
+				if ne, ok := err.(net.Error); ok && ne.Timeout() {
+					// A deadline set for the reader has passed; wait a
+					// moment rather than spin.
+					time.Sleep(h2PollWait)
+					continue
+				}
+				h.markDead()
+				return 0, err
+			}
+			ended := h.onFrame(fType, flags, streamID, payload)
+			h.readMu.Unlock()
+			if ended {
+				h.markDead()
+				return 0, io.ErrClosedPipe
+			}
+			continue
+		}
+		// A reader is at work and will bring the credit.
+		select {
+		case <-wake:
+		case <-h.done:
+		case <-time.After(h2PollWait):
+		}
 	}
 }
 
@@ -402,33 +639,56 @@ func (h *h2Conn) sendOwed() {
 }
 
 func (h *h2Conn) CloseWrite() error {
+	// After any Write in progress, so the end of the stream never overtakes
+	// data. (An empty frame uses up no window.)
+	h.dataMu.Lock()
+	defer h.dataMu.Unlock()
 	h.writeMu.Lock()
 	defer h.writeMu.Unlock()
 	return writeH2Frame(h.Conn, h2FrameData, h2FlagEndStream, h.streamID, nil)
 }
 
+// h2CloseGrace is how long the socket is kept open after Close, so that what
+// was just written reaches the other end before the connection is torn down.
+const h2CloseGrace = 100 * time.Millisecond
+
+// Close ends the connection. Writers stop at once; the socket itself is closed
+// a moment later without making the caller wait for it.
 func (h *h2Conn) Close() error {
-	time.Sleep(100 * time.Millisecond)
-	h.doneOnce.Do(func() { close(h.done) })
-	return h.Conn.Close()
+	first := false
+	h.doneOnce.Do(func() {
+		first = true
+		close(h.done)
+	})
+	h.markDead()
+	if !first {
+		return nil
+	}
+	time.AfterFunc(h2CloseGrace, func() { _ = h.Conn.Close() })
+	return nil
 }
 
 func (h *h2Conn) Write(p []byte) (int, error) {
-	h.writeMu.Lock()
-	defer h.writeMu.Unlock()
+	h.dataMu.Lock()
+	defer h.dataMu.Unlock()
 
 	total := len(p)
 	remaining := p
 
 	maxChunk := h2MaxFrameSize
+	overhead := 0
 	if h.isGRPC {
 		maxChunk = h2MaxFrameSize - 5
+		overhead = 5
 	}
 
 	for len(remaining) > 0 {
-		chunkSize := len(remaining)
-		if chunkSize > maxChunk {
-			chunkSize = maxChunk
+		chunkSize := min(len(remaining), maxChunk)
+		// Wait, if need be, until the other end has room; only as much is
+		// sent as it will take.
+		chunkSize, err := h.reserve(chunkSize, overhead)
+		if err != nil {
+			return total - len(remaining), err
 		}
 		chunk := remaining[:chunkSize]
 		remaining = remaining[chunkSize:]
@@ -443,7 +703,11 @@ func (h *h2Conn) Write(p []byte) (int, error) {
 			payload = chunk
 		}
 
-		if err := writeH2Frame(h.Conn, h2FrameData, 0, h.streamID, payload); err != nil {
+		h.writeMu.Lock()
+		err = writeH2Frame(h.Conn, h2FrameData, 0, h.streamID, payload)
+		h.writeMu.Unlock()
+		if err != nil {
+			h.markDead()
 			return total - len(remaining) - len(chunk), err
 		}
 	}
@@ -484,46 +748,74 @@ func (h *h2Conn) Read(p []byte) (int, error) {
 			}
 		}
 
+		// Nothing more can be delivered from what is held. If the other end
+		// has finished, that is the end; waiting for another frame would wait
+		// for ever. A message cut off in the middle is an error, not a clean end.
 		if h.remoteClosed {
-			if len(h.readBuf) == 0 && (!h.isGRPC || h.msgRemaining == 0) {
-				return 0, io.EOF
+			if h.isGRPC && (len(h.readBuf) > 0 || h.msgRemaining > 0) {
+				return 0, io.ErrUnexpectedEOF
 			}
+			return 0, io.EOF
 		}
 
 		// Read next frame from wire
 		fType, flags, streamID, payload, err := readH2Frame(h.Conn)
 		if err != nil {
+			// A deadline passing is not the end of the connection.
+			if ne, ok := err.(net.Error); !ok || !ne.Timeout() {
+				h.markDead()
+			}
 			return 0, err
 		}
-
-		switch fType {
-		case h2FrameData:
-			if streamID == h.streamID {
-				if flags&h2FlagEndStream != 0 {
-					h.remoteClosed = true
-				}
-				if len(payload) > 0 {
-					// Replenish flow control window so throughput remains unconstrained
-					h.owe(uint32(len(payload)), nil)
-
-					h.readBuf = append(h.readBuf, payload...)
-				}
-			}
-
-		case h2FramePing:
-			if flags&h2FlagAck == 0 {
-				// The payload buffer may be reused by the next read, so the
-				// reply keeps its own copy.
-				h.owe(0, &h2Reply{typ: h2FramePing, flags: h2FlagAck, payload: append([]byte(nil), payload...)})
-			}
-
-		case h2FrameSettings:
-			if flags&h2FlagAck == 0 {
-				h.owe(0, &h2Reply{typ: h2FrameSettings, flags: h2FlagAck})
-			}
-
-		case h2FrameRSTStream, h2FrameGoAway:
-			return 0, io.EOF
+		if h.onFrame(fType, flags, streamID, payload) {
+			h.markDead()
 		}
 	}
+}
+
+// onFrame takes in one frame read from the connection. It must be called with
+// readMu held. It reports whether the other end has ended the connection.
+func (h *h2Conn) onFrame(fType, flags byte, streamID uint32, payload []byte) (ended bool) {
+	switch fType {
+	case h2FrameData:
+		if streamID == h.streamID {
+			if flags&h2FlagEndStream != 0 {
+				h.remoteClosed = true
+			}
+			if len(payload) > 0 {
+				// Replenish flow control window so throughput remains unconstrained
+				h.owe(uint32(len(payload)), nil)
+
+				h.readBuf = append(h.readBuf, payload...)
+			}
+		}
+
+	case h2FrameHeaders:
+		// Trailers: how a gRPC server ends the stream.
+		if streamID == h.streamID && flags&h2FlagEndStream != 0 {
+			h.remoteClosed = true
+		}
+
+	case h2FrameWindowUpdate:
+		sid := h.streamID
+		h.credit(func(f *h2Flow) { f.windowUpdate(streamID, sid, payload) })
+
+	case h2FramePing:
+		if flags&h2FlagAck == 0 {
+			// The payload buffer may be reused by the next read, so the
+			// reply keeps its own copy.
+			h.owe(0, &h2Reply{typ: h2FramePing, flags: h2FlagAck, payload: append([]byte(nil), payload...)})
+		}
+
+	case h2FrameSettings:
+		if flags&h2FlagAck == 0 {
+			h.credit(func(f *h2Flow) { f.settings(payload) })
+			h.owe(0, &h2Reply{typ: h2FrameSettings, flags: h2FlagAck})
+		}
+
+	case h2FrameRSTStream, h2FrameGoAway:
+		h.remoteClosed = true
+		return true
+	}
+	return false
 }

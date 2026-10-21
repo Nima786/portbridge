@@ -797,6 +797,15 @@ firewall_apply() {
         return 0
     fi
 
+    # Only iptables is driven here (on current systems it is usually a front for
+    # nftables, which is fine). Without it nothing can be locked, and saying
+    # nothing would leave the owner believing the port is protected.
+    if ! have iptables && ! have ip6tables; then
+        echo "iptables is not installed on this server, so port $TPORT is NOT restricted to $PEER." \
+            "Install it (for example: apt install iptables), or allow only $PEER to port $TPORT in your own firewall." >&2
+        return 0
+    fi
+
     # Start clean, so a changed peer address never leaves the old one allowed.
     purge_everything "$name"
 

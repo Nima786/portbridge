@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -217,6 +218,8 @@ type wsConn struct {
 
 	wmu sync.Mutex // frames must not interleave
 	rmu sync.Mutex // one reader of br at a time: Read and Close must not race
+
+	pongBusy atomic.Bool // a reply to a ping is being sent; see Read
 }
 
 func (w *wsConn) NetConn() net.Conn {
@@ -255,8 +258,21 @@ func (w *wsConn) Read(p []byte) (int, error) {
 			w.readBuf = payload
 		case wsOpPing:
 			// Keep-alives from a CDN are normal and must be answered, or it
-			// will drop the connection as unresponsive.
-			_ = w.writeFrame(wsOpPong, payload)
+			// will drop the connection as unresponsive. The answer is sent
+			// from its own goroutine: writing takes wmu, and a writer holding
+			// it can be stuck behind a full socket while the other end is
+			// stuck the same way, each waiting for the other to read; a
+			// reader that waited on that write would never read again. Only
+			// one answer is pending at a time (a ping while one is unsent
+			// needs no second), and a ping payload is at most 125 bytes by
+			// the protocol, so a longer one is not echoed.
+			if len(payload) <= 125 && w.pongBusy.CompareAndSwap(false, true) {
+				reply := append([]byte(nil), payload...)
+				go func() {
+					defer w.pongBusy.Store(false)
+					_ = w.writeFrame(wsOpPong, reply)
+				}()
+			}
 		case wsOpPong:
 			// Nothing to do.
 		case wsOpClose:

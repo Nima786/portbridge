@@ -1052,8 +1052,20 @@ func (c *carrier) open(targetPort ...uint16) (*muxStream, error) {
 		c.mu.Unlock()
 		return nil, errMuxClosed
 	}
+	// Numbers wrap round after 2^31 streams on a long-lived carrier; one still
+	// in use is skipped, so a new stream never takes over a live one.
 	id := c.nextID
-	c.nextID++
+	for tries := 0; c.streams[id] != nil; tries++ {
+		if tries > 1<<16 {
+			c.mu.Unlock()
+			return nil, errors.New("no free stream number on this carrier")
+		}
+		id++
+		if id >= 0x80000000 {
+			id = 1
+		}
+	}
+	c.nextID = id + 1
 	if c.nextID >= 0x80000000 {
 		c.nextID = 1
 	}
@@ -1075,7 +1087,20 @@ func (c *carrier) openReverse() (*muxStream, error) {
 		return nil, errMuxClosed
 	}
 	id := c.nextReverseID
-	c.nextReverseID++
+	if id < 0x80000001 {
+		id = 0x80000001
+	}
+	for tries := 0; c.streams[id] != nil; tries++ {
+		if tries > 1<<16 {
+			c.mu.Unlock()
+			return nil, errors.New("no free stream number on this carrier")
+		}
+		id++
+		if id < 0x80000001 {
+			id = 0x80000001
+		}
+	}
+	c.nextReverseID = id + 1
 	if c.nextReverseID < 0x80000001 {
 		c.nextReverseID = 0x80000001
 	}
