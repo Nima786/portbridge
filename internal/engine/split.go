@@ -222,9 +222,10 @@ func (m *splitSessionManager) AcceptLeg(rawConn net.Conn, secret []byte) (net.Co
 // How many are kept ahead grows when a rotation had to wait for one, and falls
 // back when that stops, so a quiet connection holds few spare legs open.
 const (
-	splitWriteBase = 2  // spare legs kept for the client's own bytes
-	splitReadBase  = 3  // spare legs kept for the server's bytes
-	splitMaxBoost  = 10 // most that waiting can add to either
+	splitWriteBase  = 2  // spare legs kept for the client's own bytes
+	splitReadBase   = 3  // spare legs kept for the server's bytes
+	splitFirstBoost = 6  // what the first wait adds: a test or burst is short, so ramping up in small steps loses most of it
+	splitMaxBoost   = 14 // most that waiting can add to either
 )
 
 type legQueue struct {
@@ -340,7 +341,7 @@ func (s *splitConn) takeLeg(q *legQueue, deadline <-chan struct{}, what string) 
 		failed := q.failed
 		if !waited && !failed {
 			// Waiting means too few were kept ahead: keep more.
-			q.boost = min(max(q.boost*2, 2), splitMaxBoost)
+			q.boost = min(max(q.boost*2, splitFirstBoost), splitMaxBoost)
 			q.lastBoost = time.Now()
 		}
 		q.mu.Unlock()
