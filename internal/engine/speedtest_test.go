@@ -5,6 +5,7 @@ import (
 	"net"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestSpeedtestLoopback(t *testing.T) {
@@ -35,6 +36,12 @@ func TestSpeedtestLoopback(t *testing.T) {
 		TunnelAddr: ln.Addr().String(),
 		Transport:  TransportPlain,
 	}
+
+	// Always take the longer transfer, small, however slow this machine is
+	// (the race detector makes 1 MB take over half a second).
+	oldLong, oldMax := speedtestLongEnough, speedtestMaxMeasure
+	speedtestLongEnough, speedtestMaxMeasure = time.Hour, 4<<20
+	defer func() { speedtestLongEnough, speedtestMaxMeasure = oldLong, oldMax }()
 
 	var buf bytes.Buffer
 	if err := runSpeedtestClient(clientConn, cfg, &buf); err != nil {
@@ -91,6 +98,11 @@ func TestSpeedtestKCP(t *testing.T) {
 	defer clientConn.Close()
 
 	cfg.TunnelAddr = ln.Addr().String()
+
+	// No longer transfer here: this test is about KCP working, not the speed.
+	oldLong := speedtestLongEnough
+	speedtestLongEnough = 0
+	defer func() { speedtestLongEnough = oldLong }()
 
 	var buf bytes.Buffer
 	if err := runSpeedtestClient(clientConn, cfg, &buf); err != nil {

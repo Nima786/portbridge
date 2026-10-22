@@ -113,13 +113,15 @@ func runSpeedtestServer(c net.Conn) {
 	}
 }
 
-// runSpeedtestClient runs the client side of the in-tunnel speedtest.
-const (
+// What the timed transfers aim for. Variables, not constants, so a test can make
+// the longer transfer certain instead of depending on how fast the machine is.
+var (
 	speedtestLongEnough = 500 * time.Millisecond // a transfer this long already shows the sustained speed
 	speedtestTargetTime = 1200 * time.Millisecond
-	speedtestMaxMeasure = 64 << 20
+	speedtestMaxMeasure = float64(64 << 20)
 )
 
+// runSpeedtestClient runs the client side of the in-tunnel speedtest.
 func runSpeedtestClient(c net.Conn, cfg *Config, out io.Writer, sizeMB ...float64) error {
 	if out == nil {
 		out = os.Stdout
