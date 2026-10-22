@@ -53,6 +53,10 @@ func TestSpeedtestLoopback(t *testing.T) {
 	if !strings.Contains(out, "Upload:") {
 		t.Errorf("missing upload result in output: %s", out)
 	}
+	// On loopback 1 MB is over in a moment, so a longer one must have been timed.
+	if strings.Count(out, "were timed") != 2 {
+		t.Errorf("expected a longer transfer for both directions: %s", out)
+	}
 }
 
 func TestSpeedtestKCP(t *testing.T) {

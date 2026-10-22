@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"net"
 	"os"
 	"path/filepath"
@@ -113,6 +114,12 @@ func runSpeedtestServer(c net.Conn) {
 }
 
 // runSpeedtestClient runs the client side of the in-tunnel speedtest.
+const (
+	speedtestLongEnough = 500 * time.Millisecond // a transfer this long already shows the sustained speed
+	speedtestTargetTime = 1200 * time.Millisecond
+	speedtestMaxMeasure = 64 << 20
+)
+
 func runSpeedtestClient(c net.Conn, cfg *Config, out io.Writer, sizeMB ...float64) error {
 	if out == nil {
 		out = os.Stdout
@@ -288,6 +295,29 @@ func runSpeedtestClient(c net.Conn, cfg *Config, out io.Writer, sizeMB ...float6
 		warmupSz = 768 * 1024
 	}
 
+	// A short transfer is over before the connection has speeded up, so on a
+	// fast link it shows the start-up, not the speed the link holds (a link that
+	// carries 250 Mbit/s showed 39 in one megabyte). When the first measurement
+	// was that short, one longer transfer, sized from the speed just seen, is
+	// timed and reported instead.
+	canLonger := cfg != nil && !cfg.AntiFreeze && cfg.Transport != TransportICMP
+	longer := func(run func(uint32) (int64, time.Duration, error), n int64, d time.Duration, first uint32) (int64, time.Duration, uint32) {
+		if !canLonger || n < int64(first) || d <= 0 || d >= speedtestLongEnough {
+			return n, d, first
+		}
+		size := float64(n) / d.Seconds() * speedtestTargetTime.Seconds()
+		size = math.Min(size, speedtestMaxMeasure)
+		if size < float64(first)*1.5 {
+			return n, d, first
+		}
+		want := uint32(size)
+		n2, d2, err := run(want)
+		if err != nil || n2 < int64(want) || d2 <= 0 {
+			return n, d, first // keep the short result rather than report a failure
+		}
+		return n2, d2, want
+	}
+
 	fmt.Fprintf(out, "⬇️  Testing download throughput (%.2f MB)...\n", float64(testSize)/(1024*1024))
 	var dlBytes int64
 	var dlElapsed time.Duration
@@ -303,6 +333,14 @@ func runSpeedtestClient(c net.Conn, cfg *Config, out io.Writer, sizeMB ...float6
 		}
 		dlBytes, dlElapsed, dlErr = runServerToClient(testSize)
 	}
+	dlSize := testSize
+	if dlErr == nil {
+		run := runServerToClient
+		if reverseOriginDial {
+			run = runClientToServer
+		}
+		dlBytes, dlElapsed, dlSize = longer(run, dlBytes, dlElapsed, testSize)
+	}
 	if dlBytes == 0 && dlErr != nil {
 		return fmt.Errorf("download test: %w", dlErr)
 	}
@@ -311,6 +349,9 @@ func runSpeedtestClient(c net.Conn, cfg *Config, out io.Writer, sizeMB ...float6
 	if dlErr != nil {
 		fmt.Fprintf(out, "   Download: %.2f MB/s (%.1f Mbps) (partial: %d/%d bytes in %.2fs: %v)\n\n", dlMBps, dlMbps, dlBytes, testSize, dlElapsed.Seconds(), dlErr)
 	} else {
+		if dlSize != testSize {
+			fmt.Fprintf(out, "   (%.2f MB was over too quickly to show the sustained speed, so %.0f MB were timed)\n", float64(testSize)/(1024*1024), float64(dlSize)/(1024*1024))
+		}
 		fmt.Fprintf(out, "   Download: %.2f MB/s (%.1f Mbps) in %.2fs\n\n", dlMBps, dlMbps, dlElapsed.Seconds())
 	}
 
@@ -329,6 +370,14 @@ func runSpeedtestClient(c net.Conn, cfg *Config, out io.Writer, sizeMB ...float6
 		}
 		ulBytes, ulElapsed, ulErr = runClientToServer(testSize)
 	}
+	ulSize := testSize
+	if ulErr == nil {
+		run := runClientToServer
+		if reverseOriginDial {
+			run = runServerToClient
+		}
+		ulBytes, ulElapsed, ulSize = longer(run, ulBytes, ulElapsed, testSize)
+	}
 	if ulBytes == 0 && ulErr != nil {
 		return fmt.Errorf("upload test: %w", ulErr)
 	}
@@ -337,6 +386,9 @@ func runSpeedtestClient(c net.Conn, cfg *Config, out io.Writer, sizeMB ...float6
 	if ulErr != nil {
 		fmt.Fprintf(out, "   Upload: %.2f MB/s (%.1f Mbps) (partial: %d/%d bytes in %.2fs: %v)\n\n", ulMBps, ulMbps, ulBytes, testSize, ulElapsed.Seconds(), ulErr)
 	} else {
+		if ulSize != testSize {
+			fmt.Fprintf(out, "   (%.2f MB was over too quickly to show the sustained speed, so %.0f MB were timed)\n", float64(testSize)/(1024*1024), float64(ulSize)/(1024*1024))
+		}
 		fmt.Fprintf(out, "   Upload: %.2f MB/s (%.1f Mbps) in %.2fs\n\n", ulMBps, ulMbps, ulElapsed.Seconds())
 	}
 
