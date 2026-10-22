@@ -302,20 +302,23 @@ func runSpeedtestClient(c net.Conn, cfg *Config, out io.Writer, sizeMB ...float6
 	// timed and reported instead.
 	canLonger := cfg != nil && !cfg.AntiFreeze && cfg.Transport != TransportICMP
 	longer := func(run func(uint32) (int64, time.Duration, error), n int64, d time.Duration, first uint32) (int64, time.Duration, uint32) {
-		if !canLonger || n < int64(first) || d <= 0 || d >= speedtestLongEnough {
-			return n, d, first
+		size := first
+		// Again and again, each sized from the last: the speed seen while a
+		// connection is still speeding up understates the next.
+		for step := 0; step < 3 && canLonger && n >= int64(size) && d > 0 && d < speedtestLongEnough; step++ {
+			want := math.Max(float64(n)/d.Seconds()*speedtestTargetTime.Seconds(), float64(n)*2)
+			want = math.Min(want, speedtestMaxMeasure)
+			if want < float64(n)*1.5 {
+				break
+			}
+			sz := uint32(want)
+			n2, d2, err := run(sz)
+			if err != nil || n2 < int64(sz) || d2 <= 0 {
+				break // keep the last good result rather than report a failure
+			}
+			n, d, size = n2, d2, sz
 		}
-		size := float64(n) / d.Seconds() * speedtestTargetTime.Seconds()
-		size = math.Min(size, speedtestMaxMeasure)
-		if size < float64(first)*1.5 {
-			return n, d, first
-		}
-		want := uint32(size)
-		n2, d2, err := run(want)
-		if err != nil || n2 < int64(want) || d2 <= 0 {
-			return n, d, first // keep the short result rather than report a failure
-		}
-		return n2, d2, want
+		return n, d, size
 	}
 
 	fmt.Fprintf(out, "⬇️  Testing download throughput (%.2f MB)...\n", float64(testSize)/(1024*1024))

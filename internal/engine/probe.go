@@ -1043,41 +1043,44 @@ func runSingleProbeAttempt(parentCtx context.Context, cfg *Config, routes *route
 // the connection (TCP's slow start, KCP's ramp-up), not the speed the link
 // holds. Real tunnels measured two to four times faster than the probe said.
 const (
-	probeLongEnough  = 500 * time.Millisecond // a transfer this long already shows the sustained speed
-	probeTargetTime  = 700 * time.Millisecond // how long the longer transfer is meant to take
-	probeMaxMeasure  = 8 << 20                // never more than this in one timed transfer
-	probeBudgetShare = 3                      // a longer transfer may use up to a third of what is left
+	probeLongEnough  = 500 * time.Millisecond  // a transfer this long already shows the sustained speed
+	probeTargetTime  = 1000 * time.Millisecond // how long the longer transfer is meant to take
+	probeMaxMeasure  = 24 << 20                // never more than this in one timed transfer
+	probeBudgetShare = 3                       // a longer transfer may use up to a third of what is left
 )
 
 // measureTransfer times a transfer of first bytes. If that was over too soon to
-// mean much, one longer transfer, sized from the speed just seen, is timed and
-// used instead. The size is held to what the attempt's remaining time allows.
-// ok is false when a transfer did not complete.
+// mean much, a longer one, sized from the speed just seen, is timed and used
+// instead, and again, up to three times: the speed seen while a connection is
+// still speeding up understates the next, so each step is sized from the last
+// until one runs long enough to show what the link holds. Every size is held to
+// what the attempt's remaining time allows. ok is false when a transfer did not
+// complete.
 func measureTransfer(ctx context.Context, run func(uint32) (int64, float64, error), first uint32, allowLonger bool) (n int64, dur float64, ok bool, err error) {
 	n, dur, err = run(first)
 	if err != nil || n < int64(first) {
 		return n, dur, false, err
 	}
-	if !allowLonger || dur <= 0 || dur >= probeLongEnough.Seconds() {
-		return n, dur, true, nil
-	}
-	rate := float64(n) / dur // bytes per second
-	size := rate * probeTargetTime.Seconds()
-	if dl, has := ctx.Deadline(); has {
-		if left := time.Until(dl).Seconds(); left > 0 {
-			size = math.Min(size, rate*left/probeBudgetShare)
+	for step := 0; step < 3 && allowLonger && dur > 0 && dur < probeLongEnough.Seconds(); step++ {
+		rate := float64(n) / dur // bytes per second
+		size := math.Max(rate*probeTargetTime.Seconds(), float64(n)*2)
+		if dl, has := ctx.Deadline(); has {
+			if left := time.Until(dl).Seconds(); left > 0 {
+				size = math.Min(size, rate*left/probeBudgetShare)
+			}
 		}
+		size = math.Min(size, probeMaxMeasure)
+		if size < float64(n)*1.5 {
+			break // nothing to gain from a barely longer one
+		}
+		want := uint32(size)
+		n2, dur2, err2 := run(want)
+		if err2 != nil || n2 < int64(want) {
+			return n2, dur2, false, err2
+		}
+		n, dur = n2, dur2
 	}
-	size = math.Min(size, probeMaxMeasure)
-	if size < float64(first)*1.5 {
-		return n, dur, true, nil // nothing to gain from a barely longer one
-	}
-	want := uint32(size)
-	n2, dur2, err2 := run(want)
-	if err2 != nil || n2 < int64(want) {
-		return n2, dur2, false, err2
-	}
-	return n2, dur2, true, nil
+	return n, dur, true, nil
 }
 
 // probeRTTStats gives the round trip time and its jitter from the ping samples.

@@ -3,6 +3,7 @@ package engine
 import (
 	"context"
 	"errors"
+	"math"
 	"testing"
 	"time"
 )
@@ -86,5 +87,27 @@ func TestMeasureTransferReportsAFailedLongerOne(t *testing.T) {
 	}
 	if _, _, ok, err := measureTransfer(context.Background(), run, 384<<10, true); ok || err == nil {
 		t.Fatalf("a cut-off longer transfer counted as complete: ok=%v err=%v", ok, err)
+	}
+}
+
+// While a connection is still speeding up, a short transfer shows far less than
+// the link holds. Each step is sized from the last until one runs long enough.
+func TestMeasureTransferFollowsAConnectionAsItSpeedsUp(t *testing.T) {
+	const plateau = 25e6 // bytes per second
+	rateFor := func(size uint32) float64 { return math.Min(plateau, 1e6+float64(size)*3) }
+	calls := 0
+	run := func(sz uint32) (int64, float64, error) {
+		calls++
+		return int64(sz), float64(sz) / rateFor(sz), nil
+	}
+	n, dur, ok, err := measureTransfer(context.Background(), run, 384<<10, true)
+	if err != nil || !ok {
+		t.Fatalf("not ok: %v", err)
+	}
+	if got := float64(n) / dur; got < plateau*0.9 {
+		t.Fatalf("reported %.1f MB/s after %d transfers, the link holds %.1f", got/1e6, calls, plateau/1e6)
+	}
+	if calls > 4 {
+		t.Fatalf("%d transfers were needed", calls)
 	}
 }
