@@ -753,7 +753,7 @@ func probeOneSpec(parentCtx context.Context, spec ProbeCandidateSpec, secret []b
 	routes := newRouter(cfg)
 
 	// Attempt 1: Full handshake + 1 ping sample + sustained download/upload burst
-	hs1, rtts, dlMbps, ulMbps, partial1, err1 := runSingleProbeAttempt(parentCtx, cfg, routes, secret, 1, uint32(burstBytes))
+	hs1, rtts, dlMbps, ulMbps, partial1, err1 := runSingleProbeAttempt(parentCtx, cfg, routes, secret, 3, uint32(burstBytes))
 	if err1 != nil {
 		res.Error = simplifyProbeErr(err1)
 		res.Summary = "Blocked / Unreachable — " + res.Error
@@ -785,20 +785,9 @@ func probeOneSpec(parentCtx context.Context, spec ProbeCandidateSpec, secret []b
 		}
 	}
 
-	var sumRTT float64
-	for _, r := range rtts {
-		sumRTT += r
-	}
-	if len(rtts) > 0 {
-		res.RTTMS = round2(sumRTT / float64(len(rtts)))
-	}
-	if len(rtts) > 1 {
-		var jitterSum float64
-		for i := 1; i < len(rtts); i++ {
-			jitterSum += math.Abs(rtts[i] - rtts[i-1])
-		}
-		res.JitterMS = round2(jitterSum / float64(len(rtts)-1))
-	}
+	rttMS, jitterMS := probeRTTStats(rtts)
+	res.RTTMS = round2(rttMS)
+	res.JitterMS = round2(jitterMS)
 
 	// In Reverse mode, the Foreign server is the probe dialer and the Relay
 	// (Iran) server is the listener. Phase 0x02 (Listener -> Dialer) therefore
@@ -1007,8 +996,12 @@ func runSingleProbeAttempt(parentCtx context.Context, cfg *Config, routes *route
 			measure02 = 512 * 1024
 		}
 	}
-	dlRead, dlDur, dlErr := runPhase02(measure02)
-	if dlErr != nil || dlRead < int64(measure02) {
+	// The time left to spend on this attempt bounds how long a longer
+	// measurement may run, so a slow but working link is never mistaken for a
+	// frozen one just because it was asked for too much.
+	longer := !cfg.AntiFreeze && cfg.Transport != TransportICMP && burstBytes >= 192*1024
+	dlRead, dlDur, dlOK, dlErr := measureTransfer(ctx, runPhase02, measure02, longer)
+	if dlErr != nil || !dlOK {
 		return hsMS, rtts, 0, 0, true, nil
 	}
 	if dlDur > 0 && dlRead > 0 {
@@ -1033,8 +1026,8 @@ func runSingleProbeAttempt(parentCtx context.Context, cfg *Config, routes *route
 			return hsMS, rtts, dlMbps, 0, true, nil
 		}
 	}
-	ulSent, ulDur, ulErr := runPhase03(measure03)
-	if ulErr != nil || ulSent < int64(measure03) {
+	ulSent, ulDur, ulOK, ulErr := measureTransfer(ctx, runPhase03, measure03, longer)
+	if ulErr != nil || !ulOK {
 		return hsMS, rtts, dlMbps, 0, true, nil
 	}
 	if ulDur > 0 && ulSent > 0 {
@@ -1043,6 +1036,78 @@ func runSingleProbeAttempt(parentCtx context.Context, cfg *Config, routes *route
 
 	_, _ = c.Write([]byte{0x04})
 	return hsMS, rtts, dlMbps, ulMbps, false, nil
+}
+
+// What a probe's timed transfers are made to show. A few hundred KB is over in
+// less than one round trip on a fast link, so what it times is the start-up of
+// the connection (TCP's slow start, KCP's ramp-up), not the speed the link
+// holds. Real tunnels measured two to four times faster than the probe said.
+const (
+	probeLongEnough  = 500 * time.Millisecond // a transfer this long already shows the sustained speed
+	probeTargetTime  = 700 * time.Millisecond // how long the longer transfer is meant to take
+	probeMaxMeasure  = 8 << 20                // never more than this in one timed transfer
+	probeBudgetShare = 3                      // a longer transfer may use up to a third of what is left
+)
+
+// measureTransfer times a transfer of first bytes. If that was over too soon to
+// mean much, one longer transfer, sized from the speed just seen, is timed and
+// used instead. The size is held to what the attempt's remaining time allows.
+// ok is false when a transfer did not complete.
+func measureTransfer(ctx context.Context, run func(uint32) (int64, float64, error), first uint32, allowLonger bool) (n int64, dur float64, ok bool, err error) {
+	n, dur, err = run(first)
+	if err != nil || n < int64(first) {
+		return n, dur, false, err
+	}
+	if !allowLonger || dur <= 0 || dur >= probeLongEnough.Seconds() {
+		return n, dur, true, nil
+	}
+	rate := float64(n) / dur // bytes per second
+	size := rate * probeTargetTime.Seconds()
+	if dl, has := ctx.Deadline(); has {
+		if left := time.Until(dl).Seconds(); left > 0 {
+			size = math.Min(size, rate*left/probeBudgetShare)
+		}
+	}
+	size = math.Min(size, probeMaxMeasure)
+	if size < float64(first)*1.5 {
+		return n, dur, true, nil // nothing to gain from a barely longer one
+	}
+	want := uint32(size)
+	n2, dur2, err2 := run(want)
+	if err2 != nil || n2 < int64(want) {
+		return n2, dur2, false, err2
+	}
+	return n2, dur2, true, nil
+}
+
+// probeRTTStats gives the round trip time and its jitter from the ping samples.
+// The middle sample is used rather than the average: the first ping on a new
+// KCP or spoofed link carries the cost of setting the link up (hundreds of
+// milliseconds that real traffic never sees again) and must not drag it up.
+func probeRTTStats(rtts []float64) (rtt, jitter float64) {
+	if len(rtts) == 0 {
+		return 0, 0
+	}
+	sorted := append([]float64(nil), rtts...)
+	sort.Float64s(sorted)
+	if n := len(sorted); n%2 == 1 {
+		rtt = sorted[n/2]
+	} else {
+		rtt = (sorted[n/2-1] + sorted[n/2]) / 2
+	}
+	// The first sample is left out of the jitter when there are enough others.
+	steady := rtts
+	if len(rtts) >= 4 {
+		steady = rtts[1:]
+	}
+	if len(steady) > 1 {
+		var sum float64
+		for i := 1; i < len(steady); i++ {
+			sum += math.Abs(steady[i] - steady[i-1])
+		}
+		jitter = sum / float64(len(steady)-1)
+	}
+	return rtt, jitter
 }
 
 func effectiveProbeMbps(r *ProbeCandidateResult) float64 {
