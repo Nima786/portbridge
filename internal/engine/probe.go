@@ -178,6 +178,7 @@ func StartProbeListener(bindHost string, preferredPort int, secret []byte, ttl t
 		IPSpoof:         true,
 		allowPlainKCP:   true,
 	}
+	probeKCPDefaults(kcpCfg)
 
 	listenHost := bindHost
 	if listenHost == "0.0.0.0" {
@@ -211,18 +212,22 @@ func StartProbeListener(bindHost string, preferredPort int, secret []byte, ttl t
 	}
 
 	rawAddr := net.JoinHostPort(listenHost, strconv.Itoa(chosenPort))
-	icmpLn, _ := kcpListen(rawAddr, &Config{
+	icmpCfg := &Config{
 		Transport:       TransportICMP,
 		secret:          secret,
 		KCPDataShards:   10,
 		KCPParityShards: 3,
-	})
-	fakeTCPLn, _ := kcpListen(rawAddr, &Config{
+	}
+	probeKCPDefaults(icmpCfg)
+	icmpLn, _ := kcpListen(rawAddr, icmpCfg)
+	fakeCfg := &Config{
 		Transport:       TransportFakeTCP,
 		secret:          secret,
 		KCPDataShards:   10,
 		KCPParityShards: 3,
-	})
+	}
+	probeKCPDefaults(fakeCfg)
+	fakeTCPLn, _ := kcpListen(rawAddr, fakeCfg)
 
 	pl := &ProbeListener{
 		Port:      chosenPort,
@@ -741,6 +746,7 @@ func probeOneSpec(parentCtx context.Context, spec ProbeCandidateSpec, secret []b
 		KCPParityShards: 3,
 		secret:          secret,
 	}
+	probeKCPDefaults(cfg)
 	if spec.Stealth {
 		cfg.UTLS = true
 		cfg.UTLSProfile = "chrome"
@@ -1036,6 +1042,17 @@ func runSingleProbeAttempt(parentCtx context.Context, cfg *Config, routes *route
 
 	_, _ = c.Write([]byte{0x04})
 	return hsMS, rtts, dlMbps, ulMbps, false, nil
+}
+
+// probeKCPDefaults gives a probe's settings the KCP tuning a real tunnel has.
+// Left at zero, the ICMP and FakeTCP links fell back to a window of 256 packets
+// (a safe floor for a hand-written settings file), which on a 100 ms link holds
+// them to about 22 Mbit/s however fast the link is, while the same links in a
+// real tunnel use the usual window and run three to five times faster. The
+// benchmark then told people those links were far slower than they are.
+func probeKCPDefaults(c *Config) {
+	d := DefaultConfig()
+	c.KCPWindow, c.KCPMTU, c.KCPInterval, c.KCPResend = d.KCPWindow, d.KCPMTU, d.KCPInterval, d.KCPResend
 }
 
 // What a probe's timed transfers are made to show. A few hundred KB is over in

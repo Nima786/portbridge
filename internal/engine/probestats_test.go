@@ -111,3 +111,17 @@ func TestMeasureTransferFollowsAConnectionAsItSpeedsUp(t *testing.T) {
 		t.Fatalf("%d transfers were needed", calls)
 	}
 }
+
+// A probe must tune KCP like a real tunnel, or ICMP and FakeTCP links are held
+// to a small window and measured at a fraction of what a tunnel gets.
+func TestProbeUsesTheTunnelsKCPTuning(t *testing.T) {
+	c := &Config{Transport: TransportICMP}
+	probeKCPDefaults(c)
+	d := DefaultConfig()
+	if c.KCPWindow != d.KCPWindow || c.KCPMTU != d.KCPMTU || c.KCPInterval != d.KCPInterval || c.KCPResend != d.KCPResend {
+		t.Fatalf("probe tuning %+v differs from a tunnel's %+v", c, d)
+	}
+	if c.KCPWindow <= 256 {
+		t.Fatalf("window %d is no larger than the small fallback", c.KCPWindow)
+	}
+}
