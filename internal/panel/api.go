@@ -739,6 +739,10 @@ func (p *Panel) handleTunnelLogs(w http.ResponseWriter, r *http.Request, _ authe
 }
 
 func (p *Panel) handleCheckTunnel(w http.ResponseWriter, r *http.Request, _ authed) {
+	// A check asks both servers and can take longer than the server's usual
+	// write limit; without more time the answer is thrown away and the page
+	// sees a dropped connection instead of the result.
+	agent.ExtendDeadlines(w, 3*time.Minute)
 	var t tunnelTarget
 	if !decodeJSON(w, r, &t) {
 		return
@@ -751,6 +755,8 @@ func (p *Panel) handleCheckTunnel(w http.ResponseWriter, r *http.Request, _ auth
 }
 
 func (p *Panel) handleSpeedtestTunnel(w http.ResponseWriter, r *http.Request, _ authed) {
+	// Up to 90 seconds are spent on the test itself (see speedtestTunnel).
+	agent.ExtendDeadlines(w, 3*time.Minute)
 	var t tunnelTarget
 	if !decodeJSON(w, r, &t) {
 		return

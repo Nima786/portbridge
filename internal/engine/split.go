@@ -209,6 +209,158 @@ func (m *splitSessionManager) AcceptLeg(rawConn net.Conn, secret []byte) (net.Co
 	return nil, false, errSplitLegAttached
 }
 
+// The client's supply of rotated legs.
+//
+// A leg carries only splitLegMaxBytes before it is swapped for the next, and
+// every new leg costs a connection and a handshake: several round trips. Dialed
+// one at a time, a link with an 80 ms round trip could renew only a few legs a
+// second, which held a whole stream to well under 1 Mbit/s. So the next legs are
+// dialed side by side, several ahead of need, and handed out in the order of
+// their numbers: the server expects leg n to be the n-th one used, whichever
+// leg happened to finish dialing first.
+//
+// How many are kept ahead grows when a rotation had to wait for one, and falls
+// back when that stops, so a quiet connection holds few spare legs open.
+const (
+	splitWriteBase = 2  // spare legs kept for the client's own bytes
+	splitReadBase  = 3  // spare legs kept for the server's bytes
+	splitMaxBoost  = 10 // most that waiting can add to either
+)
+
+type legQueue struct {
+	role byte
+	base int
+
+	mu        sync.Mutex
+	ready     map[uint32]*legRef
+	nextUse   uint32 // the number of the leg the next rotation takes
+	assigned  uint32 // the highest number given to a dial
+	boost     int
+	lastBoost time.Time
+	failed    bool
+	notify    chan struct{}
+}
+
+func newLegQueue(role byte, base int) *legQueue {
+	return &legQueue{role: role, base: base, ready: make(map[uint32]*legRef), nextUse: 1, notify: make(chan struct{}, 1)}
+}
+
+// depthLocked is how many legs should be on hand or on the way.
+func (q *legQueue) depthLocked(now time.Time) int {
+	if q.boost > 0 && now.Sub(q.lastBoost) > 4*time.Second {
+		q.boost /= 2
+		q.lastBoost = now
+	}
+	return q.base + q.boost
+}
+
+// drain lets go of every leg not yet used.
+func (q *legQueue) drain() {
+	if q == nil {
+		return
+	}
+	q.mu.Lock()
+	legs := q.ready
+	q.ready = make(map[uint32]*legRef)
+	q.mu.Unlock()
+	for _, lr := range legs {
+		lr.release()
+	}
+}
+
+// topUp starts dials until enough legs are on hand or on the way.
+func (s *splitConn) topUp(q *legQueue) {
+	if q == nil || !s.isClient || s.closed.Load() {
+		return
+	}
+	q.mu.Lock()
+	depth := uint32(q.depthLocked(time.Now()))
+	var start []uint32
+	for !q.failed && q.assigned+1-q.nextUse < depth {
+		q.assigned++
+		start = append(start, q.assigned)
+	}
+	q.mu.Unlock()
+	for _, seq := range start {
+		go s.dialSeq(q, seq)
+	}
+}
+
+// dialSeq dials leg number seq, trying again if it fails: the server waits for
+// every number in turn, so one that is never delivered would stall the stream.
+func (s *splitConn) dialSeq(q *legQueue, seq uint32) {
+	var lr *legRef
+	var err error
+	for attempt := 0; attempt < 5; attempt++ {
+		if s.closed.Load() {
+			return
+		}
+		lr, err = s.dialLeg(q.role, seq)
+		if err == nil {
+			break
+		}
+		select {
+		case <-s.closedCh:
+			return
+		case <-time.After(time.Duration(attempt+1) * 200 * time.Millisecond):
+		}
+	}
+	q.mu.Lock()
+	switch {
+	case err != nil:
+		q.failed = true
+	case s.closed.Load():
+		q.mu.Unlock()
+		lr.release()
+		return
+	default:
+		q.ready[seq] = lr
+	}
+	q.mu.Unlock()
+	select {
+	case q.notify <- struct{}{}:
+	default:
+	}
+}
+
+// takeLeg returns the next leg in order, waiting for it if it is not ready.
+func (s *splitConn) takeLeg(q *legQueue, deadline <-chan struct{}, what string) (*legRef, error) {
+	timer := time.NewTimer(5 * time.Second)
+	defer timer.Stop()
+	waited := false
+	for {
+		q.mu.Lock()
+		if lr := q.ready[q.nextUse]; lr != nil {
+			delete(q.ready, q.nextUse)
+			q.nextUse++
+			q.mu.Unlock()
+			s.topUp(q)
+			return lr, nil
+		}
+		failed := q.failed
+		if !waited && !failed {
+			// Waiting means too few were kept ahead: keep more.
+			q.boost = min(max(q.boost*2, 2), splitMaxBoost)
+			q.lastBoost = time.Now()
+		}
+		q.mu.Unlock()
+		if failed {
+			return nil, fmt.Errorf("could not dial a rotated split-stream %s leg", what)
+		}
+		waited = true
+		s.topUp(q)
+		select {
+		case <-q.notify:
+		case <-deadline:
+			return nil, timeoutError{}
+		case <-timer.C:
+			return nil, fmt.Errorf("timed out dialing rotated split-stream %s leg", what)
+		case <-s.closedCh:
+			return nil, net.ErrClosed
+		}
+	}
+}
+
 type splitConn struct {
 	sessionID [16]byte
 	isClient  bool
@@ -225,7 +377,6 @@ type splitConn struct {
 	readPrewarmed  bool
 	readBuf        []byte
 	remoteEOF      atomic.Bool
-	nextReadLegCh  chan *legRef
 	readLegSeq     atomic.Uint32
 
 	wmu            sync.Mutex
@@ -233,7 +384,6 @@ type splitConn struct {
 	writeBytesLeg  int
 	writePrewarmed bool
 	writeClosed    atomic.Bool
-	nextWriteLegCh chan *legRef
 	writeLegSeq    atomic.Uint32
 
 	pendingMu        sync.Mutex
@@ -241,8 +391,9 @@ type splitConn struct {
 	pendingWriteLegs map[uint32]*legRef
 	legNotifyCh      chan struct{}
 
-	prewarmReadFlight  atomic.Bool
-	prewarmWriteFlight atomic.Bool
+	// The client's supply of rotated legs, one queue for each direction. The
+	// server does not dial, so it has none.
+	wq, rq *legQueue
 
 	rdl *deadline
 	wdl *deadline
@@ -263,8 +414,6 @@ func newSplitServerConn(sid [16]byte, leg0 net.Conn, onClose func()) *splitConn 
 		onClose:          onClose,
 		readLeg:          lr0,
 		writeLeg:         lr0,
-		nextReadLegCh:    make(chan *legRef, 8),
-		nextWriteLegCh:   make(chan *legRef, 8),
 		pendingReadLegs:  make(map[uint32]*legRef),
 		pendingWriteLegs: make(map[uint32]*legRef),
 		legNotifyCh:      make(chan struct{}, 1),
@@ -331,17 +480,17 @@ func newSplitClientConn(leg0 net.Conn, remoteAddr net.Addr, cfg *Config, purpose
 	lr0 := newLegRef(leg0, 2)
 	lr0.pendingPreface = buildSplitPreface(cfg.secret, sid, splitRoleInitial, 0)
 	sc := &splitConn{
-		sessionID:      sid,
-		isClient:       true,
-		readLeg:        lr0,
-		writeLeg:       lr0,
-		nextReadLegCh:  make(chan *legRef, 8),
-		nextWriteLegCh: make(chan *legRef, 8),
-		rdl:            newDeadline(),
-		wdl:            newDeadline(),
-		localAddr:      leg0.LocalAddr(),
-		remoteAddr:     leg0.RemoteAddr(),
-		closedCh:       make(chan struct{}),
+		sessionID:  sid,
+		isClient:   true,
+		readLeg:    lr0,
+		writeLeg:   lr0,
+		wq:         newLegQueue(splitRoleDialerWrite, splitWriteBase),
+		rq:         newLegQueue(splitRoleListenerWrite, splitReadBase),
+		rdl:        newDeadline(),
+		wdl:        newDeadline(),
+		localAddr:  leg0.LocalAddr(),
+		remoteAddr: leg0.RemoteAddr(),
+		closedCh:   make(chan struct{}),
 	}
 
 	sc.dialLeg = func(role byte, seq uint32) (*legRef, error) {
@@ -367,104 +516,16 @@ func newSplitClientConn(leg0 net.Conn, remoteAddr net.Addr, cfg *Config, purpose
 	return sc, nil
 }
 
-func (s *splitConn) prewarmClientWriteLeg() {
-	if !s.isClient || s.closed.Load() {
-		return
-	}
-	if len(s.nextWriteLegCh) >= 2 {
-		return
-	}
-	if !s.prewarmWriteFlight.CompareAndSwap(false, true) {
-		return
-	}
-	go func() {
-		for {
-			for !s.closed.Load() && len(s.nextWriteLegCh) < 2 {
-				seq := s.writeLegSeq.Add(1)
-				lr, err := s.dialLeg(splitRoleDialerWrite, seq)
-				if err != nil {
-					s.prewarmWriteFlight.Store(false)
-					return
-				}
-				select {
-				case s.nextWriteLegCh <- lr:
-				case <-s.closedCh:
-					lr.release()
-					s.prewarmWriteFlight.Store(false)
-					return
-				}
-			}
-			s.prewarmWriteFlight.Store(false)
-			if s.closed.Load() || len(s.nextWriteLegCh) >= 2 {
-				return
-			}
-			if !s.prewarmWriteFlight.CompareAndSwap(false, true) {
-				return
-			}
-		}
-	}()
-}
+// prewarmClientWriteLeg and prewarmServerWriteLeg (the second keeps its old name:
+// it readies the legs the server will write on, which the client dials) top up
+// the client's supply of rotated legs.
+func (s *splitConn) prewarmClientWriteLeg() { s.topUp(s.wq) }
 
-func (s *splitConn) prewarmServerWriteLeg() {
-	if !s.isClient || s.closed.Load() {
-		return
-	}
-	if len(s.nextReadLegCh) >= 3 {
-		return
-	}
-	if !s.prewarmReadFlight.CompareAndSwap(false, true) {
-		return
-	}
-	go func() {
-		for {
-			for !s.closed.Load() && len(s.nextReadLegCh) < 3 {
-				seq := s.readLegSeq.Add(1)
-				lr, err := s.dialLeg(splitRoleListenerWrite, seq)
-				if err != nil {
-					s.prewarmReadFlight.Store(false)
-					return
-				}
-				select {
-				case s.nextReadLegCh <- lr:
-				case <-s.closedCh:
-					lr.release()
-					s.prewarmReadFlight.Store(false)
-					return
-				}
-			}
-			s.prewarmReadFlight.Store(false)
-			if s.closed.Load() || len(s.nextReadLegCh) >= 3 {
-				return
-			}
-			if !s.prewarmReadFlight.CompareAndSwap(false, true) {
-				return
-			}
-		}
-	}()
-}
+func (s *splitConn) prewarmServerWriteLeg() { s.topUp(s.rq) }
 
 func (s *splitConn) acquireNextWriteLeg() (*legRef, error) {
 	if s.isClient {
-		select {
-		case lr := <-s.nextWriteLegCh:
-			s.prewarmClientWriteLeg()
-			return lr, nil
-		default:
-		}
-		s.prewarmClientWriteLeg()
-		timer := time.NewTimer(5 * time.Second)
-		defer timer.Stop()
-		select {
-		case lr := <-s.nextWriteLegCh:
-			s.prewarmClientWriteLeg()
-			return lr, nil
-		case <-s.wdl.wait():
-			return nil, timeoutError{}
-		case <-timer.C:
-			return nil, fmt.Errorf("timed out dialing rotated split-stream write leg")
-		case <-s.closedCh:
-			return nil, net.ErrClosed
-		}
+		return s.takeLeg(s.wq, s.wdl.wait(), "write")
 	}
 
 	// Server side waits for the client to provide the exact next splitRoleListenerWrite leg by seq.
@@ -493,26 +554,7 @@ func (s *splitConn) acquireNextWriteLeg() (*legRef, error) {
 
 func (s *splitConn) acquireNextReadLeg() (*legRef, error) {
 	if s.isClient {
-		select {
-		case lr := <-s.nextReadLegCh:
-			s.prewarmServerWriteLeg()
-			return lr, nil
-		default:
-		}
-		s.prewarmServerWriteLeg()
-		timer := time.NewTimer(5 * time.Second)
-		defer timer.Stop()
-		select {
-		case lr := <-s.nextReadLegCh:
-			s.prewarmServerWriteLeg()
-			return lr, nil
-		case <-s.rdl.wait():
-			return nil, timeoutError{}
-		case <-timer.C:
-			return nil, fmt.Errorf("timed out dialing rotated split-stream read leg")
-		case <-s.closedCh:
-			return nil, net.ErrClosed
-		}
+		return s.takeLeg(s.rq, s.rdl.wait(), "read")
 	}
 
 	// Server side waits for the client to provide the exact next splitRoleDialerWrite leg by seq.
@@ -763,23 +805,8 @@ func (s *splitConn) Close() error {
 		}
 		s.pendingMu.Unlock()
 
-		for {
-			select {
-			case lr := <-s.nextReadLegCh:
-				lr.release()
-			default:
-				goto drainWrite
-			}
-		}
-	drainWrite:
-		for {
-			select {
-			case lr := <-s.nextWriteLegCh:
-				lr.release()
-			default:
-				return
-			}
-		}
+		s.wq.drain()
+		s.rq.drain()
 	})
 	return nil
 }
