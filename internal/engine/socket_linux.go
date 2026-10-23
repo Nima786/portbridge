@@ -59,6 +59,10 @@ func tuneSocket(c net.Conn) {
 		_ = syscall.SetsockoptInt(int(fd), syscall.IPPROTO_TCP, syscall.TCP_KEEPIDLE, 30)
 		_ = syscall.SetsockoptInt(int(fd), syscall.IPPROTO_TCP, syscall.TCP_KEEPINTVL, 5)
 		_ = syscall.SetsockoptInt(int(fd), syscall.IPPROTO_TCP, syscall.TCP_KEEPCNT, 3)
+		// TCP_KEEPIDLE only checks an idle connection. When data is waiting in
+		// the send buffer and the route freezes, the kernel would otherwise
+		// retry for ~15 minutes (tcp_retries2) before failing the socket.
+		_ = syscall.SetsockoptInt(int(fd), syscall.IPPROTO_TCP, syscallTCP_USER_TIMEOUT, 30000)
 	})
 }
 
@@ -144,8 +148,9 @@ func growSocketBuffers(c any, n int) {
 	})
 }
 
-// The "force" options are not in the standard syscall package.
+// These socket options are not in the standard syscall package.
 const (
-	syscallSO_SNDBUFFORCE = 0x20
-	syscallSO_RCVBUFFORCE = 0x21
+	syscallTCP_USER_TIMEOUT = 0x12
+	syscallSO_SNDBUFFORCE   = 0x20
+	syscallSO_RCVBUFFORCE   = 0x21
 )

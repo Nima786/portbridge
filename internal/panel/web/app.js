@@ -1870,6 +1870,12 @@
     row('TCP Congestion Control', info.congestion_control || '—');
     row('Default Queue Discipline', info.qdisc || '—');
     row('Max Socket Buffer (rmem_max / wmem_max)', `${info.rmem_max || '—'} / ${info.wmem_max || '—'}`);
+    if (info.mtu_probing !== undefined && info.mtu_probing !== '') {
+      row('Path MTU Probing', info.mtu_probing === '0' ? 'Off (0)' : `Enabled (${info.mtu_probing})`);
+    }
+    if (info.conntrack_max) {
+      row('Max Tracked Connections (nf_conntrack_max)', info.conntrack_max);
+    }
     row('Managed by PortBridge', tunedByPB ? 'Yes (/etc/sysctl.d/99-portbridge-tuning.conf)' : 'No');
     $('tune-facts').replaceChildren(...rows);
 
@@ -2973,6 +2979,38 @@
 
     kids.push(h('ul', { class: 'ports-result', 'aria-live': 'polite' },
       ...(rep.notes || []).map((n) => h('li', { class: n.level === 'note' ? '' : n.level }, n.text))));
+
+    if (rep.best_port || rep.best_name || rep.ipv6_works) {
+      const recParts = [];
+      if (rep.best_port) recParts.push(`port ${rep.best_port}`);
+      if (rep.best_name) recParts.push(`SNI ${rep.best_name}`);
+      if (rep.ipv6_works && !rep.tcp_works) recParts.push('IPv6');
+      if (recParts.length) {
+        kids.push(h('div', { class: 'actions left' },
+          h('button', {
+            type: 'button',
+            class: 'primary',
+            onclick: () => {
+              const applied = [];
+              if (rep.best_port && $('tn-linkport')) {
+                $('tn-linkport').value = String(rep.best_port);
+                applied.push(`bridge port ${rep.best_port}`);
+              }
+              if (rep.best_name) {
+                if ($('tn-claim')) $('tn-claim').value = rep.best_name;
+                if ($('tn-spoofsni')) $('tn-spoofsni').value = rep.best_name;
+                applied.push(`SNI "${rep.best_name}"`);
+              }
+              if (rep.ipv6_works && !rep.tcp_works && $('tn-ipv6')) {
+                $('tn-ipv6').checked = true;
+                applied.push('IPv6');
+              }
+              showTunnelOptions();
+              setStatus(`Applied recommended ${applied.join(' & ')} from Deep Scan.`);
+            }
+          }, `Use Recommended (${recParts.join(', ')})`)));
+      }
+    }
 
     const ports = (rep.ports || []).map((p) => {
       const t = exploreStates[p.tcp] || exploreStates.untested;

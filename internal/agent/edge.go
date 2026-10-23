@@ -1999,6 +1999,8 @@ type TuneInfo struct {
 	RmemMax           string `json:"rmem_max"`
 	FileMax           string `json:"file_max"`
 	FastOpen          string `json:"fast_open"`
+	MTUProbing        string `json:"mtu_probing,omitempty"`
+	ConntrackMax      string `json:"conntrack_max,omitempty"`
 	Output            string `json:"output,omitempty"`
 }
 
@@ -2035,6 +2037,8 @@ func readTuneStatus(confDir string) TuneInfo {
 		RmemMax:           readProcSys("net/core/rmem_max"),
 		FileMax:           readProcSys("fs/file-max"),
 		FastOpen:          readProcSys("net/ipv4/tcp_fastopen"),
+		MTUProbing:        readProcSys("net/ipv4/tcp_mtu_probing"),
+		ConntrackMax:      readProcSys("net/netfilter/nf_conntrack_max"),
 	}
 }
 

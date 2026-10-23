@@ -31,7 +31,7 @@ RestartMaxDelaySec=60
 
 # Each session needs two connections plus headroom, so the default limit is
 # nowhere near enough at the capacities this is designed for.
-LimitNOFILE=65535
+LimitNOFILE=1048576
 
 # Must exceed the tunnel's own drain setting, or systemd kills it mid-drain.
 TimeoutStopSec=45

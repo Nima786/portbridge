@@ -394,12 +394,16 @@ func ExplorePorts(ctx context.Context, host string, specs []ExplorePortSpec, tok
 }
 
 func exploreTCP(ctx context.Context, addr, responder, token string) (string, int64) {
+	return exploreTCPNet(ctx, "tcp4", addr, responder, token)
+}
+
+func exploreTCPNet(ctx context.Context, network, addr, responder, token string) (string, int64) {
 	if responder == "failed" {
 		return "untested", 0
 	}
 	start := time.Now()
 	d := net.Dialer{Timeout: 3 * time.Second}
-	c, err := d.DialContext(ctx, "tcp4", addr)
+	c, err := d.DialContext(ctx, network, addr)
 	if err != nil {
 		// A refusal means the packet got there and the server answered that
 		// nothing listens: the route is open, the port just is not used. That is
@@ -438,14 +442,18 @@ func readFull(c net.Conn, b []byte) (int, error) {
 }
 
 func exploreUDP(ctx context.Context, addr, responder, token string) string {
+	return exploreUDPNet(ctx, "udp4", addr, responder, token)
+}
+
+func exploreUDPNet(ctx context.Context, network, addr, responder, token string) string {
 	if responder != "listening" {
 		return "untested"
 	}
-	ua, err := net.ResolveUDPAddr("udp4", addr)
+	ua, err := net.ResolveUDPAddr(network, addr)
 	if err != nil {
 		return "blocked"
 	}
-	c, err := net.DialUDP("udp4", nil, ua)
+	c, err := net.DialUDP(network, nil, ua)
 	if err != nil {
 		return "blocked"
 	}
@@ -477,6 +485,57 @@ func exploreUDP(ctx context.Context, addr, responder, token string) string {
 			return "data"
 		}
 	}
+}
+
+// ExploreIPv6 checks whether TCP and UDP reach the responder over IPv6 on a
+// port where the responder is listening.
+func ExploreIPv6(ctx context.Context, hostV6 string, specs []ExplorePortSpec, token string) (port int, tcpState string, udpState string, ms int64) {
+	hostV6 = strings.TrimSpace(hostV6)
+	if hostV6 == "" {
+		return 0, "", "", 0
+	}
+	spec, ok := pickIPv6Spec(specs)
+	if !ok {
+		return 0, "", "", 0
+	}
+	addr := net.JoinHostPort(hostV6, strconv.Itoa(spec.Port))
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		tcpState, ms = exploreTCPNet(ctx, "tcp6", addr, spec.TCP, token)
+	}()
+	go func() {
+		defer wg.Done()
+		udpState = exploreUDPNet(ctx, "udp6", addr, spec.UDP, token)
+	}()
+	wg.Wait()
+	return spec.Port, tcpState, udpState, ms
+}
+
+func pickIPv6Spec(specs []ExplorePortSpec) (ExplorePortSpec, bool) {
+	byPort := map[int]ExplorePortSpec{}
+	for _, s := range specs {
+		if s.TCP == "listening" || s.UDP == "listening" {
+			byPort[s.Port] = s
+		}
+	}
+	for _, p := range namesPortOrder {
+		if s, ok := byPort[p]; ok && s.TCP == "listening" {
+			return s, true
+		}
+	}
+	for _, s := range specs {
+		if s.TCP == "listening" {
+			return s, true
+		}
+	}
+	for _, s := range specs {
+		if s.UDP == "listening" {
+			return s, true
+		}
+	}
+	return ExplorePortSpec{}, false
 }
 
 // ExploreICMP sends a few pings to host. It needs the right to open a raw
@@ -534,11 +593,12 @@ func ExploreICMP(ctx context.Context, host string) (state string, ms int64) {
 
 // ExploreRequest is what the relay is asked to do.
 type ExploreRequest struct {
-	Host  string            `json:"host"` // the foreign server's address
-	Token string            `json:"token"`
-	Ports []ExplorePortSpec `json:"ports"`
-	SNIs  []string          `json:"snis,omitempty"` // empty means the built-in list
-	Reach bool              `json:"reach"`          // also try the public endpoints
+	Host   string            `json:"host"`              // the foreign server's IPv4 address
+	HostV6 string            `json:"host_v6,omitempty"` // the foreign server's IPv6 address, when both servers have IPv6
+	Token  string            `json:"token"`
+	Ports  []ExplorePortSpec `json:"ports"`
+	SNIs   []string          `json:"snis,omitempty"` // empty means the built-in list
+	Reach  bool              `json:"reach"`          // also try the public endpoints
 }
 
 // ExploreRunReport is everything the relay found.
@@ -547,6 +607,10 @@ type ExploreRunReport struct {
 	Ports     []ExplorePortResult  `json:"ports"`
 	ICMP      string               `json:"icmp"`
 	ICMPMS    int64                `json:"icmp_ms,omitempty"`
+	IPv6Port  int                  `json:"ipv6_port,omitempty"`
+	IPv6TCP   string               `json:"ipv6_tcp,omitempty"`
+	IPv6UDP   string               `json:"ipv6_udp,omitempty"`
+	IPv6MS    int64                `json:"ipv6_ms,omitempty"`
 	NamesPort int                  `json:"names_port,omitempty"`
 	Names     []SNIScanResult      `json:"names,omitempty"`
 }
@@ -580,7 +644,7 @@ func pickNamesPort(res []ExplorePortResult) int {
 	return 0
 }
 
-// RunExplore does the three checks.
+// RunExplore does the checks.
 func RunExplore(ctx context.Context, req ExploreRequest) ExploreRunReport {
 	var rep ExploreRunReport
 	var wg sync.WaitGroup
@@ -591,21 +655,35 @@ func RunExplore(ctx context.Context, req ExploreRequest) ExploreRunReport {
 			rep.Reach = ExploreReach(ctx, ExploreEndpoints)
 		}()
 	}
-	wg.Add(2)
-	go func() {
-		defer wg.Done()
-		rep.Ports = ExplorePorts(ctx, req.Host, req.Ports, req.Token)
-	}()
-	go func() {
-		defer wg.Done()
-		rep.ICMP, rep.ICMPMS = ExploreICMP(ctx, req.Host)
-	}()
+	if req.Host != "" {
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			rep.Ports = ExplorePorts(ctx, req.Host, req.Ports, req.Token)
+		}()
+		go func() {
+			defer wg.Done()
+			rep.ICMP, rep.ICMPMS = ExploreICMP(ctx, req.Host)
+		}()
+	} else {
+		rep.ICMP = "untested"
+	}
+	if req.HostV6 != "" {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			rep.IPv6Port, rep.IPv6TCP, rep.IPv6UDP, rep.IPv6MS = ExploreIPv6(ctx, req.HostV6, req.Ports, req.Token)
+		}()
+	}
 	wg.Wait()
 	sort.Slice(rep.Ports, func(i, j int) bool { return rep.Ports[i].Port < rep.Ports[j].Port })
 
 	if port := pickNamesPort(rep.Ports); port != 0 {
 		rep.NamesPort = port
 		rep.Names = ScanWhitelistedSNIs(ctx, net.JoinHostPort(req.Host, strconv.Itoa(port)), req.SNIs)
+	} else if rep.IPv6TCP == "data" && rep.IPv6Port != 0 && req.HostV6 != "" {
+		rep.NamesPort = rep.IPv6Port
+		rep.Names = ScanWhitelistedSNIs(ctx, net.JoinHostPort(req.HostV6, strconv.Itoa(rep.IPv6Port)), req.SNIs)
 	}
 	return rep
 }

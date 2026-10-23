@@ -10,7 +10,7 @@ User=root
 ExecStart=/usr/local/bin/portbridge panel run
 Restart=always
 RestartSec=3
-LimitNOFILE=65535
+LimitNOFILE=1048576
 NoNewPrivileges=yes
 PrivateTmp=yes
 

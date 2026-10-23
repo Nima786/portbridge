@@ -109,6 +109,26 @@ func TestExploreSummaryWhenNamesAreCut(t *testing.T) {
 	}
 }
 
+func TestExploreSummaryWhenIPv6WorksEvenThoughIPv4IsBlocked(t *testing.T) {
+	rep := &exploreReport{
+		RelayName: "Iran", ForeignName: "Berlin",
+		Ports:    []engine.ExplorePortResult{{Port: 443, TCP: "blocked", UDP: "blocked"}},
+		ICMP:     "blocked",
+		IPv6Port: 443,
+		IPv6TCP:  "data",
+		IPv6UDP:  "data",
+		IPv6MS:   48,
+	}
+	summariseExplore(rep)
+	txt := notesText(rep)
+	if !rep.IPv6Works || rep.BestPort != 443 {
+		t.Fatalf("ipv6_works=%v best_port=%d, want true and 443", rep.IPv6Works, rep.BestPort)
+	}
+	if !strings.Contains(txt, "good: IPv6 works from Iran to Berlin (both TCP and UDP on port 443, 48 ms)") {
+		t.Errorf("the notes lack the IPv6 finding:\n%s", txt)
+	}
+}
+
 // The whole scan, through the panel, with the "foreign" server's responder and
 // the "relay" both on this machine: the responder opens the ports, the relay
 // checks them and the names, and the responder is closed again afterwards.

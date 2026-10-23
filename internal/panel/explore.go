@@ -30,10 +30,15 @@ type exploreReport struct {
 	RelayName   string                      `json:"relay_name"`
 	ForeignName string                      `json:"foreign_name"`
 	ForeignIP   string                      `json:"foreign_ip"`
+	ForeignIPv6 string                      `json:"foreign_ipv6,omitempty"`
 	Reach       []engine.ExploreReachResult `json:"reach"`
 	Ports       []engine.ExplorePortResult  `json:"ports"`
 	ICMP        string                      `json:"icmp"`
 	ICMPMS      int64                       `json:"icmp_ms,omitempty"`
+	IPv6Port    int                         `json:"ipv6_port,omitempty"`
+	IPv6TCP     string                      `json:"ipv6_tcp,omitempty"`
+	IPv6UDP     string                      `json:"ipv6_udp,omitempty"`
+	IPv6MS      int64                       `json:"ipv6_ms,omitempty"`
 	NamesPort   int                         `json:"names_port,omitempty"`
 	Names       []engine.SNIScanResult      `json:"names,omitempty"`
 	Notes       []exploreNote               `json:"notes"`
@@ -43,6 +48,7 @@ type exploreReport struct {
 	TCPWorks  bool `json:"tcp_works"`
 	UDPWorks  bool `json:"udp_works"`
 	ICMPWorks bool `json:"icmp_works"`
+	IPv6Works bool `json:"ipv6_works"`
 }
 
 // exploreReach says whether the scan also tries the public endpoints. A variable
@@ -61,9 +67,14 @@ func (p *Panel) exploreNetwork(parent context.Context, relayID, foreignID string
 	if !fv.Online {
 		return nil, fmt.Errorf("Foreign server %s is currently offline", fv.Name)
 	}
-	foreignV4, _ := serverAddresses(fv)
-	if foreignV4 == "" {
-		return nil, fmt.Errorf("%s has no IPv4 address the panel knows of, which the scan needs", fv.Name)
+	_, relayV6 := serverAddresses(rv)
+	foreignV4, foreignV6 := serverAddresses(fv)
+	if foreignV4 == "" && foreignV6 == "" {
+		return nil, fmt.Errorf("%s has no IPv4 or IPv6 address the panel knows of, which the scan needs", fv.Name)
+	}
+	hostV6 := ""
+	if relayV6 != "" && foreignV6 != "" {
+		hostV6 = foreignV6
 	}
 
 	token := newID(12)
@@ -109,7 +120,7 @@ func (p *Panel) exploreNetwork(parent context.Context, relayID, foreignID string
 		Error  string                  `json:"error"`
 	}
 	_, err = p.callJSON(rctx, relayID, "/api/explore/run", engine.ExploreRequest{
-		Host: foreignV4, Token: token, Ports: specs, SNIs: snis, Reach: exploreReach,
+		Host: foreignV4, HostV6: hostV6, Token: token, Ports: specs, SNIs: snis, Reach: exploreReach,
 	}, &rrep)
 	if err != nil {
 		if errors.Is(err, errTooOld) {
@@ -125,10 +136,15 @@ func (p *Panel) exploreNetwork(parent context.Context, relayID, foreignID string
 		RelayName:   rv.Name,
 		ForeignName: fv.Name,
 		ForeignIP:   foreignV4,
+		ForeignIPv6: hostV6,
 		Reach:       rrep.Report.Reach,
 		Ports:       rrep.Report.Ports,
 		ICMP:        rrep.Report.ICMP,
 		ICMPMS:      rrep.Report.ICMPMS,
+		IPv6Port:    rrep.Report.IPv6Port,
+		IPv6TCP:     rrep.Report.IPv6TCP,
+		IPv6UDP:     rrep.Report.IPv6UDP,
+		IPv6MS:      rrep.Report.IPv6MS,
 		NamesPort:   rrep.Report.NamesPort,
 		Names:       rrep.Report.Names,
 	}
@@ -172,6 +188,7 @@ func summariseExplore(rep *exploreReport) {
 	rep.TCPWorks = len(tcpData) > 0
 	rep.UDPWorks = len(udpData) > 0
 	rep.ICMPWorks = rep.ICMP == "data"
+	rep.IPv6Works = rep.IPv6TCP == "data" || rep.IPv6UDP == "data"
 	add := func(level, format string, a ...any) {
 		rep.Notes = append(rep.Notes, exploreNote{Level: level, Text: fmt.Sprintf(format, a...)})
 	}
@@ -214,6 +231,18 @@ func summariseExplore(rep *exploreReport) {
 		add("warn", "Pings get no answer, so the ICMP link will not work on this route. (If %s already runs an ICMP tunnel from %s this is expected: that tunnel hides the server's own ping replies to its peer.)", fn, rn)
 	default:
 		add("note", "ICMP could not be tested from %s.", rn)
+	}
+
+	// IPv6
+	switch {
+	case rep.IPv6TCP == "data" && rep.IPv6UDP == "data":
+		add("good", "IPv6 works from %s to %s (both TCP and UDP on port %d, %d ms). Turning on IPv6 for the tunnel link is an option.", rn, fn, rep.IPv6Port, rep.IPv6MS)
+	case rep.IPv6TCP == "data":
+		add("good", "IPv6 TCP works from %s to %s (port %d, %d ms). Turning on IPv6 for the tunnel link is an option.", rn, fn, rep.IPv6Port, rep.IPv6MS)
+	case rep.IPv6UDP == "data":
+		add("good", "IPv6 UDP works from %s to %s (port %d). KCP over IPv6 can use this.", rn, fn, rep.IPv6Port)
+	case rep.IPv6TCP == "blocked" || rep.IPv6TCP == "stalled":
+		add("warn", "Both servers have IPv6, but IPv6 traffic from %s to %s did not get through on port %d.", rn, fn, rep.IPv6Port)
 	}
 
 	// Names
@@ -292,6 +321,9 @@ func summariseExplore(rep *exploreReport) {
 	if rep.BestPort == 0 && len(tcpData) > 0 {
 		sort.Ints(tcpData)
 		rep.BestPort = tcpData[0]
+	}
+	if rep.BestPort == 0 && rep.IPv6Works && rep.IPv6Port != 0 {
+		rep.BestPort = rep.IPv6Port
 	}
 	for _, n := range rep.Names {
 		if n.Reachable {
