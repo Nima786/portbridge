@@ -519,8 +519,8 @@
         isDraggable
           ? h('button', { type: 'button', 'data-focus': `srv-${s.id}-tunnel`, 'aria-label': `New tunnel with ${name}`, onclick: () => openNewTunnel(s.group === 'relay' ? s.id : '', s.group === 'foreign' ? s.id : '') }, '+ New Tunnel')
           : null,
-        h('button', { type: 'button', 'data-focus': `srv-${s.id}-tune`, 'aria-label': `Speed tuning (BBR) for ${name}`, onclick: () => openServerTune(s) },
-          'BBR Tuning'),
+        h('button', { type: 'button', 'data-focus': `srv-${s.id}-tune`, 'aria-label': `Network tuning for ${name}`, onclick: () => openServerTune(s) },
+          'Network Tuning'),
         h('button', { type: 'button', 'data-focus': `srv-${s.id}-fw`, 'aria-label': `Firewall rules for ${name}`, onclick: () => openServerFirewall(s) },
           'Firewall'),
         h('button', { type: 'button', 'data-focus': `srv-${s.id}-edit`, 'aria-label': `Edit ${name}`, onclick: () => openEdit(s) },
@@ -1787,7 +1787,17 @@
             h('span', { class: 'state ' + headState[0] }, headState[1])),
           h('ul', { class: 'check-list' }, items));
       });
-      $('diag-checks').replaceChildren(...(cols.length ? cols : [h('p', { class: 'muted' }, 'No diagnostic data returned.')]));
+      const blocked = list.some((rep) => (rep.checks || []).some((c) =>
+        c.status === 'bad' && (c.label === 'End-to-end data flow' || c.label === 'Inter-server link' || c.label === 'Peer bridge port')));
+      const children = cols.length ? cols.slice() : [h('p', { class: 'muted' }, 'No diagnostic data returned.')];
+      if (blocked) {
+        // The same advice the benchmark gives: a link that stays blocked is
+        // usually the network refusing this mode, not a fault in the tunnel.
+        children.push(h('div', { class: 'notice update diag-hint' },
+          h('strong', null, 'The link between the servers is not carrying data. '),
+          h('span', null, 'If both halves are running and this stays the same, this network may be blocking this tunnel mode. Open New Tunnel and use "Find Best Tunnel Mode" (and "Deep Scan" if few modes work) to find one that gets through.')));
+      }
+      $('diag-checks').replaceChildren(...children);
     } catch (e) {
       $('diag-checks').replaceChildren(h('p', { class: 'error' }, e.message));
     } finally {
@@ -1821,7 +1831,7 @@
     btn.disabled = true;
     if (err) err.textContent = '';
     out.hidden = false;
-    out.textContent = `Running latency, download & upload speed test through tunnel "${activeDiagTarget.name}"...\nPlease wait (up to 15–30 seconds)...`;
+    out.textContent = `Running latency, download & upload speed test through tunnel "${activeDiagTarget.name}"...\nPlease wait. This usually takes 15–30 seconds, and up to two minutes on a slow link...`;
     try {
       const res = await api('POST', '/api/tunnels/speedtest', activeDiagTarget);
       out.textContent = res.output || 'Speed test finished.';
@@ -1852,7 +1862,7 @@
       banner.className = 'notice update';
       banner.replaceChildren(
         h('strong', null, 'Standard TCP Congestion Control. '),
-        h('span', null, 'Enabling BBR & buffer tuning can significantly improve throughput and stability over long-distance or lossy links.'));
+        h('span', null, 'Network tuning turns on BBR, enlarges the network buffers and sizes the connection table. It can significantly improve throughput and stability over long-distance or lossy links.'));
     }
 
     const rows = [];
@@ -1872,16 +1882,16 @@
         h('strong', null, 'A newer tuning is available. '),
         h('span', null, 'This server was tuned by an older release. Updating raises the buffer limits (helps the UDP-based links), turns on path MTU probing and enlarges the connection table.'));
     }
-    $('tune-enable').textContent = tunedByPB ? 'Update Tuning' : 'Enable BBR Tuning';
+    $('tune-enable').textContent = tunedByPB ? 'Update Tuning' : 'Enable Network Tuning';
     $('tune-enable').hidden = upToDate;
     $('tune-disable').hidden = !tunedByPB;
   }
 
   async function openServerTune(s) {
     tuningServer = s;
-    $('tune-title').textContent = `Speed Tuning (BBR): ${s.name || s.address}`;
+    $('tune-title').textContent = `Network Tuning: ${s.name || s.address}`;
     if ($('tune-sub')) {
-      $('tune-sub').textContent = 'Google BBR congestion control and high-throughput TCP socket buffers for long-distance links.';
+      $('tune-sub').textContent = 'Google BBR congestion control, larger network buffers, path MTU probing and a bigger connection table for long-distance links.';
     }
     if ($('tune-error')) $('tune-error').textContent = '';
     $('tune-banner').hidden = true;

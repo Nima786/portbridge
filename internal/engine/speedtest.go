@@ -135,32 +135,39 @@ func runSpeedtestClient(c net.Conn, cfg *Config, out io.Writer, sizeMB ...float6
 
 	// Phase 1: Latency & Jitter
 	fmt.Fprintf(out, "⏱️  Testing latency and round-trip time...\n")
-	if _, err := c.Write([]byte{0x01}); err != nil {
-		return fmt.Errorf("ping phase start: %w", err)
-	}
 
-	var rtts []time.Duration
-	const numSamples = 1
+	// Several pings, the middle one reported, exactly as the benchmark does:
+	// the first ping on a new link carries the cost of setting it up, which
+	// real traffic never sees again. Each ping is announced on its own, which
+	// is also what an older peer expects, so a mixed-version pair still works.
+	var rttsMS []float64
+	const numSamples = 5
 	for i := 0; i < numSamples; i++ {
-		var ts [8]byte
+		var req [9]byte
+		req[0] = 0x01
 		now := time.Now()
-		binary.BigEndian.PutUint64(ts[:], uint64(now.UnixNano()))
+		binary.BigEndian.PutUint64(req[1:], uint64(now.UnixNano()))
 		_ = c.SetWriteDeadline(time.Now().Add(10 * time.Second))
-		if _, err := c.Write(ts[:]); err != nil {
+		if _, err := c.Write(req[:]); err != nil {
+			if len(rttsMS) > 0 {
+				break
+			}
 			return fmt.Errorf("ping send: %w", err)
 		}
 		_ = c.SetReadDeadline(time.Now().Add(10 * time.Second))
 		var echo [8]byte
 		if _, err := io.ReadFull(c, echo[:]); err != nil {
+			if len(rttsMS) > 0 {
+				break
+			}
 			return fmt.Errorf("ping reply: %w", err)
 		}
-		rtt := time.Since(now)
-		rtts = append(rtts, rtt)
+		rttsMS = append(rttsMS, float64(time.Since(now))/float64(time.Millisecond))
 	}
 	_ = c.SetDeadline(time.Now().Add(120 * time.Second))
 
-	avgRTT := rtts[0]
-	jitterMS := 0.0
+	rttMS, jitterMS := probeRTTStats(rttsMS)
+	avgRTT := time.Duration(rttMS * float64(time.Millisecond))
 
 	// If the underlying connection is KCP, fetch kernel transport statistics
 	type kcpStats interface {
@@ -408,6 +415,11 @@ func runSpeedtestClient(c net.Conn, cfg *Config, out io.Writer, sizeMB ...float6
 	fmt.Fprintf(out, " Download:    %.1f Mbps (%.2f MB/s)\n", dlMbps, dlMBps)
 	fmt.Fprintf(out, " Upload:      %.1f Mbps (%.2f MB/s)\n", ulMbps, ulMBps)
 	fmt.Fprintln(out, "========================================================")
+	if cfg != nil && cfg.Transport == TransportICMP {
+		fmt.Fprintln(out, " Note: ICMP links are timed on a short transfer on purpose (some")
+		fmt.Fprintln(out, " networks rate-limit ping traffic), so these speeds can read lower")
+		fmt.Fprintln(out, " than what real traffic gets.")
+	}
 	return nil
 }
 

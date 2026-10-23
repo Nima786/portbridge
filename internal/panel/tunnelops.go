@@ -1064,7 +1064,9 @@ func (p *Panel) fallbackCheck(ctx context.Context, id, name string) ([]agent.Che
 }
 
 func (p *Panel) speedtestTunnel(parent context.Context, t tunnelTarget) (string, string, error) {
-	ctx, cancel := context.WithTimeout(parent, 90*time.Second)
+	// A test can run for up to two minutes on a slow link (the longer timed
+	// transfers); 90 seconds cut it off and left no time to try the other half.
+	ctx, cancel := context.WithTimeout(parent, 160*time.Second)
 	defer cancel()
 
 	// Prefer running the speedtest from the panel's own server ("this") when it is

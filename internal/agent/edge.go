@@ -1935,7 +1935,8 @@ func CheckTunnel(confDir, name string) (TunnelCheckReport, error) {
 		case "blocked":
 			add("End-to-end data flow", "bad", "Blocked — connections open but data is dropped", ti.Live.PathNote)
 		default:
-			add("End-to-end data flow", "note", "Measuring...", "")
+			add("End-to-end data flow", "note", "Not measured yet",
+				"This half measures the data path in the background, and a reverse-mode relay only once real traffic has gone through. Run the speed test below to check it right now.")
 		}
 	} else if ti.Running {
 		add("Inter-server link", "warn", "Waiting for live telemetry from service", "")

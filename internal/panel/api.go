@@ -756,8 +756,8 @@ func (p *Panel) handleCheckTunnel(w http.ResponseWriter, r *http.Request, _ auth
 }
 
 func (p *Panel) handleSpeedtestTunnel(w http.ResponseWriter, r *http.Request, _ authed) {
-	// Up to 90 seconds are spent on the test itself (see speedtestTunnel).
-	agent.ExtendDeadlines(w, 3*time.Minute)
+	// Up to 160 seconds are spent on the test itself (see speedtestTunnel).
+	agent.ExtendDeadlines(w, 4*time.Minute)
 	var t tunnelTarget
 	if !decodeJSON(w, r, &t) {
 		return

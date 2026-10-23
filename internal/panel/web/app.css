@@ -2248,3 +2248,6 @@ button.is-loading::before {
 }
 .explore-reach-group span.ok { color: var(--good, #1a7f4b); }
 .explore-reach-group span.bad { color: var(--bad, #b3261e); }
+
+/* A hint under the diagnostic columns spans the whole row. */
+.diag-grid > .diag-hint { grid-column: 1 / -1; }

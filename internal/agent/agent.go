@@ -871,6 +871,9 @@ func newAgentHandler(token, confDir string, allowUpdates func() bool) *http.Serv
 			writeJSONReply(w, http.StatusBadRequest, map[string]any{"ok": false, "error": "name required"})
 			return
 		}
+		// The test can run past the usual two-minute limit on a slow link (the
+		// longer timed transfers); without more time the answer would be lost.
+		extendDeadlines(w, 3*time.Minute)
 		out, err := tunnelSpeedtest(confDir, req.Name, req.SizeMB)
 		if err != nil {
 			writeJSONReply(w, http.StatusUnprocessableEntity, map[string]any{"ok": false, "error": err.Error(), "output": out})
