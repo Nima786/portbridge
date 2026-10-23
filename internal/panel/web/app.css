@@ -451,6 +451,15 @@ legend { padding: 0 .4rem; font-weight: 650; }
   padding: .25rem;
   border-radius: 10px;
   border: 1px solid var(--line);
+  max-width: 100%;
+  min-width: 0;
+  overflow-x: auto;
+  overflow-y: hidden;
+  -webkit-overflow-scrolling: touch;
+  scrollbar-width: none;
+}
+.tabs::-webkit-scrollbar {
+  display: none;
 }
 .tabs [role=tab] {
   background: transparent;
@@ -461,6 +470,8 @@ legend { padding: 0 .4rem; font-weight: 650; }
   color: var(--muted);
   font-weight: 600;
   box-shadow: none;
+  flex-shrink: 0;
+  white-space: nowrap;
 }
 .tabs [role=tab]:hover {
   color: var(--text);
@@ -2050,16 +2061,33 @@ button.btn-autoheal.is-on {
 }
 
 @media (max-width: 760px) {
-  .columns { grid-template-columns: 1fr; }
+  .columns, .grid2, .diag-grid { grid-template-columns: 1fr; }
+  .column, .card, .stat-pill { min-width: 0; }
   .row, .row2 { grid-template-columns: 1fr; }
   .choice-grid.cols-2, .choice-grid.cols-3, .choice-grid.cols-4 { grid-template-columns: 1fr; }
   .cf-filter-bar { grid-template-columns: 1fr; }
   .probe-cdn-row { grid-template-columns: 1fr; }
   .top-inner { padding: .55rem .85rem; gap: .5rem; }
-  .brand { gap: .45rem; font-size: 1.05rem; }
-  .top-right { gap: .38rem; margin-left: auto; }
-  .tabs { order: 3; width: 100%; justify-content: stretch; }
-  .tabs [role=tab] { flex: 1; justify-content: center; padding: .38rem .5rem; }
+  .brand { gap: .45rem; font-size: 1.05rem; min-width: 0; }
+  .top-right { gap: .38rem; margin-left: auto; flex-shrink: 0; }
+  .tabs {
+    order: 3;
+    width: 100%;
+    max-width: 100%;
+    min-width: 0;
+    justify-content: flex-start;
+    overflow-x: auto;
+    overflow-y: hidden;
+    -webkit-overflow-scrolling: touch;
+    scrollbar-width: none;
+  }
+  .tabs [role=tab] {
+    flex: 1 0 auto;
+    white-space: nowrap;
+    justify-content: center;
+    padding: .38rem .65rem;
+    font-size: .86rem;
+  }
   main#main { padding: .9rem .85rem 3.5rem; }
   .summary-strip { grid-template-columns: repeat(2, 1fr); gap: .55rem; margin-bottom: 1.1rem; }
   .stat-pill { padding: .65rem .8rem; }

@@ -288,7 +288,11 @@
       const view = $('view-' + t);
       if (view) view.hidden = !on;
     }
-    if (focus && $('tab-' + name)) $('tab-' + name).focus();
+    const activeTab = $('tab-' + name);
+    if (activeTab && typeof activeTab.scrollIntoView === 'function') {
+      activeTab.scrollIntoView({ block: 'nearest', inline: 'nearest' });
+    }
+    if (focus && activeTab) activeTab.focus();
     refresh();
   }
 
