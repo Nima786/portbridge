@@ -347,7 +347,9 @@ type ExplorePortSpec struct {
 // answer came back), "stalled" (the connection opened but no answer came, which
 // is how a filter that cuts a connection after it starts looks), "open" (it
 // opened, and nothing more could be tested because something else uses the
-// port), "blocked" or "untested". For UDP: "data", "blocked" or "untested".
+// port), "closed" (the server answered that nothing listens there, so the route
+// is open), "blocked" (no answer at all) or "untested". For UDP: "data",
+// "blocked" or "untested".
 type ExplorePortResult struct {
 	Port  int    `json:"port"`
 	TCP   string `json:"tcp"`
@@ -399,6 +401,12 @@ func exploreTCP(ctx context.Context, addr, responder, token string) (string, int
 	d := net.Dialer{Timeout: 3 * time.Second}
 	c, err := d.DialContext(ctx, "tcp4", addr)
 	if err != nil {
+		// A refusal means the packet got there and the server answered that
+		// nothing listens: the route is open, the port just is not used. That is
+		// not the same as a connection that never gets an answer.
+		if strings.Contains(strings.ToLower(err.Error()), "refused") {
+			return "closed", 0
+		}
 		return "blocked", 0
 	}
 	defer c.Close()

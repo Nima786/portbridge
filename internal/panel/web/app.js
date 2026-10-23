@@ -2932,6 +2932,7 @@
     open: ['warn', 'opens'],
     stalled: ['bad', '✗ cut after connect'],
     blocked: ['bad', '✗ blocked'],
+    closed: ['none', 'no listener'],
     untested: ['none', '—'],
   };
 

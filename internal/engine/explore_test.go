@@ -86,8 +86,10 @@ func TestExploreFindsWhatGetsAcrossAndWhatDoesNot(t *testing.T) {
 	if got[busy].TCP != "open" {
 		t.Errorf("busy port: tcp = %q, want open (a connection only)", got[busy].TCP)
 	}
-	if got[closed].TCP != "blocked" || got[closed].UDP != "blocked" {
-		t.Errorf("closed port: %+v, want blocked both ways", got[closed])
+	// Nothing answers there: refused over TCP (the route is open, the port is
+	// just not used), no answer over UDP.
+	if got[closed].TCP != "closed" || got[closed].UDP != "blocked" {
+		t.Errorf("unused port: %+v, want closed over tcp and blocked over udp", got[closed])
 	}
 
 	// A TLS handshake gets through on the same port, whatever name it carries.

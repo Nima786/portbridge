@@ -148,7 +148,7 @@ func joinPorts(ports []int) string {
 // summariseExplore turns the raw findings into plain notes, and picks the port
 // and name worth using.
 func summariseExplore(rep *exploreReport) {
-	var tcpData, tcpOpen, tcpStalled, tcpBlocked, udpData, udpBlocked []int
+	var tcpData, tcpOpen, tcpStalled, tcpBlocked, tcpClosed, udpData, udpBlocked []int
 	for _, r := range rep.Ports {
 		switch r.TCP {
 		case "data":
@@ -159,6 +159,8 @@ func summariseExplore(rep *exploreReport) {
 			tcpStalled = append(tcpStalled, r.Port)
 		case "blocked":
 			tcpBlocked = append(tcpBlocked, r.Port)
+		case "closed":
+			tcpClosed = append(tcpClosed, r.Port)
 		}
 		switch r.UDP {
 		case "data":
@@ -190,7 +192,10 @@ func summariseExplore(rep *exploreReport) {
 		add("warn", "On ports %s the connection opens but no data comes back. That is how a filter that cuts a connection after it starts looks; avoid these ports.", joinPorts(tcpStalled))
 	}
 	if len(tcpBlocked) > 0 && len(tcpData) > 0 {
-		add("note", "Blocked outright: %s.", joinPorts(tcpBlocked))
+		add("note", "Blocked outright (no answer at all): %s.", joinPorts(tcpBlocked))
+	}
+	if len(tcpClosed) > 0 {
+		add("note", "Ports %s reached the server, which answered that nothing listens there. The route is open; the port is simply not in use or is held by the server's own firewall.", joinPorts(tcpClosed))
 	}
 
 	// UDP
@@ -206,7 +211,7 @@ func summariseExplore(rep *exploreReport) {
 	case "data":
 		add("good", "ICMP (ping) works: the ICMP link can be used (round trip %d ms).", rep.ICMPMS)
 	case "blocked":
-		add("warn", "Pings get no answer, so the ICMP link will not work on this route.")
+		add("warn", "Pings get no answer, so the ICMP link will not work on this route. (If %s already runs an ICMP tunnel from %s this is expected: that tunnel hides the server's own ping replies to its peer.)", fn, rn)
 	default:
 		add("note", "ICMP could not be tested from %s.", rn)
 	}
