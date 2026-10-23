@@ -122,3 +122,30 @@ func pendingByte(c net.Conn) (byte, bool) {
 	}
 	return 0, false
 }
+
+// growSocketBuffers asks for a send and a receive buffer of n bytes on a socket
+// the tunnel opened for itself (a raw or UDP socket). The ordinary request is
+// capped by the system limit, about 208 KB on a server that has not been tuned,
+// and a packet-based link (KCP, ICMP, fake-TCP) loses packets whenever a burst
+// outgrows that. A program running as root may go past the limit, so that is
+// tried as well; without the right it quietly changes nothing.
+func growSocketBuffers(c any, n int) {
+	sc, ok := c.(syscall.Conn)
+	if !ok {
+		return
+	}
+	raw, err := sc.SyscallConn()
+	if err != nil {
+		return
+	}
+	_ = raw.Control(func(fd uintptr) {
+		_ = syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, syscallSO_RCVBUFFORCE, n)
+		_ = syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, syscallSO_SNDBUFFORCE, n)
+	})
+}
+
+// The "force" options are not in the standard syscall package.
+const (
+	syscallSO_SNDBUFFORCE = 0x20
+	syscallSO_RCVBUFFORCE = 0x21
+)

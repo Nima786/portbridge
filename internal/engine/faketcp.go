@@ -153,6 +153,7 @@ func newFakeTCPDialConn(addr string, cfg *Config) (*fakeTCPPacketConn, error) {
 	}
 	_ = ipConn.SetReadBuffer(4 * 1024 * 1024)
 	_ = ipConn.SetWriteBuffer(4 * 1024 * 1024)
+	growSocketBuffers(ipConn, 4*1024*1024)
 
 	lport := randomEphemeralPort()
 	initSeq := randomUint32()
@@ -202,6 +203,7 @@ func newFakeTCPListenConn(addr string, cfg *Config) (*fakeTCPPacketConn, error) 
 	}
 	_ = ipConn.SetReadBuffer(4 * 1024 * 1024)
 	_ = ipConn.SetWriteBuffer(4 * 1024 * 1024)
+	growSocketBuffers(ipConn, 4*1024*1024)
 
 	lport := uint16(laddr.Port)
 	cleanup := installFakeTCPRSTDrop(lport, false)

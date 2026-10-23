@@ -41,3 +41,7 @@ func socketAlive(c net.Conn) bool {
 // pendingByte is only meaningful on Linux, where socketAlive can see that a
 // byte is waiting. Elsewhere nothing is ever reported waiting.
 func pendingByte(net.Conn) (byte, bool) { return 0, false }
+
+// growSocketBuffers does nothing off Linux: the size past the system limit is a
+// Linux facility, and the ordinary request has already been made.
+func growSocketBuffers(any, int) {}

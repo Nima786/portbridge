@@ -121,6 +121,7 @@ func openRawICMPSocket(bindIP string) (*net.IPConn, error) {
 	}
 	_ = ipConn.SetReadBuffer(8 * 1024 * 1024)
 	_ = ipConn.SetWriteBuffer(8 * 1024 * 1024)
+	growSocketBuffers(ipConn, 8*1024*1024)
 	return ipConn, nil
 }
 

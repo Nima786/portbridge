@@ -242,6 +242,7 @@ func kcpDial(addr string, cfg *Config) (net.Conn, error) {
 		}
 		_ = uConn.SetReadBuffer(4 * 1024 * 1024)
 		_ = uConn.SetWriteBuffer(4 * 1024 * 1024)
+		growSocketBuffers(uConn, 4*1024*1024)
 		pConn, err := newSpoofPacketConn(uConn, cfg, raddr)
 		if err != nil {
 			_ = uConn.Close()
@@ -415,6 +416,7 @@ func kcpListen(addr string, cfg *Config) (net.Listener, error) {
 		}
 		_ = uConn.SetReadBuffer(4 * 1024 * 1024)
 		_ = uConn.SetWriteBuffer(4 * 1024 * 1024)
+		growSocketBuffers(uConn, 4*1024*1024)
 		var defPeer *net.UDPAddr
 		if ip := net.ParseIP(cfg.PeerIP); ip != nil && ip.To4() != nil {
 			defPeer = &net.UDPAddr{IP: ip.To4()}

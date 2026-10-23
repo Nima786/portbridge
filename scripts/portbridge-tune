@@ -49,6 +49,10 @@ cmd_status() {
     say "  receive buffer max : $(current net.core.rmem_max)"
     say "  open file limit    : $(current fs.file-max)"
     say "  fast open          : $(current net.ipv4.tcp_fastopen)"
+    say "  path MTU probing   : $(current net.ipv4.tcp_mtu_probing)"
+    if [ -e /proc/sys/net/netfilter/nf_conntrack_max ]; then
+        say "  tracked connections: $(current net.netfilter.nf_conntrack_max) at most"
+    fi
     if [ -f "$CONF" ]; then
         say "  tuned by PortBridge: ${GREEN}yes${R}"
     else
@@ -77,6 +81,16 @@ cmd_apply() {
         qd=fq
     fi
 
+    # The firewall's connection table, where there is one. A tunnel with many
+    # connections open at once (a pool, Split mode) can fill the default table,
+    # and once it is full the kernel silently drops new connections. The setting
+    # only exists while the tracking module is loaded, so it is written only
+    # then, and is never forced on a server that does not track connections.
+    local ct=""
+    if [ -e /proc/sys/net/netfilter/nf_conntrack_max ]; then
+        ct="net.netfilter.nf_conntrack_max = 1048576"
+    fi
+
     cat >"$CONF" <<EOF
 $MARK
 # Remove this file and reboot (or run: portbridge-tune undo) to go back.
@@ -89,10 +103,20 @@ net.core.default_qdisc = $qd
 
 # Allow big enough buffers to keep a long-distance link full. The defaults are
 # sized for short hops, which caps speed no matter how fast the line is.
-net.core.rmem_max = 16777216
-net.core.wmem_max = 16777216
-net.ipv4.tcp_rmem = 4096 87380 16777216
-net.ipv4.tcp_wmem = 4096 65536 16777216
+# The same limits cap the buffers of UDP and raw sockets, which the KCP, ICMP and
+# fake-TCP links use: on an untuned server the limit is about 208 KB, and a
+# burst bigger than that is simply dropped. 32 MB is memory the kernel only uses
+# when a link really is that fast and that far away.
+net.core.rmem_max = 33554432
+net.core.wmem_max = 33554432
+net.core.rmem_default = 1048576
+net.core.wmem_default = 1048576
+net.ipv4.tcp_rmem = 4096 87380 33554432
+net.ipv4.tcp_wmem = 4096 65536 33554432
+
+# If a router along the way drops large packets without saying so, a transfer
+# stalls for ever. With this on, the kernel notices and uses smaller packets.
+net.ipv4.tcp_mtu_probing = 1
 
 # Keep a healthy backlog so bursts of new users are not dropped.
 net.core.somaxconn = 8192
@@ -112,6 +136,7 @@ net.ipv4.tcp_slow_start_after_idle = 0
 
 # Plenty of file handles: each session uses two connections.
 fs.file-max = 2097152
+$ct
 EOF
 
     # Load the file itself: that reports on its own settings, where "--system"
