@@ -2,6 +2,7 @@ package agent
 
 import (
 	"bytes"
+	"context"
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/subtle"
@@ -1106,6 +1107,76 @@ func newAgentHandler(token, confDir string, allowUpdates func() bool) *http.Serv
 		writeJSONReply(w, http.StatusOK, map[string]any{"ok": true, "result": res})
 	})
 
+	// POST /api/explore/listen: open a temporary responder on a set of ports, for
+	// the deep scan run from the other server.
+	mux.HandleFunc("/api/explore/listen", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, `{"error":"method not allowed"}`, http.StatusMethodNotAllowed)
+			return
+		}
+		if !checkAgentAuth(r, token) {
+			http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
+			return
+		}
+		var req struct {
+			Ports []int  `json:"ports"`
+			Token string `json:"token"`
+		}
+		if err := json.NewDecoder(io.LimitReader(r.Body, 16*1024)).Decode(&req); err != nil || len(req.Token) < 8 || len(req.Token) > 64 {
+			writeJSONReply(w, http.StatusBadRequest, map[string]any{"ok": false, "error": "ports and a token are needed"})
+			return
+		}
+		if len(req.Ports) == 0 {
+			req.Ports = engine.DefaultExplorePorts
+		}
+		infos, err := startExploreResponder(req.Ports, req.Token)
+		if err != nil {
+			writeJSONReply(w, http.StatusUnprocessableEntity, map[string]any{"ok": false, "error": err.Error()})
+			return
+		}
+		writeJSONReply(w, http.StatusOK, map[string]any{"ok": true, "ports": infos})
+	})
+
+	// POST /api/explore/stop: close the deep scan's responder early.
+	mux.HandleFunc("/api/explore/stop", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, `{"error":"method not allowed"}`, http.StatusMethodNotAllowed)
+			return
+		}
+		if !checkAgentAuth(r, token) {
+			http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
+			return
+		}
+		stopExploreResponder()
+		writeJSONReply(w, http.StatusOK, map[string]any{"ok": true})
+	})
+
+	// POST /api/explore/run: the deep scan's checks, made from this server.
+	mux.HandleFunc("/api/explore/run", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, `{"error":"method not allowed"}`, http.StatusMethodNotAllowed)
+			return
+		}
+		if !checkAgentAuth(r, token) {
+			http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
+			return
+		}
+		var req engine.ExploreRequest
+		if err := json.NewDecoder(io.LimitReader(r.Body, 64*1024)).Decode(&req); err != nil || net.ParseIP(req.Host) == nil || req.Token == "" {
+			writeJSONReply(w, http.StatusBadRequest, map[string]any{"ok": false, "error": "a server address and a token are needed"})
+			return
+		}
+		if len(req.SNIs) > 60 {
+			req.SNIs = req.SNIs[:60]
+		}
+		if len(req.Ports) > 64 {
+			req.Ports = req.Ports[:64]
+		}
+		ctx, cancel := context.WithTimeout(r.Context(), 70*time.Second)
+		defer cancel()
+		writeJSONReply(w, http.StatusOK, map[string]any{"ok": true, "report": engine.RunExplore(ctx, req)})
+	})
+
 	// POST /api/callhome: register or update the panel callback URL(s) and fingerprint
 	// so this agent calls the panel on /hub/poll in the background without needing SSH.
 	mux.HandleFunc("/api/callhome", func(w http.ResponseWriter, r *http.Request) {
@@ -1792,6 +1863,39 @@ func registerProbeListener(pl *engine.ProbeListener) string {
 		stopProbeListener(id)
 	})
 	return id
+}
+
+// The deep scan's responder. Only one at a time; a new scan replaces the last,
+// and it closes by itself after exploreResponderTTL.
+var (
+	exploreMu        sync.Mutex
+	exploreResponder *engine.ExploreResponder
+)
+
+const exploreResponderTTL = 90 * time.Second
+
+func startExploreResponder(ports []int, token string) ([]engine.ExplorePortInfo, error) {
+	exploreMu.Lock()
+	defer exploreMu.Unlock()
+	if exploreResponder != nil {
+		exploreResponder.Close()
+		exploreResponder = nil
+	}
+	r, infos, err := engine.StartExploreResponder(ports, token, exploreResponderTTL)
+	if err != nil {
+		return nil, err
+	}
+	exploreResponder = r
+	return infos, nil
+}
+
+func stopExploreResponder() {
+	exploreMu.Lock()
+	defer exploreMu.Unlock()
+	if exploreResponder != nil {
+		exploreResponder.Close()
+		exploreResponder = nil
+	}
 }
 
 func stopProbeListener(id string) {

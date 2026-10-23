@@ -68,6 +68,7 @@ func (p *Panel) routes() http.Handler {
 	mux.HandleFunc("POST /api/tunnels/speedtest", p.withAuth(p.handleSpeedtestTunnel))
 	mux.HandleFunc("POST /api/tunnels/test-outbound", p.withAuth(p.handleTestOutboundTunnel))
 	mux.HandleFunc("POST /api/tunnels/probe", p.withAuth(p.handleProbeTunnel))
+	mux.HandleFunc("POST /api/tunnels/explore", p.withAuth(p.handleExplore))
 	mux.HandleFunc("POST /api/probe/sni-scan", p.withAuth(p.handleProbeSNIScan))
 	mux.HandleFunc("POST /api/probe/sni-test", p.withAuth(p.handleProbeSNITest))
 	mux.HandleFunc("POST /api/probe/spoof-test", p.withAuth(p.handleProbeSpoofTest))
@@ -866,6 +867,41 @@ func (p *Panel) handleProbeTunnel(w http.ResponseWriter, r *http.Request, _ auth
 		}
 		writeJSON(w, http.StatusOK, rep)
 	}
+}
+
+// handleExplore runs the deep scan: what the network between a relay and a
+// foreign server actually lets through.
+func (p *Panel) handleExplore(w http.ResponseWriter, r *http.Request, _ authed) {
+	agent.ExtendDeadlines(w, 3*time.Minute)
+	var req struct {
+		Relay   string   `json:"relay"`
+		Foreign string   `json:"foreign"`
+		SNIs    []string `json:"snis"`
+	}
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	var snis []string
+	for _, s := range req.SNIs {
+		s = strings.ToLower(strings.TrimSpace(s))
+		if s == "" {
+			continue
+		}
+		if !engine.HostnameRe.MatchString(s) {
+			writeErr(w, http.StatusBadRequest, fmt.Sprintf("%q is not a domain name.", s))
+			return
+		}
+		snis = append(snis, s)
+		if len(snis) >= 40 {
+			break
+		}
+	}
+	rep, err := p.exploreNetwork(r.Context(), strings.TrimSpace(req.Relay), strings.TrimSpace(req.Foreign), snis)
+	if err != nil {
+		writeErr(w, http.StatusUnprocessableEntity, capitalise(plainAgentError(err))+".")
+		return
+	}
+	writeJSON(w, http.StatusOK, rep)
 }
 
 func (p *Panel) handleProbeSNIScan(w http.ResponseWriter, r *http.Request, _ authed) {

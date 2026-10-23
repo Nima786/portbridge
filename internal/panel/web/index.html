@@ -575,6 +575,26 @@
           </div>
           <p id="tn-probe-error" class="error" role="alert"></p>
           <div id="tn-probe-results" class="probe-results" hidden></div>
+          <p id="tn-explore-hint" class="explore-hint" hidden></p>
+        </div>
+
+        <!-- Deep Scan: what the network lets through (optional) -->
+        <div id="tn-explore-box" class="probe-box explore-box">
+          <div class="probe-head">
+            <div>
+              <strong>Deep Scan: what can get through</strong>
+              <p class="muted small">Optional. From the Relay, checks which ports, protocols and domain names reach the Foreign server, and which well-known providers the Relay can connect to at all. Takes about a minute. Use it when the search above finds little that works, or just to see what a filter allows.</p>
+            </div>
+            <button type="button" id="tn-explore-btn">Run Deep Scan</button>
+          </div>
+          <div id="tn-explore-live" class="probe-live-box" hidden>
+            <div class="probe-live-head">
+              <span class="probe-spinner" aria-hidden="true"></span>
+              <span id="tn-explore-status" role="status" aria-live="polite">Scanning…</span>
+            </div>
+          </div>
+          <p id="tn-explore-error" class="error" role="alert"></p>
+          <div id="tn-explore-results" class="explore-results" hidden></div>
         </div>
       </section>
 

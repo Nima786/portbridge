@@ -2157,3 +2157,66 @@ button.is-loading::before {
 .mig-notes-list li + li {
   margin-top: .35rem;
 }
+
+/* ------------------------------------------------------- Deep Scan */
+.explore-results {
+  margin-top: .85rem;
+  display: grid;
+  gap: .75rem;
+}
+.explore-hint {
+  margin: .65rem 0 0;
+  padding: .55rem .8rem;
+  border-radius: var(--radius-sm);
+  background: var(--accent-soft);
+  border: 1px solid var(--accent-border);
+  font-size: .86rem;
+}
+.explore-hint button {
+  margin-left: .5rem;
+}
+.explore-results h4 {
+  margin: 0 0 .35rem;
+  font-size: .88rem;
+}
+.explore-ports {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(10.5rem, 1fr));
+  gap: .4rem;
+}
+.explore-port {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: .3rem .5rem;
+  padding: .35rem .55rem;
+  border: 1px solid var(--accent-border);
+  border-radius: var(--radius-sm);
+  background: var(--panel);
+  font-size: .8rem;
+}
+.explore-port strong {
+  font-family: ui-monospace, "Cascadia Code", Consolas, monospace;
+  min-width: 3.1rem;
+}
+.explore-port .ok { color: var(--good, #1a7f4b); font-weight: 650; }
+.explore-port .bad { color: var(--bad, #b3261e); }
+.explore-port .warn { color: var(--warn, #9a6700); }
+.explore-port .none { color: var(--muted, #6b7280); }
+.explore-port button {
+  margin-left: auto;
+  padding: .1rem .45rem;
+  font-size: .72rem;
+}
+.explore-reach {
+  font-size: .82rem;
+}
+.explore-reach summary {
+  cursor: pointer;
+  font-weight: 650;
+}
+.explore-reach-group {
+  margin: .4rem 0 0;
+}
+.explore-reach-group span.ok { color: var(--good, #1a7f4b); }
+.explore-reach-group span.bad { color: var(--bad, #b3261e); }

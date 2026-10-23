@@ -2925,6 +2925,152 @@
     });
   }
 
+  // ------------------------------------------------------------ deep scan
+
+  const exploreStates = {
+    data: ['ok', '✓ works'],
+    open: ['warn', 'opens'],
+    stalled: ['bad', '✗ cut after connect'],
+    blocked: ['bad', '✗ blocked'],
+    untested: ['none', '—'],
+  };
+
+  function shortText(s, n) {
+    s = String(s || '');
+    return s.length > n ? s.slice(0, n - 1) + '…' : s;
+  }
+
+  function renderExplore(rep) {
+    const box = $('tn-explore-results');
+    if (!box) return;
+    box.hidden = false;
+    const kids = [];
+
+    kids.push(h('ul', { class: 'ports-result', 'aria-live': 'polite' },
+      ...(rep.notes || []).map((n) => h('li', { class: n.level === 'note' ? '' : n.level }, n.text))));
+
+    const ports = (rep.ports || []).map((p) => {
+      const t = exploreStates[p.tcp] || exploreStates.untested;
+      const u = exploreStates[p.udp] || exploreStates.untested;
+      const useBtn = p.tcp === 'data'
+        ? h('button', {
+            type: 'button',
+            class: 'use-port-btn',
+            onclick: () => {
+              if ($('tn-linkport')) $('tn-linkport').value = String(p.port);
+              setStatus(`Tunnel bridge port set to ${p.port}.`);
+            }
+          }, 'Use')
+        : null;
+      return h('div', { class: 'explore-port' },
+        h('strong', null, String(p.port)),
+        h('span', { class: t[0], title: 'TCP' }, 'TCP ' + t[1]),
+        h('span', { class: u[0], title: 'UDP' }, 'UDP ' + u[1]),
+        useBtn);
+    });
+    if (ports.length) {
+      kids.push(h('div', null,
+        h('h4', null, `Ports to ${rep.foreign_name || 'the Foreign server'}`),
+        h('div', { class: 'explore-ports' }, ...ports)));
+    }
+
+    if ((rep.names || []).length) {
+      const items = rep.names.map((n) => h('li', { class: n.reachable ? 'good' : 'bad' },
+        h('strong', { class: 'mono' }, n.sni),
+        n.reachable
+          ? ` — ✓ got through · ${Math.round(n.rtt_ms || 0)} ms`
+          : ` — blocked (${shortText(n.error || 'cut', 60)})`,
+        n.reachable
+          ? h('button', {
+              type: 'button',
+              class: 'use-port-btn',
+              onclick: () => {
+                if ($('tn-claim')) $('tn-claim').value = n.sni;
+                if ($('tn-spoofsni')) $('tn-spoofsni').value = n.sni;
+                setStatus(`Using "${n.sni}" as the name the link claims.`);
+              }
+            }, 'Use')
+          : null));
+      kids.push(h('div', null,
+        h('h4', null, `Domain names (tested on port ${rep.names_port})`),
+        h('ul', { class: 'ports-result' }, ...items)));
+    }
+
+    if ((rep.reach || []).length) {
+      const order = [];
+      const groups = {};
+      for (const r of rep.reach) {
+        if (!groups[r.group]) {
+          groups[r.group] = [];
+          order.push(r.group);
+        }
+        groups[r.group].push(r);
+      }
+      const total = rep.reach.length;
+      const okCount = rep.reach.filter((r) => r.ok).length;
+      kids.push(h('details', { class: 'explore-reach' },
+        h('summary', null, `Well-known providers reachable from ${rep.relay_name || 'the Relay'}: ${okCount} of ${total}`),
+        ...order.map((g) => h('p', { class: 'explore-reach-group' },
+          h('strong', null, g + ': '),
+          ...groups[g].map((r, i) => h('span', {
+            class: r.ok ? 'ok' : 'bad',
+            title: r.ok ? `${r.ms} ms` : (r.error || ''),
+          }, (i ? ' · ' : '') + (r.ok ? '✓ ' : '✗ ') + r.name))))));
+    }
+    box.replaceChildren(...kids);
+  }
+
+  async function runDeepScan() {
+    const btn = $('tn-explore-btn');
+    const err = $('tn-explore-error');
+    const live = $('tn-explore-live');
+    const res = $('tn-explore-results');
+    if (!btn) return;
+    const relay = $('tn-relay').value;
+    const foreign = $('tn-foreign').value;
+    err.textContent = '';
+    res.hidden = true;
+    res.replaceChildren();
+    if (!relay || !foreign) {
+      err.textContent = 'Select both a Relay (Iran) server and a Foreign server first.';
+      return;
+    }
+    btn.disabled = true;
+    btn.textContent = 'Scanning…';
+    live.hidden = false;
+    $('tn-explore-status').textContent = 'Checking what reaches the Foreign server from the Relay: ports, protocols, domain names and well-known providers. This takes about a minute.';
+    if (live.scrollIntoView) live.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+    try {
+      const rep = await api('POST', '/api/tunnels/explore', { relay, foreign });
+      live.hidden = true;
+      renderExplore(rep);
+    } catch (e) {
+      live.hidden = true;
+      err.textContent = e.message;
+    } finally {
+      btn.disabled = false;
+      btn.textContent = 'Run Deep Scan';
+    }
+  }
+
+  if ($('tn-explore-btn')) $('tn-explore-btn').addEventListener('click', runDeepScan);
+
+  // After the normal search, a short pointer to the deep scan when little worked.
+  function showExploreHint(rep) {
+    const el = $('tn-explore-hint');
+    if (!el) return;
+    const ok = (rep.results || []).filter((r) => r.status === 'ok').length;
+    if (ok > 2) {
+      el.hidden = true;
+      return;
+    }
+    el.replaceChildren(
+      (ok === 0 ? 'Nothing worked in the search above. ' : 'Only a few modes worked. ') +
+      'A deep scan can show what this route does let through.',
+      h('button', { type: 'button', onclick: runDeepScan }, 'Run Deep Scan'));
+    el.hidden = false;
+  }
+
   // ----------------------------------------- smart route & transport probe
 
   async function populateProbeCFPick() {
@@ -3132,6 +3278,7 @@
       err.textContent = '';
       resBox.hidden = true;
       resBox.replaceChildren();
+      if ($('tn-explore-hint')) $('tn-explore-hint').hidden = true;
       btn.disabled = true;
       btn.textContent = 'Starting…';
       setProbeProgress('Preparing temporary benchmark listeners on both servers…', 4);
@@ -3202,6 +3349,7 @@
         sess = null;
         if (live) live.hidden = true;
         renderProbeResults(finalRep, false, -1);
+        showExploreHint(finalRep);
       } catch (e) {
         if (live) live.hidden = true;
         err.textContent = e.message;
