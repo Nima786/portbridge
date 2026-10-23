@@ -1863,7 +1863,17 @@
     row('Managed by PortBridge', tunedByPB ? 'Yes (/etc/sysctl.d/99-portbridge-tuning.conf)' : 'No');
     $('tune-facts').replaceChildren(...rows);
 
-    $('tune-enable').hidden = !!info.bbr_active && tunedByPB;
+    // A server tuned by an older release has smaller buffer limits than the
+    // current tuning sets; it is offered the update rather than nothing.
+    const upToDate = !!info.bbr_active && tunedByPB && Number(info.rmem_max) >= 33554432 && Number(info.wmem_max) >= 33554432;
+    if (tunedByPB && !upToDate) {
+      banner.className = 'notice update';
+      banner.replaceChildren(
+        h('strong', null, 'A newer tuning is available. '),
+        h('span', null, 'This server was tuned by an older release. Updating raises the buffer limits (helps the UDP-based links), turns on path MTU probing and enlarges the connection table.'));
+    }
+    $('tune-enable').textContent = tunedByPB ? 'Update Tuning' : 'Enable BBR Tuning';
+    $('tune-enable').hidden = upToDate;
     $('tune-disable').hidden = !tunedByPB;
   }
 
