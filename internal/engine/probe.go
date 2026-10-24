@@ -784,7 +784,7 @@ func probeOneSpec(parentCtx context.Context, spec ProbeCandidateSpec, secret []b
 	}
 
 	// Attempt 1: Full handshake + ping samples + download/upload burst
-	hs1, rtts, dlMbps, ulMbps, partial1, err1 := runSingleProbeAttempt(parentCtx, cfg, routes, secret, pings1, burst1)
+	hs1, rtts1, dlMbps, ulMbps, partial1, err1 := runSingleProbeAttempt(parentCtx, cfg, routes, secret, pings1, burst1)
 	if err1 != nil {
 		res.Error = simplifyProbeErr(err1)
 		res.Summary = "Blocked / Unreachable — " + res.Error
@@ -793,6 +793,7 @@ func probeOneSpec(parentCtx context.Context, spec ProbeCandidateSpec, secret []b
 	res.Successes++
 
 	var partial2 bool
+	var rtts2 []float64
 	if partial1 {
 		// Handshake and initial ping succeeded, but the sustained burst was cut off
 		// mid-stream by a DPI packet-count filter. Skip Attempt 2 to save time.
@@ -801,11 +802,11 @@ func probeOneSpec(parentCtx context.Context, spec ProbeCandidateSpec, secret []b
 		res.Error = "connected, then frozen mid-stream by ISP/DPI filter"
 	} else {
 		// Attempt 2: Repeat connection check + pings + 32 KB burst to confirm stability & jitter
-		hs2, rtts2, _, _, p2, err2 := runSingleProbeAttempt(parentCtx, cfg, routes, secret, pings2, burst2)
+		hs2, r2, _, _, p2, err2 := runSingleProbeAttempt(parentCtx, cfg, routes, secret, pings2, burst2)
 		partial2 = p2
 		if err2 == nil {
 			res.Successes++
-			rtts = append(rtts, rtts2...)
+			rtts2 = r2
 			res.HandshakeMS = round2((hs1 + hs2) / 2.0)
 			if partial2 {
 				res.Error = "connected, then frozen mid-stream by ISP/DPI filter"
@@ -816,7 +817,7 @@ func probeOneSpec(parentCtx context.Context, spec ProbeCandidateSpec, secret []b
 		}
 	}
 
-	rttMS, jitterMS := probeRTTStats(rtts)
+	rttMS, jitterMS := probeRTTStatsAttempts(rtts1, rtts2)
 	res.RTTMS = round2(rttMS)
 	res.JitterMS = round2(jitterMS)
 
@@ -894,9 +895,23 @@ func runSingleProbeAttempt(parentCtx context.Context, cfg *Config, routes *route
 	}
 	hsMS = float64(time.Since(t0)) / float64(time.Millisecond)
 
-	// Ping samples (use 2.0s deadline on first ping so dead UDP/KCP or DPI-dropped streams fail fast)
+	// Ping samples (use 2.0s deadline on first ping so dead UDP/KCP or DPI-dropped streams fail fast).
+	// Each per-ping deadline also overrides the one the attempt's context set
+	// on expiry, so the loop watches the time itself: once at least two
+	// samples are in and too little is left for the transfer check, it stops
+	// pinging rather than letting a slow but healthy link (many pings on a
+	// high-latency path in Gaming mode) run out the clock and be reported as
+	// frozen mid-stream.
+	attemptDeadline, hasDeadline := ctx.Deadline()
 	for i := 0; i < pings; i++ {
-		_ = c.SetDeadline(time.Now().Add(2000 * time.Millisecond))
+		if hasDeadline && len(rtts) >= 2 && time.Until(attemptDeadline) < probePingReserve {
+			break
+		}
+		pingDeadline := time.Now().Add(2000 * time.Millisecond)
+		if hasDeadline && attemptDeadline.Before(pingDeadline) {
+			pingDeadline = attemptDeadline
+		}
+		_ = c.SetDeadline(pingDeadline)
 		pStart := time.Now()
 		var req [9]byte
 		req[0] = 0x01
@@ -1155,6 +1170,64 @@ func probeRTTStats(rtts []float64) (rtt, jitter float64) {
 			sum += math.Abs(steady[i] - steady[i-1])
 		}
 		jitter = sum / float64(len(steady)-1)
+	}
+	return rtt, jitter
+}
+
+// probePingReserve is the time an attempt keeps back from its ping samples
+// for the transfer check that follows them.
+const probePingReserve = 2500 * time.Millisecond
+
+// probeRTTStatsAttempts gives the round trip time and jitter from the ping
+// samples of several attempts, each on its own fresh connection. Every
+// attempt's first ping pays for setting its link up (hundreds of milliseconds
+// on KCP, FakeTCP and ICMP), so it is left out of each attempt, not only the
+// first one; and jitter is the change between consecutive pings within one
+// connection, never the jump from the last ping of one attempt to the set-up
+// ping of the next, which no game ever sees. Run together, those two inflated
+// a healthy KCP link's jitter to tens of milliseconds.
+func probeRTTStatsAttempts(attempts ...[]float64) (rtt, jitter float64) {
+	var all, steady []float64
+	var diffSum float64
+	var diffs int
+	for _, a := range attempts {
+		all = append(all, a...)
+		s := a
+		if len(a) >= 2 {
+			s = a[1:]
+		}
+		steady = append(steady, s...)
+		for i := 1; i < len(s); i++ {
+			diffSum += math.Abs(s[i] - s[i-1])
+			diffs++
+		}
+	}
+	if len(all) == 0 {
+		return 0, 0
+	}
+	base := steady
+	if len(base) < 3 {
+		base = all
+	}
+	sorted := append([]float64(nil), base...)
+	sort.Float64s(sorted)
+	if n := len(sorted); n%2 == 1 {
+		rtt = sorted[n/2]
+	} else {
+		rtt = (sorted[n/2-1] + sorted[n/2]) / 2
+	}
+	if diffs == 0 {
+		// Too few samples once the set-up pings are left out: fall back to
+		// every change within each attempt.
+		for _, a := range attempts {
+			for i := 1; i < len(a); i++ {
+				diffSum += math.Abs(a[i] - a[i-1])
+				diffs++
+			}
+		}
+	}
+	if diffs > 0 {
+		jitter = diffSum / float64(diffs)
 	}
 	return rtt, jitter
 }
@@ -1494,23 +1567,34 @@ func DecodeProbeCode(code string) (ipv4, ipv6 string, port int, secret []byte, e
 func FormatProbeReport(rep *ProbeBenchmarkReport) string {
 	var b strings.Builder
 	fmt.Fprintln(&b, "\n================ PortBridge Route & Transport Benchmark ================")
-	fmt.Fprintf(&b, " %-42s  %-9s  %-8s  %-10s  %s\n", "TRANSPORT MODE", "STATUS", "PING", "SPEED", "SCORE")
-	fmt.Fprintln(&b, " -----------------------------------------------------------------------")
+	fmt.Fprintf(&b, " %-42s  %-9s  %-8s  %-8s  %-10s  %s\n", "TRANSPORT MODE", "STATUS", "PING", "JITTER", "SPEED", "SCORE")
+	fmt.Fprintln(&b, " ---------------------------------------------------------------------------------")
 	for _, r := range rep.Results {
 		st := strings.ToUpper(r.Status)
 		ping := "—"
+		jit := "—"
 		speed := "—"
 		if r.Successes > 0 {
 			ping = fmt.Sprintf("%.0f ms", r.RTTMS)
+			jit = fmt.Sprintf("±%.1f", r.JitterMS)
 			speed = fmt.Sprintf("%.1f Mbps", r.AvgMbps)
 		}
-		fmt.Fprintf(&b, " %-42s  %-9s  %-8s  %-10s  %3d/100\n",
-			r.Label, st, ping, speed, r.Score)
+		fmt.Fprintf(&b, " %-42s  %-9s  %-8s  %-8s  %-10s  %3d/100\n",
+			r.Label, st, ping, jit, speed, r.Score)
 	}
-	fmt.Fprintln(&b, "========================================================================")
+	fmt.Fprintln(&b, "==================================================================================")
+	for _, r := range rep.Results {
+		if r.Status != "ok" && r.Error != "" {
+			fmt.Fprintf(&b, " ✖ %s: %s\n", r.Label, r.Error)
+		}
+	}
 	if rep.Recommended != nil {
 		rec := rep.Recommended
-		fmt.Fprintf(&b, "\n★ Recommended Configuration (%d/100):\n", rec.Score)
+		if rec.Gaming {
+			fmt.Fprintf(&b, "\n★ Best for Gaming (%d/100):\n", rec.Score)
+		} else {
+			fmt.Fprintf(&b, "\n★ Recommended Configuration (%d/100):\n", rec.Score)
+		}
 		fmt.Fprintf(&b, "  • Mode:      %s\n", rec.Mode)
 		fmt.Fprintf(&b, "  • Transport: %s (%s)\n", rec.Label, rec.Link)
 		if rec.Domain != "" {
@@ -1562,6 +1646,7 @@ func CmdProbe(args []string) {
 	fs := flag.NewFlagSet("probe", flag.ExitOnError)
 	cdn := fs.String("cdn", "", "Optional Cloudflare/CDN subdomain pointed at the listener server")
 	mode := fs.String("mode", "direct", "Direction label for the report (direct or reverse)")
+	gaming := fs.Bool("gaming", false, "Rank for gaming: lowest ping and jitter, with a light 64 KB transfer check instead of a bulk speed test")
 	var codeArg string
 	var flagArgs []string
 	for _, a := range args {
@@ -1578,7 +1663,7 @@ func CmdProbe(args []string) {
 	if codeArg == "" {
 		fmt.Fprintln(os.Stderr, "Usage:")
 		fmt.Fprintln(os.Stderr, "  1. On Server A: portbridge probe listen")
-		fmt.Fprintln(os.Stderr, "  2. On Server B: portbridge probe [-cdn sub.domain.com] <PBPROBE1:...>")
+		fmt.Fprintln(os.Stderr, "  2. On Server B: portbridge probe [-gaming] [-cdn sub.domain.com] <PBPROBE1:...>")
 		os.Exit(2)
 	}
 
@@ -1589,8 +1674,17 @@ func CmdProbe(args []string) {
 	}
 
 	specs := BuildProbeCandidates(*mode, ipv4, ipv6, port, *cdn)
-	fmt.Printf("🔍 Benchmarking %d transport modes against %s:%d...\n", len(specs), ipv4, port)
-	results := RunProbeDialer(context.Background(), specs, secret, 384*1024)
+	burst := 384 * 1024
+	if *gaming {
+		burst = 64 * 1024
+		for i := range specs {
+			specs[i].Gaming = true
+		}
+		fmt.Printf("🎮 Gaming benchmark: %d transport modes against %s:%d (lowest ping & jitter)...\n", len(specs), ipv4, port)
+	} else {
+		fmt.Printf("🔍 Benchmarking %d transport modes against %s:%d...\n", len(specs), ipv4, port)
+	}
+	results := RunProbeDialer(context.Background(), specs, secret, burst)
 	rep := FinalizeProbeReport(results, *cdn)
 	fmt.Print(FormatProbeReport(rep))
 }

@@ -25,6 +25,39 @@ func TestProbeRTTIgnoresTheSetUpCostOfTheFirstPing(t *testing.T) {
 	}
 }
 
+// Each attempt opens a fresh link whose first ping pays for setting it up.
+// Only leaving out the very first sample, and measuring the jump from one
+// attempt's last ping to the next attempt's set-up ping, made a steady KCP
+// link (40 ms, ±1 ms) look like it had ~70 ms of jitter, which sank it in
+// the Gaming score.
+func TestProbeRTTAttemptsLeaveOutEveryAttemptsSetUpPing(t *testing.T) {
+	a1 := []float64{864, 40, 41, 40, 41, 40, 41, 40, 41, 40, 41, 40}
+	a2 := []float64{700, 41, 40, 41, 40, 41, 40, 41}
+	rtt, jitter := probeRTTStatsAttempts(a1, a2)
+	if rtt < 40 || rtt > 41 {
+		t.Fatalf("rtt = %.1f, want about 40", rtt)
+	}
+	if jitter > 1.5 {
+		t.Fatalf("jitter = %.1f, the set-up pings and the gap between attempts must not count", jitter)
+	}
+	if _, old := probeRTTStats(append(append([]float64(nil), a1...), a2...)); old < 30 {
+		t.Fatalf("the single-list stats gave jitter %.1f; this test no longer shows the problem", old)
+	}
+
+	// The General mode shape: 3 pings, then 2.
+	rtt, jitter = probeRTTStatsAttempts([]float64{500, 90, 92}, []float64{450, 91})
+	if rtt < 90 || rtt > 92 || jitter > 3 {
+		t.Fatalf("3+2 samples gave rtt %.1f jitter %.1f, want about 91 and small", rtt, jitter)
+	}
+	// Too few samples to leave any out still gives an answer.
+	if r, j := probeRTTStatsAttempts([]float64{50, 70}, nil); r != 60 || j != 20 {
+		t.Fatalf("two samples gave %v %v, want 60 20", r, j)
+	}
+	if r, j := probeRTTStatsAttempts(nil, nil); r != 0 || j != 0 {
+		t.Fatalf("no samples gave %v %v", r, j)
+	}
+}
+
 // A transfer that was over in a blink says little; one longer transfer, sized
 // from the speed just seen, is what is reported.
 func TestMeasureTransferTimesALongerOneWhenTheFirstWasTooShort(t *testing.T) {

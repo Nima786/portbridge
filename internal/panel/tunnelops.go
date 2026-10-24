@@ -1385,7 +1385,13 @@ func (p *Panel) runProbeStep(parent context.Context, dialerID, secret string, sp
 	if err := p.checkProbeStep(dialerID, secret, spec); err != nil {
 		return engine.ProbeCandidateResult{}, err
 	}
-	dctx, dcancel := context.WithTimeout(parent, 15*time.Second)
+	// Two attempts of up to 6.5 s each (10 s each with Anti-Freeze rotation)
+	// must fit, or a slow but working candidate comes back as unreachable.
+	stepTimeout := 15 * time.Second
+	if spec.AntiFreeze {
+		stepTimeout = 24 * time.Second
+	}
+	dctx, dcancel := context.WithTimeout(parent, stepTimeout)
 	defer dcancel()
 	burstBytes := 0
 	if spec.Gaming {

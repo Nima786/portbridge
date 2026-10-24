@@ -3292,10 +3292,13 @@
     }
     const preset = radio('tn-load') || 'light';
     if (cand.gaming && ['plain', 'website', 'sni-spoof'].includes(cand.link)) {
+      // Gaming over a TCP link: one connection per user (no shared mux), so a
+      // big download on one stream never holds up another player's packets.
+      // The pool and connection limits come from the chosen load preset.
+      if (preset !== 'custom') applyCreateLoadPreset(preset);
       setRadio('tn-load', 'custom');
       sharingTouched = true;
       setRadio('tn-shared', 'one');
-      if ($('tn-pool-n')) $('tn-pool-n').value = '16';
     } else if (preset === 'custom') {
       sharingTouched = true;
       setRadio('tn-shared', cand.shared ? 'shared' : 'one');
@@ -3394,7 +3397,7 @@
       kids.push(h('div', { class: 'probe-rec-card' },
         h('div', { class: 'probe-rec-main' },
           h('div', { class: 'probe-rec-top' },
-            h('span', { class: 'probe-score-pill' }, `★ Recommended · ${rec.score}/100`),
+            h('span', { class: 'probe-score-pill' }, `${rec.gaming ? '★ Best for Gaming' : '★ Recommended'} · ${rec.score}/100`),
             h('strong', null, rec.label)),
           h('p', { class: 'probe-rec-summary' }, rec.summary || '')),
         h('button', {
