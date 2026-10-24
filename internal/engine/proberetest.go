@@ -39,7 +39,8 @@ func probeGroupKey(r *ProbeCandidateResult) string {
 }
 
 // ProbeRetestIDs picks the results worth testing a second time:
-//   - one that froze, or that was unstable;
+//   - one that froze, or that was unstable, while another link of its kind
+//     to the same address worked;
 //   - one that could not connect while another link of its kind to the same
 //     address could (so the address and port are fine);
 //   - one that worked but at a fifth or less of the speed of the others of
@@ -48,7 +49,10 @@ func probeGroupKey(r *ProbeCandidateResult) string {
 // Split rotation is slow by design and is not compared on speed, and a
 // Gaming run's speeds are not speeds, so neither is.
 func ProbeRetestIDs(results []ProbeCandidateResult) []string {
-	okSpeeds := map[string][]float64{}
+	// Each direction is compared on its own: a dip in one direction only
+	// is hidden in a blend of both.
+	okDown := map[string][]float64{}
+	okUp := map[string][]float64{}
 	okAny := map[string]bool{}
 	for i := range results {
 		r := &results[i]
@@ -58,8 +62,22 @@ func ProbeRetestIDs(results []ProbeCandidateResult) []string {
 		k := probeGroupKey(r)
 		okAny[k] = true
 		if !r.AntiFreeze && !r.Gaming {
-			okSpeeds[k] = append(okSpeeds[k], effectiveProbeMbps(r))
+			okDown[k] = append(okDown[k], r.DownMbps)
+			okUp[k] = append(okUp[k], r.UpMbps)
 		}
+	}
+	// others is the group's speeds with one copy of own left out.
+	others := func(all []float64, own float64) []float64 {
+		var out []float64
+		skipped := false
+		for _, v := range all {
+			if !skipped && v == own {
+				skipped = true
+				continue
+			}
+			out = append(out, v)
+		}
+		return out
 	}
 	median := func(v []float64) float64 {
 		s := append([]float64(nil), v...)
@@ -79,7 +97,11 @@ func ProbeRetestIDs(results []ProbeCandidateResult) []string {
 		k := probeGroupKey(r)
 		switch r.Status {
 		case "throttled", "degraded":
-			first = append(first, r.ID)
+			// When nothing of its kind to that address works either, the
+			// network is blocking it, not having a bad moment.
+			if okAny[k] {
+				first = append(first, r.ID)
+			}
 		case "blocked":
 			if okAny[k] {
 				third = append(third, r.ID)
@@ -89,17 +111,10 @@ func ProbeRetestIDs(results []ProbeCandidateResult) []string {
 				continue
 			}
 			// Compare with the others, not with itself.
-			var others []float64
-			own := effectiveProbeMbps(r)
-			skipped := false
-			for _, v := range okSpeeds[k] {
-				if !skipped && v == own {
-					skipped = true
-					continue
-				}
-				others = append(others, v)
-			}
-			if len(others) >= 2 && own < probeOutlierShare*median(others) {
+			od, ou := others(okDown[k], r.DownMbps), others(okUp[k], r.UpMbps)
+			lowDown := len(od) >= 2 && r.DownMbps < probeOutlierShare*median(od)
+			lowUp := len(ou) >= 2 && r.UpMbps < probeOutlierShare*median(ou)
+			if lowDown || lowUp {
 				second = append(second, r.ID)
 			}
 		}

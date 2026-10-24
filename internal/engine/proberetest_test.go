@@ -33,6 +33,9 @@ func TestProbeRetestIDsPicksTheDoubtful(t *testing.T) {
 		retestResult("direct-http-tcp", "direct", "plain", a, "ok", 1.9, 204),
 		retestResult("direct-plain", "direct", "plain", a, "ok", 1146, 746),
 		retestResult("direct-kcp", "direct", "kcp", a, "ok", 55, 40),
+		retestResult("direct-ip-spoof", "direct", "kcp", a, "ok", 49, 52),
+		// A dip in one direction only: 60 down where the others do 400+.
+		retestResult("direct-ipv4-grpc-dip", "direct", "grpc", a, "ok", 60, 629),
 		retestResult("direct-faketcp", "direct", "faketcp", a, "blocked", 0, 0), // KCP to the same address works
 		retestResult("direct-icmp", "direct", "icmp", a, "blocked", 0, 0),       // nothing of its kind works
 	}
@@ -41,7 +44,7 @@ func TestProbeRetestIDsPicksTheDoubtful(t *testing.T) {
 	res = append(res, split)
 
 	got := ProbeRetestIDs(res)
-	for _, id := range []string{"direct-grpc", "direct-tls-stealth", "direct-http-tcp", "direct-faketcp"} {
+	for _, id := range []string{"direct-grpc", "direct-tls-stealth", "direct-http-tcp", "direct-faketcp", "direct-ipv4-grpc-dip"} {
 		if !slices.Contains(got, id) {
 			t.Errorf("%s not re-tested; got %v", id, got)
 		}
@@ -68,6 +71,18 @@ func TestProbeRetestIDsComparesLikeWithLike(t *testing.T) {
 	}
 	if got := ProbeRetestIDs(res); len(got) != 0 {
 		t.Fatalf("re-tests %v, want none", got)
+	}
+	// Everything of a kind frozen to one address (Dagger to Aeza over IPv4)
+	// is the network blocking it: not re-tested.
+	a := "198.51.100.7:2053"
+	frozen := []ProbeCandidateResult{
+		retestResult("direct-kcp", "direct", "kcp", a, "throttled", 0, 0),
+		retestResult("direct-faketcp", "direct", "faketcp", a, "throttled", 0, 0),
+		retestResult("direct-plain", "direct", "plain", a, "throttled", 0, 0),
+		retestResult("direct-icmp", "direct", "icmp", a, "ok", 66, 42),
+	}
+	if got := ProbeRetestIDs(frozen); len(got) != 0 {
+		t.Fatalf("re-tests %v of links frozen like all their kind, want none", got)
 	}
 }
 

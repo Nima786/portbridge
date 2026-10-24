@@ -176,7 +176,9 @@ func StartProbeListenerAvoiding(bindHost string, preferredPort int, avoid map[in
 	if preferredPort > 0 && !avoid[preferredPort] {
 		candidates = append(candidates, preferredPort)
 	}
-	for _, p := range CDNHTTPSPorts {
+	// Then the other HTTPS-looking ports a tunnel's bridge is usually given
+	// (the ones Auto-Heal picks from too), before any random one.
+	for _, p := range append(append([]int(nil), CDNHTTPSPorts...), 4433, 7443, 9443) {
 		if p != preferredPort && !avoid[p] {
 			candidates = append(candidates, p)
 		}
@@ -1008,6 +1010,9 @@ const (
 	probeHardCap         = 16 * time.Second
 	probeHardCapSplit    = 22 * time.Second
 	probeMinMeasure      = 32 * 1024
+	// probeHandshakeCap bounds connecting and the secure handshake, which
+	// used to be bounded by the whole planned attempt.
+	probeHandshakeCap = 6 * time.Second
 )
 
 // probeStallWindow is how long a transfer may go without moving a byte before
@@ -1074,6 +1079,20 @@ func runSingleProbeAttempt(parentCtx context.Context, cfg *Config, routes *route
 
 	_ = raw.SetDeadline(time.Now().Add(2500 * time.Millisecond))
 
+	// The handshake gets no more time than it always had: only moving data
+	// earns the longer cap. Some handshakes set their own, longer deadlines,
+	// so this one cuts the connection itself if it is not done in time.
+	var hsMu sync.Mutex
+	hsDone := false
+	hsTimer := time.AfterFunc(probeHandshakeCap, func() {
+		hsMu.Lock()
+		defer hsMu.Unlock()
+		if !hsDone {
+			_ = raw.SetDeadline(time.Now())
+		}
+	})
+	defer hsTimer.Stop()
+
 	c, err := wrapDialPurpose(raw, cfg.withClaimedName(claim), authPurposeSpeedtest)
 	if err != nil {
 		return 0, nil, 0, 0, "", fmt.Errorf("handshake: %w", err)
@@ -1083,6 +1102,9 @@ func runSingleProbeAttempt(parentCtx context.Context, cfg *Config, routes *route
 	if err := sendAuthPurpose(c, secret, authPurposeSpeedtest); err != nil {
 		return 0, nil, 0, 0, "", fmt.Errorf("auth: %w", err)
 	}
+	hsMu.Lock()
+	hsDone = true
+	hsMu.Unlock()
 	hsMS = float64(time.Since(t0)) / float64(time.Millisecond)
 
 	// Ping samples (use 2.0s deadline on first ping so dead UDP/KCP or DPI-dropped streams fail fast).
