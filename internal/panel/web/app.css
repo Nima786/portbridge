@@ -1851,6 +1851,47 @@ select.cf-server-pick {
 .probe-head p {
   margin: .15rem 0 0;
 }
+.probe-goal-row {
+  display: flex;
+  align-items: center;
+  gap: .5rem;
+  flex-wrap: wrap;
+  margin-top: .65rem;
+  padding-top: .6rem;
+  border-top: 1px solid var(--line);
+}
+.probe-goal-label {
+  font-size: .8rem;
+  font-weight: 650;
+  color: var(--muted);
+  margin-right: .15rem;
+}
+label.probe-goal-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: .42rem;
+  margin: 0;
+  padding: .34rem .68rem;
+  border-radius: 7px;
+  border: 1px solid var(--line);
+  background: var(--well);
+  font-size: .79rem;
+  font-weight: 450;
+  color: var(--text);
+  cursor: pointer;
+  transition: border-color .15s ease, background .15s ease;
+}
+label.probe-goal-pill:hover {
+  border-color: var(--accent-border);
+}
+label.probe-goal-pill:has(input:checked) {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+}
+label.probe-goal-pill input[type="radio"] {
+  width: auto;
+  margin: 0;
+}
 .probe-cdn-row {
   display: grid;
   grid-template-columns: 1.4fr 1fr;
@@ -1915,7 +1956,7 @@ select.cf-server-pick {
 }
 .probe-row {
   display: grid;
-  grid-template-columns: minmax(170px, 1.6fr) 5.5rem 4.8rem 6.2rem 4.6rem auto;
+  grid-template-columns: minmax(170px, 1.6fr) 5.5rem 5.2rem 6.2rem 4.6rem auto;
   align-items: center;
   gap: .6rem;
   padding: .5rem .75rem;

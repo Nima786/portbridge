@@ -49,6 +49,7 @@ type ProbeCandidateSpec struct {
 	CDN        bool   `json:"cdn"`
 	IPv6       bool   `json:"ipv6"`
 	Shared     bool   `json:"shared"` // recommended pooling mode (mux vs pool)
+	Gaming     bool   `json:"gaming,omitempty"`
 	ServerName string `json:"server_name,omitempty"`
 	Domain     string `json:"domain,omitempty"`
 	TargetAddr string `json:"target_addr"` // host:port to dial
@@ -640,6 +641,18 @@ func BuildProbeCandidates(mode, ipv4, ipv6 string, port int, cdnDomain string) [
 				TargetAddr: addr6,
 				Port:       port,
 			},
+			ProbeCandidateSpec{
+				ID:         mode + "-ipv6-plain",
+				Label:      dirLabel + " (IPv6) · Plain TCP (Raw)",
+				Mode:       mode,
+				Link:       "plain",
+				Transport:  string(TransportPlain),
+				Stealth:    false,
+				IPv6:       true,
+				Shared:     false,
+				TargetAddr: addr6,
+				Port:       port,
+			},
 		)
 	}
 
@@ -758,8 +771,20 @@ func probeOneSpec(parentCtx context.Context, spec ProbeCandidateSpec, secret []b
 
 	routes := newRouter(cfg)
 
-	// Attempt 1: Full handshake + 1 ping sample + sustained download/upload burst
-	hs1, rtts, dlMbps, ulMbps, partial1, err1 := runSingleProbeAttempt(parentCtx, cfg, routes, secret, 3, uint32(burstBytes))
+	pings1 := 3
+	burst1 := uint32(burstBytes)
+	pings2 := 2
+	burst2 := uint32(32 * 1024)
+	if spec.Gaming {
+		pings1 = 12
+		if burst1 == 0 || burst1 > 64*1024 {
+			burst1 = 64 * 1024
+		}
+		pings2 = 8
+	}
+
+	// Attempt 1: Full handshake + ping samples + download/upload burst
+	hs1, rtts, dlMbps, ulMbps, partial1, err1 := runSingleProbeAttempt(parentCtx, cfg, routes, secret, pings1, burst1)
 	if err1 != nil {
 		res.Error = simplifyProbeErr(err1)
 		res.Summary = "Blocked / Unreachable — " + res.Error
@@ -775,8 +800,8 @@ func probeOneSpec(parentCtx context.Context, spec ProbeCandidateSpec, secret []b
 		res.HandshakeMS = round2(hs1)
 		res.Error = "connected, then frozen mid-stream by ISP/DPI filter"
 	} else {
-		// Attempt 2: Repeat connection check + 2 pings + 32 KB burst to confirm stability & jitter
-		hs2, rtts2, _, _, p2, err2 := runSingleProbeAttempt(parentCtx, cfg, routes, secret, 2, 32*1024)
+		// Attempt 2: Repeat connection check + pings + 32 KB burst to confirm stability & jitter
+		hs2, rtts2, _, _, p2, err2 := runSingleProbeAttempt(parentCtx, cfg, routes, secret, pings2, burst2)
 		partial2 = p2
 		if err2 == nil {
 			res.Successes++
@@ -821,7 +846,11 @@ func probeOneSpec(parentCtx context.Context, spec ProbeCandidateSpec, secret []b
 		res.Summary = fmt.Sprintf("Unstable (%d/%d connections succeeded, %.1f Mbps, %.0f ms)", res.Successes, res.Attempts, res.AvgMbps, res.RTTMS)
 	default:
 		res.Status = "ok"
-		res.Summary = fmt.Sprintf("Healthy — %.1f Mbps avg (↓%.1f / ↑%.1f Mbps), %.0f ms ping", res.AvgMbps, res.DownMbps, res.UpMbps, res.RTTMS)
+		if spec.Gaming {
+			res.Summary = fmt.Sprintf("Gaming Ready — %.0f ms ping, ±%.1f ms jitter (%.1f Mbps)", res.RTTMS, res.JitterMS, res.AvgMbps)
+		} else {
+			res.Summary = fmt.Sprintf("Healthy — %.1f Mbps avg (↓%.1f / ↑%.1f Mbps), %.0f ms ping", res.AvgMbps, res.DownMbps, res.UpMbps, res.RTTMS)
+		}
 	}
 	return res
 }
@@ -1154,26 +1183,33 @@ func FinalizeProbeReport(results []ProbeCandidateResult, cdnDomain string) *Prob
 		maxMbps = 5
 	}
 
+	var isGaming bool
 	for i := range results {
+		if results[i].Gaming {
+			isGaming = true
+		}
 		results[i].Score = scoreCandidate(&results[i], maxMbps)
 	}
 
 	// Check if Direct Fake TLS AND Cloudflare CDN WebSocket both worked well;
-	// if so, synthesize the Fake TLS + CDN Auto-Fallback hybrid recommendation.
+	// if so, synthesize the Fake TLS + CDN Auto-Fallback hybrid recommendation
+	// (skipped in Gaming mode where lowest ping & jitter without CDN hops wins).
 	var bestDirectTLS *ProbeCandidateResult
 	var bestCDNWS *ProbeCandidateResult
-	for i := range results {
-		r := &results[i]
-		if r.Status != "ok" {
-			continue
-		}
-		if r.Mode == "direct" && (r.Link == "website" || r.Link == "sni-spoof") && !r.IPv6 {
-			if bestDirectTLS == nil || r.Score > bestDirectTLS.Score {
-				bestDirectTLS = r
+	if !isGaming {
+		for i := range results {
+			r := &results[i]
+			if r.Status != "ok" {
+				continue
 			}
-		}
-		if r.Mode == "direct" && r.Link == "cdn" {
-			bestCDNWS = r
+			if r.Mode == "direct" && (r.Link == "website" || r.Link == "sni-spoof") && !r.IPv6 {
+				if bestDirectTLS == nil || r.Score > bestDirectTLS.Score {
+					bestDirectTLS = r
+				}
+			}
+			if r.Mode == "direct" && r.Link == "cdn" {
+				bestCDNWS = r
+			}
 		}
 	}
 
@@ -1224,6 +1260,13 @@ func FinalizeProbeReport(results []ProbeCandidateResult, cdnDomain string) *Prob
 		if results[i].Score != results[j].Score {
 			return results[i].Score > results[j].Score
 		}
+		if isGaming {
+			latI := results[i].RTTMS + results[i].JitterMS*2.0
+			latJ := results[j].RTTMS + results[j].JitterMS*2.0
+			if latI != latJ {
+				return latI < latJ
+			}
+		}
 		return effectiveProbeMbps(&results[i]) > effectiveProbeMbps(&results[j])
 	})
 
@@ -1255,6 +1298,9 @@ func scoreCandidate(r *ProbeCandidateResult, maxMbps float64) int {
 			score = 20
 		}
 		return score
+	}
+	if r.Gaming {
+		return scoreGamingCandidate(r)
 	}
 
 	// 1. Reliability (0..45)
@@ -1294,6 +1340,56 @@ func scoreCandidate(r *ProbeCandidateResult, maxMbps float64) int {
 	total := int(math.Round(rel + rttScore + jitScore + tpScore + dpiBonus))
 	if total > 98 {
 		total = 98
+	}
+	if total < 1 {
+		total = 1
+	}
+	return total
+}
+
+func scoreGamingCandidate(r *ProbeCandidateResult) int {
+	// 1. Reliability / Zero Packet Drop (0..35)
+	rel := 35.0 * (float64(r.Successes) / float64(maxInt(1, r.Attempts)))
+
+	// 2. Lowest Ping / RTT (0..30): 10 ms = 30 pts, 50 ms = 23.7 pts, 100 ms = 15.8 pts, >= 200 ms = 0 pts
+	rttScore := 30.0 * clamp01(1.0-(r.RTTMS-10.0)/190.0)
+
+	// 3. Lowest Jitter / Tick Stability (0..22): 0 ms = 22 pts, 3 ms = 19.8 pts, 10 ms = 14.7 pts, >= 30 ms = 0 pts
+	jitScore := 22.0 * clamp01(1.0-r.JitterMS/30.0)
+
+	// 4. Gaming Transport Mechanics Bonus (0..8):
+	// Rewards transports that eliminate TCP head-of-line blocking (KCP/FEC over UDP or Raw TCP)
+	// or have zero framing/encryption overhead (Plain TCP with Dedicated Pool).
+	var gamingBonus float64
+	switch {
+	case r.Link == "kcp" || r.Link == "ip-spoof" || r.Link == "faketcp":
+		gamingBonus = 8.0
+	case r.Link == "plain" && !r.WebHeader:
+		gamingBonus = 7.0
+	case r.Link == "plain" && r.WebHeader:
+		gamingBonus = 6.5
+	case r.Link == "website" && !r.Stealth:
+		gamingBonus = 6.0
+	case (r.Link == "website" && r.Stealth) || r.Link == "sni-spoof":
+		gamingBonus = 4.5
+	case r.Link == "icmp":
+		gamingBonus = 4.0
+	case r.Link == "grpc":
+		gamingBonus = 3.0
+	case r.Link == "split":
+		gamingBonus = 1.5
+	case r.Link == "cdn" || r.Link == "grpc-cdn":
+		gamingBonus = 1.0
+	default:
+		gamingBonus = 3.0
+	}
+
+	// 5. Light Bandwidth Sanity Check (0..5): full credit at >= 10 Mbps
+	tpScore := 5.0 * clamp01(effectiveProbeMbps(r)/10.0)
+
+	total := int(math.Round(rel + rttScore + jitScore + gamingBonus + tpScore))
+	if total > 99 {
+		total = 99
 	}
 	if total < 1 {
 		total = 1

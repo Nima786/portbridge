@@ -549,9 +549,20 @@
           <div class="probe-head">
             <div>
               <strong>Smart Route &amp; Transport Benchmark</strong>
-              <p class="muted small">Not sure which mode works best between these two servers? Test Direct, Reverse, Fake TLS, Stealth, gRPC, KCP, and Cloudflare CDN simultaneously to score speed, ping, and DPI resistance.</p>
+              <p class="muted small">Not sure which mode works best between these two servers? Test Direct, Reverse, Fake TLS, Stealth, gRPC, KCP, FakeTCP, and Cloudflare CDN to find the best route.</p>
             </div>
             <button type="button" id="tn-probe-btn" class="primary">Find Best Tunnel Mode</button>
+          </div>
+          <div class="probe-goal-row" role="radiogroup" aria-label="Benchmark Optimization Goal">
+            <span class="probe-goal-label">Optimize for:</span>
+            <label class="probe-goal-pill">
+              <input type="radio" name="tn-probe-goal" value="general" checked>
+              <span><strong>General (Speed &amp; Stealth)</strong> — Max download/upload Mbps &amp; DPI resistance</span>
+            </label>
+            <label class="probe-goal-pill">
+              <input type="radio" name="tn-probe-goal" value="gaming">
+              <span><strong>Gaming (Lowest Ping &amp; Jitter)</strong> — 20 rapid game-tick pings, FEC &amp; zero HoL blocking</span>
+            </label>
           </div>
           <div class="probe-cdn-row">
             <div class="probe-cdn-input">

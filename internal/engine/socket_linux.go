@@ -55,6 +55,8 @@ func tuneSocket(c net.Conn) {
 		return
 	}
 	_ = raw.Control(func(fd uintptr) {
+		_ = syscall.SetsockoptInt(int(fd), syscall.IPPROTO_TCP, syscall.TCP_NODELAY, 1)
+		_ = syscall.SetsockoptInt(int(fd), syscall.IPPROTO_TCP, syscallTCP_QUICKACK, 1)
 		_ = syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_KEEPALIVE, 1)
 		_ = syscall.SetsockoptInt(int(fd), syscall.IPPROTO_TCP, syscall.TCP_KEEPIDLE, 30)
 		_ = syscall.SetsockoptInt(int(fd), syscall.IPPROTO_TCP, syscall.TCP_KEEPINTVL, 5)
@@ -150,6 +152,7 @@ func growSocketBuffers(c any, n int) {
 
 // These socket options are not in the standard syscall package.
 const (
+	syscallTCP_QUICKACK     = 0x0c
 	syscallTCP_USER_TIMEOUT = 0x12
 	syscallSO_SNDBUFFORCE   = 0x20
 	syscallSO_RCVBUFFORCE   = 0x21

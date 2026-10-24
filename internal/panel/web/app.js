@@ -3291,7 +3291,12 @@
       $('tn-domain').value = cand.domain;
     }
     const preset = radio('tn-load') || 'light';
-    if (preset === 'custom') {
+    if (cand.gaming && ['plain', 'website', 'sni-spoof'].includes(cand.link)) {
+      setRadio('tn-load', 'custom');
+      sharingTouched = true;
+      setRadio('tn-shared', 'one');
+      if ($('tn-pool-n')) $('tn-pool-n').value = '16';
+    } else if (preset === 'custom') {
       sharingTouched = true;
       setRadio('tn-shared', cand.shared ? 'shared' : 'one');
       if (cand.shared && $('tn-links-n')) {
@@ -3314,7 +3319,9 @@
     if (isActive) {
       return h('div', { class: 'probe-row active' },
         h('div', { class: 'probe-row-label' }, r.label,
-          h('span', { class: 'probe-row-sub' }, 'Running handshake, ping & download/upload burst...')),
+          h('span', { class: 'probe-row-sub' }, r.gaming
+            ? 'Running 20 rapid game-tick pings & 64 KB anti-freeze check...'
+            : 'Running handshake, ping & download/upload burst...')),
         h('span', { class: 'state note' }, 'Testing…'),
         h('span', { class: 'probe-metric' }, '…'),
         h('span', { class: 'probe-metric' }, '…'),
@@ -3351,12 +3358,18 @@
         speedNode = `${r.avg_mbps.toFixed(1)} Mbps`;
       }
     }
+    let rttNode = '—';
+    if (r.successes > 0) {
+      rttNode = h('span', { title: `Ping: ${Math.round(r.rtt_ms)} ms · Jitter: ±${(r.jitter_ms || 0).toFixed(1)} ms · Handshake: ${Math.round(r.handshake_ms || 0)} ms` },
+        `${Math.round(r.rtt_ms)} ms`,
+        h('span', { class: 'probe-row-sub' }, `±${(r.jitter_ms || 0).toFixed(1)} ms`));
+    }
     return h('div', { class: 'probe-row' },
       h('div', { class: 'probe-row-label' },
         r.label,
         r.error && r.status !== 'ok' ? h('span', { class: 'probe-row-sub' }, r.error) : null),
       h('span', { class: 'state ' + st[0] }, st[1]),
-      h('span', { class: 'probe-metric' }, r.successes > 0 ? `${Math.round(r.rtt_ms)} ms` : '—'),
+      h('span', { class: 'probe-metric' }, rttNode),
       h('span', { class: 'probe-metric' }, speedNode),
       isLive
         ? h('span', { class: 'muted small' }, r.status === 'ok' ? 'Done' : (r.status === 'throttled' ? 'Capped' : '—'))
@@ -3443,7 +3456,8 @@
           foreign,
           cdn_domain: cdn,
         });
-        const cands = sess.candidates || [];
+        const isGaming = radio('tn-probe-goal') === 'gaming';
+        const cands = (sess.candidates || []).map((c) => Object.assign({}, c, { gaming: isGaming }));
         if (!cands.length) {
           throw new Error('No benchmark candidates could be prepared for these two servers.');
         }

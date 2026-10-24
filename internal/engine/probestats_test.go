@@ -124,4 +124,89 @@ func TestProbeUsesTheTunnelsKCPTuning(t *testing.T) {
 	if c.KCPWindow <= 256 {
 		t.Fatalf("window %d is no larger than the small fallback", c.KCPWindow)
 	}
+	if c.KCPInterval != 5 {
+		t.Fatalf("KCP interval = %d, want 5 ms low-latency tick", c.KCPInterval)
+	}
+}
+
+func TestFinalizeProbeReportGamingMode(t *testing.T) {
+	baseResults := []ProbeCandidateResult{
+		{
+			ProbeCandidateSpec: ProbeCandidateSpec{
+				ID:        "direct-stealth",
+				Label:     "Direct · Stealth uTLS + TLS Fragmentation",
+				Mode:      "direct",
+				Link:      "website",
+				Transport: "tls",
+				Stealth:   true,
+			},
+			Status:    "ok",
+			Attempts:  2,
+			Successes: 2,
+			RTTMS:     88,
+			JitterMS:  14.5,
+			DownMbps:  180,
+			UpMbps:    160,
+			AvgMbps:   170,
+		},
+		{
+			ProbeCandidateSpec: ProbeCandidateSpec{
+				ID:        "direct-kcp",
+				Label:     "Direct · KCP over UDP (FEC)",
+				Mode:      "direct",
+				Link:      "kcp",
+				Transport: "kcp",
+			},
+			Status:    "ok",
+			Attempts:  2,
+			Successes: 2,
+			RTTMS:     42,
+			JitterMS:  1.2,
+			DownMbps:  35,
+			UpMbps:    32,
+			AvgMbps:   33.5,
+		},
+		{
+			ProbeCandidateSpec: ProbeCandidateSpec{
+				ID:        "direct-cdn-ws",
+				Label:     "Direct · Cloudflare CDN (WebSocket)",
+				Mode:      "direct",
+				Link:      "cdn",
+				Transport: "wss",
+				CDN:       true,
+			},
+			Status:    "ok",
+			Attempts:  2,
+			Successes: 2,
+			RTTMS:     135,
+			JitterMS:  22.0,
+			DownMbps:  90,
+			UpMbps:    80,
+			AvgMbps:   85,
+		},
+	}
+
+	// 1. In General mode, high-Mbps Stealth (or Hybrid Fake TLS + CDN) wins
+	generalIn := make([]ProbeCandidateResult, len(baseResults))
+	copy(generalIn, baseResults)
+	genRep := FinalizeProbeReport(generalIn, "edge.example.com")
+	if genRep.Recommended == nil || genRep.Recommended.ID == "direct-kcp" {
+		t.Fatalf("general mode recommended %+v, expected high-throughput stealth/hybrid to win", genRep.Recommended)
+	}
+
+	// 2. In Gaming mode, low-ping low-jitter KCP (42 ms, ±1.2 ms) must beat 88 ms Stealth and 135 ms CDN
+	gamingIn := make([]ProbeCandidateResult, len(baseResults))
+	copy(gamingIn, baseResults)
+	for i := range gamingIn {
+		gamingIn[i].Gaming = true
+	}
+	gamRep := FinalizeProbeReport(gamingIn, "edge.example.com")
+	if gamRep.Recommended == nil || gamRep.Recommended.ID != "direct-kcp" {
+		t.Fatalf("gaming mode recommended %+v, want direct-kcp", gamRep.Recommended)
+	}
+	for _, r := range gamRep.Results {
+		if r.Hybrid {
+			t.Fatalf("gaming mode should not synthesize CDN hybrid recommendation")
+		}
+	}
 }

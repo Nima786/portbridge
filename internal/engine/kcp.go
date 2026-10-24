@@ -300,7 +300,7 @@ func sendUDPDecoyClientHello(addr, sni string, ttl int) {
 const (
 	kcpDefaultWindow   = 2048
 	kcpDefaultMTU      = 1400
-	kcpDefaultInterval = 10
+	kcpDefaultInterval = 5
 	kcpDefaultResend   = 2
 )
 

@@ -1387,11 +1387,15 @@ func (p *Panel) runProbeStep(parent context.Context, dialerID, secret string, sp
 	}
 	dctx, dcancel := context.WithTimeout(parent, 15*time.Second)
 	defer dcancel()
+	burstBytes := 0
+	if spec.Gaming {
+		burstBytes = 64 * 1024
+	}
 	var drep probeDialReply
 	_, err := p.callJSON(dctx, dialerID, "/api/probe/dial", map[string]any{
 		"specs":       []engine.ProbeCandidateSpec{spec},
 		"secret":      secret,
-		"burst_bytes": 0,
+		"burst_bytes": burstBytes,
 	}, &drep)
 	if err != nil {
 		return engine.ProbeCandidateResult{
@@ -1415,7 +1419,14 @@ func (p *Panel) runProbeStep(parent context.Context, dialerID, secret string, sp
 			Summary:            "Blocked / Unreachable — " + msg,
 		}, nil
 	}
-	return drep.Results[0], nil
+	res := drep.Results[0]
+	if spec.Gaming && !res.Gaming {
+		res.Gaming = true
+		if res.Status == "ok" {
+			res.Summary = fmt.Sprintf("Gaming Ready — %.0f ms ping, ±%.1f ms jitter (%.1f Mbps)", res.RTTMS, res.JitterMS, res.AvgMbps)
+		}
+	}
+	return res, nil
 }
 
 func (p *Panel) finishProbeSession(sess probeSession, results []engine.ProbeCandidateResult) *engine.ProbeBenchmarkReport {
