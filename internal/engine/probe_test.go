@@ -2,6 +2,7 @@ package engine
 
 import (
 	"context"
+	"net"
 	"strings"
 	"testing"
 	"time"
@@ -43,6 +44,37 @@ func TestMultiTransportProbeEngine(t *testing.T) {
 		}
 		if r.Score <= 0 {
 			t.Errorf("candidate %s expected positive score, got %d", r.ID, r.Score)
+		}
+	}
+}
+
+// KCP over IPv6 must really carry a probe, not only be listed.
+func TestProbeKCPOverIPv6Loopback(t *testing.T) {
+	if l, err := net.Listen("tcp", "[::1]:0"); err != nil {
+		t.Skip("no IPv6 loopback here")
+	} else {
+		_ = l.Close()
+	}
+	ln, err := StartProbeListener("0.0.0.0", 0, nil, 30*time.Second)
+	if err != nil {
+		t.Fatalf("StartProbeListener failed: %v", err)
+	}
+	defer ln.Close()
+	var specs []ProbeCandidateSpec
+	for _, c := range BuildProbeCandidates("direct", "127.0.0.1", "::1", ln.Port, "") {
+		if c.ID == "direct-ipv6-kcp" || c.ID == "direct-ipv6-plain" {
+			c.Gaming = true
+			specs = append(specs, c)
+		}
+	}
+	if len(specs) != 2 {
+		t.Fatalf("got %d IPv6 candidates, want 2", len(specs))
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	for _, r := range RunProbeDialer(ctx, specs, ln.Secret, 0) {
+		if r.Status != "ok" {
+			t.Errorf("%s over IPv6: status %s, error %q", r.ID, r.Status, r.Error)
 		}
 	}
 }

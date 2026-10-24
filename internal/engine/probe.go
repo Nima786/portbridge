@@ -90,6 +90,7 @@ type ProbeListener struct {
 
 	tcpLn     net.Listener
 	kcpLn     net.Listener
+	kcp6Ln    net.Listener // IPv6-only UDP; nil when bound to one address
 	icmpLn    net.Listener
 	fakeTCPLn net.Listener
 	splitMgr  *splitSessionManager
@@ -230,11 +231,35 @@ func StartProbeListener(bindHost string, preferredPort int, secret []byte, ttl t
 	probeKCPDefaults(fakeCfg)
 	fakeTCPLn, _ := kcpListen(rawAddr, fakeCfg)
 
+	// The KCP listener above takes IPv4 only (it also has to accept the
+	// spoofed-source candidates), so KCP over IPv6 gets its own IPv6-only
+	// UDP socket on the same port. Without it the IPv6 KCP candidate always
+	// timed out, though a real KCP tunnel over IPv6 works.
+	var kcp6Ln net.Listener
+	if listenHost == "" {
+		if u6, err := net.ListenUDP("udp6", &net.UDPAddr{IP: net.IPv6unspecified, Port: chosenPort}); err == nil {
+			kcp6Cfg := &Config{
+				Transport:       TransportKCP,
+				secret:          secret,
+				KCPDataShards:   10,
+				KCPParityShards: 3,
+				allowPlainKCP:   true,
+			}
+			probeKCPDefaults(kcp6Cfg)
+			if ln6, err := kcpServePacketConn(u6, kcp6Cfg); err == nil {
+				kcp6Ln = ln6
+			} else {
+				_ = u6.Close()
+			}
+		}
+	}
+
 	pl := &ProbeListener{
 		Port:      chosenPort,
 		Secret:    secret,
 		tcpLn:     tcpLn,
 		kcpLn:     kcpLn,
+		kcp6Ln:    kcp6Ln,
 		icmpLn:    icmpLn,
 		fakeTCPLn: fakeTCPLn,
 		splitMgr:  newSplitSessionManager(),
@@ -244,6 +269,9 @@ func StartProbeListener(bindHost string, preferredPort int, secret []byte, ttl t
 
 	go pl.serveTCP()
 	go pl.servePacketLn(pl.kcpLn)
+	if pl.kcp6Ln != nil {
+		go pl.servePacketLn(pl.kcp6Ln)
+	}
 	if pl.icmpLn != nil {
 		go pl.servePacketLn(pl.icmpLn)
 	}
@@ -264,6 +292,9 @@ func (pl *ProbeListener) Close() {
 		}
 		if pl.kcpLn != nil {
 			_ = pl.kcpLn.Close()
+		}
+		if pl.kcp6Ln != nil {
+			_ = pl.kcp6Ln.Close()
 		}
 		if pl.icmpLn != nil {
 			_ = pl.icmpLn.Close()
@@ -653,6 +684,21 @@ func BuildProbeCandidates(mode, ipv4, ipv6 string, port int, cdnDomain string) [
 				TargetAddr: addr6,
 				Port:       port,
 			},
+			// The IPv6 route is often shorter than the IPv4 one, so KCP is
+			// tried on it too: a tunnel can run KCP over IPv6, and the
+			// lowest-ping gaming route may be exactly that pair.
+			ProbeCandidateSpec{
+				ID:         mode + "-ipv6-kcp",
+				Label:      dirLabel + " (IPv6) · KCP over UDP (FEC)",
+				Mode:       mode,
+				Link:       "kcp",
+				Transport:  string(TransportKCP),
+				Stealth:    false,
+				IPv6:       true,
+				Shared:     true,
+				TargetAddr: addr6,
+				Port:       port,
+			},
 		)
 	}
 
@@ -848,7 +894,7 @@ func probeOneSpec(parentCtx context.Context, spec ProbeCandidateSpec, secret []b
 	default:
 		res.Status = "ok"
 		if spec.Gaming {
-			res.Summary = fmt.Sprintf("Gaming Ready — %.0f ms ping, ±%.1f ms jitter (%.1f Mbps)", res.RTTMS, res.JitterMS, res.AvgMbps)
+			res.Summary = GamingSummary(res.RTTMS, res.JitterMS)
 		} else {
 			res.Summary = fmt.Sprintf("Healthy — %.1f Mbps avg (↓%.1f / ↑%.1f Mbps), %.0f ms ping", res.AvgMbps, res.DownMbps, res.UpMbps, res.RTTMS)
 		}
@@ -1420,12 +1466,21 @@ func scoreCandidate(r *ProbeCandidateResult, maxMbps float64) int {
 	return total
 }
 
+// GamingSummary is the one-line verdict for a healthy Gaming benchmark
+// result. It leaves out Mbps on purpose: the 64 KB check only shows the link
+// does not freeze, and its speed says nothing about what the link carries.
+func GamingSummary(rttMS, jitterMS float64) string {
+	return fmt.Sprintf("Gaming Ready — %.0f ms ping, ±%.1f ms jitter, no freeze on the 64 KB check", rttMS, jitterMS)
+}
+
 func scoreGamingCandidate(r *ProbeCandidateResult) int {
 	// 1. Reliability / Zero Packet Drop (0..35)
 	rel := 35.0 * (float64(r.Successes) / float64(maxInt(1, r.Attempts)))
 
-	// 2. Lowest Ping / RTT (0..30): 10 ms = 30 pts, 50 ms = 23.7 pts, 100 ms = 15.8 pts, >= 200 ms = 0 pts
-	rttScore := 30.0 * clamp01(1.0-(r.RTTMS-10.0)/190.0)
+	// 2. Lowest Ping / RTT (0..35): 10 ms = 35 pts, 50 ms = 27.6 pts, 100 ms = 18.4 pts, >= 200 ms = 0 pts.
+	// Every 10 ms of ping is worth ~1.8 pts, more than the transport bonus
+	// gap between any two working links, so a clearly shorter route wins.
+	rttScore := 35.0 * clamp01(1.0-(r.RTTMS-10.0)/190.0)
 
 	// 3. Lowest Jitter / Tick Stability (0..22): 0 ms = 22 pts, 3 ms = 19.8 pts, 10 ms = 14.7 pts, >= 30 ms = 0 pts
 	jitScore := 22.0 * clamp01(1.0-r.JitterMS/30.0)
@@ -1457,10 +1512,13 @@ func scoreGamingCandidate(r *ProbeCandidateResult) int {
 		gamingBonus = 3.0
 	}
 
-	// 5. Light Bandwidth Sanity Check (0..5): full credit at >= 10 Mbps
-	tpScore := 5.0 * clamp01(effectiveProbeMbps(r)/10.0)
-
-	total := int(math.Round(rel + rttScore + jitScore + gamingBonus + tpScore))
+	// No points for the Mbps of the 64 KB check: so small a transfer ends
+	// while TCP is still in slow start (a few round trips at a small window),
+	// while KCP sends it all at once, so it reads 3 Mbps on a TCP link that
+	// carries gigabits and ~10 Mbps on KCP. Scoring it handed KCP points over
+	// a TCP route with a clearly lower ping. The check only has to complete,
+	// which every "ok" result already has (a frozen one is "throttled").
+	total := int(math.Round(rel + rttScore + jitScore + gamingBonus))
 	if total > 99 {
 		total = 99
 	}
@@ -1578,6 +1636,13 @@ func FormatProbeReport(rep *ProbeBenchmarkReport) string {
 			ping = fmt.Sprintf("%.0f ms", r.RTTMS)
 			jit = fmt.Sprintf("±%.1f", r.JitterMS)
 			speed = fmt.Sprintf("%.1f Mbps", r.AvgMbps)
+			if r.Gaming {
+				// The 64 KB check's speed is not the link's speed.
+				speed = "check ok"
+				if r.Status == "throttled" {
+					speed = "froze"
+				}
+			}
 		}
 		fmt.Fprintf(&b, " %-42s  %-9s  %-8s  %-8s  %-10s  %3d/100\n",
 			r.Label, st, ping, jit, speed, r.Score)

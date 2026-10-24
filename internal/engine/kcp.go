@@ -449,6 +449,35 @@ type kcpListenerWrap struct {
 	ownConn io.Closer
 }
 
+// kcpServePacketConn serves plain KCP sessions on a socket the caller has
+// already opened (and from then on owns it), for when the socket needs
+// options kcpListen does not set, such as an IPv6-only UDP socket next to an
+// IPv4 one on the same port.
+func kcpServePacketConn(pc net.PacketConn, cfg *Config) (net.Listener, error) {
+	key := sha256.Sum256(cfg.secret)
+	block, err := kcp.NewAESBlockCrypt(key[:16])
+	if err != nil {
+		return nil, fmt.Errorf("kcp crypto: %w", err)
+	}
+	dataShards, parityShards := 10, 3
+	if cfg.KCPDataShards > 0 {
+		dataShards = cfg.KCPDataShards
+	}
+	if cfg.KCPParityShards >= 0 {
+		parityShards = cfg.KCPParityShards
+	}
+	if uc, ok := pc.(*net.UDPConn); ok {
+		_ = uc.SetReadBuffer(4 * 1024 * 1024)
+		_ = uc.SetWriteBuffer(4 * 1024 * 1024)
+		growSocketBuffers(uc, 4*1024*1024)
+	}
+	ln, err := kcp.ServeConn(block, dataShards, parityShards, pc)
+	if err != nil {
+		return nil, fmt.Errorf("serving kcp: %w", err)
+	}
+	return &kcpListenerWrap{Listener: ln, cfg: cfg, ownConn: pc}, nil
+}
+
 func (l *kcpListenerWrap) Accept() (net.Conn, error) {
 	sess, err := l.Listener.AcceptKCP()
 	if err != nil {

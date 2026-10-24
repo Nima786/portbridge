@@ -3350,7 +3350,15 @@
     const scoreCls = r.score >= 75 ? '' : (r.score >= 45 ? ' warn' : ' bad');
     const canUse = !isLive && (r.status === 'ok' || r.status === 'degraded');
     let speedNode = '—';
-    if (r.successes > 0) {
+    if (r.successes > 0 && r.gaming) {
+      // Gaming mode only runs a 64 KB anti-freeze check; its Mbps reflects
+      // TCP slow start, not the link's speed, so it is not shown as a speed.
+      speedNode = r.status === 'throttled'
+        ? 'Frozen'
+        : h('span', { title: 'Gaming mode sends only 64 KB each way to catch DPI freezes. Run the General benchmark to measure real speed.' },
+            'Passed',
+            h('span', { class: 'probe-row-sub' }, '64 KB freeze check'));
+    } else if (r.successes > 0) {
       if (r.status === 'throttled' && !(r.avg_mbps > 0)) {
         speedNode = 'Frozen';
       } else if (r.down_mbps > 0 || r.up_mbps > 0) {

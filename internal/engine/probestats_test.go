@@ -162,6 +162,49 @@ func TestProbeUsesTheTunnelsKCPTuning(t *testing.T) {
 	}
 }
 
+// From a real Dagger <-> Aeza run: KCP on the IPv4 route (84 ms) was ranked
+// above Plain TCP on the IPv6 route (74 ms, steadier) because the 64 KB
+// check reads ~10 Mbps on KCP and ~3 Mbps on TCP still in slow start. In
+// Gaming mode the clearly lower ping must win; KCP on the same short route
+// should then beat TCP.
+func TestGamingRanksTheLowerPingRouteAboveTheSmallTransfersSpeed(t *testing.T) {
+	mk := func(id, link string, ipv6 bool, rtt, jit, down, up float64) ProbeCandidateResult {
+		return ProbeCandidateResult{
+			ProbeCandidateSpec: ProbeCandidateSpec{ID: id, Link: link, IPv6: ipv6, Gaming: true},
+			Status:             "ok", Attempts: 2, Successes: 2,
+			RTTMS: rtt, JitterMS: jit, DownMbps: down, UpMbps: up, AvgMbps: (down + up) / 2,
+		}
+	}
+	rep := FinalizeProbeReport([]ProbeCandidateResult{
+		mk("reverse-kcp", "kcp", false, 84, 0.6, 8.9, 11.4),
+		mk("reverse-faketcp", "faketcp", false, 85, 0.2, 9.1, 12.0),
+		mk("direct-ipv6-plain", "plain", true, 74, 0.2, 3.7, 3.0),
+	}, "")
+	if rep.Recommended == nil || rep.Recommended.ID != "direct-ipv6-plain" {
+		t.Fatalf("recommended %+v, want the 74 ms IPv6 route", rep.Recommended)
+	}
+
+	rep = FinalizeProbeReport([]ProbeCandidateResult{
+		mk("direct-ipv6-plain", "plain", true, 74, 0.2, 3.7, 3.0),
+		mk("direct-ipv6-kcp", "kcp", true, 74, 0.3, 9.5, 11.0),
+	}, "")
+	if rep.Recommended == nil || rep.Recommended.ID != "direct-ipv6-kcp" {
+		t.Fatalf("recommended %+v, want KCP on the same 74 ms route", rep.Recommended)
+	}
+}
+
+func TestBuildProbeCandidatesTriesKCPOverIPv6(t *testing.T) {
+	found := false
+	for _, c := range BuildProbeCandidates("direct", "203.0.113.5", "2001:db8::5", 2053, "") {
+		if c.ID == "direct-ipv6-kcp" {
+			found = c.IPv6 && c.Link == "kcp" && c.TargetAddr == "[2001:db8::5]:2053"
+		}
+	}
+	if !found {
+		t.Fatal("no KCP over IPv6 candidate")
+	}
+}
+
 func TestFinalizeProbeReportGamingMode(t *testing.T) {
 	baseResults := []ProbeCandidateResult{
 		{

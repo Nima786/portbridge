@@ -1429,7 +1429,7 @@ func (p *Panel) runProbeStep(parent context.Context, dialerID, secret string, sp
 	if spec.Gaming && !res.Gaming {
 		res.Gaming = true
 		if res.Status == "ok" {
-			res.Summary = fmt.Sprintf("Gaming Ready — %.0f ms ping, ±%.1f ms jitter (%.1f Mbps)", res.RTTMS, res.JitterMS, res.AvgMbps)
+			res.Summary = engine.GamingSummary(res.RTTMS, res.JitterMS)
 		}
 	}
 	return res, nil
