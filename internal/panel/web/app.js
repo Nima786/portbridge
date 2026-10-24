@@ -424,6 +424,7 @@
     const [data] = await Promise.all([api('GET', '/api/servers'), loadUpdates()]);
     serversCache = data.servers || [];
     updateSummaryStrip();
+    if (dragged) return;
     const text = JSON.stringify(serversCache) + JSON.stringify(updatesCache && updatesCache.servers);
     if (text === lastServers) return;
     lastServers = text;
@@ -450,6 +451,89 @@
     if (s.online) return h('span', { class: 'state ok' }, 'Online');
     if (s.problem === 'not checked yet') return h('span', { class: 'state unknown' }, 'Checking');
     return h('span', { class: 'state bad' }, 'Offline');
+  }
+
+  const SVG_NS = 'http://www.w3.org/2000/svg';
+
+  function svgEl(tag, attrs, ...kids) {
+    const el = document.createElementNS(SVG_NS, tag);
+    if (attrs) {
+      for (const [k, v] of Object.entries(attrs)) {
+        if (v === null || v === undefined || v === false) continue;
+        el.setAttribute(k, v === true ? '' : String(v));
+      }
+    }
+    for (const kid of kids.flat()) {
+      if (kid === null || kid === undefined || kid === false) continue;
+      el.append(kid);
+    }
+    return el;
+  }
+
+  function fmtBytes(bytes) {
+    const b = Number(bytes) || 0;
+    const gb = 1024 * 1024 * 1024;
+    if (b >= 0.95 * gb) return `${(b / gb).toFixed(1)} GB`;
+    const mb = 1024 * 1024;
+    return `${Math.round(b / mb)} MB`;
+  }
+
+  function metricRing(pct) {
+    const clamped = Math.max(0, Math.min(100, Number(pct) || 0));
+    const r = 17;
+    const c = 2 * Math.PI * r;
+    const offset = c * (1 - clamped / 100);
+    const tone = clamped >= 90 ? 'bad' : (clamped >= 70 ? 'warn' : 'ok');
+    return h('div', { class: `metric-ring ring-${tone}`, 'aria-hidden': 'true' },
+      svgEl('svg', { viewBox: '0 0 44 44', width: '44', height: '44', class: 'metric-ring-svg' },
+        svgEl('circle', { class: 'metric-ring-track', cx: '22', cy: '22', r: String(r) }),
+        svgEl('circle', {
+          class: 'metric-ring-fill',
+          cx: '22',
+          cy: '22',
+          r: String(r),
+          'stroke-dasharray': c.toFixed(2),
+          'stroke-dashoffset': offset.toFixed(2),
+        })),
+      h('span', { class: 'metric-ring-val mono' }, `${Math.round(clamped)}%`));
+  }
+
+  function serverMetrics(ov, name) {
+    if (!ov) return null;
+    const cores = Number(ov.cpu_cores) || 0;
+    const memTotal = Number(ov.mem_total_bytes) || 0;
+    if (!cores && !memTotal) return null;
+
+    const boxes = [];
+    if (cores > 0) {
+      const cpuPct = Math.max(0, Math.min(100, Number(ov.cpu_percent) || 0));
+      const freePct = Math.max(0, 100 - cpuPct);
+      const coresLabel = `${cores} ${cores === 1 ? 'Core' : 'Cores'}`;
+      boxes.push(h('div', { class: 'metric-box', title: `CPU usage: ${cpuPct.toFixed(1)}% across ${coresLabel} (${freePct.toFixed(1)}% available)` },
+        metricRing(cpuPct),
+        h('div', { class: 'metric-info' },
+          h('div', { class: 'metric-head' },
+            h('span', { class: 'metric-label' }, 'CPU'),
+            h('span', { class: 'metric-val mono' }, `${cpuPct.toFixed(1)}%`)),
+          h('div', { class: 'metric-sub' }, `${coresLabel} · ${Math.round(freePct)}% free`))));
+    }
+    if (memTotal > 0) {
+      const memAvail = Math.min(memTotal, Math.max(0, Number(ov.mem_avail_bytes) || 0));
+      const memUsed = Math.max(0, memTotal - memAvail);
+      const memPct = Math.max(0, Math.min(100, Number(ov.mem_used_percent) || ((memUsed * 100) / memTotal)));
+      const gb = 1024 * 1024 * 1024;
+      const usedTotalStr = memTotal >= 0.9 * gb
+        ? `${(memUsed / gb).toFixed(1)} / ${(memTotal / gb).toFixed(1)} GB`
+        : `${fmtBytes(memUsed)} / ${fmtBytes(memTotal)}`;
+      boxes.push(h('div', { class: 'metric-box', title: `Memory: ${fmtBytes(memUsed)} used of ${fmtBytes(memTotal)} (${fmtBytes(memAvail)} available)` },
+        metricRing(memPct),
+        h('div', { class: 'metric-info' },
+          h('div', { class: 'metric-head' },
+            h('span', { class: 'metric-label' }, 'Memory'),
+            h('span', { class: 'metric-val mono' }, usedTotalStr)),
+          h('div', { class: 'metric-sub' }, `${fmtBytes(memAvail)} available`))));
+    }
+    return h('div', { class: 'server-metrics', 'aria-label': `CPU and memory usage on ${name}` }, ...boxes);
   }
 
   function serverCard(s) {
@@ -512,6 +596,7 @@
         serverState(s)),
       h('div', { class: 'meta-chips' }, chips),
       badges.length ? h('div', { class: 'badges' }, badges) : null,
+      serverMetrics(ov, name),
       problem,
       sshUpdate,
       mini,

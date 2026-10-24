@@ -10,6 +10,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"math"
 	"net"
 	"os"
 	"path/filepath"
@@ -17,6 +18,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/Nima786/portbridge/internal/engine"
@@ -94,6 +96,11 @@ type Overview struct {
 	BBRActive         bool         `json:"bbr_active"`
 	TunedByPB         bool         `json:"tuned_by_pb"`
 	CongestionControl string       `json:"congestion_control,omitempty"`
+	CPUPercent        float64      `json:"cpu_percent"`
+	CPUCores          int          `json:"cpu_cores,omitempty"`
+	MemTotalBytes     uint64       `json:"mem_total_bytes,omitempty"`
+	MemAvailBytes     uint64       `json:"mem_avail_bytes,omitempty"`
+	MemUsedPercent    float64      `json:"mem_used_percent"`
 	Tunnels           []TunnelInfo `json:"tunnels"`
 }
 
@@ -234,7 +241,7 @@ func LocalOverview(confDir string) Overview {
 	v4, v6 := localPublicAddresses()
 	host, _ := os.Hostname()
 	tune := readTuneStatus(confDir)
-	return Overview{
+	ov := Overview{
 		OK:                true,
 		Version:           engine.Version,
 		Hostname:          host,
@@ -246,4 +253,149 @@ func LocalOverview(confDir string) Overview {
 		CongestionControl: tune.CongestionControl,
 		Tunnels:           TunnelsReport(confDir),
 	}
+	if _, isSys := hostFor(confDir).(systemHost); isSys {
+		ov.CPUPercent, ov.CPUCores = readCPUUsage()
+		ov.MemTotalBytes, ov.MemAvailBytes, ov.MemUsedPercent = readMemUsage()
+	}
+	return ov
+}
+
+var (
+	cpuMu          sync.Mutex
+	lastCPUTotal   uint64
+	lastCPUIdle    uint64
+	lastCPUSample  time.Time
+	lastCPUPercent float64
+)
+
+func init() {
+	if b, err := os.ReadFile("/proc/stat"); err == nil {
+		if total, idle, ok := parseProcStatCPU(string(b)); ok {
+			lastCPUTotal = total
+			lastCPUIdle = idle
+			lastCPUSample = time.Now()
+		}
+	}
+}
+
+// parseProcStatCPU reads the aggregate "cpu " line from /proc/stat and returns
+// total ticks and idle (idle + iowait) ticks.
+func parseProcStatCPU(content string) (total, idle uint64, ok bool) {
+	for _, line := range strings.Split(content, "\n") {
+		if !strings.HasPrefix(line, "cpu ") {
+			continue
+		}
+		fields := strings.Fields(line)
+		if len(fields) < 5 {
+			return 0, 0, false
+		}
+		limit := len(fields)
+		if limit > 9 {
+			limit = 9 // user nice system idle iowait irq softirq steal
+		}
+		for i := 1; i < limit; i++ {
+			v, err := strconv.ParseUint(fields[i], 10, 64)
+			if err != nil {
+				return 0, 0, false
+			}
+			total += v
+			if i == 4 || i == 5 { // idle + iowait
+				idle += v
+			}
+		}
+		return total, idle, total > 0
+	}
+	return 0, 0, false
+}
+
+func readCPUUsage() (pct float64, cores int) {
+	cores = runtime.NumCPU()
+	b, err := os.ReadFile("/proc/stat")
+	if err != nil {
+		return 0, 0
+	}
+	total, idle, ok := parseProcStatCPU(string(b))
+	if !ok {
+		return 0, 0
+	}
+
+	cpuMu.Lock()
+	defer cpuMu.Unlock()
+
+	if lastCPUTotal == 0 {
+		lastCPUTotal = total
+		lastCPUIdle = idle
+		lastCPUSample = time.Now()
+		return 0, cores
+	}
+	if time.Since(lastCPUSample) >= 200*time.Millisecond && total > lastCPUTotal {
+		dTotal := total - lastCPUTotal
+		dIdle := uint64(0)
+		if idle >= lastCPUIdle {
+			dIdle = idle - lastCPUIdle
+		}
+		if dIdle > dTotal {
+			dIdle = dTotal
+		}
+		raw := float64(dTotal-dIdle) * 100.0 / float64(dTotal)
+		lastCPUPercent = math.Round(math.Max(0, math.Min(100, raw))*10) / 10
+		lastCPUTotal = total
+		lastCPUIdle = idle
+		lastCPUSample = time.Now()
+	}
+	return lastCPUPercent, cores
+}
+
+// parseProcMeminfo parses MemTotal and MemAvailable from /proc/meminfo.
+func parseProcMeminfo(content string) (totalBytes, availBytes uint64, usedPct float64, ok bool) {
+	var totalKB, availKB, freeKB, buffersKB, cachedKB uint64
+	var hasTotal, hasAvail bool
+	for _, line := range strings.Split(content, "\n") {
+		fields := strings.Fields(line)
+		if len(fields) < 2 {
+			continue
+		}
+		v, err := strconv.ParseUint(fields[1], 10, 64)
+		if err != nil {
+			continue
+		}
+		switch fields[0] {
+		case "MemTotal:":
+			totalKB, hasTotal = v, true
+		case "MemAvailable:":
+			availKB, hasAvail = v, true
+		case "MemFree:":
+			freeKB = v
+		case "Buffers:":
+			buffersKB = v
+		case "Cached:":
+			cachedKB = v
+		}
+	}
+	if !hasTotal || totalKB == 0 {
+		return 0, 0, 0, false
+	}
+	if !hasAvail {
+		availKB = freeKB + buffersKB + cachedKB
+	}
+	if availKB > totalKB {
+		availKB = totalKB
+	}
+	totalBytes = totalKB * 1024
+	availBytes = availKB * 1024
+	usedKB := totalKB - availKB
+	usedPct = math.Round((float64(usedKB)*100.0/float64(totalKB))*10) / 10
+	return totalBytes, availBytes, usedPct, true
+}
+
+func readMemUsage() (totalBytes, availBytes uint64, usedPct float64) {
+	b, err := os.ReadFile("/proc/meminfo")
+	if err != nil {
+		return 0, 0, 0
+	}
+	t, a, p, ok := parseProcMeminfo(string(b))
+	if !ok {
+		return 0, 0, 0
+	}
+	return t, a, p
 }
