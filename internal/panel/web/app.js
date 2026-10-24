@@ -3357,7 +3357,7 @@
         ? 'Frozen'
         : h('span', { title: 'Gaming mode sends only 64 KB each way to catch DPI freezes. Run the General benchmark to measure real speed.' },
             'Passed',
-            h('span', { class: 'probe-row-sub' }, '64 KB freeze check'));
+            h('span', { class: 'probe-row-sub' }, '64 KB check'));
     } else if (r.successes > 0) {
       if (r.status === 'throttled' && !(r.avg_mbps > 0)) {
         speedNode = 'Frozen';

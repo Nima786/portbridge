@@ -1979,6 +1979,11 @@ label.probe-goal-pill input[type="radio"] {
   font-family: ui-monospace, "Cascadia Code", Consolas, monospace;
   font-size: .8rem;
   white-space: nowrap;
+  min-width: 0;
+}
+.probe-metric .probe-row-sub {
+  white-space: normal;
+  overflow-wrap: anywhere;
 }
 .probe-row button.probe-use-btn {
   padding: .24rem .58rem;
