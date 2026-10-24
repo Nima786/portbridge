@@ -3310,12 +3310,41 @@
       sharingTouched = false;
       applyCreateLoadPreset(preset);
     }
-    if (cand.port && ['cdn', 'website-cdn-backup', 'grpc-cdn'].includes(cand.link)) {
-      $('tn-linkport').value = String(cand.port);
-    }
     showTunnelOptions();
     setStatus(`Applied "${cand.label}" (Score ${cand.score}/100). Enter your Inbound Port(s) in Step 5 and click Create Tunnel.`);
     $('tn-service').focus();
+    applyProbePort(cand);
+  }
+
+  // The benchmark's result holds for the port it tested on: a network can
+  // treat ports differently. That port is used for the tunnel's bridge when
+  // the server that listens on it (Foreign in Direct mode, Relay in Reverse)
+  // can give it to a tunnel; when something there has it now, the form's
+  // port is kept and the person is told the result may not carry over.
+  async function applyProbePort(cand) {
+    const field = $('tn-linkport');
+    if (!cand || !cand.port || !field) return;
+    const cur = Number(field.value || 0);
+    if (cur === cand.port) return;
+    const listenSrv = cand.mode === 'reverse' ? $('tn-relay').value : $('tn-foreign').value;
+    const listenName = (serverById(listenSrv) || {}).name || (cand.mode === 'reverse' ? 'the Relay server' : 'the Foreign server');
+    const base = `Applied "${cand.label}" (Score ${cand.score}/100).`;
+    if (listenSrv) {
+      try {
+        const res = await api('POST', '/api/ports', { server: listenSrv, ports: String(cand.port) });
+        const st = (res.ports || []).find((p) => p.port === cand.port);
+        if (st && st.state !== 'free') {
+          const who = st.by ? ` by ${st.by}` : '';
+          setStatus(`${base} The benchmark tested on port ${cand.port}, but that port is now used on ${listenName}${who}, so the Tunnel Bridge Port was left at ${cur}. The result may differ on another port; "Deep Scan" can check which ports get through.`, true);
+          return;
+        }
+      } catch (e) {
+        // Not able to ask: the port is still the one that was tested, and
+        // creating the tunnel checks it again.
+      }
+    }
+    field.value = String(cand.port);
+    setStatus(`${base} Tunnel Bridge Port set to ${cand.port}, the port the benchmark tested on. Enter your Inbound Port(s) in Step 5 and click Create Tunnel.`);
   }
 
   function renderProbeRow(r, isLive, isActive) {
@@ -3378,7 +3407,8 @@
     return h('div', { class: 'probe-row' },
       h('div', { class: 'probe-row-label' },
         r.label,
-        r.error && r.status !== 'ok' ? h('span', { class: 'probe-row-sub' }, r.error) : null),
+        r.error && r.status !== 'ok' ? h('span', { class: 'probe-row-sub' }, r.error) : null,
+        r.retested ? h('span', { class: 'probe-row-sub', title: 'The first result looked like a bad moment on the route, so this mode was tested a second time and both runs were taken into account.' }, 'Checked twice') : null),
       h('span', { class: 'state ' + st[0] }, st[1]),
       h('span', { class: 'probe-metric' }, rttNode),
       h('span', { class: 'probe-metric' }, speedNode),
@@ -3460,6 +3490,7 @@
 
       let sess = null;
       const doneResults = [];
+      const retests = [];
       try {
         sess = await api('POST', '/api/tunnels/probe', {
           action: 'start',
@@ -3478,7 +3509,7 @@
 
         for (let i = 0; i < cands.length; i++) {
           const spec = cands[i];
-          const pct = Math.round(((i + 0.2) / cands.length) * 92) + 4;
+          const pct = Math.round(((i + 0.2) / cands.length) * 84) + 4;
           btn.textContent = `Testing (${i + 1}/${cands.length})…`;
           setProbeProgress(`Step ${i + 1} of ${cands.length}: ${spec.label}…`, pct);
           renderProbeResults({ results: liveState, notes: sess.notes }, true, i);
@@ -3513,11 +3544,40 @@
           renderProbeResults({ results: liveState, notes: sess.notes }, true, -1);
         }
 
+        // One test of a few seconds can catch a bad moment on the route: a
+        // working link reading a fraction of its speed, or shown as frozen.
+        // The results that look like that are tested once more, and the
+        // panel keeps what the two runs say together.
+        let retestIDs = [];
+        try {
+          retestIDs = (await api('POST', '/api/tunnels/probe', { action: 'retest', results: doneResults })).ids || [];
+        } catch (e) {
+          retestIDs = [];
+        }
+        for (let j = 0; j < retestIDs.length; j++) {
+          const idx = cands.findIndex((c) => c.id === retestIDs[j]);
+          if (idx < 0) continue;
+          const spec = cands[idx];
+          btn.textContent = `Re-checking (${j + 1}/${retestIDs.length})…`;
+          setProbeProgress(`Re-checking a result that looked like a bad moment: ${spec.label}…`, 88 + Math.round((j / retestIDs.length) * 9));
+          renderProbeResults({ results: liveState, notes: sess.notes }, true, idx);
+          const dialerID = spec.mode === 'reverse' ? sess.foreign_id : sess.relay_id;
+          const secret = spec.mode === 'reverse' ? sess.reverse_secret : sess.direct_secret;
+          try {
+            const again = await api('POST', '/api/tunnels/probe', { action: 'step', dialer_id: dialerID, secret, spec });
+            retests.push(again);
+          } catch (e) {
+            // The first result stands.
+          }
+          renderProbeResults({ results: liveState, notes: sess.notes }, true, -1);
+        }
+
         setProbeProgress('Calculating final scores and best tunnel recommendation…', 98);
         const finalRep = await api('POST', '/api/tunnels/probe', {
           action: 'finish',
           session: sess,
           results: doneResults,
+          retests,
         });
         sess = null;
         if (live) live.hidden = true;

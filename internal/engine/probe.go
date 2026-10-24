@@ -72,6 +72,9 @@ type ProbeCandidateResult struct {
 	Score       int     `json:"score"`
 	Summary     string  `json:"summary"`
 	Hybrid      bool    `json:"hybrid,omitempty"`
+	// Retested is set when the result was checked a second time at the end
+	// of the run (see ProbeRetestIDs).
+	Retested bool `json:"retested,omitempty"`
 }
 
 // ProbeBenchmarkReport is the full ranked benchmark output.
@@ -147,6 +150,14 @@ func makeEphemeralCert(cn string) (tls.Certificate, error) {
 // StartProbeListener binds a free TCP+UDP port (preferring preferredPort and
 // Cloudflare HTTPS ports) and serves probe connections until Close() or ttl.
 func StartProbeListener(bindHost string, preferredPort int, secret []byte, ttl time.Duration) (*ProbeListener, error) {
+	return StartProbeListenerAvoiding(bindHost, preferredPort, nil, secret, ttl)
+}
+
+// StartProbeListenerAvoiding is StartProbeListener that never takes one of the
+// avoid ports. A port nothing listens on can still belong to something: a
+// stopped tunnel owns its port, and a benchmark that tested on it would
+// recommend a port the new tunnel then cannot have.
+func StartProbeListenerAvoiding(bindHost string, preferredPort int, avoid map[int]bool, secret []byte, ttl time.Duration) (*ProbeListener, error) {
 	if len(secret) < 16 {
 		secret = make([]byte, 32)
 		if _, err := rand.Read(secret); err != nil {
@@ -162,15 +173,17 @@ func StartProbeListener(bindHost string, preferredPort int, secret []byte, ttl t
 	}
 
 	var candidates []int
-	if preferredPort > 0 {
+	if preferredPort > 0 && !avoid[preferredPort] {
 		candidates = append(candidates, preferredPort)
 	}
 	for _, p := range CDNHTTPSPorts {
-		if p != preferredPort {
+		if p != preferredPort && !avoid[p] {
 			candidates = append(candidates, p)
 		}
 	}
-	candidates = append(candidates, 0) // OS-assigned fallback
+	// OS-assigned fallback, tried a few times in case it hands out a port
+	// that is to be avoided.
+	candidates = append(candidates, 0, 0, 0)
 
 	kcpCfg := &Config{
 		Transport:       TransportKCP,
@@ -198,6 +211,10 @@ func StartProbeListener(bindHost string, preferredPort int, secret []byte, ttl t
 			continue
 		}
 		actualPort := tln.Addr().(*net.TCPAddr).Port
+		if avoid[actualPort] {
+			_ = tln.Close()
+			continue
+		}
 		uaddr := net.JoinHostPort(listenHost, strconv.Itoa(actualPort))
 		uln, err := kcpListen(uaddr, kcpCfg)
 		if err != nil {
@@ -699,6 +716,52 @@ func BuildProbeCandidates(mode, ipv4, ipv6 string, port int, cdnDomain string) [
 				TargetAddr: addr6,
 				Port:       port,
 			},
+			// The other stream links a tunnel can run over IPv6. Where IPv4
+			// between two servers is blocked and IPv6 is not, these were
+			// never offered. ICMP and FakeTCP are not here: they work over
+			// IPv4 only, in a real tunnel as much as in this test.
+			ProbeCandidateSpec{
+				ID:         mode + "-ipv6-grpc",
+				Label:      dirLabel + " (IPv6) · gRPC Stream (HTTP/2)",
+				Mode:       mode,
+				Link:       "grpc",
+				Transport:  string(TransportGRPC),
+				Stealth:    false,
+				IPv6:       true,
+				Shared:     true,
+				ServerName: "www.google.com",
+				TargetAddr: addr6,
+				Port:       port,
+			},
+			ProbeCandidateSpec{
+				ID:         mode + "-ipv6-split",
+				Label:      dirLabel + " (IPv6) · Split-Stream TLS (Anti-Freeze Rotation)",
+				Mode:       mode,
+				Link:       "split",
+				Transport:  string(TransportTLS),
+				Stealth:    true,
+				SNISpoof:   true,
+				SpoofSNI:   DefaultSpoofSNI,
+				AntiFreeze: true,
+				IPv6:       true,
+				Shared:     true,
+				ServerName: DefaultSpoofSNI,
+				TargetAddr: addr6,
+				Port:       port,
+			},
+			ProbeCandidateSpec{
+				ID:         mode + "-ipv6-http-tcp",
+				Label:      dirLabel + " (IPv6) · TCP + HTTP Header",
+				Mode:       mode,
+				Link:       "plain",
+				Transport:  string(TransportPlain),
+				WebHeader:  true,
+				IPv6:       true,
+				Shared:     false,
+				ServerName: "www.bing.com",
+				TargetAddr: addr6,
+				Port:       port,
+			},
 		)
 	}
 
@@ -770,6 +833,25 @@ func RunProbeDialer(ctx context.Context, specs []ProbeCandidateSpec, secret []by
 		}
 		results = append(results, res)
 	}
+
+	// The results that look like a bad moment rather than the link are
+	// tested once more (see ProbeRetestIDs). A run of one candidate has
+	// nothing to compare with; the panel re-tests those itself.
+	if len(specs) > 1 && ctx.Err() == nil {
+		var retests []ProbeCandidateResult
+		for _, id := range ProbeRetestIDs(results) {
+			if ctx.Err() != nil {
+				break
+			}
+			for _, spec := range specs {
+				if spec.ID == id {
+					retests = append(retests, probeOneSpec(ctx, spec, secret, burstBytes))
+					break
+				}
+			}
+		}
+		results = MergeProbeRetests(results, retests)
+	}
 	return results
 }
 
@@ -838,24 +920,32 @@ func probeOneSpec(parentCtx context.Context, spec ProbeCandidateSpec, secret []b
 	}
 	res.Successes++
 
-	var partial2 bool
+	var partial2 string
 	var rtts2 []float64
-	if partial1 {
-		// Handshake and initial ping succeeded, but the sustained burst was cut off
-		// mid-stream by a DPI packet-count filter. Skip Attempt 2 to save time.
+	if partial1 != "" {
+		// Handshake and initial ping succeeded, but the transfer stopped
+		// moving (or barely moved). Skip Attempt 2 to save time.
 		res.Attempts = 1
 		res.HandshakeMS = round2(hs1)
-		res.Error = "connected, then frozen mid-stream by ISP/DPI filter"
+		res.Error = partial1
 	} else {
 		// Attempt 2: Repeat connection check + pings + 32 KB burst to confirm stability & jitter
-		hs2, r2, _, _, p2, err2 := runSingleProbeAttempt(parentCtx, cfg, routes, secret, pings2, burst2)
+		hs2, r2, dl2, ul2, p2, err2 := runSingleProbeAttempt(parentCtx, cfg, routes, secret, pings2, burst2)
 		partial2 = p2
 		if err2 == nil {
 			res.Successes++
 			rtts2 = r2
 			res.HandshakeMS = round2((hs1 + hs2) / 2.0)
-			if partial2 {
-				res.Error = "connected, then frozen mid-stream by ISP/DPI filter"
+			if partial2 != "" {
+				res.Error = partial2
+			}
+			// The first attempt's transfer is the measurement; the second only
+			// stands in for a direction the first could not time.
+			if dlMbps == 0 {
+				dlMbps = dl2
+			}
+			if ulMbps == 0 {
+				ulMbps = ul2
 			}
 		} else {
 			res.HandshakeMS = round2(hs1)
@@ -881,12 +971,18 @@ func probeOneSpec(parentCtx context.Context, spec ProbeCandidateSpec, secret []b
 	res.AvgMbps = round1((dlMbps + ulMbps) / 2.0)
 
 	switch {
-	case partial1 || partial2:
+	case partial1 != "" || partial2 != "":
 		res.Status = "throttled"
-		if res.AvgMbps > 0 {
-			res.Summary = fmt.Sprintf("Throttled — DPI freeze mid-stream (%.1f Mbps, %.0f ms ping)", res.AvgMbps, res.RTTMS)
+		why := partial1
+		if why == "" {
+			why = partial2
+		}
+		if why == probeTooSlowMsg {
+			res.Summary = fmt.Sprintf("Throttled — connected (%.0f ms ping), but data barely moves", res.RTTMS)
+		} else if res.AvgMbps > 0 {
+			res.Summary = fmt.Sprintf("Throttled — data stopped mid-stream (%.1f Mbps before it stopped, %.0f ms ping)", res.AvgMbps, res.RTTMS)
 		} else {
-			res.Summary = fmt.Sprintf("Throttled — connected (%.0f ms ping), then frozen mid-stream by DPI filter", res.RTTMS)
+			res.Summary = fmt.Sprintf("Throttled — connected (%.0f ms ping), then data stopped mid-stream", res.RTTMS)
 		}
 	case res.Successes < res.Attempts:
 		res.Status = "degraded"
@@ -902,21 +998,69 @@ func probeOneSpec(parentCtx context.Context, spec ProbeCandidateSpec, secret []b
 	return res
 }
 
-func runSingleProbeAttempt(parentCtx context.Context, cfg *Config, routes *router, secret []byte, pings int, burstBytes uint32) (hsMS float64, rtts []float64, dlMbps, ulMbps float64, partial bool, err error) {
-	attemptTimeout := 6500 * time.Millisecond
+// How long one attempt is planned to take, and the most it may take while
+// data is still moving. The plan sizes the transfers; the cap is only reached
+// by a link that is slow but working, which used to run out of the planned
+// time and be reported as frozen by DPI though its data was still flowing.
+const (
+	probeSoftBudget      = 6500 * time.Millisecond
+	probeSoftBudgetSplit = 10000 * time.Millisecond
+	probeHardCap         = 16 * time.Second
+	probeHardCapSplit    = 22 * time.Second
+	probeMinMeasure      = 32 * 1024
+)
+
+// probeStallWindow is how long a transfer may go without moving a byte before
+// it counts as frozen. A variable so a test can shorten it.
+var probeStallWindow = 3 * time.Second
+
+// Why an attempt's transfer was cut off, in the words the results show.
+const (
+	probeFrozenMsg  = "connected, then data stopped mid-stream (frozen by the network or a DPI filter)"
+	probeTooSlowMsg = "connected, but data barely moves (far too slow to use)"
+)
+
+// probeSizeFor sizes a timed transfer from the speed just seen, so it fits in
+// the planned time that is left: as it was for a fast link, smaller for a slow
+// one. rate is in bytes per second; 0 means not known yet.
+func probeSizeFor(rate float64, def uint32, soft time.Time) uint32 {
+	if rate <= 0 {
+		return def
+	}
+	left := time.Until(soft).Seconds()
+	if left < 1 {
+		left = 1
+	}
+	size := rate * left / 4
+	if size < probeMinMeasure {
+		size = probeMinMeasure
+	}
+	if size >= float64(def) {
+		return def
+	}
+	return uint32(size)
+}
+
+// runSingleProbeAttempt opens one connection and runs the ping and transfer
+// checks over it. partial says why a transfer was cut off ("" when none was).
+func runSingleProbeAttempt(parentCtx context.Context, cfg *Config, routes *router, secret []byte, pings int, burstBytes uint32) (hsMS float64, rtts []float64, dlMbps, ulMbps float64, partial string, err error) {
+	soft, hardCap := probeSoftBudget, probeHardCap
 	if cfg.AntiFreeze {
-		attemptTimeout = 10000 * time.Millisecond
-		if burstBytes > 32*1024 {
+		soft, hardCap = probeSoftBudgetSplit, probeHardCapSplit
+		// A light check (the second attempt, or Gaming) stays light.
+		if burstBytes < 192*1024 && burstBytes > 32*1024 {
 			burstBytes = 32 * 1024
 		}
 	}
-	ctx, cancel := context.WithTimeout(parentCtx, attemptTimeout)
+	ctx, cancel := context.WithTimeout(parentCtx, hardCap)
 	defer cancel()
 
 	t0 := time.Now()
+	softDeadline := t0.Add(soft)
+	hardDeadline, _ := ctx.Deadline()
 	raw, claim, err := routes.dial(2200 * time.Millisecond)
 	if err != nil {
-		return 0, nil, 0, 0, false, fmt.Errorf("tcp dial: %w", err)
+		return 0, nil, 0, 0, "", fmt.Errorf("tcp dial: %w", err)
 	}
 	defer raw.Close()
 	tuneSocket(raw)
@@ -932,30 +1076,27 @@ func runSingleProbeAttempt(parentCtx context.Context, cfg *Config, routes *route
 
 	c, err := wrapDialPurpose(raw, cfg.withClaimedName(claim), authPurposeSpeedtest)
 	if err != nil {
-		return 0, nil, 0, 0, false, fmt.Errorf("handshake: %w", err)
+		return 0, nil, 0, 0, "", fmt.Errorf("handshake: %w", err)
 	}
 	defer c.Close()
 
 	if err := sendAuthPurpose(c, secret, authPurposeSpeedtest); err != nil {
-		return 0, nil, 0, 0, false, fmt.Errorf("auth: %w", err)
+		return 0, nil, 0, 0, "", fmt.Errorf("auth: %w", err)
 	}
 	hsMS = float64(time.Since(t0)) / float64(time.Millisecond)
 
 	// Ping samples (use 2.0s deadline on first ping so dead UDP/KCP or DPI-dropped streams fail fast).
-	// Each per-ping deadline also overrides the one the attempt's context set
-	// on expiry, so the loop watches the time itself: once at least two
-	// samples are in and too little is left for the transfer check, it stops
-	// pinging rather than letting a slow but healthy link (many pings on a
-	// high-latency path in Gaming mode) run out the clock and be reported as
-	// frozen mid-stream.
-	attemptDeadline, hasDeadline := ctx.Deadline()
+	// Once at least two samples are in and too little of the planned time is
+	// left for the transfer check, it stops pinging rather than letting a slow
+	// but healthy link (many pings on a high-latency path in Gaming mode) eat
+	// the time the transfers need.
 	for i := 0; i < pings; i++ {
-		if hasDeadline && len(rtts) >= 2 && time.Until(attemptDeadline) < probePingReserve {
+		if len(rtts) >= 2 && time.Until(softDeadline) < probePingReserve {
 			break
 		}
 		pingDeadline := time.Now().Add(2000 * time.Millisecond)
-		if hasDeadline && attemptDeadline.Before(pingDeadline) {
-			pingDeadline = attemptDeadline
+		if hardDeadline.Before(pingDeadline) {
+			pingDeadline = hardDeadline
 		}
 		_ = c.SetDeadline(pingDeadline)
 		pStart := time.Now()
@@ -964,22 +1105,36 @@ func runSingleProbeAttempt(parentCtx context.Context, cfg *Config, routes *route
 		binary.BigEndian.PutUint64(req[1:], uint64(pStart.UnixNano()))
 		if _, err := c.Write(req[:]); err != nil {
 			if len(rtts) > 0 {
-				return hsMS, rtts, 0, 0, true, nil
+				return hsMS, rtts, 0, 0, probeFrozenMsg, nil
 			}
-			return hsMS, rtts, 0, 0, false, fmt.Errorf("ping write: %w", err)
+			return hsMS, rtts, 0, 0, "", fmt.Errorf("ping write: %w", err)
 		}
 		var echo [8]byte
 		if _, err := io.ReadFull(c, echo[:]); err != nil {
 			if len(rtts) > 0 {
-				return hsMS, rtts, 0, 0, true, nil
+				return hsMS, rtts, 0, 0, probeFrozenMsg, nil
 			}
-			return hsMS, rtts, 0, 0, false, fmt.Errorf("ping read: %w", err)
+			return hsMS, rtts, 0, 0, "", fmt.Errorf("ping read: %w", err)
 		}
 		rtts = append(rtts, float64(time.Since(pStart))/float64(time.Millisecond))
 	}
 
-	if dl, ok := ctx.Deadline(); ok {
-		_ = c.SetDeadline(dl)
+	// Every step of a transfer gets probeStallWindow to move something, up
+	// to the attempt's cap. Frozen is "nothing moved for that long", not "did
+	// not finish in the planned time".
+	stallDeadline := func() time.Time {
+		d := time.Now().Add(probeStallWindow)
+		if d.After(hardDeadline) {
+			d = hardDeadline
+		}
+		return d
+	}
+	// cutOff says why a transfer that did not finish was cut off.
+	cutOff := func() string {
+		if time.Until(hardDeadline) <= 100*time.Millisecond {
+			return probeTooSlowMsg
+		}
+		return probeFrozenMsg
 	}
 
 	minRTTSec := 0.0
@@ -993,12 +1148,15 @@ func runSingleProbeAttempt(parentCtx context.Context, cfg *Config, routes *route
 		minRTTSec = minRTT / 1000.0
 	}
 
+	readBuf := make([]byte, 32*1024)
+
 	// Helper to run one 0x02 (Listener -> Dialer) transfer of sz bytes.
 	runPhase02 := func(sz uint32) (int64, float64, error) {
 		var hdr [5]byte
 		hdr[0] = 0x02
 		binary.BigEndian.PutUint32(hdr[1:], sz)
 		reqStart := time.Now()
+		_ = c.SetDeadline(stallDeadline())
 		if _, err := c.Write(hdr[:]); err != nil {
 			return 0, 0, err
 		}
@@ -1007,7 +1165,21 @@ func runSingleProbeAttempt(parentCtx context.Context, cfg *Config, routes *route
 			return 0, 0, err
 		}
 		readStart := time.Now()
-		n, rerr := io.CopyN(io.Discard, c, int64(sz))
+		var n int64
+		var rerr error
+		for n < int64(sz) {
+			want := int64(len(readBuf))
+			if rem := int64(sz) - n; rem < want {
+				want = rem
+			}
+			_ = c.SetReadDeadline(stallDeadline())
+			k, err := c.Read(readBuf[:want])
+			n += int64(k)
+			if err != nil {
+				rerr = err
+				break
+			}
+		}
 		dur := time.Since(readStart).Seconds()
 		if minRTTSec > 0 {
 			totalSec := time.Since(reqStart).Seconds()
@@ -1033,6 +1205,7 @@ func runSingleProbeAttempt(parentCtx context.Context, cfg *Config, routes *route
 		var hdr [5]byte
 		hdr[0] = 0x03
 		binary.BigEndian.PutUint32(hdr[1:], sz)
+		_ = c.SetDeadline(stallDeadline())
 		if _, err := c.Write(hdr[:]); err != nil {
 			return 0, 0, err
 		}
@@ -1048,6 +1221,7 @@ func runSingleProbeAttempt(parentCtx context.Context, cfg *Config, routes *route
 			if rem := int64(sz) - sent; rem < chunk {
 				chunk = rem
 			}
+			_ = c.SetWriteDeadline(stallDeadline())
 			n, err := c.Write(payload[:chunk])
 			if n > 0 {
 				sent += int64(n)
@@ -1058,6 +1232,10 @@ func runSingleProbeAttempt(parentCtx context.Context, cfg *Config, routes *route
 			}
 		}
 		if werr == nil {
+			// What was written may still sit in buffers on the way, and
+			// nothing says how it is moving, so the completion is waited for
+			// up to the attempt's cap.
+			_ = c.SetReadDeadline(hardDeadline)
 			if _, err := io.ReadFull(c, ackByte[:]); err != nil {
 				werr = err
 			}
@@ -1074,64 +1252,85 @@ func runSingleProbeAttempt(parentCtx context.Context, cfg *Config, routes *route
 		return sent, dur, werr
 	}
 
+	// The planned time left bounds how long a longer measurement may run,
+	// so it is what measureTransfer is given; the cap is never planned for.
+	softCtx, softCancel := context.WithDeadline(ctx, softDeadline)
+	defer softCancel()
+
 	// Phase 0x02 (Listener -> Dialer):
 	// When burstBytes >= 192 KB, first send a warm-up command so TCP exits Slow Start
 	// (and any packet token-bucket burst is primed) before timing the steady-state burst.
+	// Split rotation is warmed up too, with less, so its connection ramp is
+	// past before the timing starts. Each timed size after a warm-up is fitted
+	// to the speed the warm-up showed.
+	full := burstBytes >= 192*1024
 	measure02 := burstBytes
-	if !cfg.AntiFreeze && burstBytes >= 192*1024 {
+	if full {
 		warmup02 := uint32(128 * 1024)
-		if cfg.Transport == TransportICMP {
-			warmup02 = 512 * 1024
-		}
-		if wn, _, werr := runPhase02(warmup02); werr != nil || wn < int64(warmup02) {
-			return hsMS, rtts, 0, 0, true, nil
-		}
-		if !cfg.Transport.IsPacketBased() {
+		switch {
+		case cfg.AntiFreeze:
+			warmup02, measure02 = 64*1024, 128*1024
+		case cfg.Transport == TransportICMP:
+			warmup02, measure02 = 512*1024, 512*1024
+		case !cfg.Transport.IsPacketBased():
 			measure02 = 384 * 1024
-		} else if cfg.Transport == TransportICMP {
-			measure02 = 512 * 1024
+		}
+		wn, wd, werr := runPhase02(warmup02)
+		if werr != nil || wn < int64(warmup02) {
+			return hsMS, rtts, 0, 0, cutOff(), nil
+		}
+		if wd > 0 {
+			measure02 = probeSizeFor(float64(wn)/wd, measure02, softDeadline)
 		}
 	}
-	// The time left to spend on this attempt bounds how long a longer
-	// measurement may run, so a slow but working link is never mistaken for a
-	// frozen one just because it was asked for too much.
-	longer := !cfg.AntiFreeze && cfg.Transport != TransportICMP && burstBytes >= 192*1024
-	dlRead, dlDur, dlOK, dlErr := measureTransfer(ctx, runPhase02, measure02, longer)
+	longer := cfg.Transport != TransportICMP && full
+	dlRead, dlDur, dlOK, dlErr := measureTransfer(softCtx, runPhase02, measure02, longer)
 	if dlErr != nil || !dlOK {
-		return hsMS, rtts, 0, 0, true, nil
+		return hsMS, rtts, 0, 0, cutOff(), nil
 	}
+	dlRate := 0.0
 	if dlDur > 0 && dlRead > 0 {
-		dlMbps = (float64(dlRead) * 8 / 1_000_000) / dlDur
+		dlRate = float64(dlRead) / dlDur
+		dlMbps = dlRate * 8 / 1_000_000
 	}
 
 	// Phase 0x03 (Dialer -> Listener):
 	// Warm up the Dialer -> Listener direction first (critical for Reverse mode where
 	// Dialer -> Listener is User Download Foreign -> Relay, and where transit routers
 	// often apply a ~768 KB token-bucket burst allowance to ICMP Echo Requests before
-	// enforcing their sustained ICMP rate limit).
+	// enforcing their sustained ICMP rate limit). Its sizes start from the
+	// download speed until the upload's own warm-up has shown its speed.
 	measure03 := burstBytes
-	if !cfg.AntiFreeze && burstBytes >= 192*1024 {
+	if full {
 		warmup03 := uint32(128 * 1024)
-		if cfg.Transport == TransportICMP {
-			warmup03 = 768 * 1024
-			measure03 = 512 * 1024
-		} else if !cfg.Transport.IsPacketBased() {
+		switch {
+		case cfg.AntiFreeze:
+			warmup03, measure03 = 64*1024, 128*1024
+		case cfg.Transport == TransportICMP:
+			warmup03, measure03 = 768*1024, 512*1024
+		case !cfg.Transport.IsPacketBased():
 			measure03 = 384 * 1024
 		}
-		if wn, _, werr := runPhase03(warmup03); werr != nil || wn < int64(warmup03) {
-			return hsMS, rtts, dlMbps, 0, true, nil
+		warmup03 = probeSizeFor(dlRate, warmup03, softDeadline)
+		wn, wd, werr := runPhase03(warmup03)
+		if werr != nil || wn < int64(warmup03) {
+			return hsMS, rtts, dlMbps, 0, cutOff(), nil
+		}
+		if wd > 0 {
+			measure03 = probeSizeFor(float64(wn)/wd, measure03, softDeadline)
 		}
 	}
-	ulSent, ulDur, ulOK, ulErr := measureTransfer(ctx, runPhase03, measure03, longer)
+	ulSent, ulDur, ulOK, ulErr := measureTransfer(softCtx, runPhase03, measure03, longer)
 	if ulErr != nil || !ulOK {
-		return hsMS, rtts, dlMbps, 0, true, nil
+		return hsMS, rtts, dlMbps, 0, cutOff(), nil
 	}
 	if ulDur > 0 && ulSent > 0 {
 		ulMbps = (float64(ulSent) * 8 / 1_000_000) / ulDur
 	}
 
+	_ = c.SetWriteDeadline(stallDeadline())
 	_, _ = c.Write([]byte{0x04})
-	return hsMS, rtts, dlMbps, ulMbps, false, nil
+	return hsMS, rtts, dlMbps, ulMbps, "", nil
 }
 
 // probeKCPDefaults gives a probe's settings the KCP tuning a real tunnel has.
@@ -1172,9 +1371,11 @@ func measureTransfer(ctx context.Context, run func(uint32) (int64, float64, erro
 		rate := float64(n) / dur // bytes per second
 		size := math.Max(rate*probeTargetTime.Seconds(), float64(n)*2)
 		if dl, has := ctx.Deadline(); has {
-			if left := time.Until(dl).Seconds(); left > 0 {
-				size = math.Min(size, rate*left/probeBudgetShare)
+			left := time.Until(dl).Seconds()
+			if left <= 0 {
+				break // the planned time is used up; keep what was measured
 			}
+			size = math.Min(size, rate*left/probeBudgetShare)
 		}
 		size = math.Min(size, probeMaxMeasure)
 		if size < float64(n)*1.5 {

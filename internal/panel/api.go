@@ -811,7 +811,9 @@ func (p *Panel) handleTestOutboundTunnel(w http.ResponseWriter, r *http.Request,
 }
 
 func (p *Panel) handleProbeTunnel(w http.ResponseWriter, r *http.Request, _ authed) {
-	agent.ExtendDeadlines(w, 5*time.Minute)
+	// The one-request run tests every candidate and re-tests the doubtful
+	// ones; on a slow pair that is well past five minutes.
+	agent.ExtendDeadlines(w, 15*time.Minute)
 	var req struct {
 		Action    string                        `json:"action"`
 		Relay     string                        `json:"relay"`
@@ -823,11 +825,21 @@ func (p *Panel) handleProbeTunnel(w http.ResponseWriter, r *http.Request, _ auth
 		Spec      engine.ProbeCandidateSpec     `json:"spec"`
 		Session   probeSession                  `json:"session"`
 		Results   []engine.ProbeCandidateResult `json:"results"`
+		Retests   []engine.ProbeCandidateResult `json:"retests"`
 	}
 	if !decodeJSON(w, r, &req) {
 		return
 	}
 	switch req.Action {
+	case "retest":
+		// Which of the results the page should test once more before it
+		// finishes (the step-by-step run tests one candidate at a time, so
+		// nothing on a server can compare them).
+		ids := engine.ProbeRetestIDs(req.Results)
+		if ids == nil {
+			ids = []string{}
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"ids": ids})
 	case "start":
 		sess, err := p.startProbeSession(r.Context(), strings.TrimSpace(req.Relay), strings.TrimSpace(req.Foreign), strings.TrimSpace(req.CDNDomain))
 		if err != nil {
@@ -843,7 +855,7 @@ func (p *Panel) handleProbeTunnel(w http.ResponseWriter, r *http.Request, _ auth
 		}
 		writeJSON(w, http.StatusOK, res)
 	case "finish":
-		rep := p.finishProbeSession(req.Session, req.Results)
+		rep := p.finishProbeSession(req.Session, engine.MergeProbeRetests(req.Results, req.Retests))
 		writeJSON(w, http.StatusOK, rep)
 	case "sni-scan":
 		rep, err := p.scanRelaySNIs(r.Context(), strings.TrimSpace(req.Relay), nil)

@@ -981,7 +981,18 @@ func newAgentHandler(token, confDir string, allowUpdates func() bool) *http.Serv
 			PreferredPort int `json:"preferred_port"`
 		}
 		_ = json.NewDecoder(io.LimitReader(r.Body, 4096)).Decode(&req)
-		pl, err := engine.StartProbeListener("0.0.0.0", req.PreferredPort, nil, 300*time.Second)
+		// Never test on a port a tunnel here owns, running or stopped: the
+		// benchmark recommends the port it tested on, and the new tunnel
+		// could not have it. Ports something listens on (the panel, this
+		// agent, a web server) cannot be taken by the listener anyway.
+		avoid := map[int]bool{}
+		for _, c := range portsClaimedByOthers(confDir, "") {
+			avoid[c.port] = true
+		}
+		// The panel closes the listener when the run ends; this is only the
+		// limit for a run abandoned half way. A slow pair with IPv6 and
+		// re-tests can take well over five minutes.
+		pl, err := engine.StartProbeListenerAvoiding("0.0.0.0", req.PreferredPort, avoid, nil, 20*time.Minute)
 		if err != nil {
 			writeJSONReply(w, http.StatusUnprocessableEntity, map[string]any{"ok": false, "error": err.Error()})
 			return
@@ -1037,6 +1048,9 @@ func newAgentHandler(token, confDir string, allowUpdates func() bool) *http.Serv
 			writeJSONReply(w, http.StatusBadRequest, map[string]any{"ok": false, "error": "invalid probe secret"})
 			return
 		}
+		// A batch (Auto-Heal tests every candidate in one request) runs far
+		// past the usual two-minute limit, and the answer would be lost.
+		extendDeadlines(w, 15*time.Minute)
 		results := engine.RunProbeDialer(r.Context(), req.Specs, sec, req.BurstBytes)
 		writeJSONReply(w, http.StatusOK, map[string]any{"ok": true, "results": results})
 	})

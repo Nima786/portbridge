@@ -1385,11 +1385,12 @@ func (p *Panel) runProbeStep(parent context.Context, dialerID, secret string, sp
 	if err := p.checkProbeStep(dialerID, secret, spec); err != nil {
 		return engine.ProbeCandidateResult{}, err
 	}
-	// Two attempts of up to 6.5 s each (10 s each with Anti-Freeze rotation)
-	// must fit, or a slow but working candidate comes back as unreachable.
-	stepTimeout := 15 * time.Second
+	// Two attempts must fit. Each is planned at 6.5 s (10 s with Anti-Freeze
+	// rotation) but may run to 16 s (22 s) while a slow link's data is still
+	// moving; cut short, a slow but working candidate came back as unreachable.
+	stepTimeout := 40 * time.Second
 	if spec.AntiFreeze {
-		stepTimeout = 24 * time.Second
+		stepTimeout = 52 * time.Second
 	}
 	dctx, dcancel := context.WithTimeout(parent, stepTimeout)
 	defer dcancel()
