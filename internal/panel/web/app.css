@@ -2003,6 +2003,30 @@ label.probe-goal-pill input[type="radio"] {
   border-color: var(--accent);
   background: var(--accent-soft);
 }
+.probe-row.is-applied {
+  border-color: var(--ok-border);
+  background: var(--ok-soft);
+}
+button.is-applied {
+  border-color: var(--ok-border) !important;
+  background: var(--ok) !important;
+  color: #fff !important;
+  font-weight: 650;
+}
+.probe-applied-banner {
+  margin: 0;
+  padding: .55rem .8rem;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--ok-border);
+  background: var(--ok-soft);
+  color: var(--text);
+  font-size: .84rem;
+  font-weight: 550;
+}
+.probe-applied-banner.warn {
+  border-color: var(--warn-border);
+  background: var(--warn-soft);
+}
 .probe-live-box {
   margin-top: .8rem;
   padding: .75rem .95rem;

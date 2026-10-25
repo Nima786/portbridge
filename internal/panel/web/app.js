@@ -3292,6 +3292,11 @@
     });
   }
 
+  let lastProbeReport = null;
+  let appliedProbeID = '';
+  let appliedProbeText = '';
+  let appliedProbeWarn = false;
+
   function applyProbeCandidate(cand) {
     if (!cand) return;
     if ($('tn-probe-service') && $('tn-service') && $('tn-probe-service').value.trim()) {
@@ -3340,12 +3345,19 @@
     }
     showTunnelOptions();
     const svc = $('tn-service') ? $('tn-service').value.trim() : '';
+    const bport = cand.port || Number(($('tn-linkport') && $('tn-linkport').value) || 0);
+    appliedProbeID = cand.id || cand.label || '';
+    appliedProbeWarn = false;
     if (svc) {
-      setStatus(`Applied "${cand.label}" (Score ${cand.score}/100) with Inbound Port(s) ${svc}.`);
+      appliedProbeText = `✓ Applied "${cand.label}" (${cand.score}/100) — Inbound Port(s): ${svc}${bport ? ` · Tunnel Bridge Port: ${bport}` : ''}. Click "Create Tunnel" below when ready.`;
+      setStatus(appliedProbeText);
     } else {
-      setStatus(`Applied "${cand.label}" (Score ${cand.score}/100). Enter your Inbound Port(s) and click Create Tunnel.`);
-      $('tn-service').focus();
+      appliedProbeText = `✓ Applied "${cand.label}" (${cand.score}/100)${bport ? ` — Tunnel Bridge Port: ${bport}` : ''}. Enter your Inbound Port(s) above, then click "Create Tunnel".`;
+      setStatus(appliedProbeText);
+      if ($('tn-probe-service')) $('tn-probe-service').focus();
+      else if ($('tn-service')) $('tn-service').focus();
     }
+    if (lastProbeReport) renderProbeResults(lastProbeReport, false, -1);
     applyProbePort(cand);
   }
 
@@ -3368,7 +3380,11 @@
         const st = (res.ports || []).find((p) => p.port === cand.port);
         if (st && st.state !== 'free') {
           const who = st.by ? ` by ${st.by}` : '';
-          setStatus(`${base} The benchmark tested on port ${cand.port}, but that port is now used on ${listenName}${who}, so the Tunnel Bridge Port was left at ${cur}. The result may differ on another port; "Deep Scan" can check which ports get through.`, true);
+          const msg = `${base} The benchmark tested on port ${cand.port}, but that port is now used on ${listenName}${who}, so the Tunnel Bridge Port was left at ${cur}. The result may differ on another port; "Deep Scan" can check which ports get through.`;
+          appliedProbeWarn = true;
+          appliedProbeText = msg;
+          setStatus(msg, true);
+          if (lastProbeReport) renderProbeResults(lastProbeReport, false, -1);
           return;
         }
       } catch (e) {
@@ -3378,11 +3394,15 @@
     }
     field.value = String(cand.port);
     if ($('tn-probe-linkport')) $('tn-probe-linkport').value = String(cand.port);
+    appliedProbeWarn = false;
     if (svc) {
+      appliedProbeText = `✓ Applied "${cand.label}" (${cand.score}/100) — Inbound Port(s): ${svc} · Tunnel Bridge Port: ${cand.port} (tested port). Click "Create Tunnel" below when ready.`;
       setStatus(`${base} Inbound Port(s) set to ${svc} and Tunnel Bridge Port set to ${cand.port} (tested port). Click Create Tunnel when ready.`);
     } else {
-      setStatus(`${base} Tunnel Bridge Port set to ${cand.port}, the port the benchmark tested on. Enter your Inbound Port(s) and click Create Tunnel.`);
+      appliedProbeText = `✓ Applied "${cand.label}" (${cand.score}/100) — Tunnel Bridge Port: ${cand.port} (tested port). Enter your Inbound Port(s) above, then click "Create Tunnel".`;
+      setStatus(`${base} Tunnel Bridge Port set to ${cand.port}, the port the benchmark tested on. Enter your Inbound Port(s) in Step 5 and click Create Tunnel.`);
     }
+    if (lastProbeReport) renderProbeResults(lastProbeReport, false, -1);
   }
 
   function renderProbeRow(r, isLive, isActive) {
@@ -3416,6 +3436,7 @@
     const st = stMap[r.status] || ['bad', r.status || 'Blocked'];
     const scoreCls = r.score >= 75 ? '' : (r.score >= 45 ? ' warn' : ' bad');
     const canUse = !isLive && (r.status === 'ok' || r.status === 'degraded');
+    const isApplied = !isLive && appliedProbeID && (r.id === appliedProbeID || r.label === appliedProbeID);
     let speedNode = '—';
     if (r.successes > 0 && r.gaming) {
       // Gaming mode only runs a 64 KB anti-freeze check; its Mbps reflects
@@ -3442,7 +3463,7 @@
         `${Math.round(r.rtt_ms)} ms`,
         h('span', { class: 'probe-row-sub' }, `±${(r.jitter_ms || 0).toFixed(1)} ms`));
     }
-    return h('div', { class: 'probe-row' },
+    return h('div', { class: 'probe-row' + (isApplied ? ' is-applied' : '') },
       h('div', { class: 'probe-row-label' },
         r.label,
         r.error && r.status !== 'ok' ? h('span', { class: 'probe-row-sub' }, r.error) : null,
@@ -3456,9 +3477,9 @@
       canUse
         ? h('button', {
             type: 'button',
-            class: 'probe-use-btn',
+            class: 'probe-use-btn' + (isApplied ? ' is-applied' : ''),
             onclick: () => applyProbeCandidate(r)
-          }, 'Use')
+          }, isApplied ? '✓ Applied' : 'Use')
         : h('span', { class: 'muted small' }, '—'));
   }
 
@@ -3466,10 +3487,12 @@
     const box = $('tn-probe-results');
     if (!box) return;
     box.hidden = false;
+    if (!isLive) lastProbeReport = rep;
 
     const kids = [];
     if (!isLive && rep.recommended) {
       const rec = rep.recommended;
+      const recApplied = appliedProbeID && (rec.id === appliedProbeID || rec.label === appliedProbeID);
       kids.push(h('div', { class: 'probe-rec-card' },
         h('div', { class: 'probe-rec-main' },
           h('div', { class: 'probe-rec-top' },
@@ -3478,9 +3501,16 @@
           h('p', { class: 'probe-rec-summary' }, rec.summary || '')),
         h('button', {
           type: 'button',
-          class: 'primary',
+          class: 'primary' + (recApplied ? ' is-applied' : ''),
           onclick: () => applyProbeCandidate(rec)
-        }, 'Apply Recommended')));
+        }, recApplied ? '✓ Applied' : 'Apply Recommended')));
+    }
+    if (!isLive && appliedProbeText) {
+      kids.push(h('p', {
+        id: 'tn-probe-applied',
+        class: 'probe-applied-banner' + (appliedProbeWarn ? ' warn' : ''),
+        role: 'status',
+      }, appliedProbeText));
     }
 
     const rows = (rep.results || []).map((r, idx) => renderProbeRow(r, !!isLive, isLive && idx === activeIdx));
@@ -3521,6 +3551,10 @@
       if (linkPort > 0 && $('tn-linkport')) $('tn-linkport').value = String(linkPort);
 
       err.textContent = '';
+      lastProbeReport = null;
+      appliedProbeID = '';
+      appliedProbeText = '';
+      appliedProbeWarn = false;
       resBox.hidden = true;
       resBox.replaceChildren();
       if ($('tn-explore-hint')) $('tn-explore-hint').hidden = true;
@@ -3667,6 +3701,10 @@
     if ($('tn-spoof-test-results')) $('tn-spoof-test-results').replaceChildren();
     if ($('tn-probe-error')) $('tn-probe-error').textContent = '';
     if ($('tn-probe-live')) $('tn-probe-live').hidden = true;
+    lastProbeReport = null;
+    appliedProbeID = '';
+    appliedProbeText = '';
+    appliedProbeWarn = false;
     if ($('tn-probe-results')) {
       $('tn-probe-results').hidden = true;
       $('tn-probe-results').replaceChildren();
