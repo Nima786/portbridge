@@ -1604,7 +1604,13 @@
         ? h('button', {
             type: 'button',
             class: 'use-port-btn',
-            onclick: () => { linkInput.value = String(port); linkInput.focus(); }
+            onclick: () => {
+              linkInput.value = String(port);
+              if (linkInput.id === 'tn-linkport' && $('tn-probe-linkport')) {
+                $('tn-probe-linkport').value = String(port);
+              }
+              linkInput.focus();
+            }
           }, `Use :${port}`)
         : null;
       return h('li', { class: cls },
@@ -3079,6 +3085,7 @@
               const applied = [];
               if (rep.best_port && $('tn-linkport')) {
                 $('tn-linkport').value = String(rep.best_port);
+                if ($('tn-probe-linkport')) $('tn-probe-linkport').value = String(rep.best_port);
                 applied.push(`bridge port ${rep.best_port}`);
               }
               if (rep.best_name) {
@@ -3106,6 +3113,7 @@
             class: 'use-port-btn',
             onclick: () => {
               if ($('tn-linkport')) $('tn-linkport').value = String(p.port);
+              if ($('tn-probe-linkport')) $('tn-probe-linkport').value = String(p.port);
               setStatus(`Tunnel bridge port set to ${p.port}.`);
             }
           }, 'Use')
@@ -3267,8 +3275,28 @@
     });
   }
 
+  if ($('tn-probe-service') && $('tn-service')) {
+    $('tn-probe-service').addEventListener('input', () => {
+      $('tn-service').value = $('tn-probe-service').value;
+    });
+    $('tn-service').addEventListener('input', () => {
+      $('tn-probe-service').value = $('tn-service').value;
+    });
+  }
+  if ($('tn-probe-linkport') && $('tn-linkport')) {
+    $('tn-probe-linkport').addEventListener('input', () => {
+      $('tn-linkport').value = $('tn-probe-linkport').value;
+    });
+    $('tn-linkport').addEventListener('input', () => {
+      $('tn-probe-linkport').value = $('tn-linkport').value;
+    });
+  }
+
   function applyProbeCandidate(cand) {
     if (!cand) return;
+    if ($('tn-probe-service') && $('tn-service') && $('tn-probe-service').value.trim()) {
+      $('tn-service').value = $('tn-probe-service').value.trim();
+    }
     $('tn-gre').checked = false;
     setRadio('tn-mode', cand.mode === 'reverse' ? 'reverse' : 'direct');
     setRadio('tn-link', cand.ip_spoof ? 'ip-spoof' : (cand.anti_freeze ? 'split' : (cand.sni_spoof ? 'sni-spoof' : (cand.link || 'website'))));
@@ -3311,8 +3339,13 @@
       applyCreateLoadPreset(preset);
     }
     showTunnelOptions();
-    setStatus(`Applied "${cand.label}" (Score ${cand.score}/100). Enter your Inbound Port(s) in Step 5 and click Create Tunnel.`);
-    $('tn-service').focus();
+    const svc = $('tn-service') ? $('tn-service').value.trim() : '';
+    if (svc) {
+      setStatus(`Applied "${cand.label}" (Score ${cand.score}/100) with Inbound Port(s) ${svc}.`);
+    } else {
+      setStatus(`Applied "${cand.label}" (Score ${cand.score}/100). Enter your Inbound Port(s) and click Create Tunnel.`);
+      $('tn-service').focus();
+    }
     applyProbePort(cand);
   }
 
@@ -3325,7 +3358,7 @@
     const field = $('tn-linkport');
     if (!cand || !cand.port || !field) return;
     const cur = Number(field.value || 0);
-    if (cur === cand.port) return;
+    const svc = $('tn-service') ? $('tn-service').value.trim() : '';
     const listenSrv = cand.mode === 'reverse' ? $('tn-relay').value : $('tn-foreign').value;
     const listenName = (serverById(listenSrv) || {}).name || (cand.mode === 'reverse' ? 'the Relay server' : 'the Foreign server');
     const base = `Applied "${cand.label}" (Score ${cand.score}/100).`;
@@ -3344,7 +3377,12 @@
       }
     }
     field.value = String(cand.port);
-    setStatus(`${base} Tunnel Bridge Port set to ${cand.port}, the port the benchmark tested on. Enter your Inbound Port(s) in Step 5 and click Create Tunnel.`);
+    if ($('tn-probe-linkport')) $('tn-probe-linkport').value = String(cand.port);
+    if (svc) {
+      setStatus(`${base} Inbound Port(s) set to ${svc} and Tunnel Bridge Port set to ${cand.port} (tested port). Click Create Tunnel when ready.`);
+    } else {
+      setStatus(`${base} Tunnel Bridge Port set to ${cand.port}, the port the benchmark tested on. Enter your Inbound Port(s) and click Create Tunnel.`);
+    }
   }
 
   function renderProbeRow(r, isLive, isActive) {
@@ -3476,6 +3514,11 @@
       const relay = $('tn-relay').value;
       const foreign = $('tn-foreign').value;
       const cdn = ($('tn-probe-cdn') && $('tn-probe-cdn').value.trim()) || ($('tn-domain') && $('tn-domain').value.trim()) || '';
+      const servicePorts = ($('tn-probe-service') && $('tn-probe-service').value.trim()) || ($('tn-service') && $('tn-service').value.trim()) || '';
+      const userPorts = ($('tn-users') && $('tn-users').value.trim()) || '';
+      const linkPort = Number(($('tn-probe-linkport') && $('tn-probe-linkport').value) || ($('tn-linkport') && $('tn-linkport').value) || 0);
+      if (servicePorts && $('tn-service')) $('tn-service').value = servicePorts;
+      if (linkPort > 0 && $('tn-linkport')) $('tn-linkport').value = String(linkPort);
 
       err.textContent = '';
       resBox.hidden = true;
@@ -3497,6 +3540,9 @@
           relay,
           foreign,
           cdn_domain: cdn,
+          service_ports: servicePorts,
+          user_ports: userPorts,
+          link_port: linkPort,
         });
         const isGaming = radio('tn-probe-goal') === 'gaming';
         const cands = (sess.candidates || []).map((c) => Object.assign({}, c, { gaming: isGaming }));
@@ -3566,6 +3612,11 @@
           try {
             const again = await api('POST', '/api/tunnels/probe', { action: 'step', dialer_id: dialerID, secret, spec });
             retests.push(again);
+            if (again && (again.status === 'ok' || (liveState[idx] && liveState[idx].status !== 'ok'))) {
+              liveState[idx] = Object.assign({}, again, { retested: true });
+            } else if (liveState[idx]) {
+              liveState[idx] = Object.assign({}, liveState[idx], { retested: true });
+            }
           } catch (e) {
             // The first result stands.
           }
@@ -3619,6 +3670,12 @@
     if ($('tn-probe-results')) {
       $('tn-probe-results').hidden = true;
       $('tn-probe-results').replaceChildren();
+    }
+    if ($('tn-probe-service') && $('tn-service')) {
+      $('tn-probe-service').value = $('tn-service').value;
+    }
+    if ($('tn-probe-linkport') && $('tn-linkport')) {
+      $('tn-probe-linkport').value = $('tn-linkport').value;
     }
     populateProbeCFPick();
     $('tunnel-form').hidden = false;

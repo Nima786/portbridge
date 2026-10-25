@@ -177,10 +177,13 @@ func StartProbeListenerAvoiding(bindHost string, preferredPort int, avoid map[in
 		candidates = append(candidates, preferredPort)
 	}
 	// Then the other HTTPS-looking ports a tunnel's bridge is usually given
-	// (the ones Auto-Heal picks from too), before any random one.
-	for _, p := range append(append([]int(nil), CDNHTTPSPorts...), 4433, 7443, 9443) {
-		if p != preferredPort && !avoid[p] {
-			candidates = append(candidates, p)
+	// (the ones Auto-Heal picks from too), before any random one, whenever a
+	// preferred port or avoid list was supplied.
+	if preferredPort > 0 || len(avoid) > 0 {
+		for _, p := range append(append([]int(nil), CDNHTTPSPorts...), 4433, 7443, 9443) {
+			if p != preferredPort && !avoid[p] {
+				candidates = append(candidates, p)
+			}
 		}
 	}
 	// OS-assigned fallback, tried a few times in case it hands out a port

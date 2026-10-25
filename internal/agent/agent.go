@@ -978,7 +978,8 @@ func newAgentHandler(token, confDir string, allowUpdates func() bool) *http.Serv
 			return
 		}
 		var req struct {
-			PreferredPort int `json:"preferred_port"`
+			PreferredPort int   `json:"preferred_port"`
+			AvoidPorts    []int `json:"avoid_ports"`
 		}
 		_ = json.NewDecoder(io.LimitReader(r.Body, 4096)).Decode(&req)
 		// Never test on a port a tunnel here owns, running or stopped: the
@@ -988,6 +989,11 @@ func newAgentHandler(token, confDir string, allowUpdates func() bool) *http.Serv
 		avoid := map[int]bool{}
 		for _, c := range portsClaimedByOthers(confDir, "") {
 			avoid[c.port] = true
+		}
+		for _, p := range req.AvoidPorts {
+			if p >= 1 && p <= 65535 {
+				avoid[p] = true
+			}
 		}
 		// The panel closes the listener when the run ends; this is only the
 		// limit for a run abandoned half way. A slow pair with IPv6 and

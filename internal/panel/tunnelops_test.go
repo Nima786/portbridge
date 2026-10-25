@@ -1,6 +1,7 @@
 package panel
 
 import (
+	"context"
 	"encoding/base64"
 	"net/http/httptest"
 	"os"
@@ -411,5 +412,50 @@ func TestAProbeStepMustPointAtAServerOfTheFleet(t *testing.T) {
 	}
 	if err := p.checkProbeStep("far", "s", engine.ProbeCandidateSpec{TargetAddr: "cdn.example.com:443", CDN: true}); err != nil {
 		t.Errorf("a CDN name was refused: %v", err)
+	}
+}
+
+func TestProbeSessionHonorsAndAvoidsUserPorts(t *testing.T) {
+	p, foreignID, _ := twoServers(t)
+	ctx := context.Background()
+
+	// 1. When linkPort conflicts with servicePorts, the probe session avoids
+	// all service/user ports on both servers and records a note.
+	sess, err := p.startProbeSessionWithPorts(ctx, "this", foreignID, "", "2053, 2083", "8443", 2053)
+	if err != nil {
+		t.Fatalf("startProbeSessionWithPorts failed: %v", err)
+	}
+	defer p.finishProbeSession(*sess, nil)
+
+	avoided := map[int]bool{2053: true, 2083: true, 8443: true}
+	for _, c := range sess.Candidates {
+		if avoided[c.Port] {
+			t.Fatalf("candidate %s used avoided port %d", c.ID, c.Port)
+		}
+	}
+	if !strings.Contains(strings.Join(sess.Notes, "\n"), "Port note:") {
+		t.Fatalf("expected port clash note in %v", sess.Notes)
+	}
+
+	// 2. When a distinct linkPort is requested, at least one listener binds it
+	// (the second server in this in-process test shares 0.0.0.0 so it falls
+	// back to another port and records a listener note).
+	sess2, err := p.startProbeSessionWithPorts(ctx, "this", foreignID, "", "443, 2096", "", 37443)
+	if err != nil {
+		t.Fatalf("startProbeSessionWithPorts (custom linkPort) failed: %v", err)
+	}
+	defer p.finishProbeSession(*sess2, nil)
+
+	usedCustom := false
+	for _, c := range sess2.Candidates {
+		if c.Port == 443 || c.Port == 2096 {
+			t.Fatalf("candidate %s used avoided inbound port %d", c.ID, c.Port)
+		}
+		if c.Port == 37443 {
+			usedCustom = true
+		}
+	}
+	if !usedCustom {
+		t.Fatalf("expected at least one direction to test on requested port 37443, got candidates %+v", sess2.Candidates)
 	}
 }

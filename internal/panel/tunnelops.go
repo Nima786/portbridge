@@ -1262,7 +1262,41 @@ type probeDialReply struct {
 	Error   string                        `json:"error"`
 }
 
+func parseProbeAvoidPorts(lists ...string) []int {
+	var out []int
+	seen := map[int]bool{}
+	for _, s := range lists {
+		for _, tok := range strings.FieldsFunc(s, func(r rune) bool {
+			return r == ',' || r == ' ' || r == '\t' || r == '\n'
+		}) {
+			if dash := strings.IndexByte(tok, '-'); dash > 0 && dash < len(tok)-1 {
+				lo, err1 := strconv.Atoi(tok[:dash])
+				hi, err2 := strconv.Atoi(tok[dash+1:])
+				if err1 == nil && err2 == nil && lo >= 1 && hi <= 65535 && lo <= hi && hi-lo < 64 {
+					for p := lo; p <= hi; p++ {
+						if !seen[p] {
+							seen[p] = true
+							out = append(out, p)
+						}
+					}
+				}
+				continue
+			}
+			p, err := strconv.Atoi(tok)
+			if err == nil && p >= 1 && p <= 65535 && !seen[p] {
+				seen[p] = true
+				out = append(out, p)
+			}
+		}
+	}
+	return out
+}
+
 func (p *Panel) startProbeSession(parent context.Context, relayID, foreignID, cdnDomain string) (*probeSession, error) {
+	return p.startProbeSessionWithPorts(parent, relayID, foreignID, cdnDomain, "", "", 0)
+}
+
+func (p *Panel) startProbeSessionWithPorts(parent context.Context, relayID, foreignID, cdnDomain, servicePorts, userPorts string, linkPort int) (*probeSession, error) {
 	rv, rok := p.viewOf(relayID)
 	fv, fok := p.viewOf(foreignID)
 	if !rok || !fok {
@@ -1284,11 +1318,35 @@ func (p *Panel) startProbeSession(parent context.Context, relayID, foreignID, cd
 		rv6 = relayV6
 	}
 
+	avoidPorts := parseProbeAvoidPorts(servicePorts, userPorts)
+	avoidSet := map[int]bool{}
+	for _, ap := range avoidPorts {
+		avoidSet[ap] = true
+	}
+
+	directPref := 2053
+	reversePref := 2083
+	var portClashNote string
+	requestedPort := 0
+	if linkPort >= 1 && linkPort <= 65535 {
+		if avoidSet[linkPort] {
+			portClashNote = fmt.Sprintf("Port note: Tunnel Bridge Port %d matches one of your Inbound/User ports, so the benchmark tested on a separate free bridge port instead.", linkPort)
+		} else {
+			requestedPort = linkPort
+			directPref = linkPort
+			reversePref = linkPort
+		}
+	}
+
 	startListen := func(listenerID string, prefPort int) (probeListenReply, error) {
 		lctx, lcancel := context.WithTimeout(parent, 15*time.Second)
 		defer lcancel()
 		var lrep probeListenReply
-		_, err := p.callJSON(lctx, listenerID, "/api/probe/listen", map[string]int{"preferred_port": prefPort}, &lrep)
+		payload := map[string]any{"preferred_port": prefPort}
+		if len(avoidPorts) > 0 {
+			payload["avoid_ports"] = avoidPorts
+		}
+		_, err := p.callJSON(lctx, listenerID, "/api/probe/listen", payload, &lrep)
 		if err != nil {
 			if errors.Is(err, errTooOld) {
 				return probeListenReply{}, fmt.Errorf("%s is running an older PortBridge release; update it first to use Smart Benchmark", p.serverName(listenerID))
@@ -1311,11 +1369,11 @@ func (p *Panel) startProbeSession(parent context.Context, relayID, foreignID, cd
 	wg.Add(2)
 	go func() {
 		defer wg.Done()
-		dListen, dErr = startListen(foreignID, 2053)
+		dListen, dErr = startListen(foreignID, directPref)
 	}()
 	go func() {
 		defer wg.Done()
-		rListen, rErr = startListen(relayID, 2083)
+		rListen, rErr = startListen(relayID, reversePref)
 	}()
 	wg.Wait()
 
@@ -1328,10 +1386,16 @@ func (p *Panel) startProbeSession(parent context.Context, relayID, foreignID, cd
 		ForeignID: foreignID,
 		CDNDomain: cdnDomain,
 	}
+	if portClashNote != "" {
+		sess.Notes = append(sess.Notes, portClashNote)
+	}
 	if dErr == nil {
 		sess.DirectListenID = dListen.ID
 		sess.DirectSecret = dListen.Secret
 		sess.Candidates = append(sess.Candidates, engine.BuildProbeCandidates("direct", foreignV4, fv6, dListen.Port, cdnDomain)...)
+		if requestedPort > 0 && dListen.Port != requestedPort {
+			sess.Notes = append(sess.Notes, fmt.Sprintf("Direct listener note: Tunnel Bridge Port %d is in use on %s, so Direct modes were tested on port %d.", requestedPort, p.serverName(foreignID), dListen.Port))
+		}
 	} else {
 		sess.Notes = append(sess.Notes, "Direct listener note: "+dErr.Error())
 	}
@@ -1339,6 +1403,9 @@ func (p *Panel) startProbeSession(parent context.Context, relayID, foreignID, cd
 		sess.ReverseListenID = rListen.ID
 		sess.ReverseSecret = rListen.Secret
 		sess.Candidates = append(sess.Candidates, engine.BuildProbeCandidates("reverse", relayV4, rv6, rListen.Port, "")...)
+		if requestedPort > 0 && rListen.Port != requestedPort {
+			sess.Notes = append(sess.Notes, fmt.Sprintf("Reverse listener note: Tunnel Bridge Port %d is in use on %s, so Reverse modes were tested on port %d.", requestedPort, p.serverName(relayID), rListen.Port))
+		}
 	} else {
 		sess.Notes = append(sess.Notes, "Reverse listener note: "+rErr.Error())
 	}

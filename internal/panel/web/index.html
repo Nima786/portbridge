@@ -564,6 +564,16 @@
               <span><strong>Gaming (Lowest Ping &amp; Jitter)</strong> — 20 rapid game-tick pings, FEC &amp; zero HoL blocking</span>
             </label>
           </div>
+          <div class="probe-ports-row">
+            <div class="probe-port-field">
+              <label for="tn-probe-service">Inbound Port(s) <span class="muted">(Foreign · e.g. X-UI / V2Ray)</span></label>
+              <input id="tn-probe-service" inputmode="numeric" placeholder="e.g. 443, 2096">
+            </div>
+            <div class="probe-port-field">
+              <label for="tn-probe-linkport">Tunnel Bridge Port <span class="muted">(internal server-to-server port)</span></label>
+              <input id="tn-probe-linkport" type="number" min="1" max="65535" value="2053" placeholder="2053 (or empty for auto)" inputmode="numeric">
+            </div>
+          </div>
           <div class="probe-cdn-row">
             <div class="probe-cdn-input">
               <label for="tn-probe-cdn">Optional CDN Subdomain to include in benchmark <span class="muted">(pointed at Foreign server with Cloudflare Proxy ON)</span></label>
@@ -1063,7 +1073,7 @@
           <div class="port-box">
             <label for="tn-linkport">Tunnel Bridge Port</label>
             <span class="field-hint">Internal port between the two servers</span>
-            <input id="tn-linkport" type="number" min="1" max="65535" value="443" inputmode="numeric">
+            <input id="tn-linkport" type="number" min="1" max="65535" value="2053" inputmode="numeric">
           </div>
         </div>
         <div class="actions left port-check-bar">

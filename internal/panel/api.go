@@ -815,17 +815,20 @@ func (p *Panel) handleProbeTunnel(w http.ResponseWriter, r *http.Request, _ auth
 	// ones; on a slow pair that is well past five minutes.
 	agent.ExtendDeadlines(w, 15*time.Minute)
 	var req struct {
-		Action    string                        `json:"action"`
-		Relay     string                        `json:"relay"`
-		Foreign   string                        `json:"foreign"`
-		CDNDomain string                        `json:"cdn_domain"`
-		SpoofIP   string                        `json:"spoof_ip"`
-		DialerID  string                        `json:"dialer_id"`
-		Secret    string                        `json:"secret"`
-		Spec      engine.ProbeCandidateSpec     `json:"spec"`
-		Session   probeSession                  `json:"session"`
-		Results   []engine.ProbeCandidateResult `json:"results"`
-		Retests   []engine.ProbeCandidateResult `json:"retests"`
+		Action       string                        `json:"action"`
+		Relay        string                        `json:"relay"`
+		Foreign      string                        `json:"foreign"`
+		CDNDomain    string                        `json:"cdn_domain"`
+		ServicePorts string                        `json:"service_ports"`
+		UserPorts    string                        `json:"user_ports"`
+		LinkPort     int                           `json:"link_port"`
+		SpoofIP      string                        `json:"spoof_ip"`
+		DialerID     string                        `json:"dialer_id"`
+		Secret       string                        `json:"secret"`
+		Spec         engine.ProbeCandidateSpec     `json:"spec"`
+		Session      probeSession                  `json:"session"`
+		Results      []engine.ProbeCandidateResult `json:"results"`
+		Retests      []engine.ProbeCandidateResult `json:"retests"`
 	}
 	if !decodeJSON(w, r, &req) {
 		return
@@ -841,7 +844,7 @@ func (p *Panel) handleProbeTunnel(w http.ResponseWriter, r *http.Request, _ auth
 		}
 		writeJSON(w, http.StatusOK, map[string]any{"ids": ids})
 	case "start":
-		sess, err := p.startProbeSession(r.Context(), strings.TrimSpace(req.Relay), strings.TrimSpace(req.Foreign), strings.TrimSpace(req.CDNDomain))
+		sess, err := p.startProbeSessionWithPorts(r.Context(), strings.TrimSpace(req.Relay), strings.TrimSpace(req.Foreign), strings.TrimSpace(req.CDNDomain), strings.TrimSpace(req.ServicePorts), strings.TrimSpace(req.UserPorts), req.LinkPort)
 		if err != nil {
 			writeErr(w, http.StatusUnprocessableEntity, capitalise(plainAgentError(err))+".")
 			return
