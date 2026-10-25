@@ -417,15 +417,29 @@ func TestAProbeStepMustPointAtAServerOfTheFleet(t *testing.T) {
 
 func TestProbeSessionHonorsAndAvoidsUserPorts(t *testing.T) {
 	p, foreignID, _ := twoServers(t)
+	const relayToken = "pba_relay"
+	relayDir := t.TempDir()
+	relaySrv := httptest.NewTLSServer(agent.NewHandler(relayToken, relayDir, nil))
+	t.Cleanup(relaySrv.Close)
+	r := addTestServer(t, p, Server{
+		ID:          "near",
+		Name:        "Tehran",
+		Group:       GroupRelay,
+		Address:     "198.51.100.10",
+		AgentURL:    relaySrv.URL,
+		Fingerprint: fingerprintOf(relaySrv.Certificate().Raw),
+	}, relayToken)
+	p.fleet.refresh(r)
+
 	ctx := context.Background()
 
 	// 1. When linkPort conflicts with servicePorts, the probe session avoids
 	// all service/user ports on both servers and records a note.
-	sess, err := p.startProbeSessionWithPorts(ctx, "this", foreignID, "", "2053, 2083", "8443", 2053)
+	sess, err := p.startProbeSessionWithPorts(ctx, r.ID, foreignID, "", "2053, 2083", "8443", 2053)
 	if err != nil {
 		t.Fatalf("startProbeSessionWithPorts failed: %v", err)
 	}
-	defer p.finishProbeSession(*sess, nil)
+	p.finishProbeSession(*sess, nil)
 
 	avoided := map[int]bool{2053: true, 2083: true, 8443: true}
 	for _, c := range sess.Candidates {
@@ -440,7 +454,7 @@ func TestProbeSessionHonorsAndAvoidsUserPorts(t *testing.T) {
 	// 2. When a distinct linkPort is requested, at least one listener binds it
 	// (the second server in this in-process test shares 0.0.0.0 so it falls
 	// back to another port and records a listener note).
-	sess2, err := p.startProbeSessionWithPorts(ctx, "this", foreignID, "", "443, 2096", "", 37443)
+	sess2, err := p.startProbeSessionWithPorts(ctx, r.ID, foreignID, "", "443, 2096", "", 37443)
 	if err != nil {
 		t.Fatalf("startProbeSessionWithPorts (custom linkPort) failed: %v", err)
 	}

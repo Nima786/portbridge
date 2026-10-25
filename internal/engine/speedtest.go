@@ -312,6 +312,9 @@ func runSpeedtestClient(c net.Conn, cfg *Config, out io.Writer, sizeMB ...float6
 	canLonger := cfg != nil && !cfg.AntiFreeze && cfg.Transport != TransportICMP
 	longer := func(run func(uint32) (int64, time.Duration, error), n int64, d time.Duration, first uint32) (int64, time.Duration, uint32) {
 		size := first
+		if d <= 0 && n >= int64(size) {
+			d = time.Microsecond
+		}
 		// Again and again, each sized from the last: the speed seen while a
 		// connection is still speeding up understates the next.
 		for step := 0; step < 3 && canLonger && n >= int64(size) && d > 0 && d < speedtestLongEnough; step++ {
@@ -322,6 +325,9 @@ func runSpeedtestClient(c net.Conn, cfg *Config, out io.Writer, sizeMB ...float6
 			}
 			sz := uint32(want)
 			n2, d2, err := run(sz)
+			if err == nil && n2 >= int64(sz) && d2 <= 0 {
+				d2 = time.Microsecond
+			}
 			if err != nil || n2 < int64(sz) || d2 <= 0 {
 				break // keep the last good result rather than report a failure
 			}
