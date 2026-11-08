@@ -441,6 +441,10 @@
         <label for="add-passphrase">Key Passphrase <span class="muted">(leave empty unless your key is encrypted)</span></label>
         <input id="add-passphrase" type="password" autocomplete="new-password" placeholder="Leave empty for unencrypted keys">
       </div>
+      <div id="auth-sudo" hidden>
+        <label for="add-sudo-password">Sudo / Root Password <span class="muted">(optional — leave empty if sudo is passwordless or uses your SSH password)</span></label>
+        <input id="add-sudo-password" type="password" autocomplete="new-password" placeholder="Leave empty for passwordless sudo or same as SSH password">
+      </div>
 
       <label class="check-card" id="add-update-row">
         <input type="checkbox" id="add-update" checked>

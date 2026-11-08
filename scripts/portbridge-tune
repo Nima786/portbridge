@@ -30,7 +30,17 @@ ok() { printf '%s\n' "${GREEN}$*${R}"; }
 warn() { printf '%s\n' "${YELLOW}$*${R}" >&2; }
 die() { printf '%s\n' "${RED}$*${R}" >&2; exit 1; }
 
-[ "$(id -u)" -eq 0 ] || die "Please run this as root."
+if [ "$(id -u)" -ne 0 ]; then
+    if command -v sudo >/dev/null 2>&1; then
+        warn "Not running as root; switching to root with sudo -i..."
+        SELF=/usr/local/bin/portbridge-tune
+        if [ -f "$0" ]; then
+            SELF="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
+        fi
+        exec sudo -i "$SELF" "$@"
+    fi
+    die "Please run this as root (try: sudo -i)."
+fi
 
 current() { sysctl -n "$1" 2>/dev/null; }
 

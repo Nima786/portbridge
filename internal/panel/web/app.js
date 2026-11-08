@@ -794,12 +794,17 @@
 
   function showAuth() {
     const kind = authKind();
+    const usr = ($('add-user') && $('add-user').value.trim()) || 'root';
     $('auth-password').hidden = kind !== 'password';
     $('auth-key').hidden = kind !== 'key';
     $('auth-file').hidden = kind !== 'file';
     $('auth-passphrase').hidden = kind === 'password';
+    if ($('auth-sudo')) $('auth-sudo').hidden = usr === 'root';
     if (kind === 'password') $('add-passphrase').value = '';
     syncChoiceCards($('add-dialog'));
+  }
+  if ($('add-user')) {
+    $('add-user').addEventListener('input', showAuth);
   }
   for (const r of document.querySelectorAll('input[name="auth"]')) {
     r.addEventListener('change', () => {
@@ -810,6 +815,7 @@
 
   function clearSecrets() {
     $('add-password').value = '';
+    if ($('add-sudo-password')) $('add-sudo-password').value = '';
     $('add-key').value = '';
     $('add-passphrase').value = '';
     $('add-file').value = '';
@@ -917,6 +923,7 @@
     if (kind === 'password') body.password = $('add-password').value;
     else body.private_key = kind === 'key' ? $('add-key').value : keyFromFile;
     if (kind !== 'password' && $('add-passphrase').value) body.passphrase = $('add-passphrase').value;
+    if ($('add-sudo-password') && $('add-sudo-password').value) body.sudo_password = $('add-sudo-password').value;
 
     const updating = addMode.kind === 'ssh-update';
     if (updating) {

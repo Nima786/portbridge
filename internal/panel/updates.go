@@ -768,7 +768,11 @@ func (p *Panel) sshUpdate(j *job, s Server, r addRequest) error {
 	}
 	f := parseFacts(facts)
 	if f["pb_uid"] != "0" {
-		return errors.New("the account given is not root; PortBridge needs root to update")
+		j.say("Logged in as %q; switching to root with sudo -i...", r.User)
+		if err := rm.ensureRoot(r.User, r.Password, r.SudoPassword); err != nil {
+			return err
+		}
+		j.say("Switched to root (sudo -i).")
 	}
 	arch := archName(f["pb_arch"])
 	if arch == "" {

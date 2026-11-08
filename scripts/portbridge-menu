@@ -105,7 +105,18 @@ pause() {
 }
 
 require_root() {
-    [ "$(id -u)" -eq 0 ] || { err "Please run this as root."; exit 1; }
+    if [ "$(id -u)" -ne 0 ]; then
+        if command -v sudo >/dev/null 2>&1; then
+            say "${YELLOW}Not running as root; switching to root with sudo -i...${R}"
+            local self=/usr/local/bin/portbridge-menu
+            if [ -f "$0" ]; then
+                self="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
+            fi
+            exec sudo -i "$self" "$@"
+        fi
+        err "Please run this as root (try: sudo -i)."
+        exit 1
+    fi
 }
 
 # ------------------------------------------------------------------- utilities
@@ -4894,7 +4905,7 @@ service_menu() {
 
 # ------------------------------------------------------------------------- entry
 
-require_root
+require_root "$@"
 [ -x "$BIN" ] || { err "PortBridge is not installed properly: $BIN is missing."; exit 1; }
 mkdir -p "$CONF_DIR" "$RUN_DIR" "$AGENTS_DIR"
 chmod 700 "$CONF_DIR" "$AGENTS_DIR"

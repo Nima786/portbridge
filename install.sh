@@ -41,7 +41,19 @@ warn() { printf '%s\n' "${YELLOW}$*${R}"; }
 die()  { printf '%s\n' "${RED}$*${R}" >&2; exit 1; }
 step() { printf '\n%s\n' "${B}==> $*${R}"; }
 
-[ "$(id -u)" -eq 0 ] || die "Please run this as root."
+if [ "$(id -u)" -ne 0 ]; then
+    if command -v sudo >/dev/null 2>&1; then
+        warn "Not running as root (${USER:-$(id -un)}); switching to root with sudo -i..."
+        if [ -f "$0" ]; then
+            SELF_DIR=$(cd "$(dirname "$0")" && pwd)
+            exec sudo -i bash "$SELF_DIR/$(basename "$0")" "$@"
+        else
+            # shellcheck disable=SC2016
+            exec sudo -i bash -c 'bash <(curl -fsSL "https://raw.githubusercontent.com/$0/main/install.sh") "$@"' "$REPO" "$@"
+        fi
+    fi
+    die "Please run this as root (try: sudo -i)."
+fi
 
 FORCE=no
 NOMENU=no

@@ -36,15 +36,16 @@ import (
 
 // addRequest is what the "Add server" form sends.
 type addRequest struct {
-	Name        string `json:"name"`
-	Group       string `json:"group"`
-	Address     string `json:"address"`
-	SSHPort     int    `json:"ssh_port"`
-	User        string `json:"user"`
-	Password    string `json:"password"`
-	PrivateKey  string `json:"private_key"`
-	Passphrase  string `json:"passphrase"`
-	AllowUpdate bool   `json:"allow_update"`
+	Name         string `json:"name"`
+	Group        string `json:"group"`
+	Address      string `json:"address"`
+	SSHPort      int    `json:"ssh_port"`
+	User         string `json:"user"`
+	Password     string `json:"password"`
+	SudoPassword string `json:"sudo_password"`
+	PrivateKey   string `json:"private_key"`
+	Passphrase   string `json:"passphrase"`
+	AllowUpdate  bool   `json:"allow_update"`
 	// HostKey is the SSH fingerprint the person saw and confirmed for this
 	// address (from /api/servers/hostkey). The login only goes through to a
 	// server that shows exactly this key, so a man in the middle cannot collect
@@ -215,7 +216,58 @@ func (b *syncBuffer) String() string {
 
 // remote is an SSH connection to a server being added.
 type remote struct {
-	c *ssh.Client
+	c        *ssh.Client
+	sudoMode string // "", "nopass", "pass", "su"
+	sudoPass string
+}
+
+// ensureRoot checks that a non-root SSH account can elevate to root via
+// "sudo -i" (or "su - root" if sudo is unavailable) and records how to run
+// root commands for the rest of the session.
+func (rm *remote) ensureRoot(user, sshPass, sudoPass string) error {
+	if out, _ := rm.run("sudo -n -i -- sh -c 'echo pb_sudo_uid=$(id -u)'", nil, 15*time.Second); parseFacts(out)["pb_sudo_uid"] == "0" {
+		rm.sudoMode = "nopass"
+		return nil
+	}
+	var candidates []string
+	if sudoPass != "" {
+		candidates = append(candidates, sudoPass)
+	}
+	if sshPass != "" && sshPass != sudoPass {
+		candidates = append(candidates, sshPass)
+	}
+	for _, pw := range candidates {
+		if out, _ := rm.run("sudo -S -p '' -i -- sh -c 'exec </dev/null; echo pb_sudo_uid=$(id -u)'", []byte(pw+"\n"), 20*time.Second); parseFacts(out)["pb_sudo_uid"] == "0" {
+			rm.sudoMode = "pass"
+			rm.sudoPass = pw
+			return nil
+		}
+	}
+	for _, pw := range candidates {
+		if out, _ := rm.run("su - root -c 'exec </dev/null; echo pb_sudo_uid=$(id -u)'", []byte(pw+"\n"), 20*time.Second); parseFacts(out)["pb_sudo_uid"] == "0" {
+			rm.sudoMode = "su"
+			rm.sudoPass = pw
+			return nil
+		}
+	}
+	if len(candidates) == 0 {
+		return fmt.Errorf("the account %q is not root and sudo requires a password; enter the Sudo / Root Password in the form", user)
+	}
+	return fmt.Errorf("the account %q is not root and could not switch to root with sudo -i (check that %q has sudo access and the password is correct)", user, user)
+}
+
+func (rm *remote) runRoot(cmd string, timeout time.Duration) (string, error) {
+	inner := "exec </dev/null; export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$PATH; " + cmd
+	switch rm.sudoMode {
+	case "nopass":
+		return rm.run("sudo -n -i -- bash -c "+shellQuote(inner), nil, timeout)
+	case "pass":
+		return rm.run("sudo -S -p '' -i -- bash -c "+shellQuote(inner), []byte(rm.sudoPass+"\n"), timeout)
+	case "su":
+		return rm.run("su - root -c "+shellQuote("bash -c "+shellQuote(inner)), []byte(rm.sudoPass+"\n"), timeout)
+	default:
+		return rm.run(cmd, nil, timeout)
+	}
 }
 
 func (rm *remote) run(cmd string, stdin []byte, timeout time.Duration) (string, error) {
@@ -337,7 +389,11 @@ func (p *Panel) addServer(j *job, r addRequest) (string, error) {
 		return "", fmt.Errorf("the panel could not read the server when it looked at it; its answer was: %s", lastLines(facts, 5))
 	}
 	if uid != "0" {
-		return "", errors.New("the account given is not root; PortBridge needs root to manage services and the firewall")
+		j.say("Logged in as %q; switching to root with sudo -i...", r.User)
+		if err := rm.ensureRoot(r.User, r.Password, r.SudoPassword); err != nil {
+			return "", err
+		}
+		j.say("Switched to root (sudo -i).")
 	}
 	arch := archName(f["pb_arch"])
 	if arch == "" {
@@ -499,11 +555,18 @@ func (p *Panel) waitForCall(srv Server) (*agent.Overview, error) {
 
 func remoteAgentSetup(rm *remote, extra string) (agent.AgentSetupResult, error) {
 	var res agent.AgentSetupResult
-	out, err := rm.run("/usr/local/bin/portbridge agent setup -json "+extra, nil, time.Minute)
-	// The JSON is the last line; anything before it is the service manager talking.
+	out, err := rm.runRoot("/usr/local/bin/portbridge agent setup -json "+extra, time.Minute)
+	// The JSON is the last JSON line; anything before or after it is the
+	// service manager or login shell talking.
 	last := out
 	if i := strings.LastIndex(out, "\n"); i >= 0 {
 		last = out[i+1:]
+	}
+	for _, line := range strings.Split(out, "\n") {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "{") && strings.HasSuffix(line, "}") {
+			last = line
+		}
 	}
 	if jerr := json.Unmarshal([]byte(last), &res); jerr != nil {
 		if err != nil {
@@ -563,11 +626,12 @@ func (p *Panel) install(j *job, rm *remote, arch string) error {
 		return 'x'
 	}, dir)
 	j.say("Copying PortBridge across (%d KB)...", buf.Len()/1024)
-	if out, err := rm.run("mkdir -p "+dir+" && tar -xzf - -C "+dir, buf.Bytes(), 3*time.Minute); err != nil {
+	if out, err := rm.run("mkdir -p "+dir+" && tar -xzf - -C "+dir+" && chmod -R a+rX "+dir, buf.Bytes(), 3*time.Minute); err != nil {
 		return fmt.Errorf("copying PortBridge across failed: %v %s", err, out)
 	}
 	j.say("Installing...")
-	out, err := rm.run("bash "+dir+"/install.sh --from-dir "+dir+" --no-menu; rc=$?; rm -rf "+dir+"; exit $rc", nil, 5*time.Minute)
+	out, err := rm.runRoot("bash "+dir+"/install.sh --from-dir "+dir+" --no-menu; rc=$?; rm -rf "+dir+"; exit $rc", 5*time.Minute)
+	_, _ = rm.run("rm -rf "+dir, nil, 15*time.Second)
 	if err != nil {
 		return fmt.Errorf("the installer failed: %v\n%s", err, lastLines(out, 12))
 	}
