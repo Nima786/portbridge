@@ -227,6 +227,15 @@ func (f *fleet) overview(ctx context.Context, srv Server) (*agent.Overview, erro
 	if err := json.Unmarshal(body, &ov); err != nil {
 		return nil, fmt.Errorf("the server's agent sent something unreadable: %w", err)
 	}
+	if len(ov.IPv4) == 0 || len(ov.IPv6) == 0 {
+		rv4, rv6 := resolveAddressIPs(srv.Address)
+		if len(ov.IPv4) == 0 && rv4 != "" {
+			ov.IPv4 = []string{rv4}
+		}
+		if len(ov.IPv6) == 0 && rv6 != "" {
+			ov.IPv6 = []string{rv6}
+		}
+	}
 	return &ov, nil
 }
 

@@ -472,4 +472,25 @@ func TestProbeSessionHonorsAndAvoidsUserPorts(t *testing.T) {
 	if !usedCustom {
 		t.Fatalf("expected at least one direction to test on requested port 37443, got candidates %+v", sess2.Candidates)
 	}
+
+	// 3. A server behind 1:1 NAT (like Oracle Cloud) added by hostname has no
+	// public IP on its local NIC, so checkProbeStep must accept both its
+	// resolved IP and its configured hostname.
+	natSrv := addTestServer(t, p, Server{
+		ID:          "oracle",
+		Name:        "Oracle_AU",
+		Group:       GroupForeign,
+		Address:     "cp.example.invalid",
+		AgentURL:    relaySrv.URL,
+		Fingerprint: fingerprintOf(relaySrv.Certificate().Raw),
+	}, relayToken)
+	p.fleet.refresh(natSrv)
+	if err := p.checkProbeStep(r.ID, "sec", engine.ProbeCandidateSpec{
+		Mode:       "direct",
+		Transport:  "tls",
+		TargetAddr: "cp.example.invalid:3466",
+		Port:       3466,
+	}); err != nil {
+		t.Fatalf("checkProbeStep rejected server added by hostname: %v", err)
+	}
 }

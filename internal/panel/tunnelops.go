@@ -163,16 +163,54 @@ func firstIP(list []string) string {
 	return ""
 }
 
+// resolveAddressIPs returns the public IPv4/IPv6 of an address or hostname.
+// Cloud VMs behind 1:1 NAT (Oracle Cloud, AWS, GCP, Azure) only see a private
+// RFC1918 IP on their network interface, so when such a server is added by
+// hostname (e.g. cp.websy.au) or IP, resolving srv.Address supplies its public IP.
+func resolveAddressIPs(addr string) (v4, v6 string) {
+	addr = strings.TrimSpace(addr)
+	if addr == "" {
+		return "", ""
+	}
+	if ip := net.ParseIP(addr); ip != nil {
+		if p4 := ip.To4(); p4 != nil {
+			return p4.String(), ""
+		}
+		return "", ip.String()
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	ips, err := net.DefaultResolver.LookupIPAddr(ctx, addr)
+	if err != nil {
+		return "", ""
+	}
+	for _, ia := range ips {
+		if ia.IP == nil {
+			continue
+		}
+		if p4 := ia.IP.To4(); p4 != nil {
+			if v4 == "" && ia.IP.IsGlobalUnicast() && !ia.IP.IsPrivate() {
+				v4 = p4.String()
+			}
+		} else if v6 == "" && ia.IP.IsGlobalUnicast() && !ia.IP.IsPrivate() {
+			v6 = ia.IP.String()
+		}
+	}
+	return v4, v6
+}
+
 // addressesOf is a server's public IPv4 and IPv6 addresses, as far as is known.
 func addressesOf(v serverView) (v4, v6 string) {
 	if v.Overview != nil {
 		v4, v6 = firstIP(v.Overview.IPv4), firstIP(v.Overview.IPv6)
 	}
-	if ip := net.ParseIP(v.Address); ip != nil {
-		if ip.To4() != nil && v4 == "" {
-			v4 = v.Address
-		} else if ip.To4() == nil && v6 == "" {
-			v6 = v.Address
+	if v4 == "" || v6 == "" {
+		rv4, rv6 := resolveAddressIPs(v.Address)
+		if v4 == "" {
+			v4 = rv4
+		}
+		if v6 == "" {
+			v6 = rv6
 		}
 	}
 	return v4, v6
@@ -1216,14 +1254,7 @@ func (p *Panel) setServerFirewall(parent context.Context, id, action string) (ag
 }
 
 func serverAddresses(v serverView) (v4, v6 string) {
-	if v.Overview != nil {
-		if len(v.Overview.IPv4) > 0 {
-			v4 = v.Overview.IPv4[0]
-		}
-		if len(v.Overview.IPv6) > 0 {
-			v6 = v.Overview.IPv6[0]
-		}
-	}
+	v4, v6 = addressesOf(v)
 	if v4 == "" && v.Address != "" {
 		if ip := net.ParseIP(v.Address); ip != nil && ip.To4() == nil {
 			if v6 == "" {
@@ -1431,9 +1462,15 @@ func (p *Panel) checkProbeStep(dialerID, secret string, spec engine.ProbeCandida
 		return errors.New("the probe target port is not valid")
 	}
 	if net.ParseIP(host) == nil {
-		// A name is only for the CDN checks.
+		// A name is for CDN checks, or a server added by hostname whose DNS
+		// was not resolved yet.
 		if spec.CDN {
 			return nil
+		}
+		for _, v := range p.fleet.views() {
+			if strings.EqualFold(v.Address, host) {
+				return nil
+			}
 		}
 		return errors.New("the probe target is not one of the panel's servers")
 	}
