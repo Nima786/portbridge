@@ -878,7 +878,7 @@ func (c *Config) Validate() error {
 		// sending a CDN's connection to the real website instead of to us.
 		switch {
 		case c.Transport == TransportPlain || c.Transport.IsPacketBased():
-			return fmt.Errorf("real_site needs a website-style link (tls, wss, h2 or grpc); the %s link has no handshake to hide behind", c.Transport)
+			return fmt.Errorf("real_site needs a website-style link (tls, wss, xhttp, h2 or grpc); the %s link has no handshake to hide behind", c.Transport)
 		case c.CDN:
 			return fmt.Errorf("real_site cannot be used with cdn = on: a CDN makes its own connection and cannot carry the proof")
 		case c.AltTarget != "":
@@ -1076,8 +1076,8 @@ func (c *Config) Validate() error {
 	}
 
 	if !ValidTransport(c.Transport) {
-		return fmt.Errorf("transport must be %q, %q, %q, %q, %q, %q, %q or %q, got %q",
-			TransportPlain, TransportTLS, TransportWSS, TransportH2, TransportGRPC, TransportKCP, TransportICMP, TransportFakeTCP, c.Transport)
+		return fmt.Errorf("transport must be %q, %q, %q, %q, %q, %q, %q, %q or %q, got %q",
+			TransportPlain, TransportTLS, TransportWSS, TransportXHTTP, TransportH2, TransportGRPC, TransportKCP, TransportICMP, TransportFakeTCP, c.Transport)
 	}
 	if c.Transport != TransportPlain && !c.Transport.IsPacketBased() {
 		// Only the accepting side presents a certificate, and it is created on
@@ -1116,9 +1116,9 @@ func (c *Config) Validate() error {
 		}
 	}
 	if c.CDN {
-		if c.Transport != TransportWSS && c.Transport != TransportH2 && c.Transport != TransportGRPC {
-			return fmt.Errorf("cdn needs transport %q, %q or %q, got %q",
-				TransportWSS, TransportH2, TransportGRPC, c.Transport)
+		if c.Transport != TransportWSS && c.Transport != TransportXHTTP && c.Transport != TransportH2 && c.Transport != TransportGRPC {
+			return fmt.Errorf("cdn needs transport %q, %q, %q or %q, got %q",
+				TransportWSS, TransportXHTTP, TransportH2, TransportGRPC, c.Transport)
 		}
 		// It also routes by hostname, so an address cannot stand in for one.
 		if c.ServerName == "" {

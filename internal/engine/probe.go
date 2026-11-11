@@ -98,6 +98,7 @@ type ProbeListener struct {
 	icmpLn    net.Listener
 	fakeTCPLn net.Listener
 	splitMgr  *splitSessionManager
+	xhttpMgr  *xhttpSessionManager
 	cert      tls.Certificate
 	closed    chan struct{}
 	once      sync.Once
@@ -292,6 +293,7 @@ func StartProbeListenerAvoiding(bindHost string, preferredPort int, avoid map[in
 		icmpLn:    icmpLn,
 		fakeTCPLn: fakeTCPLn,
 		splitMgr:  newSplitSessionManager(),
+		xhttpMgr:  newXHTTPSessionManager(),
 		cert:      cert,
 		closed:    make(chan struct{}),
 	}
@@ -330,6 +332,9 @@ func (pl *ProbeListener) Close() {
 		}
 		if pl.fakeTCPLn != nil {
 			_ = pl.fakeTCPLn.Close()
+		}
+		if pl.xhttpMgr != nil {
+			pl.xhttpMgr.Close()
 		}
 	})
 }
@@ -387,13 +392,38 @@ func (pl *ProbeListener) handleTCPConn(raw net.Conn) {
 		innerConn := &peekedConn{Conn: ts, peeked: []byte{innerFirst[0]}}
 
 		switch innerFirst[0] {
-		case 'G': // WebSocket HTTP/1.1 Upgrade ("GET /tunnel ...")
+		case 'G': // WebSocket Upgrade ("GET /tunnel ...") or SplitHTTP/XHTTP ("GET /api/v1/stream/...")
+			const xhttpPrefix = "GET " + defaultXHTTPPath + "/"
+			var restG [len(xhttpPrefix) - 1]byte
+			if _, err := io.ReadFull(ts, restG[:]); err != nil {
+				_ = ts.Close()
+				return
+			}
+			head := append([]byte{'G'}, restG[:]...)
+			fullPeek := &peekedConn{Conn: ts, peeked: head}
+			if string(head) == xhttpPrefix {
+				xhttpCfg := &Config{
+					Transport: TransportXHTTP,
+					secret:    pl.Secret,
+				}
+				xConn, err := pl.xhttpMgr.AcceptConn(fullPeek, xhttpCfg, nil)
+				if err != nil {
+					_ = ts.Close()
+					return
+				}
+				if _, err := recvAuthPurpose(xConn, pl.Secret, nil); err != nil {
+					_ = xConn.Close()
+					return
+				}
+				runSpeedtestServer(xConn)
+				return
+			}
 			wsCfg := &Config{
 				Transport: TransportWSS,
 				WSPath:    defaultWSPath,
 				secret:    pl.Secret,
 			}
-			wsConn, err := wsAccept(innerConn, wsCfg, nil)
+			wsConn, err := wsAccept(fullPeek, wsCfg, nil)
 			if err != nil {
 				_ = ts.Close()
 				return
@@ -404,13 +434,31 @@ func (pl *ProbeListener) handleTCPConn(raw net.Conn) {
 			}
 			runSpeedtestServer(wsConn)
 
-		case 'P': // HTTP/2 / gRPC client preface ("PRI * HTTP/2.0...")
+		case 'P': // HTTP/2 / gRPC client preface ("PRI * HTTP/2.0...") or XHTTP uplink ("POST /api/v1/stream/...")
+			var restP [4]byte
+			if _, err := io.ReadFull(ts, restP[:]); err != nil {
+				_ = ts.Close()
+				return
+			}
+			head := append([]byte{'P'}, restP[:]...)
+			fullPeek := &peekedConn{Conn: ts, peeked: head}
+			if string(head) == "POST " {
+				xhttpCfg := &Config{
+					Transport: TransportXHTTP,
+					secret:    pl.Secret,
+				}
+				_, err := pl.xhttpMgr.AcceptConn(fullPeek, xhttpCfg, nil)
+				if err != nil && !errors.Is(err, errXHTTPUplinkAttached) {
+					_ = ts.Close()
+				}
+				return
+			}
 			h2Cfg := &Config{
 				Transport: TransportGRPC,
 				WSPath:    defaultWSPath,
 				secret:    pl.Secret,
 			}
-			h2Conn, err := h2Accept(innerConn, h2Cfg)
+			h2Conn, err := h2Accept(fullPeek, h2Cfg)
 			if err != nil {
 				_ = ts.Close()
 				return
@@ -583,6 +631,18 @@ func BuildProbeCandidates(mode, ipv4, ipv6 string, port int, cdnDomain string) [
 				Stealth:    false,
 				Shared:     true,
 				ServerName: "www.google.com",
+				TargetAddr: addr4,
+				Port:       port,
+			},
+			ProbeCandidateSpec{
+				ID:         mode + "-xhttp",
+				Label:      v4Label + " · SplitHTTP / XHTTP (GET + POST Stream)",
+				Mode:       mode,
+				Link:       "xhttp",
+				Transport:  string(TransportXHTTP),
+				Stealth:    true,
+				Shared:     true,
+				ServerName: "www.bing.com",
 				TargetAddr: addr4,
 				Port:       port,
 			},
@@ -769,6 +829,19 @@ func BuildProbeCandidates(mode, ipv4, ipv6 string, port int, cdnDomain string) [
 				Port:       port,
 			},
 			ProbeCandidateSpec{
+				ID:         mode + "-ipv6-xhttp",
+				Label:      dirLabel + " (IPv6) · SplitHTTP / XHTTP (GET + POST Stream)",
+				Mode:       mode,
+				Link:       "xhttp",
+				Transport:  string(TransportXHTTP),
+				Stealth:    true,
+				IPv6:       true,
+				Shared:     true,
+				ServerName: "www.bing.com",
+				TargetAddr: addr6,
+				Port:       port,
+			},
+			ProbeCandidateSpec{
 				ID:         mode + "-ipv6-split",
 				Label:      dirLabel + " (IPv6) · Split-Stream TLS (Anti-Freeze Rotation)",
 				Mode:       mode,
@@ -810,6 +883,20 @@ func BuildProbeCandidates(mode, ipv4, ipv6 string, port int, cdnDomain string) [
 				Mode:       "direct",
 				Link:       "cdn",
 				Transport:  string(TransportWSS),
+				CDN:        true,
+				Stealth:    true,
+				Shared:     true,
+				ServerName: cdnDomain,
+				Domain:     cdnDomain,
+				TargetAddr: cdnAddr,
+				Port:       port,
+			},
+			ProbeCandidateSpec{
+				ID:         "direct-cdn-xhttp",
+				Label:      "Direct · Cloudflare CDN (SplitHTTP / XHTTP)",
+				Mode:       "direct",
+				Link:       "xhttp-cdn",
+				Transport:  string(TransportXHTTP),
 				CDN:        true,
 				Stealth:    true,
 				Shared:     true,
@@ -1699,8 +1786,12 @@ func scoreCandidate(r *ProbeCandidateResult, maxMbps float64) int {
 	switch {
 	case (r.Link == "website" && r.Stealth) || r.Link == "sni-spoof" || r.Link == "split":
 		dpiBonus = 10.0
+	case r.Link == "xhttp":
+		dpiBonus = 9.5
 	case r.Link == "website" || r.Link == "grpc":
 		dpiBonus = 9.0
+	case r.Link == "xhttp-cdn":
+		dpiBonus = 8.8
 	case r.Link == "cdn" || r.Link == "grpc-cdn":
 		dpiBonus = 8.5
 	case r.Link == "kcp-hop":
@@ -1763,11 +1854,13 @@ func scoreGamingCandidate(r *ProbeCandidateResult) int {
 		gamingBonus = 4.5
 	case r.Link == "icmp":
 		gamingBonus = 4.0
+	case r.Link == "xhttp":
+		gamingBonus = 3.5
 	case r.Link == "grpc":
 		gamingBonus = 3.0
 	case r.Link == "split":
 		gamingBonus = 1.5
-	case r.Link == "cdn" || r.Link == "grpc-cdn":
+	case r.Link == "cdn" || r.Link == "grpc-cdn" || r.Link == "xhttp-cdn":
 		gamingBonus = 1.0
 	default:
 		gamingBonus = 3.0

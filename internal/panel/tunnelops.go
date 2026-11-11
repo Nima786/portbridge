@@ -325,6 +325,18 @@ func (p *Panel) toSpec(r createRequest) (agent.EdgeSpec, error) {
 		if domain == "" {
 			return s, errors.New("the CDN standing by needs your domain, pointed at the CDN")
 		}
+	case "xhttp":
+		s.Transport, s.ServerName = "xhttp", claimed
+		if s.ServerName == "" {
+			s.ServerName = "www.bing.com"
+		}
+		s.UTLS, s.TLSFragment = on(r.Stealth), on(r.Stealth)
+		s.RealSite = on(r.RealSite)
+	case "xhttp-cdn":
+		s.Transport, s.CDN, s.ServerName, s.CleanIPs = "xhttp", "on", domain, r.CleanIPs
+		if domain == "" {
+			return s, errors.New("SplitHTTP / XHTTP through a CDN needs your domain, pointed at the CDN")
+		}
 	case "grpc":
 		s.Transport, s.ServerName = "grpc", claimed
 		if s.ServerName == "" {

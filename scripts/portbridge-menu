@@ -588,6 +588,10 @@ explain_disguise() {
         say "     ${DIM}Runs over UDP with Reed-Solomon Forward Error Correction (10 data / 3 parity shards)${R}"
         say "     ${DIM}and AES encryption. Drops are repaired instantly without retransmission delays.${R}"
         say "     ${DIM}Immune to TCP middlebox RST drops; no TLS cert needed.${R}"
+        say ""
+        say "  ${B}7) SplitHTTP / XHTTP stream${R} ${DIM}(chunked GET + sequenced POST, direct or CDN)${R}"
+        say "     ${DIM}Splits the link into standard HTTP/1.1 GET + POST requests over TLS with zero${R}"
+        say "     ${DIM}WebSocket Upgrade headers. Works directly or through any Cloudflare / CDN plan.${R}"
     else
         say ""
         say "  ${B}4) HTTP/2 / gRPC stream${R}"
@@ -599,6 +603,10 @@ explain_disguise() {
         say "     ${DIM}Runs over UDP with Reed-Solomon Forward Error Correction (10 data / 3 parity shards)${R}"
         say "     ${DIM}and AES encryption. Drops are repaired instantly without retransmission delays.${R}"
         say "     ${DIM}Immune to TCP middlebox RST drops; no TLS cert needed.${R}"
+        say ""
+        say "  ${B}6) SplitHTTP / XHTTP stream${R} ${DIM}(chunked GET + sequenced POST, direct or CDN)${R}"
+        say "     ${DIM}Splits the link into standard HTTP/1.1 GET + POST requests over TLS with zero${R}"
+        say "     ${DIM}WebSocket Upgrade headers. Works directly or through any Cloudflare / CDN plan.${R}"
     fi
     hr
 }
@@ -808,12 +816,13 @@ ask_disguise() {
 
     explain_disguise "$mode"
     if [ "$mode" = direct ]; then
-        choice=$(choose "Choose 1, 2, 3, 4, 5 or 6" "2" 1 2 3 4 5 6)
+        choice=$(choose "Choose 1, 2, 3, 4, 5, 6 or 7" "2" 1 2 3 4 5 6 7)
     else
-        choice=$(choose "Choose 1, 2, 3, 4 or 5" "2" 1 2 3 4 5)
+        choice=$(choose "Choose 1, 2, 3, 4, 5 or 6" "2" 1 2 3 4 5 6)
         case "$choice" in
             4) choice=5 ;; # gRPC
             5) choice=6 ;; # KCP
+            6) choice=7 ;; # XHTTP
         esac
     fi
 
@@ -858,6 +867,7 @@ ask_disguise() {
             ok "Chosen: Loss-resistant KCP over UDP with Reed-Solomon FEC."
             return 0
             ;;
+        7) DG_TRANSPORT=xhttp ;;
     esac
 
     if [ "$choice" = 3 ] || [ "$choice" = 4 ]; then
@@ -964,6 +974,51 @@ ask_disguise() {
                 DG_FRAGMENT=on
             fi
         fi
+    elif [ "$choice" = 7 ]; then
+        DG_WSPATH="/api/v1/$(head -c 9 /dev/urandom | base64 | tr -dc 'a-zA-Z0-9' | head -c 8)"
+        say ""
+        info "SplitHTTP / XHTTP stream can connect directly to your foreign server, or"
+        info "route through Cloudflare or another HTTP/1.1 CDN with zero Upgrade headers."
+        say ""
+        say "  ${NUM}1${R}) Direct to foreign server IP ${DIM}(claims any normal website name, e.g. www.bing.com)${R}"
+        say "  ${NUM}2${R}) Through Cloudflare / CDN ${DIM}(needs your domain pointed at the CDN; no WebSocket/gRPC toggle needed)${R}"
+        local xhttp_choice
+        xhttp_choice=$(choose "Choose 1 or 2" "1" 1 2)
+        if [ "$xhttp_choice" = 2 ]; then
+            DG_CDN=on
+            say ""
+            info "Needs a domain you control pointed at your foreign server behind the CDN (SSL mode: Full)."
+            local domain
+            domain=$(ask_domain)
+            DG_SERVERNAME=$domain
+            say ""
+            info "Routing SplitHTTP / XHTTP through CDN using $DG_SERVERNAME$DG_WSPATH"
+            if [ "$mode" = reverse ]; then
+                warn "Note: a CDN only carries connections towards your domain, so with"
+                warn "reverse this only works if the domain points at THIS Iran server."
+            fi
+            say ""
+            info "Clean Cloudflare IPs (optional): Enter one or more verified clean IPs"
+            info "(comma-separated, e.g. 104.16.12.34, 172.67.45.67). Leave blank to resolve via DNS."
+            DG_CLEAN_IPS=$(ask_clean_ips "Clean Cloudflare IPs")
+            say ""
+            warn "Two things to set on the CDN for SplitHTTP / XHTTP mode:"
+            warn "  - SSL/TLS encryption mode must be Full."
+            warn "  - Cloudflare forwards only these ports: $CDN_PORTS"
+        else
+            DG_CDN=off
+            say ""
+            info "The direct SplitHTTP / XHTTP link will claim to be an HTTPS API/website."
+            DG_SERVERNAME=$(ask_site_name "Name for it to claim" "www.bing.com")
+            [ -n "$DG_SERVERNAME" ] || DG_SERVERNAME=www.bing.com
+            say ""
+            info "TLS ClientHello customization: Use Chrome TLS profile (uTLS) and record"
+            info "fragmentation on direct connections."
+            if confirm "Enable uTLS & TLS fragmentation?"; then
+                DG_UTLS=on
+                DG_FRAGMENT=on
+            fi
+        fi
     else
         say ""
         info "The link will claim to be a website. Any believable name works, and it"
@@ -1060,6 +1115,8 @@ ask_http_host() {
 describe_disguise() {
     case "$1:$2" in
         tls:*) printf 'looks like a normal website' ;;
+        xhttp:on) printf 'SplitHTTP / XHTTP stream through a CDN' ;;
+        xhttp:*) printf 'SplitHTTP / XHTTP stream (GET + POST)' ;;
         h2:on) printf 'HTTP/2 stream through Cloudflare' ;;
         h2:*) printf 'looks like HTTP/2 web traffic' ;;
         grpc:on) printf 'gRPC stream through Cloudflare' ;;
@@ -1402,7 +1459,7 @@ explain_sharing() {
     local transport=${DG_TRANSPORT:-plain} rec_one="" rec_two=""
     # The two choices are always numbered the same way, so "2" never means
     # something different from one screen to the next. Only the suggestion moves.
-    if [ "$transport" = kcp ] || [ "$transport" = wss ] || [ "$transport" = grpc ]; then
+    if [ "$transport" = kcp ] || [ "$transport" = wss ] || [ "$transport" = xhttp ] || [ "$transport" = grpc ]; then
         rec_two=" ${DIM}(recommended for $transport)${R}"
     else
         rec_one=" ${DIM}(recommended)${R}"
@@ -1444,7 +1501,7 @@ ask_mux_links() {
 ask_sharing() {
     explain_sharing
     local transport=${DG_TRANSPORT:-plain} def=1
-    if [ "$transport" = kcp ] || [ "$transport" = wss ] || [ "$transport" = grpc ]; then
+    if [ "$transport" = kcp ] || [ "$transport" = wss ] || [ "$transport" = xhttp ] || [ "$transport" = grpc ]; then
         def=2
     fi
     case "$(choose "Choose 1 or 2" "$def" 1 2)" in
@@ -2078,7 +2135,7 @@ create_tunnel() {
         say "${DIM}IPv6 is not offered through a CDN, which reaches your server by name.${R}"
     else
         case "$DG_TRANSPORT" in
-            plain | tls | h2 | grpc | kcp)
+            plain | tls | xhttp | h2 | grpc | kcp)
                 # A foreign server that was given by its IPv6 address is that
                 # address already, so it is not asked for again.
                 case "$peer" in
@@ -2422,7 +2479,7 @@ join_tunnel() {
         return 1
     fi
     case "$mode" in direct | reverse) ;; *) err "That code has an unknown mode."; return 1 ;; esac
-    case "$DG_TRANSPORT" in plain | tls | wss | h2 | grpc | kcp) ;; *) err "That code has an unknown link type."; return 1 ;; esac
+    case "$DG_TRANSPORT" in plain | tls | wss | xhttp | h2 | grpc | kcp | icmp | faketcp) ;; *) err "That code has an unknown link type."; return 1 ;; esac
     case "$DG_CDN" in on | off) ;; *) err "That code has a bad CDN setting."; return 1 ;; esac
     case "$MX_MUX" in on | off) ;; *) err "That code has a bad sharing setting."; return 1 ;; esac
     case "$DG_HTTPHEADER" in on | off) ;; *) err "That code has a bad web header setting."; return 1 ;; esac
@@ -2690,6 +2747,8 @@ status_line() {
     local look
     case "$transport:$cdn" in
         tls:*) look=website ;;
+        xhttp:on) look=xhttp-cdn ;;
+        xhttp:*) look=xhttp ;;
         h2:*) look=http2 ;;
         grpc:*) look=grpc ;;
         kcp:*) look=kcp-udp ;;

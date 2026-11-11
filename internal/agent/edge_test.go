@@ -314,3 +314,64 @@ func TestRealSiteFallsBackToASiteThisServerCanReach(t *testing.T) {
 		t.Fatalf("the real website goes with a browser's hello, as in the menu")
 	}
 }
+
+func TestCreateAndJoinXHTTPDirectAndCDN(t *testing.T) {
+	// 1. Direct XHTTP with Stealth + RealSite
+	edgeDir := t.TempDir()
+	originDir := t.TempDir()
+	s := EdgeSpec{
+		Name:         "txhttp",
+		Mode:         "direct",
+		Transport:    "xhttp",
+		ServerName:   "www.bing.com",
+		UTLS:         "on",
+		TLSFragment:  "on",
+		RealSite:     "on",
+		Mux:          "on",
+		MuxLinks:     4,
+		PeerIP:       "5.6.7.8",
+		LocalIP:      "1.2.3.4",
+		LinkPort:     2053,
+		UserPorts:    "31707",
+		ServicePorts: "31707",
+	}
+	res, err := CreateEdge(s, edgeDir)
+	if err != nil {
+		t.Fatalf("CreateEdge(xhttp): %v", err)
+	}
+	p, err := decodePairingCode(res.Code)
+	if err != nil {
+		t.Fatalf("decodePairingCode: %v", err)
+	}
+	if p.Transport != "xhttp" || !strings.HasPrefix(p.WSPath, "/api/v1/") {
+		t.Fatalf("unexpected pairing code fields: transport=%q ws_path=%q", p.Transport, p.WSPath)
+	}
+	if err := applyPairingData(p, originDir); err != nil {
+		t.Fatalf("applyPairingData(xhttp): %v", err)
+	}
+
+	// 2. XHTTP over CDN via EditEdge mode switch
+	editRes, err := EditEdge(EditSpec{
+		Name:       "txhttp",
+		Mode:       "direct",
+		Transport:  "xhttp",
+		CDN:        "on",
+		ServerName: "edge.example.com",
+		CleanIPs:   "104.16.12.34",
+		Mux:        "on",
+		MuxLinks:   4,
+	}, edgeDir)
+	if err != nil {
+		t.Fatalf("EditEdge(xhttp-cdn): %v", err)
+	}
+	p2, err := decodePairingCode(editRes.Code)
+	if err != nil {
+		t.Fatalf("decodePairingCode after edit: %v", err)
+	}
+	if p2.Transport != "xhttp" || p2.CDN != "on" || p2.ServerName != "edge.example.com" {
+		t.Fatalf("unexpected edited pairing code: %+v", p2)
+	}
+	if err := updatePairingData(p2, originDir, nil); err != nil {
+		t.Fatalf("updatePairingData(xhttp-cdn): %v", err)
+	}
+}

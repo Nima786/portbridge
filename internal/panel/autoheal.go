@@ -895,14 +895,14 @@ func (ah *autoHealer) healTunnel(ctx context.Context, j *job, key, name, relayID
 			serverName = cdnDomain
 		}
 	}
-	if serverName == "" && (best.Transport == "tls" || best.Transport == "wss" || best.Transport == "grpc") {
+	if serverName == "" && (best.Transport == "tls" || best.Transport == "wss" || best.Transport == "xhttp" || best.Transport == "grpc") {
 		serverName = "www.bing.com"
 	}
 	httpHost := ""
 	if best.WebHeader {
 		httpHost = "www.bing.com"
 	}
-	realSite := !best.CDN && (best.Transport == "tls" || best.Transport == "grpc")
+	realSite := !best.CDN && (best.Transport == "tls" || best.Transport == "xhttp" || best.Transport == "grpc")
 
 	// A CDN backup route the owner set up is kept where it can still work: on a
 	// direct website-style link. It cannot be combined with showing the real
@@ -910,7 +910,7 @@ func (ah *autoHealer) healTunnel(ctx context.Context, j *job, key, name, relayID
 	// is left off for the tunnel that keeps the backup.
 	altHost := ""
 	switch best.Transport {
-	case "tls", "wss", "h2", "grpc":
+	case "tls", "wss", "xhttp", "h2", "grpc":
 		// (IPv6 between the servers cannot be combined with a CDN route.)
 		if curInfo.AltHost != "" && !best.CDN && !best.IPv6 && best.Mode == "direct" {
 			altHost = curInfo.AltHost

@@ -4,7 +4,7 @@ This document tracks the gradual rollout of PortBridge's six next-generation ant
 
 ---
 
-## Phase 1 (Implemented in `v0.17.57`)
+## Phase 1 (Implemented in `v0.17.57`–`v0.17.58`)
 
 ### 1. Dynamic Port-Hopping KCP (`kcp-hop` / `port_hop = on`)
 - **Status**: ✅ Implemented (`v0.17.57`)
@@ -17,7 +17,7 @@ This document tracks the gradual rollout of PortBridge's six next-generation ant
   - **Firewall**: `portbridge-firewall` opens the peer-locked UDP port range `TPORT:ENDPORT` automatically and purges rules cleanly by tunnel comment tag.
 
 ### 2. SplitHTTP / XHTTP (`xhttp` & `xhttp-cdn` / `transport = xhttp`)
-- **Status**: 🚧 Planned Next (Phase 1B)
+- **Status**: ✅ Implemented (`v0.17.58`)
 - **Problem Solved**: Stateful DPI systems detect or throttle WebSocket (`Upgrade: websocket` / `101 Switching Protocols`) and long-lived raw TLS byte counters, while many CDNs require special enterprise/dashboard toggles for gRPC.
 - **Architecture**:
   - Splits downlink and uplink into completely ordinary, standard HTTP/1.1 HTTPS requests (`internal/engine/xhttp.go`) with zero `Upgrade` headers:

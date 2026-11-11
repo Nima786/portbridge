@@ -196,6 +196,9 @@ func (s *EdgeSpec) normalise() {
 	if s.Transport == "wss" && s.WSPath == "" {
 		s.WSPath = "/" + randomAlnum(10)
 	}
+	if s.Transport == "xhttp" && s.WSPath == "" {
+		s.WSPath = "/api/v1/" + randomAlnum(8)
+	}
 	// As the menu does: showing the real website goes with a browser's hello.
 	if s.RealSite == "on" {
 		s.UTLS = "on"
@@ -250,9 +253,9 @@ func (s *EdgeSpec) check() error {
 		return fmt.Errorf("mode %q is not direct or reverse", s.Mode)
 	}
 	switch s.Transport {
-	case "plain", "tls", "wss", "grpc", "kcp", "icmp", "faketcp":
+	case "plain", "tls", "wss", "xhttp", "grpc", "kcp", "icmp", "faketcp":
 	default:
-		return fmt.Errorf("link type %q is not one of plain, tls, wss, grpc, kcp, icmp or faketcp", s.Transport)
+		return fmt.Errorf("link type %q is not one of plain, tls, wss, xhttp, grpc, kcp, icmp or faketcp", s.Transport)
 	}
 	for _, f := range []struct{ name, val string }{
 		{"cdn", s.CDN}, {"mux", s.Mux}, {"utls", s.UTLS}, {"tls_fragment", s.TLSFragment},
@@ -1087,7 +1090,7 @@ type EditSpec struct {
 
 	// Optional transport / mode replacement fields:
 	Mode       string `json:"mode,omitempty"`        // "direct" or "reverse"
-	Transport  string `json:"transport,omitempty"`   // "plain", "tls", "wss", "grpc", "kcp", "icmp", "faketcp"
+	Transport  string `json:"transport,omitempty"`   // "plain", "tls", "wss", "xhttp", "grpc", "kcp", "icmp", "faketcp"
 	ServerName string `json:"server_name,omitempty"` // SNI / domain
 	CDN        string `json:"cdn,omitempty"`         // "on" or "off"
 	AltHost    string `json:"alt_host,omitempty"`    // CDN backup domain

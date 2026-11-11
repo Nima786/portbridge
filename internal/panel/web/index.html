@@ -709,6 +709,28 @@
           </label>
 
           <label class="choice-card">
+            <input type="radio" name="tn-link" value="xhttp">
+            <div class="choice-body">
+              <div class="choice-top">
+                <strong>SplitHTTP / XHTTP Stream</strong>
+                <span class="pill-tag tag-good">GET + POST</span>
+              </div>
+              <span class="choice-desc">Splits traffic into a chunked HTTP/1.1 GET downlink and sequenced keep-alive POST uplinks with zero WebSocket Upgrade headers.</span>
+            </div>
+          </label>
+
+          <label class="choice-card">
+            <input type="radio" name="tn-link" value="xhttp-cdn">
+            <div class="choice-body">
+              <div class="choice-top">
+                <strong>SplitHTTP / XHTTP via Cloudflare / CDN</strong>
+                <span class="pill-tag tag-good">CDN · No Upgrade</span>
+              </div>
+              <span class="choice-desc">Standard HTTP/1.1 GET + POST streaming through any Cloudflare / CDN plan with zero WebSocket or gRPC toggle needed.</span>
+            </div>
+          </label>
+
+          <label class="choice-card">
             <input type="radio" name="tn-link" value="grpc">
             <div class="choice-body">
               <div class="choice-top">

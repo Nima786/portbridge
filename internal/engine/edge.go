@@ -290,7 +290,7 @@ func (e *edge) acceptTunnel(ctx context.Context, ln net.Listener) {
 				tuneSocket(raw)
 				c, err := wrapAccept(raw, e.cfg, e.cert, e.guard)
 				if err != nil {
-					if errors.Is(err, errStrangerForwarded) || errors.Is(err, errSplitLegAttached) {
+					if errors.Is(err, errStrangerForwarded) || errors.Is(err, errSplitLegAttached) || errors.Is(err, errXHTTPUplinkAttached) {
 						return
 					}
 					e.logAuth.printf("refused a tunnel connection from %s: %v", raw.RemoteAddr(), err)

@@ -45,6 +45,11 @@ const (
 	// Cloudflare, so the foreign server's own address never appears on it.
 	TransportWSS Transport = "wss"
 
+	// TransportXHTTP splits downlink (chunked HTTP/1.1 GET) and uplink
+	// (sequenced HTTP/1.1 POSTs over rotated keep-alive sockets) over TLS,
+	// avoiding WebSocket upgrade headers while remaining compatible with CDNs.
+	TransportXHTTP Transport = "xhttp"
+
 	// TransportH2 wraps the link in HTTP/2 streaming frames over TLS, appearing
 	// as an active HTTP/2 web connection.
 	TransportH2 Transport = "h2"
@@ -75,7 +80,7 @@ const (
 
 func ValidTransport(t Transport) bool {
 	switch t {
-	case TransportPlain, TransportTLS, TransportWSS, TransportH2, TransportGRPC, TransportKCP, TransportICMP, TransportFakeTCP:
+	case TransportPlain, TransportTLS, TransportWSS, TransportXHTTP, TransportH2, TransportGRPC, TransportKCP, TransportICMP, TransportFakeTCP:
 		return true
 	}
 	return false
@@ -96,7 +101,7 @@ func IsKCPFamily(t Transport) bool {
 // claims to be. An HTTPS site offers these; anything else would be a giveaway.
 func alpnFor(t Transport) []string {
 	switch t {
-	case TransportWSS:
+	case TransportWSS, TransportXHTTP:
 		return []string{"http/1.1"}
 	case TransportH2, TransportGRPC:
 		return []string{"h2", "http/1.1"}
@@ -192,6 +197,10 @@ func checkNegotiated(proto string, t Transport) error {
 	case TransportWSS:
 		if proto == "h2" {
 			return errors.New("the far end chose HTTP/2 for a websocket tunnel, which needs HTTP/1.1")
+		}
+	case TransportXHTTP:
+		if proto == "h2" {
+			return errors.New("the far end chose HTTP/2 for an xhttp tunnel, which needs HTTP/1.1")
 		}
 	}
 	return nil
@@ -499,9 +508,17 @@ func wrapDial(raw net.Conn, cfg *Config) (net.Conn, error) {
 }
 
 // wrapDialPurpose is wrapDial for a caller that knows what the connection is
-// for. The purpose only matters to the websocket disguise, which authenticates
-// inside the upgrade request and so has to say it there.
+// for. The purpose only matters to disguises that authenticate inside the HTTP
+// request headers and so have to say it there.
 func wrapDialPurpose(raw net.Conn, cfg *Config, purpose byte) (net.Conn, error) {
+	return wrapDialPurposeInternal(raw, cfg, purpose, false)
+}
+
+func wrapDialPurposeTLSOnly(raw net.Conn, cfg *Config, purpose byte) (net.Conn, error) {
+	return wrapDialPurposeInternal(raw, cfg, purpose, true)
+}
+
+func wrapDialPurposeInternal(raw net.Conn, cfg *Config, purpose byte, tlsOnly bool) (net.Conn, error) {
 	injectedDecoy := false
 	if cfg.SNISpoof && cfg.Transport != TransportKCP && cfg.Transport != TransportICMP && cfg.Transport != TransportFakeTCP && !isDecoyRawBypassed(raw.RemoteAddr()) {
 		if injectDecoyClientHello(raw, cfg.EffectiveSpoofSNI(), cfg.SNISpoofTTL) == nil {
@@ -533,17 +550,17 @@ func wrapDialPurpose(raw net.Conn, cfg *Config, purpose byte) (net.Conn, error) 
 		}
 		return raw, nil
 
-	case TransportTLS, TransportWSS, TransportH2, TransportGRPC:
+	case TransportTLS, TransportWSS, TransportXHTTP, TransportH2, TransportGRPC:
 		echList, echErr := resolveECHConfigList(cfg, raw.RemoteAddr())
 		if echErr != nil {
 			_ = raw.Close()
 			return nil, echErr
 		}
 
-		conn, err := wrapDialTLSOnce(raw, cfg, purpose, echList)
+		conn, err := wrapDialTLSOnce(raw, cfg, purpose, echList, tlsOnly)
 		if err != nil && injectedDecoy && isTLSStageError(err) {
 			if fresh, dialErr := redialPeer(raw); dialErr == nil {
-				if connClean, errClean := wrapDialTLSOnce(fresh, cfg, purpose, echList); errClean == nil {
+				if connClean, errClean := wrapDialTLSOnce(fresh, cfg, purpose, echList, tlsOnly); errClean == nil {
 					markDecoyRawBypass(raw.RemoteAddr())
 					return connClean, nil
 				} else {
@@ -563,7 +580,7 @@ func wrapDialPurpose(raw net.Conn, cfg *Config, purpose byte) (net.Conn, error) 
 		if retryList, isRej := extractECHRetryConfigs(err); isRej && len(retryList) > 0 && !bytes.Equal(retryList, echList) {
 			cacheECHConfigList(domain, retryList)
 			if fresh, dialErr := redialPeer(raw); dialErr == nil {
-				conn2, err2 := wrapDialTLSOnce(fresh, cfg, purpose, retryList)
+				conn2, err2 := wrapDialTLSOnce(fresh, cfg, purpose, retryList, tlsOnly)
 				if err2 == nil {
 					return conn2, nil
 				}
@@ -582,7 +599,7 @@ func wrapDialPurpose(raw net.Conn, cfg *Config, purpose byte) (net.Conn, error) 
 		// standard uTLS fingerprint + fragmentation, and remember the bypass so
 		// subsequent pool connections do not pay an ECH retry penalty.
 		if fresh, dialErr := redialPeer(raw); dialErr == nil {
-			if connFallback, errFallback := wrapDialTLSOnce(fresh, cfg.withoutECH(), purpose, nil); errFallback == nil {
+			if connFallback, errFallback := wrapDialTLSOnce(fresh, cfg.withoutECH(), purpose, nil, tlsOnly); errFallback == nil {
 				markECHBypass(domain)
 				echFallbackLog.printf("ECH handshake to %s was not accepted (%v); fell back automatically to standard TLS", domain, err)
 				return connFallback, nil
@@ -596,7 +613,7 @@ func wrapDialPurpose(raw net.Conn, cfg *Config, purpose byte) (net.Conn, error) 
 	}
 }
 
-func wrapDialTLSOnce(raw net.Conn, cfg *Config, purpose byte, echConfigList []byte) (net.Conn, error) {
+func wrapDialTLSOnce(raw net.Conn, cfg *Config, purpose byte, echConfigList []byte, tlsOnly bool) (net.Conn, error) {
 	connToWrap := raw
 	if cfg.useFragment() {
 		size := cfg.TLSFragmentSize
@@ -647,6 +664,9 @@ func wrapDialTLSOnce(raw net.Conn, cfg *Config, purpose byte, echConfigList []by
 			_ = raw.Close()
 			return nil, err
 		}
+		if tlsOnly {
+			return uClient, nil
+		}
 		if cfg.Transport == TransportTLS {
 			if cfg.AntiFreeze {
 				return newSplitClientConn(uClient, raw.RemoteAddr(), cfg, purpose)
@@ -655,6 +675,9 @@ func wrapDialTLSOnce(raw net.Conn, cfg *Config, purpose byte, echConfigList []by
 		}
 		if cfg.Transport == TransportWSS {
 			return wsDialPurpose(uClient, cfg, purpose)
+		}
+		if cfg.Transport == TransportXHTTP {
+			return xhttpDialPurpose(uClient, raw.RemoteAddr(), cfg, purpose)
 		}
 		return h2Dial(uClient, cfg)
 	}
@@ -682,6 +705,9 @@ func wrapDialTLSOnce(raw net.Conn, cfg *Config, purpose byte, echConfigList []by
 		_ = raw.Close()
 		return nil, err
 	}
+	if tlsOnly {
+		return tc, nil
+	}
 	if cfg.Transport == TransportTLS {
 		if cfg.AntiFreeze {
 			return newSplitClientConn(tc, raw.RemoteAddr(), cfg, purpose)
@@ -690,6 +716,9 @@ func wrapDialTLSOnce(raw net.Conn, cfg *Config, purpose byte, echConfigList []by
 	}
 	if cfg.Transport == TransportWSS {
 		return wsDialPurpose(tc, cfg, purpose)
+	}
+	if cfg.Transport == TransportXHTTP {
+		return xhttpDialPurpose(tc, raw.RemoteAddr(), cfg, purpose)
 	}
 	return h2Dial(tc, cfg)
 }
@@ -710,7 +739,7 @@ func wrapAccept(raw net.Conn, cfg *Config, cert *tls.Certificate, guard ...*repl
 		}
 		return raw, nil
 
-	case TransportTLS, TransportWSS, TransportH2, TransportGRPC:
+	case TransportTLS, TransportWSS, TransportXHTTP, TransportH2, TransportGRPC:
 		connToWrap := raw
 		if cfg.RealSite && !cfg.CDN {
 			var g *replayGuard
@@ -753,6 +782,13 @@ func wrapAccept(raw net.Conn, cfg *Config, cert *tls.Certificate, guard ...*repl
 			}
 			return wsAccept(ts, cfg, g)
 		}
+		if cfg.Transport == TransportXHTTP {
+			var g *replayGuard
+			if len(guard) > 0 {
+				g = guard[0]
+			}
+			return defaultXHTTPManager.AcceptConn(ts, cfg, g)
+		}
 		return h2Accept(ts, cfg)
 
 	default:
@@ -777,6 +813,14 @@ func describeTransport(cfg *Config) string {
 		} else {
 			base = fmt.Sprintf("disguised as a websocket over HTTPS (%s%s)",
 				cfg.EffectiveServerName(), cfg.effectiveWSPath())
+		}
+	case TransportXHTTP:
+		if cfg.CDN {
+			base = fmt.Sprintf("disguised as SplitHTTP/XHTTP (%s%s) and routed through a CDN, so this server's address never appears on it",
+				cfg.EffectiveServerName(), cfg.effectiveXHTTPPath())
+		} else {
+			base = fmt.Sprintf("disguised as SplitHTTP/XHTTP (%s%s)",
+				cfg.EffectiveServerName(), cfg.effectiveXHTTPPath())
 		}
 	case TransportH2:
 		if cfg.CDN {

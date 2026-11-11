@@ -216,7 +216,7 @@ func (o *origin) runDirect(ctx context.Context) error {
 				tuneSocket(raw)
 				c, err := wrapAccept(raw, o.cfg, o.cert, o.guard)
 				if err != nil {
-					if errors.Is(err, errStrangerForwarded) || errors.Is(err, errSplitLegAttached) {
+					if errors.Is(err, errStrangerForwarded) || errors.Is(err, errSplitLegAttached) || errors.Is(err, errXHTTPUplinkAttached) {
 						return
 					}
 					o.logAuth.printf("refused a tunnel connection from %s: %v", raw.RemoteAddr(), err)

@@ -1163,6 +1163,10 @@
     const host = m ? m[1] : '';
     const sniSuffix = any.sni_spoof ? ' + Decoy SNI' : '';
     if (/CDN backup/i.test(raw)) return (host ? `HTTPS (${host}) + CDN` : 'HTTPS + CDN Backup') + sniSuffix;
+    if (/SplitHTTP|XHTTP/i.test(raw) || any.transport === 'xhttp') {
+      if (any.cdn || /through a CDN/i.test(raw)) return (host ? `XHTTP + CDN (${host})` : 'XHTTP + CDN') + sniSuffix;
+      return (host ? `XHTTP (${host})` : 'SplitHTTP / XHTTP') + sniSuffix;
+    }
     if (/gRPC through a CDN/i.test(raw)) return (host ? `gRPC + CDN (${host})` : 'gRPC + CDN') + sniSuffix;
     if (/through a CDN/i.test(raw)) return (host ? `CDN (${host})` : 'CDN (WebSocket)') + sniSuffix;
     if (/gRPC/i.test(raw)) return (host ? `gRPC (${host})` : 'gRPC') + sniSuffix;
@@ -1386,18 +1390,19 @@
     if (any.port_hop) return 'kcp-hop';
     if (any.anti_freeze) return 'split';
     if (any.sni_spoof && !any.cdn) return 'sni-spoof';
+    if (any.cdn && any.transport === 'xhttp') return 'xhttp-cdn';
     if (any.cdn && any.transport === 'grpc') return 'grpc-cdn';
     if (any.cdn && any.alt_target) return 'website-cdn-backup';
     if (any.cdn) return 'cdn';
-    if (['grpc', 'kcp', 'icmp', 'faketcp', 'plain'].includes(any.transport)) return any.transport;
+    if (['xhttp', 'grpc', 'kcp', 'icmp', 'faketcp', 'plain'].includes(any.transport)) return any.transport;
     return 'website';
   }
 
   function recommendCapacityFor(linkKey, loadPreset) {
     const preset = ['light', 'medium', 'heavy'].includes(loadPreset) ? loadPreset : 'light';
     const isRawKCP = ['icmp', 'faketcp', 'ip-spoof'].includes(linkKey);
-    const isCDN = ['cdn', 'website-cdn-backup', 'grpc-cdn'].includes(linkKey);
-    const isMuxFirst = ['split', 'grpc', 'kcp', 'kcp-hop'].includes(linkKey);
+    const isCDN = ['cdn', 'website-cdn-backup', 'xhttp-cdn', 'grpc-cdn'].includes(linkKey);
+    const isMuxFirst = ['split', 'xhttp', 'grpc', 'kcp', 'kcp-hop'].includes(linkKey);
 
     if (isRawKCP) {
       if (preset === 'heavy') return { shared: true, muxLinks: 4, pool: 100, maxConn: 8000 };
@@ -1433,7 +1438,7 @@
 
   function describeCapacityAdvice(linkKey, isShared, poolSize, muxLinks, maxConn) {
     const isRawKCP = ['icmp', 'faketcp', 'ip-spoof'].includes(linkKey);
-    const isCDN = ['cdn', 'website-cdn-backup', 'grpc-cdn'].includes(linkKey);
+    const isCDN = ['cdn', 'website-cdn-backup', 'xhttp-cdn', 'grpc-cdn'].includes(linkKey);
     const sessions = (maxConn || 2000).toLocaleString();
     if (isRawKCP) {
       if (!isShared) {
@@ -2801,12 +2806,12 @@
     const link = gre ? 'plain' : radio('tn-link');
     $('tn-opt-webheader').hidden = gre || link !== 'plain';
     $('tn-webhost').disabled = !$('tn-webheader').checked;
-    $('tn-opt-claim').hidden = !['website', 'split', 'sit', 'website-cdn-backup', 'grpc'].includes(link);
-    const needDomain = ['cdn', 'website-cdn-backup', 'grpc-cdn'].includes(link);
+    $('tn-opt-claim').hidden = !['website', 'split', 'sit', 'website-cdn-backup', 'xhttp', 'grpc'].includes(link);
+    const needDomain = ['cdn', 'website-cdn-backup', 'xhttp-cdn', 'grpc-cdn'].includes(link);
     $('tn-opt-domain').hidden = !needDomain;
     if (needDomain) ensureTunnelCFHelper();
-    $('tn-opt-clean').hidden = !['cdn', 'grpc-cdn'].includes(link);
-    $('tn-opt-stealth').hidden = !['website', 'split', 'sit', 'sni-spoof', 'grpc'].includes(link);
+    $('tn-opt-clean').hidden = !['cdn', 'xhttp-cdn', 'grpc-cdn'].includes(link);
+    $('tn-opt-stealth').hidden = !['website', 'split', 'sit', 'sni-spoof', 'xhttp', 'grpc'].includes(link);
     if ($('tn-opt-snispoof')) {
       $('tn-opt-snispoof').hidden = gre || ['kcp', 'kcp-hop', 'icmp', 'faketcp', 'sit'].includes(link);
       if (link === 'ip-spoof' || link === 'sni-spoof') {
@@ -2823,7 +2828,7 @@
     }
     if (link === 'grpc' && $('tn-claim').value === 'www.bing.com') $('tn-claim').value = 'www.google.com';
     if (link !== 'grpc' && $('tn-claim').value === 'www.google.com') $('tn-claim').value = 'www.bing.com';
-    const v6ok = !gre && ['plain', 'website', 'split', 'sni-spoof', 'grpc', 'kcp', 'kcp-hop'].includes(link) &&
+    const v6ok = !gre && ['plain', 'website', 'split', 'sni-spoof', 'xhttp', 'grpc', 'kcp', 'kcp-hop'].includes(link) &&
       hasIPv6(serverById($('tn-relay').value)) && hasIPv6(serverById($('tn-foreign').value));
     $('tn-ipv6-row').hidden = !v6ok;
     if (!v6ok) $('tn-ipv6').checked = false;
@@ -3327,7 +3332,7 @@
     if (cand.spoof_ip && $('tn-spoofip')) {
       $('tn-spoofip').value = cand.spoof_ip;
     }
-    if (cand.server_name && ['website', 'split', 'sit', 'website-cdn-backup', 'grpc'].includes(cand.link)) {
+    if (cand.server_name && ['website', 'split', 'sit', 'website-cdn-backup', 'xhttp', 'grpc'].includes(cand.link)) {
       $('tn-claim').value = cand.server_name;
     }
     if (cand.domain) {
@@ -3992,7 +3997,7 @@
       return fail('The number of User Listen Ports must match the number of Inbound Ports.', $('tn-users'));
     }
     if (!(r.link_port >= 1 && r.link_port <= 65535)) return fail('Tunnel Bridge Port must be between 1 and 65535.', $('tn-linkport'));
-    if (['cdn', 'website-cdn-backup', 'grpc-cdn'].includes(r.link) && !r.domain) return fail('Enter your CDN domain.', $('tn-domain'));
+    if (['cdn', 'website-cdn-backup', 'xhttp-cdn', 'grpc-cdn'].includes(r.link) && !r.domain) return fail('Enter your CDN domain.', $('tn-domain'));
     if (!r.shared && !(r.pool >= 1 && r.pool <= 10000)) return fail('Connection Pool Size must be between 1 and 10000.', $('tn-pool'));
     if (r.shared && !(r.shared_links >= 1 && r.shared_links <= 16)) return fail('Number of shared Mux connections must be between 1 and 16.', $('tn-links-n'));
     if (!(r.max_conn >= 1 && r.max_conn <= 100000)) return fail('Max Concurrent User Sessions must be between 1 and 100000.', $('tn-max-conn'));
