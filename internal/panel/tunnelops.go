@@ -117,22 +117,24 @@ type createRequest struct {
 
 	// Link is how the link between the servers looks: plain, website, cdn,
 	// website-cdn-backup, grpc, grpc-cdn or kcp.
-	Link       string `json:"link"`
-	ServerName string `json:"server_name"` // the name it claims
-	Domain     string `json:"domain"`      // the domain pointed at the CDN
-	CleanIPs   string `json:"clean_ips"`
-	Stealth    bool   `json:"stealth"`    // a browser's hello, split up
-	WebHeader  bool   `json:"web_header"` // a plain link opening like web traffic
-	WebHost    string `json:"web_host"`
-	RealSite   bool   `json:"real_site"`
-	GRE        bool   `json:"gre"`
-	SIT        bool   `json:"sit"`
-	AntiFreeze bool   `json:"anti_freeze"`
-	SNISpoof   bool   `json:"sni_spoof"`
-	SpoofSNI   string `json:"spoof_sni"`
-	IPSpoof    bool   `json:"ip_spoof"`
-	SpoofIP    string `json:"spoof_ip"`
-	IPv6       bool   `json:"ipv6"`
+	Link         string `json:"link"`
+	ServerName   string `json:"server_name"` // the name it claims
+	Domain       string `json:"domain"`      // the domain pointed at the CDN
+	CleanIPs     string `json:"clean_ips"`
+	Stealth      bool   `json:"stealth"`    // a browser's hello, split up
+	WebHeader    bool   `json:"web_header"` // a plain link opening like web traffic
+	WebHost      string `json:"web_host"`
+	RealSite     bool   `json:"real_site"`
+	GRE          bool   `json:"gre"`
+	SIT          bool   `json:"sit"`
+	AntiFreeze   bool   `json:"anti_freeze"`
+	PortHop      bool   `json:"port_hop"`
+	PortHopPorts int    `json:"port_hop_ports,omitempty"`
+	SNISpoof     bool   `json:"sni_spoof"`
+	SpoofSNI     string `json:"spoof_sni"`
+	IPSpoof      bool   `json:"ip_spoof"`
+	SpoofIP      string `json:"spoof_ip"`
+	IPv6         bool   `json:"ipv6"`
 
 	Shared      bool `json:"shared"`
 	SharedLinks int  `json:"shared_links"`
@@ -337,6 +339,14 @@ func (p *Panel) toSpec(r createRequest) (agent.EdgeSpec, error) {
 		}
 	case "kcp":
 		s.Transport = "kcp"
+		if r.PortHop {
+			s.PortHop = "on"
+			s.PortHopPorts = r.PortHopPorts
+		}
+	case "kcp-hop":
+		s.Transport = "kcp"
+		s.PortHop = "on"
+		s.PortHopPorts = r.PortHopPorts
 	case "faketcp":
 		s.Transport = "faketcp"
 	case "icmp":
@@ -476,8 +486,20 @@ func intsOf(list string) []int {
 // Iran half is made.
 func (p *Panel) checkForeignPorts(ctx context.Context, j *job, foreignID string, s agent.EdgeSpec) error {
 	ask := intsOf(s.ServicePorts)
+	var hopPorts []int
 	if s.Mode == "direct" {
-		ask = append(ask, s.LinkPort)
+		if s.PortHop == "on" {
+			cnt := s.PortHopPorts
+			if cnt <= 0 {
+				cnt = engine.DefaultPortHopPorts
+			}
+			for i := 0; i < cnt && s.LinkPort+i <= 65535; i++ {
+				hopPorts = append(hopPorts, s.LinkPort+i)
+			}
+			ask = append(ask, hopPorts...)
+		} else {
+			ask = append(ask, s.LinkPort)
+		}
 	}
 	if s.OutboundProxy == "on" && s.OutboundProxyPort > 0 {
 		ask = append(ask, s.OutboundProxyPort)
@@ -489,7 +511,15 @@ func (p *Panel) checkForeignPorts(ctx context.Context, j *job, foreignID string,
 	}
 	var problems []string
 	if s.Mode == "direct" {
-		if ps := st[s.LinkPort]; ps.State == "busy" || ps.State == "reserved" {
+		if len(hopPorts) > 0 {
+			for _, hp := range hopPorts {
+				if ps := st[hp]; ps.State == "busy" || ps.State == "reserved" {
+					problems = append(problems, fmt.Sprintf("port-hop bridge port %d is already used on the foreign server%s",
+						hp, byWhom(ps.By)))
+					break
+				}
+			}
+		} else if ps := st[s.LinkPort]; ps.State == "busy" || ps.State == "reserved" {
 			problems = append(problems, fmt.Sprintf("the port between the servers, %d, is already used on the foreign server%s",
 				s.LinkPort, byWhom(ps.By)))
 		}

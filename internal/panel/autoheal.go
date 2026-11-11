@@ -580,6 +580,8 @@ func describeTunnelInfo(ti agent.TunnelInfo) string {
 		tr += " (6in4)"
 	} else if ti.CDN {
 		tr += " (CDN)"
+	} else if ti.PortHop {
+		tr += " (Port-Hop)"
 	} else if ti.AntiFreeze {
 		tr += " (Split-Stream)"
 	} else if strings.Contains(linkLower, "website header") {
@@ -607,6 +609,7 @@ func sameCandidateAsCurrent(c engine.ProbeCandidateResult, ti agent.TunnelInfo) 
 		c.IPv6 == curIPv6 &&
 		c.CDN == ti.CDN &&
 		c.AntiFreeze == ti.AntiFreeze &&
+		c.PortHop == ti.PortHop &&
 		c.WebHeader == curHTTP
 }
 
@@ -941,6 +944,7 @@ func (ah *autoHealer) healTunnel(ctx context.Context, j *job, key, name, relayID
 		GRE:          "off",
 		SIT:          "off",
 		AntiFreeze:   onOff(best.AntiFreeze),
+		PortHop:      onOff(best.PortHop),
 		Mux:          muxMode,
 		MuxLinks:     muxLinks,
 		Pool:         curInfo.PoolSize,
@@ -970,6 +974,8 @@ func describeCandidate(c engine.ProbeCandidateResult) string {
 		tr += " (CDN)"
 	} else if c.IPSpoof {
 		tr += " (IP Spoof)"
+	} else if c.PortHop {
+		tr += " (Port-Hop)"
 	} else if c.AntiFreeze {
 		tr += " (Split-Stream)"
 	} else if c.SNISpoof {

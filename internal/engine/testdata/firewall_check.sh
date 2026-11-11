@@ -130,5 +130,14 @@ check "peer allowed" "grep -q -- '-s 1.2.3.4/32.*portbridge:t1.*ACCEPT\|-s 1.2.3
 check "drop in place" "grep -q 'portbridge:t1.*DROP' '$S/rules'"
 check "ipv6 drop in place" "grep -q 'portbridge:t1.*DROP' '$S/rules6'"
 
+echo "== port_hop = on locks full UDP port range and removes cleanly"
+printf 'name = thop\nmode = direct\nrole = origin\ntunnel_addr = 0.0.0.0:7465\ninbound_addr = 127.0.0.1:80\npeer_ip = 1.2.3.4\nfirewall = on\ntransport = kcp\nport_hop = on\nport_hop_ports = 8\n' > "$CONF/thop.conf"
+bash "$FW" apply thop >/dev/null 2>&1
+check "port-hop UDP range 7465:7472 peer allow" "grep -q -- '-s 1.2.3.4 -p udp --dport 7465:7472 -m comment --comment \"portbridge:thop\" -j ACCEPT' '$S/rules'"
+check "port-hop UDP range 7465:7472 drop" "grep -q -- '-p udp --dport 7465:7472 -m comment --comment \"portbridge:thop\" -j DROP' '$S/rules'"
+bash "$FW" remove thop >/dev/null 2>&1
+check "port-hop rules removed on teardown" "[ \$(grep -c 'portbridge:thop' '$S/rules') -eq 0 ]"
+rm -f "$CONF/thop.conf"
+
 rm -rf "$T"
 exit $fail

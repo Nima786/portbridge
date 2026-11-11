@@ -131,6 +131,24 @@ load() {
     PROTO=tcp
     [ "$TRANSPORT" = kcp ] && PROTO=udp
     [ "$TRANSPORT" = icmp ] && PROTO=icmp
+
+    PORT_HOP=$(read_conf "$conf" port_hop)
+    PORT_HOP_PORTS=$(read_conf "$conf" port_hop_ports)
+    TPORT_SPEC=$TPORT
+    TPORT_NFT=$TPORT
+    if [ "$PROTO" = udp ] && [ "$PORT_HOP" = on ]; then
+        case "$PORT_HOP_PORTS" in
+            '' | *[!0-9]*) PORT_HOP_PORTS=8 ;;
+        esac
+        [ "$PORT_HOP_PORTS" -lt 1 ] && PORT_HOP_PORTS=8
+        [ "$PORT_HOP_PORTS" -gt 64 ] && PORT_HOP_PORTS=64
+        local end_port=$((TPORT + PORT_HOP_PORTS - 1))
+        [ "$end_port" -gt 65535 ] && end_port=65535
+        if [ "$end_port" -gt "$TPORT" ]; then
+            TPORT_SPEC="$TPORT:$end_port"
+            TPORT_NFT="$TPORT-$end_port"
+        fi
+    fi
     return 0
 }
 
@@ -149,6 +167,49 @@ delete_rule() {
 }
 
 tag() { printf 'portbridge:%s' "$1"; }
+nft_tag() { printf 'portbridge-%s' "$1"; }
+nft_chain() { printf 'pb_%s' "${1//-/_}"; }
+
+nft_purge_own() {
+    local name=$1 ch
+    have nft || return 0
+    ch=$(nft_chain "$name")
+    nft flush chain inet portbridge "$ch" 2>/dev/null || true
+    nft delete chain inet portbridge "$ch" 2>/dev/null || true
+}
+
+nft_apply_lock() {
+    local name=$1 ch fam=ip loop=127.0.0.1 tcomment
+    ch=$(nft_chain "$name")
+    tcomment=$(nft_tag "$name")
+    if [[ "$PEER" == *:* ]]; then
+        fam=ip6
+        loop=::1
+    fi
+    nft add table inet portbridge 2>/dev/null || return 1
+    nft "add chain inet portbridge $ch { type filter hook input priority -10; policy accept; }" 2>/dev/null || return 1
+    nft flush chain inet portbridge "$ch" 2>/dev/null || return 1
+    if [ "$PROTO" = icmp ]; then
+        nft add rule inet portbridge "$ch" ip saddr "$PEER" icmp type echo-request accept comment "\"$tcomment\"" 2>/dev/null || {
+            nft_purge_own "$name"
+            return 1
+        }
+        return 0
+    fi
+    nft add rule inet portbridge "$ch" "$fam" saddr "$PEER" "$PROTO" dport "$TPORT_NFT" accept comment "\"$tcomment\"" 2>/dev/null || {
+        nft_purge_own "$name"
+        return 1
+    }
+    nft add rule inet portbridge "$ch" "$fam" saddr "$loop" "$PROTO" dport "$TPORT_NFT" accept comment "\"$tcomment\"" 2>/dev/null || true
+    if [ "$fam" = ip ] && [ "$IP_SPOOF" = on ] && [ -n "$SPOOF_IP" ] && valid_ipv4 "$SPOOF_IP" && [ "$SPOOF_IP" != "$PEER" ]; then
+        nft add rule inet portbridge "$ch" ip saddr "$SPOOF_IP" "$PROTO" dport "$TPORT_NFT" accept comment "\"$tcomment\"" 2>/dev/null || true
+    fi
+    nft add rule inet portbridge "$ch" "$PROTO" dport "$TPORT_NFT" drop comment "\"$tcomment\"" 2>/dev/null || {
+        nft_purge_own "$name"
+        return 1
+    }
+    return 0
+}
 
 # rule_spec <name> <target> [source] - fills RULE with a rule for the loaded
 # tunnel, after the chain name. The same words serve for checking, adding and
@@ -160,7 +221,7 @@ rule_spec() {
     if [ "$PROTO" = icmp ]; then
         RULE+=(-p icmp -m comment --comment "$(tag "$name")" -j "$target")
     else
-        RULE+=(-p "$PROTO" --dport "$TPORT" -m comment --comment "$(tag "$name")" -j "$target")
+        RULE+=(-p "$PROTO" --dport "$TPORT_SPEC" -m comment --comment "$(tag "$name")" -j "$target")
     fi
 }
 
@@ -230,6 +291,7 @@ purge_everything() {
     local name=$1
     purge_own iptables "$name"
     purge_own ip6tables "$name"
+    nft_purge_own "$name"
     if [ "$LISTENS" = yes ] && [ "$ENABLED" != off ]; then
         purge_legacy iptables "$TPORT" "$PEER"
         purge_legacy ip6tables "$TPORT" "$PEER"
@@ -797,12 +859,18 @@ firewall_apply() {
         return 0
     fi
 
-    # Only iptables is driven here (on current systems it is usually a front for
-    # nftables, which is fine). Without it nothing can be locked, and saying
-    # nothing would leave the owner believing the port is protected.
+    # Prefer iptables/ip6tables (on modern Linux usually backed by nf_tables),
+    # falling back to native nft when iptables is absent.
     if ! have iptables && ! have ip6tables; then
-        echo "iptables is not installed on this server, so port $TPORT is NOT restricted to $PEER." \
-            "Install it (for example: apt install iptables), or allow only $PEER to port $TPORT in your own firewall." >&2
+        if have nft; then
+            nft_purge_own "$name"
+            if nft_apply_lock "$name"; then
+                echo "tunnel port $TPORT_SPEC ($PROTO) is restricted to $PEER (via nftables)"
+                return 0
+            fi
+        fi
+        echo "iptables is not installed on this server, so port $TPORT_SPEC is NOT restricted to $PEER." \
+            "Install it (for example: apt install iptables), or allow only $PEER to port $TPORT_SPEC in your own firewall." >&2
         return 0
     fi
 
@@ -851,7 +919,7 @@ firewall_apply() {
         confirm_allowed iptables "$name" "$PEER" || return 0
     fi
 
-    echo "tunnel port $TPORT ($PROTO) is restricted to $PEER"
+    echo "tunnel port $TPORT_SPEC ($PROTO) is restricted to $PEER"
 }
 
 # cmd_sweep [quiet|all] - removes whatever PortBridge left behind for tunnels that
@@ -966,15 +1034,19 @@ cmd_status() {
             continue
         fi
         if [ "$LISTENS" != yes ]; then
-            printf '%-16s %-8s %-7s %-10s %s\n' "$name" "$TPORT" "-" "not needed" "this side dials out"
+            printf '%-16s %-11s %-7s %-10s %s\n' "$name" "$TPORT_SPEC" "-" "not needed" "this side dials out"
             continue
         fi
         local state="open"
         rule_spec "$name" DROP
         if have iptables && iptables -C INPUT "${RULE[@]}" 2>/dev/null; then
             state="locked"
+        elif have ip6tables && ip6tables -C INPUT "${RULE[@]}" 2>/dev/null; then
+            state="locked"
+        elif have nft && nft list chain inet portbridge "$(nft_chain "$name")" >/dev/null 2>&1; then
+            state="locked"
         fi
-        printf '%-16s %-8s %-7s %-10s %s\n' "$name" "$TPORT" "$ENABLED" "$state" \
+        printf '%-16s %-11s %-7s %-10s %s\n' "$name" "$TPORT_SPEC" "$ENABLED" "$state" \
             "$([ "$state" = locked ] && echo "$PEER only" || echo "everyone")"
     done
 
@@ -1030,11 +1102,11 @@ cmd_show() {
         echo "this side dials out; no rules expected"
         return 0
     fi
-    echo "rules for port $TPORT:"
-    have iptables && { iptables -S INPUT | grep -- "--dport $TPORT" || echo "  (none)"; }
+    echo "rules for port $TPORT_SPEC:"
+    have iptables && { iptables -S INPUT | grep -- "--dport $TPORT_SPEC" || echo "  (none)"; }
     if have ip6tables; then
         echo "IPv6:"
-        ip6tables -S INPUT | grep -- "--dport $TPORT" || echo "  (none)"
+        ip6tables -S INPUT | grep -- "--dport $TPORT_SPEC" || echo "  (none)"
     fi
 }
 

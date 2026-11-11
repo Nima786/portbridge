@@ -349,7 +349,7 @@ func validatePairing(p *PairingData) error {
 		{"cdn", p.CDN}, {"mux", p.Mux}, {"utls", p.UTLS}, {"tls_fragment", p.TLSFragment},
 		{"ech", p.ECH}, {"http_header", p.HTTPHeader}, {"gre", p.GRE}, {"sit", p.SIT},
 		{"real_site", p.RealSite}, {"sni_spoof", p.SNISpoof}, {"ip_spoof", p.IPSpoof},
-		{"anti_freeze", p.AntiFreeze}, {"website_bridge", p.WebsiteBridge},
+		{"anti_freeze", p.AntiFreeze}, {"port_hop", p.PortHop}, {"website_bridge", p.WebsiteBridge},
 		{"outbound_proxy", p.OutboundProxy},
 	} {
 		if f.val != "" && f.val != "on" && f.val != "off" {
@@ -363,6 +363,14 @@ func validatePairing(p *PairingData) error {
 	}
 	if p.OutboundProxyMode != "" && p.OutboundProxyMode != "split" && p.OutboundProxyMode != "all" {
 		return fmt.Errorf("outbound_proxy_mode must be split or all, got %q", p.OutboundProxyMode)
+	}
+	if p.PortHop == "on" && p.Transport != "kcp" {
+		return errors.New("port_hop requires transport kcp")
+	}
+	if php := strings.TrimSpace(p.PortHopPorts); php != "" {
+		if n, err := strconv.Atoi(php); err != nil || n < 1 || n > 64 {
+			return fmt.Errorf("port_hop_ports %q must be from 1 to 64", p.PortHopPorts)
+		}
 	}
 	if mc := strings.TrimSpace(p.MaxConn); mc != "" {
 		if n, err := strconv.Atoi(mc); err != nil || n < 1 || n > 100000 {

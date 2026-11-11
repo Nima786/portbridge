@@ -164,6 +164,12 @@ func buildOriginConf(p *PairingData, secretFile, certFile, keyFile string) strin
 	if p.AntiFreeze == "on" {
 		fmt.Fprintf(&b, "anti_freeze = on\n")
 	}
+	if p.PortHop == "on" {
+		fmt.Fprintf(&b, "port_hop = on\n")
+		if php := strings.TrimSpace(p.PortHopPorts); php != "" {
+			fmt.Fprintf(&b, "port_hop_ports = %s\n", php)
+		}
+	}
 	if p.ProxyProtocol == "v1" || p.ProxyProtocol == "v2" {
 		fmt.Fprintf(&b, "\n# Tell the service each user's real address; it must be set to expect it.\n")
 		fmt.Fprintf(&b, "proxy_protocol = %s\n", p.ProxyProtocol)

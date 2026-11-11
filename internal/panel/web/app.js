@@ -1169,6 +1169,7 @@
     if (/HTTPS site/i.test(raw) || any.transport === 'tls' || any.transport === 'tlsmux') {
       return (host ? `HTTPS (${host})` : 'HTTPS') + sniSuffix;
     }
+    if (any.port_hop || /port hopping/i.test(raw)) return 'KCP Port-Hop (UDP)' + sniSuffix;
     if (/KCP/i.test(raw) || any.transport === 'kcp') return 'KCP (UDP)' + sniSuffix;
     if (/website header/i.test(raw)) return (host ? `TCP + HTTP (${host})` : 'TCP + HTTP Header') + sniSuffix;
     if (/plain/i.test(raw) || any.transport === 'tcp' || any.transport === 'tcpmux') return 'Plain TCP' + sniSuffix;
@@ -1225,6 +1226,7 @@
     else if (/browser TLS/i.test(combinedLinkDesc)) extraTags.push('uTLS');
     if (any.sit) extraTags.push('6in4 (Protocol 41)');
     if (any.anti_freeze) extraTags.push('Anti-Freeze (24KB Rotation)');
+    if (any.port_hop) extraTags.push(`Port-Hop (${any.port_hop_ports || 8} UDP ports)`);
     if (any.sni_spoof) extraTags.push(`Decoy SNI (${any.spoof_sni || 'challenges.cloudflare.com'})`);
     if (any.ip_spoof) extraTags.push(`Spoof IP (${any.spoof_ip || '104.18.4.130'})`);
     if (any.real_site) extraTags.push('Real-Site Cover');
@@ -1381,6 +1383,7 @@
     if (any.gre) return 'gre';
     if (any.sit) return 'sit';
     if (any.ip_spoof) return 'ip-spoof';
+    if (any.port_hop) return 'kcp-hop';
     if (any.anti_freeze) return 'split';
     if (any.sni_spoof && !any.cdn) return 'sni-spoof';
     if (any.cdn && any.transport === 'grpc') return 'grpc-cdn';
@@ -1394,7 +1397,7 @@
     const preset = ['light', 'medium', 'heavy'].includes(loadPreset) ? loadPreset : 'light';
     const isRawKCP = ['icmp', 'faketcp', 'ip-spoof'].includes(linkKey);
     const isCDN = ['cdn', 'website-cdn-backup', 'grpc-cdn'].includes(linkKey);
-    const isMuxFirst = ['split', 'grpc', 'kcp'].includes(linkKey);
+    const isMuxFirst = ['split', 'grpc', 'kcp', 'kcp-hop'].includes(linkKey);
 
     if (isRawKCP) {
       if (preset === 'heavy') return { shared: true, muxLinks: 4, pool: 100, maxConn: 8000 };
@@ -2805,7 +2808,7 @@
     $('tn-opt-clean').hidden = !['cdn', 'grpc-cdn'].includes(link);
     $('tn-opt-stealth').hidden = !['website', 'split', 'sit', 'sni-spoof', 'grpc'].includes(link);
     if ($('tn-opt-snispoof')) {
-      $('tn-opt-snispoof').hidden = gre || ['kcp', 'icmp', 'faketcp', 'sit'].includes(link);
+      $('tn-opt-snispoof').hidden = gre || ['kcp', 'kcp-hop', 'icmp', 'faketcp', 'sit'].includes(link);
       if (link === 'ip-spoof' || link === 'sni-spoof') {
         $('tn-snispoof').checked = true;
         $('tn-snispoof').disabled = true;
@@ -2820,7 +2823,7 @@
     }
     if (link === 'grpc' && $('tn-claim').value === 'www.bing.com') $('tn-claim').value = 'www.google.com';
     if (link !== 'grpc' && $('tn-claim').value === 'www.google.com') $('tn-claim').value = 'www.bing.com';
-    const v6ok = !gre && ['plain', 'website', 'split', 'sni-spoof', 'grpc', 'kcp'].includes(link) &&
+    const v6ok = !gre && ['plain', 'website', 'split', 'sni-spoof', 'grpc', 'kcp', 'kcp-hop'].includes(link) &&
       hasIPv6(serverById($('tn-relay').value)) && hasIPv6(serverById($('tn-foreign').value));
     $('tn-ipv6-row').hidden = !v6ok;
     if (!v6ok) $('tn-ipv6').checked = false;
@@ -3311,7 +3314,7 @@
     }
     $('tn-gre').checked = false;
     setRadio('tn-mode', cand.mode === 'reverse' ? 'reverse' : 'direct');
-    setRadio('tn-link', cand.ip_spoof ? 'ip-spoof' : (cand.anti_freeze ? 'split' : (cand.sni_spoof ? 'sni-spoof' : (cand.link || 'website'))));
+    setRadio('tn-link', cand.ip_spoof ? 'ip-spoof' : (cand.port_hop ? 'kcp-hop' : (cand.anti_freeze ? 'split' : (cand.sni_spoof ? 'sni-spoof' : (cand.link || 'website')))));
     $('tn-stealth').checked = !!cand.stealth;
     $('tn-webheader').checked = !!cand.web_header;
     $('tn-ipv6').checked = !!cand.ipv6;
@@ -3748,7 +3751,8 @@
     const ipSpoof = !gre && link === 'ip-spoof';
     const sit = !gre && link === 'sit';
     const antiFreeze = !gre && link === 'split';
-    const sniSpoof = !gre && !sit && (ipSpoof || link === 'sni-spoof' || ($('tn-snispoof') && !$('tn-opt-snispoof').hidden && $('tn-snispoof').checked));
+    const portHop = !gre && link === 'kcp-hop';
+    const sniSpoof = !gre && !sit && !portHop && (ipSpoof || link === 'sni-spoof' || ($('tn-snispoof') && !$('tn-opt-snispoof').hidden && $('tn-snispoof').checked));
     return {
       name: $('tn-name').value.trim(),
       relay: $('tn-relay').value,
@@ -3769,6 +3773,7 @@
       gre,
       sit,
       anti_freeze: antiFreeze,
+      port_hop: portHop,
       ipv6: $('tn-ipv6').checked,
       shared,
       shared_links: shared ? Number($('tn-links-n').value || 4) : 0,

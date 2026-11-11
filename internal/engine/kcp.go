@@ -261,6 +261,20 @@ func kcpDial(addr string, cfg *Config) (net.Conn, error) {
 		sendUDPDecoyClientHello(addr, cfg.EffectiveSpoofSNI(), cfg.SNISpoofTTL)
 	}
 
+	if cfg.PortHop {
+		pConn, err := newPortHopDialConn(addr, cfg)
+		if err != nil {
+			return nil, err
+		}
+		sess, err := kcp.NewConn2(pConn.RemoteAddr(), block, dataShards, parityShards, pConn)
+		if err != nil {
+			_ = pConn.Close()
+			return nil, fmt.Errorf("dialing port-hop kcp: %w", err)
+		}
+		tuneKCP(sess, cfg)
+		return newKCPConn(sess, pConn), nil
+	}
+
 	sess, err := kcp.DialWithOptions(addr, block, dataShards, parityShards)
 	if err != nil {
 		return nil, fmt.Errorf("dialing kcp: %w", err)
@@ -353,6 +367,8 @@ func tuneKCP(sess *kcp.UDPSession, cfg *Config) {
 	if cfg.Transport == TransportICMP || cfg.Transport == TransportFakeTCP {
 		defaultWin = 256
 		defaultMTU = 1200
+	} else if cfg.PortHop {
+		defaultMTU = 1360
 	}
 	w := orDefault(cfg.KCPWindow, defaultWin)
 	sess.SetWindowSize(w, w)
@@ -426,10 +442,32 @@ func kcpListen(addr string, cfg *Config) (net.Listener, error) {
 			_ = uConn.Close()
 			return nil, err
 		}
+		var packetConn net.PacketConn = pConn
+		if cfg.PortHop && cfg.allowPlainKCP {
+			hopConn, hopErr := wrapPortHopListenConn(pConn, "udp4", cfg.EffectivePortHopPorts(), cfg.secret, true, nil)
+			if hopErr != nil {
+				_ = pConn.Close()
+				return nil, hopErr
+			}
+			packetConn = hopConn
+		}
+		ln, err := kcp.ServeConn(block, dataShards, parityShards, packetConn)
+		if err != nil {
+			_ = packetConn.Close()
+			return nil, fmt.Errorf("serving spoofed kcp: %w", err)
+		}
+		return &kcpListenerWrap{Listener: ln, cfg: cfg, ownConn: packetConn}, nil
+	}
+
+	if cfg.PortHop {
+		pConn, err := newPortHopListenConn(addr, cfg, nil)
+		if err != nil {
+			return nil, err
+		}
 		ln, err := kcp.ServeConn(block, dataShards, parityShards, pConn)
 		if err != nil {
 			_ = pConn.Close()
-			return nil, fmt.Errorf("serving spoofed kcp: %w", err)
+			return nil, fmt.Errorf("serving port-hop kcp: %w", err)
 		}
 		return &kcpListenerWrap{Listener: ln, cfg: cfg, ownConn: pConn}, nil
 	}

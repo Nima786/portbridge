@@ -76,13 +76,15 @@ type PairingData struct {
 	ProxyProtocol string
 
 	// Whitelisted SNI decoy ClientHello and source IP spoofing settings.
-	SNISpoof   string
-	SpoofSNI   string
-	IPSpoof    string
-	SpoofIP    string
-	SIT        string
-	AntiFreeze string
-	MaxConn    string
+	SNISpoof     string
+	SpoofSNI     string
+	IPSpoof      string
+	SpoofIP      string
+	SIT          string
+	AntiFreeze   string
+	PortHop      string
+	PortHopPorts string
+	MaxConn      string
 
 	// Website Bridge & Smart Outbound Proxy settings.
 	WebsiteBridge         string
@@ -156,6 +158,8 @@ func decodePairingCode(code string) (*PairingData, error) {
 		SpoofIP:       kv["spoof_ip"],
 		SIT:           kv["sit"],
 		AntiFreeze:    kv["anti_freeze"],
+		PortHop:       kv["port_hop"],
+		PortHopPorts:  kv["port_hop_ports"],
 		MaxConn:       kv["max_conn"],
 
 		WebsiteBridge:         kv["website_bridge"],

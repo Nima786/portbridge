@@ -70,6 +70,8 @@ type TunnelInfo struct {
 	IPSpoof               bool        `json:"ip_spoof"`
 	SpoofIP               string      `json:"spoof_ip,omitempty"`
 	AntiFreeze            bool        `json:"anti_freeze"`
+	PortHop               bool        `json:"port_hop"`
+	PortHopPorts          int         `json:"port_hop_ports,omitempty"`
 	ProxyProtocol         string      `json:"proxy_protocol"`
 	WebsiteBridge         bool        `json:"website_bridge,omitempty"`
 	WebsiteDomains        string      `json:"website_domains,omitempty"`
@@ -163,6 +165,10 @@ func tunnelInfo(path string, host agentHost) TunnelInfo {
 	ti.IPSpoof = cfg.IPSpoof
 	ti.SpoofIP = cfg.SpoofIP
 	ti.AntiFreeze = cfg.AntiFreeze
+	ti.PortHop = cfg.PortHop
+	if cfg.PortHop {
+		ti.PortHopPorts = cfg.EffectivePortHopPorts()
+	}
 	ti.WebsiteBridge = cfg.WebsiteBridge
 	ti.WebsiteDomains = cfg.WebsiteDomains
 	ti.OutboundProxy = cfg.OutboundProxy

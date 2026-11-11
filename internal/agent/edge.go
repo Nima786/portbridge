@@ -35,25 +35,27 @@ type EdgeSpec struct {
 	Mode string `json:"mode"` // direct or reverse
 
 	// What the link looks like: plain, tls, wss, grpc or kcp.
-	Transport   string `json:"transport"`
-	ServerName  string `json:"server_name,omitempty"`  // the name the link claims
-	WSPath      string `json:"ws_path,omitempty"`      // web-socket path, made up when empty
-	CDN         string `json:"cdn,omitempty"`          // on when the link goes through a CDN
-	AltHost     string `json:"alt_host,omitempty"`     // domain of the CDN backup route
-	CleanIPs    string `json:"clean_ips,omitempty"`    // clean CDN addresses to dial
-	UTLS        string `json:"utls,omitempty"`         // a browser's hello
-	TLSFragment string `json:"tls_fragment,omitempty"` // the hello split up
-	HTTPHeader  string `json:"http_header,omitempty"`  // a plain link opening like web traffic
-	HTTPHost    string `json:"http_host,omitempty"`
-	RealSite    string `json:"real_site,omitempty"` // strangers are shown the real website
-	CoverSite   string `json:"cover_site,omitempty"`
-	GRE         string `json:"gre,omitempty"`
-	SIT         string `json:"sit,omitempty"`
-	SNISpoof    string `json:"sni_spoof,omitempty"` // decoy ClientHello with whitelisted SNI
-	SpoofSNI    string `json:"spoof_sni,omitempty"`
-	IPSpoof     string `json:"ip_spoof,omitempty"` // source IP spoofing over raw sockets
-	SpoofIP     string `json:"spoof_ip,omitempty"`
-	AntiFreeze  string `json:"anti_freeze,omitempty"` // multi-connection split-stream leg rotation
+	Transport    string `json:"transport"`
+	ServerName   string `json:"server_name,omitempty"`  // the name the link claims
+	WSPath       string `json:"ws_path,omitempty"`      // web-socket path, made up when empty
+	CDN          string `json:"cdn,omitempty"`          // on when the link goes through a CDN
+	AltHost      string `json:"alt_host,omitempty"`     // domain of the CDN backup route
+	CleanIPs     string `json:"clean_ips,omitempty"`    // clean CDN addresses to dial
+	UTLS         string `json:"utls,omitempty"`         // a browser's hello
+	TLSFragment  string `json:"tls_fragment,omitempty"` // the hello split up
+	HTTPHeader   string `json:"http_header,omitempty"`  // a plain link opening like web traffic
+	HTTPHost     string `json:"http_host,omitempty"`
+	RealSite     string `json:"real_site,omitempty"` // strangers are shown the real website
+	CoverSite    string `json:"cover_site,omitempty"`
+	GRE          string `json:"gre,omitempty"`
+	SIT          string `json:"sit,omitempty"`
+	SNISpoof     string `json:"sni_spoof,omitempty"` // decoy ClientHello with whitelisted SNI
+	SpoofSNI     string `json:"spoof_sni,omitempty"`
+	IPSpoof      string `json:"ip_spoof,omitempty"` // source IP spoofing over raw sockets
+	SpoofIP      string `json:"spoof_ip,omitempty"`
+	AntiFreeze   string `json:"anti_freeze,omitempty"` // multi-connection split-stream leg rotation
+	PortHop      string `json:"port_hop,omitempty"`    // dynamic UDP port hopping over KCP
+	PortHopPorts int    `json:"port_hop_ports,omitempty"`
 
 	ProxyProtocol string `json:"proxy_protocol,omitempty"` // off, v1 or v2
 	Mux           string `json:"mux,omitempty"`
@@ -148,14 +150,22 @@ func (s *EdgeSpec) normalise() {
 		s.SIT = "off"
 		s.ServerName, s.WSPath, s.CDN, s.AltHost, s.CleanIPs = "", "", "off", "", ""
 		s.UTLS, s.TLSFragment, s.HTTPHeader, s.HTTPHost, s.RealSite, s.CoverSite = "", "", "", "", "", ""
-		s.SNISpoof, s.SpoofSNI, s.IPSpoof, s.SpoofIP, s.AntiFreeze = "", "", "", "", ""
+		s.SNISpoof, s.SpoofSNI, s.IPSpoof, s.SpoofIP, s.AntiFreeze, s.PortHop = "", "", "", "", "", ""
+		s.PortHopPorts = 0
 	}
 	if s.SIT == "on" {
 		s.Transport = "plain"
 		s.GRE = "off"
 		s.ServerName, s.WSPath, s.CDN, s.AltHost, s.CleanIPs = "", "", "off", "", ""
 		s.UTLS, s.TLSFragment, s.HTTPHeader, s.HTTPHost, s.RealSite, s.CoverSite = "", "", "", "", "", ""
-		s.SNISpoof, s.SpoofSNI, s.IPSpoof, s.SpoofIP, s.AntiFreeze = "", "", "", "", ""
+		s.SNISpoof, s.SpoofSNI, s.IPSpoof, s.SpoofIP, s.AntiFreeze, s.PortHop = "", "", "", "", "", ""
+		s.PortHopPorts = 0
+	}
+	if s.PortHop == "on" {
+		s.Transport = "kcp"
+		if s.PortHopPorts <= 0 {
+			s.PortHopPorts = engine.DefaultPortHopPorts
+		}
 	}
 	if s.AntiFreeze == "on" {
 		if s.Transport == "" || s.Transport == "plain" || engine.IsKCPFamily(engine.Transport(s.Transport)) {
@@ -248,7 +258,7 @@ func (s *EdgeSpec) check() error {
 		{"cdn", s.CDN}, {"mux", s.Mux}, {"utls", s.UTLS}, {"tls_fragment", s.TLSFragment},
 		{"http_header", s.HTTPHeader}, {"gre", s.GRE}, {"sit", s.SIT}, {"real_site", s.RealSite},
 		{"sni_spoof", s.SNISpoof}, {"ip_spoof", s.IPSpoof}, {"anti_freeze", s.AntiFreeze},
-		{"website_bridge", s.WebsiteBridge}, {"outbound_proxy", s.OutboundProxy},
+		{"port_hop", s.PortHop}, {"website_bridge", s.WebsiteBridge}, {"outbound_proxy", s.OutboundProxy},
 	} {
 		if f.val != "" && f.val != "on" && f.val != "off" {
 			return fmt.Errorf("%s must be on or off, got %q", f.name, f.val)
@@ -301,6 +311,12 @@ func (s *EdgeSpec) check() error {
 	}
 	if s.Pool < 1 || s.Pool > 10000 {
 		return errors.New("connection pool size must be from 1 to 10000")
+	}
+	if s.PortHop == "on" && s.Transport != "kcp" {
+		return errors.New("dynamic port hopping requires the KCP (UDP) transport")
+	}
+	if s.PortHopPorts != 0 && (s.PortHopPorts < 1 || s.PortHopPorts > 64) {
+		return errors.New("port_hop_ports must be from 1 to 64")
 	}
 	if s.MaxConn != 0 && (s.MaxConn < 1 || s.MaxConn > 100000) {
 		return errors.New("max_conn must be from 1 to 100000")
@@ -535,6 +551,12 @@ func buildEdgeConf(s *EdgeSpec, l edgeLayout, confDir string, now time.Time) str
 	if s.AntiFreeze == "on" {
 		w("anti_freeze = on\n")
 	}
+	if s.PortHop == "on" {
+		w("port_hop = on\n")
+		if s.PortHopPorts > 0 {
+			w("port_hop_ports = %d\n", s.PortHopPorts)
+		}
+	}
 	if s.ProxyProtocol == "v1" || s.ProxyProtocol == "v2" {
 		w("\n# Pass each user's real address on; the service must be set to expect it.\n")
 		w("proxy_protocol = %s\n", s.ProxyProtocol)
@@ -659,6 +681,13 @@ func EncodePairingCode(p *PairingData) string {
 		extra.WriteString("anti_freeze=on\n")
 		v = max(v, 10)
 	}
+	if p.PortHop == "on" {
+		extra.WriteString("port_hop=on\n")
+		if php := strings.TrimSpace(p.PortHopPorts); php != "" {
+			fmt.Fprintf(&extra, "port_hop_ports=%s\n", php)
+		}
+		v = max(v, 10)
+	}
 	if mc := strings.TrimSpace(p.MaxConn); mc != "" && mc != "2000" {
 		fmt.Fprintf(&extra, "max_conn=%s\n", mc)
 		v = max(v, 10)
@@ -755,7 +784,7 @@ func edgePairingCode(confDir, name string) (string, error) {
 		HTTPHeader: kv["http_header"], HTTPHost: kv["http_host"], GRE: kv["gre"], SIT: kv["sit"],
 		RealSite: kv["real_site"], CoverSite: kv["cover_site"], ProxyProtocol: kv["proxy_protocol"],
 		SNISpoof: kv["sni_spoof"], SpoofSNI: kv["spoof_sni"], IPSpoof: kv["ip_spoof"], SpoofIP: kv["spoof_ip"],
-		AntiFreeze: kv["anti_freeze"], MaxConn: kv["max_conn"],
+		AntiFreeze: kv["anti_freeze"], PortHop: kv["port_hop"], PortHopPorts: kv["port_hop_ports"], MaxConn: kv["max_conn"],
 		WebsiteBridge: kv["website_bridge"], WebsiteDomains: kv["website_domains"],
 		OutboundProxy: kv["outbound_proxy"], OutboundProxyPort: kv["outbound_proxy_port"],
 		OutboundProxyMode: kv["outbound_proxy_mode"], OutboundIranDomains: kv["outbound_iran_domains"],
@@ -1080,8 +1109,10 @@ type EditSpec struct {
 	IPSpoof      string `json:"ip_spoof,omitempty"`     // "on" or "off"
 	SpoofIP      string `json:"spoof_ip,omitempty"`     // whitelisted IPv4 address
 	AntiFreeze   string `json:"anti_freeze,omitempty"`  // "on" or "off"
-	IPv6         *bool  `json:"ipv6,omitempty"`         // true for IPv6 bridge, false for IPv4
-	Mux          string `json:"mux,omitempty"`          // "on" or "off"
+	PortHop      string `json:"port_hop,omitempty"`     // "on" or "off"
+	PortHopPorts int    `json:"port_hop_ports,omitempty"`
+	IPv6         *bool  `json:"ipv6,omitempty"` // true for IPv6 bridge, false for IPv4
+	Mux          string `json:"mux,omitempty"`  // "on" or "off"
 
 	WebsiteBridge         string `json:"website_bridge,omitempty"`
 	WebsiteDomains        string `json:"website_domains,omitempty"`
@@ -1395,6 +1426,8 @@ func EditEdge(spec EditSpec, confDir string) (EdgeResult, error) {
 			IPSpoof:               spec.IPSpoof,
 			SpoofIP:               spec.SpoofIP,
 			AntiFreeze:            spec.AntiFreeze,
+			PortHop:               spec.PortHop,
+			PortHopPorts:          spec.PortHopPorts,
 			ProxyProtocol:         pp,
 			Mux:                   mux,
 			MuxLinks:              muxLinks,

@@ -163,6 +163,8 @@ func TestPairingCodeFieldsMatch(t *testing.T) {
 		"spoof_ip":                "configured from the web panel and engine",
 		"sit":                     "configured from the web panel and engine",
 		"anti_freeze":             "configured from the web panel and engine",
+		"port_hop":                "configured from the web panel and engine",
+		"port_hop_ports":          "configured from the web panel and engine",
 		"max_conn":                "configured from the web panel and engine",
 		"website_bridge":          "configured from the web panel Websites tab",
 		"website_domains":         "configured from the web panel Websites tab",

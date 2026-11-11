@@ -793,6 +793,10 @@ func describeTransport(cfg *Config) string {
 			base = fmt.Sprintf("disguised as gRPC over HTTP/2 (%s)", cfg.EffectiveServerName())
 		}
 	case TransportKCP:
+		if cfg.PortHop {
+			return fmt.Sprintf("loss-resistant KCP/UDP transport with FEC (%d/%d shards) and dynamic port hopping (%d UDP ports)",
+				cfg.KCPDataShards, cfg.KCPParityShards, cfg.EffectivePortHopPorts())
+		}
 		if cfg.IPSpoof {
 			return fmt.Sprintf("loss-resistant KCP/UDP transport with FEC (%d/%d shards) and source IP spoofing (%s / %s)",
 				cfg.KCPDataShards, cfg.KCPParityShards, cfg.EffectiveSpoofIP(), cfg.EffectiveSpoofSNI())

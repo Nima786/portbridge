@@ -223,6 +223,14 @@ type Config struct {
 	// TCP 5-tuple ever reaches the ISP's mid-stream byte-counter freeze threshold.
 	AntiFreeze bool
 
+	// PortHop rotates both the local UDP ephemeral source port and the server
+	// UDP destination port across [tunnel_port .. tunnel_port+PortHopPorts-1]
+	// every PortHopInterval (default 15s) beneath KCP+FEC, defeating per-5-tuple
+	// UDP QoS rate-limiters while keeping a single continuous KCP session alive.
+	PortHop         bool
+	PortHopPorts    int
+	PortHopInterval time.Duration
+
 	// ProxyProtocol passes each user's real address to the service in the
 	// standard PROXY protocol header: proxyProtocolOff, or the version written
 	// (1 or 2). On the edge any version means "send users' addresses across"; on
@@ -787,6 +795,19 @@ func (c *Config) Set(key, val string) error {
 		default:
 			return fmt.Errorf("anti_freeze must be on or off, got %q", val)
 		}
+	case "port_hop":
+		switch strings.ToLower(strings.TrimSpace(val)) {
+		case "on", "yes", "true":
+			c.PortHop = true
+		case "off", "no", "false":
+			c.PortHop = false
+		default:
+			return fmt.Errorf("port_hop must be on or off, got %q", val)
+		}
+	case "port_hop_ports":
+		return num(&c.PortHopPorts)
+	case "port_hop_interval":
+		return dur(&c.PortHopInterval)
 	case "website_bridge":
 		switch strings.ToLower(strings.TrimSpace(val)) {
 		case "on", "yes", "true":
@@ -1046,6 +1067,12 @@ func (c *Config) Validate() error {
 
 	if err := c.validateKCP(); err != nil {
 		return err
+	}
+	if c.PortHopPorts < 0 || c.PortHopPorts > 64 {
+		return fmt.Errorf("port_hop_ports must be between 1 and 64, got %d", c.PortHopPorts)
+	}
+	if c.PortHop && c.Transport != TransportKCP {
+		return fmt.Errorf("port_hop requires transport %q, got %q", TransportKCP, c.Transport)
 	}
 
 	if !ValidTransport(c.Transport) {

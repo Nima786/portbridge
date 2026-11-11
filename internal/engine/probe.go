@@ -46,6 +46,7 @@ type ProbeCandidateSpec struct {
 	IPSpoof    bool   `json:"ip_spoof,omitempty"`
 	SpoofIP    string `json:"spoof_ip,omitempty"`
 	AntiFreeze bool   `json:"anti_freeze,omitempty"`
+	PortHop    bool   `json:"port_hop,omitempty"`
 	CDN        bool   `json:"cdn"`
 	IPv6       bool   `json:"ipv6"`
 	Shared     bool   `json:"shared"` // recommended pooling mode (mux vs pool)
@@ -196,6 +197,8 @@ func StartProbeListenerAvoiding(bindHost string, preferredPort int, avoid map[in
 		KCPDataShards:   10,
 		KCPParityShards: 3,
 		IPSpoof:         true,
+		PortHop:         true,
+		PortHopPorts:    4,
 		allowPlainKCP:   true,
 	}
 	probeKCPDefaults(kcpCfg)
@@ -268,10 +271,14 @@ func StartProbeListenerAvoiding(bindHost string, preferredPort int, avoid map[in
 				allowPlainKCP:   true,
 			}
 			probeKCPDefaults(kcp6Cfg)
-			if ln6, err := kcpServePacketConn(u6, kcp6Cfg); err == nil {
+			var pc6 net.PacketConn = u6
+			if hop6, hopErr := wrapPortHopListenConn(u6, "udp6", 4, secret, true, avoid); hopErr == nil {
+				pc6 = hop6
+			}
+			if ln6, err := kcpServePacketConn(pc6, kcp6Cfg); err == nil {
 				kcp6Ln = ln6
 			} else {
-				_ = u6.Close()
+				_ = pc6.Close()
 			}
 		}
 	}
@@ -591,6 +598,17 @@ func BuildProbeCandidates(mode, ipv4, ipv6 string, port int, cdnDomain string) [
 				Port:       port,
 			},
 			ProbeCandidateSpec{
+				ID:         mode + "-kcp-hop",
+				Label:      v4Label + " · KCP Port-Hopping UDP (Anti-QoS)",
+				Mode:       mode,
+				Link:       "kcp-hop",
+				Transport:  string(TransportKCP),
+				PortHop:    true,
+				Shared:     true,
+				TargetAddr: addr4,
+				Port:       port,
+			},
+			ProbeCandidateSpec{
 				ID:         mode + "-ip-spoof",
 				Label:      v4Label + " · Source IP + SNI Spoof (" + DefaultSpoofIP + ")",
 				Mode:       mode,
@@ -716,6 +734,18 @@ func BuildProbeCandidates(mode, ipv4, ipv6 string, port int, cdnDomain string) [
 				Link:       "kcp",
 				Transport:  string(TransportKCP),
 				Stealth:    false,
+				IPv6:       true,
+				Shared:     true,
+				TargetAddr: addr6,
+				Port:       port,
+			},
+			ProbeCandidateSpec{
+				ID:         mode + "-ipv6-kcp-hop",
+				Label:      dirLabel + " (IPv6) · KCP Port-Hopping UDP (Anti-QoS)",
+				Mode:       mode,
+				Link:       "kcp-hop",
+				Transport:  string(TransportKCP),
+				PortHop:    true,
 				IPv6:       true,
 				Shared:     true,
 				TargetAddr: addr6,
@@ -882,6 +912,9 @@ func probeOneSpec(parentCtx context.Context, spec ProbeCandidateSpec, secret []b
 		IPSpoof:         spec.IPSpoof,
 		SpoofIP:         spec.SpoofIP,
 		AntiFreeze:      spec.AntiFreeze,
+		PortHop:         spec.PortHop,
+		PortHopPorts:    4,
+		PortHopInterval: 500 * time.Millisecond,
 		UTLS:            false,
 		TLSFragment:     false,
 		ECH:             false,
@@ -1670,6 +1703,8 @@ func scoreCandidate(r *ProbeCandidateResult, maxMbps float64) int {
 		dpiBonus = 9.0
 	case r.Link == "cdn" || r.Link == "grpc-cdn":
 		dpiBonus = 8.5
+	case r.Link == "kcp-hop":
+		dpiBonus = 7.5
 	case r.Link == "faketcp" || r.Link == "ip-spoof":
 		dpiBonus = 7.0
 	case r.Link == "kcp":
@@ -1716,7 +1751,7 @@ func scoreGamingCandidate(r *ProbeCandidateResult) int {
 	// or have zero framing/encryption overhead (Plain TCP with Dedicated Pool).
 	var gamingBonus float64
 	switch {
-	case r.Link == "kcp" || r.Link == "ip-spoof" || r.Link == "faketcp":
+	case r.Link == "kcp" || r.Link == "kcp-hop" || r.Link == "ip-spoof" || r.Link == "faketcp":
 		gamingBonus = 8.0
 	case r.Link == "plain" && !r.WebHeader:
 		gamingBonus = 7.0
