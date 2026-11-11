@@ -486,3 +486,88 @@ func TestXHTTPProbeListenerIntegration(t *testing.T) {
 			r.Status, r.Successes, r.Error, r.Summary)
 	}
 }
+
+func TestXHTTPConcurrentReadAndCloseRace(t *testing.T) {
+	secret := []byte("race-close-secret-0123456789abcd")
+	cert := makeXHTTPTestCert(t, "www.bing.com")
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("net.Listen: %v", err)
+	}
+	defer ln.Close()
+
+	serverCfg := DefaultConfig()
+	serverCfg.Mode = ModeDirect
+	serverCfg.Role = RoleOrigin
+	serverCfg.Transport = TransportXHTTP
+	serverCfg.ServerName = "www.bing.com"
+	serverCfg.secret = secret
+	serverCfg.prepareTLS(&cert)
+
+	srvConns := make(chan net.Conn, 32)
+	go func() {
+		for {
+			raw, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func(c net.Conn) {
+				sc, err := wrapAccept(c, serverCfg, &cert)
+				if err != nil {
+					if !errors.Is(err, errXHTTPUplinkAttached) {
+						_ = c.Close()
+					}
+					return
+				}
+				srvConns <- sc
+			}(raw)
+		}
+	}()
+	defer func() {
+		for {
+			select {
+			case sc := <-srvConns:
+				_ = sc.Close()
+			default:
+				return
+			}
+		}
+	}()
+
+	clientCfg := DefaultConfig()
+	clientCfg.Mode = ModeDirect
+	clientCfg.Role = RoleEdge
+	clientCfg.TunnelAddr = ln.Addr().String()
+	clientCfg.Transport = TransportXHTTP
+	clientCfg.ServerName = "www.bing.com"
+	clientCfg.secret = secret
+	clientCfg.prepareTLS(nil)
+
+	for i := 0; i < 10; i++ {
+		rawDial, err := net.DialTimeout("tcp", ln.Addr().String(), 5*time.Second)
+		if err != nil {
+			t.Fatalf("net.Dial: %v", err)
+		}
+		cc, err := wrapDial(rawDial, clientCfg)
+		if err != nil {
+			t.Fatalf("wrapDial: %v", err)
+		}
+		if _, err := cc.Write([]byte("ping")); err != nil {
+			t.Fatalf("Write: %v", err)
+		}
+		readDone := make(chan struct{})
+		go func() {
+			defer close(readDone)
+			var buf [64]byte
+			_, _ = cc.Read(buf[:])
+		}()
+		time.Sleep(10 * time.Millisecond)
+		_ = cc.Close()
+		select {
+		case <-readDone:
+		case <-time.After(3 * time.Second):
+			t.Fatal("cc.Read did not unblock promptly on cc.Close")
+		}
+	}
+}

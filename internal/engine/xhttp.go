@@ -744,9 +744,6 @@ type xhttpClientConn struct {
 	spaceCh    chan struct{}
 	flushedCh  chan struct{}
 
-	warmMu   sync.Mutex
-	warmSock *xhttpUplinkSocket
-
 	wdl               *deadline
 	writeDeadlineNano atomic.Int64
 
@@ -828,30 +825,6 @@ func xhttpDialPurpose(downConn net.Conn, remoteAddr net.Addr, cfg *Config, purpo
 		closedCh:      make(chan struct{}),
 	}
 
-	// Pre-warm one uplink keep-alive TLS socket in parallel with the GET handshake
-	// so the first Write incurs zero extra TLS handshake round-trips.
-	go func() {
-		uconn, uerr := dialUplink()
-		if uerr != nil {
-			return
-		}
-		if cc.closed.Load() {
-			_ = uconn.Close()
-			return
-		}
-		cc.warmMu.Lock()
-		if cc.closed.Load() || cc.warmSock != nil {
-			cc.warmMu.Unlock()
-			_ = uconn.Close()
-			return
-		}
-		cc.warmSock = &xhttpUplinkSocket{
-			conn: uconn,
-			br:   bufio.NewReaderSize(uconn, 8*1024),
-		}
-		cc.warmMu.Unlock()
-	}()
-
 	ua := browserProfiles[0].userAgent
 	reqStr := "GET " + basePath + "/" + sidHex + " HTTP/1.1\r\n" +
 		"Host: " + host + "\r\n" +
@@ -879,40 +852,40 @@ func xhttpDialPurpose(downConn net.Conn, remoteAddr net.Addr, cfg *Config, purpo
 		return nil, fmt.Errorf("%w: %v", errXHTTPHandshake, err)
 	}
 	if resp.StatusCode != http.StatusOK {
-		_ = resp.Body.Close()
 		_ = cc.Close()
+		_ = resp.Body.Close()
 		return nil, fmt.Errorf("%w: got %s", errXHTTPHandshake, resp.Status)
 	}
 
 	// Verify 9-byte server greeting frame inside the chunked body.
 	var helloHdr [5]byte
 	if _, err := io.ReadFull(resp.Body, helloHdr[:]); err != nil {
-		_ = resp.Body.Close()
 		_ = cc.Close()
+		_ = resp.Body.Close()
 		return nil, fmt.Errorf("%w: reading greeting: %v", errXHTTPHandshake, err)
 	}
 	helloLen := binary.BigEndian.Uint32(helloHdr[1:5])
 	if helloHdr[0] != xhttpFrameHello || helloLen != 4 {
-		_ = resp.Body.Close()
 		_ = cc.Close()
+		_ = resp.Body.Close()
 		return nil, fmt.Errorf("%w: invalid greeting frame", errXHTTPHandshake)
 	}
 	var gotHello [4]byte
 	if _, err := io.ReadFull(resp.Body, gotHello[:]); err != nil {
-		_ = resp.Body.Close()
 		_ = cc.Close()
+		_ = resp.Body.Close()
 		return nil, fmt.Errorf("%w: reading greeting token: %v", errXHTTPHandshake, err)
 	}
 	wantHello := xhttpHelloToken(cfg.secret, sid)
 	if subtle.ConstantTimeCompare(gotHello[:], wantHello[:]) != 1 {
-		_ = resp.Body.Close()
 		_ = cc.Close()
+		_ = resp.Body.Close()
 		return nil, fmt.Errorf("%w: greeting signature mismatch", errXHTTPHandshake)
 	}
 
 	if err := downConn.SetDeadline(time.Time{}); err != nil {
-		_ = resp.Body.Close()
 		_ = cc.Close()
+		_ = resp.Body.Close()
 		return nil, err
 	}
 	cc.downBody = resp.Body
@@ -1058,16 +1031,8 @@ func (c *xhttpClientConn) Write(p []byte) (int, error) {
 	return total, nil
 }
 
-func (c *xhttpClientConn) takeWarmSocket() *xhttpUplinkSocket {
-	c.warmMu.Lock()
-	defer c.warmMu.Unlock()
-	s := c.warmSock
-	c.warmSock = nil
-	return s
-}
-
 func (c *xhttpClientConn) uplinkWorker() {
-	sock := c.takeWarmSocket()
+	var sock *xhttpUplinkSocket
 	defer func() {
 		sock.close()
 		c.smu.Lock()
@@ -1183,8 +1148,8 @@ func (c *xhttpClientConn) uplinkWorker() {
 func (c *xhttpClientConn) postChunk(sockPtr **xhttpUplinkSocket, seq uint64, payload []byte, fin bool) error {
 	var lastErr error
 	for attempt := 0; attempt < 3; attempt++ {
-		if c.closed.Load() && !fin {
-			// Allow brief flush during Close(), abort if completely torn down.
+		if c.closed.Load() {
+			return net.ErrClosed
 		}
 		sock := *sockPtr
 		reused := sock != nil && sock.reqs > 0
@@ -1318,13 +1283,15 @@ func (c *xhttpClientConn) Close() error {
 		c.closed.Store(true)
 		close(c.closedCh)
 
-		if ws := c.takeWarmSocket(); ws != nil {
-			ws.close()
-		}
+		// Close the underlying TCP/TLS socket first so any goroutine blocked in
+		// Read(c.downBody) unblocks immediately without racing on net/http's
+		// non-thread-safe chunked body reader or stalling on body drain.
+		_ = c.downConn.Close()
+		c.rmu.Lock()
 		if c.downBody != nil {
 			_ = c.downBody.Close()
 		}
-		_ = c.downConn.Close()
+		c.rmu.Unlock()
 	})
 	return nil
 }
