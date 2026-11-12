@@ -58,6 +58,12 @@ const (
 	// enabling direct compatibility with Cloudflare gRPC proxying and evading DPI.
 	TransportGRPC Transport = "grpc"
 
+	// TransportH3 wraps the link in QUIC v1 (RFC 9000) + TLS 1.3 + HTTP/3 (RFC 9114)
+	// over UDP, eliminating TCP RST interference and TCP head-of-line blocking.
+	// When CDN is enabled, the client speaks QUIC/HTTP/3 to the CDN edge while
+	// splitting uplink/downlink streams for CDN origin compatibility.
+	TransportH3 Transport = "h3"
+
 	// TransportKCP wraps the link in encrypted KCP over UDP with Reed-Solomon Forward Error Correction.
 	TransportKCP Transport = "kcp"
 
@@ -80,7 +86,7 @@ const (
 
 func ValidTransport(t Transport) bool {
 	switch t {
-	case TransportPlain, TransportTLS, TransportWSS, TransportXHTTP, TransportH2, TransportGRPC, TransportKCP, TransportICMP, TransportFakeTCP:
+	case TransportPlain, TransportTLS, TransportWSS, TransportXHTTP, TransportH2, TransportGRPC, TransportH3, TransportKCP, TransportICMP, TransportFakeTCP:
 		return true
 	}
 	return false
@@ -101,7 +107,9 @@ func IsKCPFamily(t Transport) bool {
 // claims to be. An HTTPS site offers these; anything else would be a giveaway.
 func alpnFor(t Transport) []string {
 	switch t {
-	case TransportWSS, TransportXHTTP:
+	case TransportWSS, TransportXHTTP, TransportH3:
+		// Note: QUIC/HTTP/3 sockets explicitly advertise NextProtoH3 ("h3");
+		// alpnFor(TransportH3) is used for the TCP TLS origin listener when CDN = on.
 		return []string{"http/1.1"}
 	case TransportH2, TransportGRPC:
 		return []string{"h2", "http/1.1"}
@@ -519,6 +527,9 @@ func wrapDialPurposeTLSOnly(raw net.Conn, cfg *Config, purpose byte) (net.Conn, 
 }
 
 func wrapDialPurposeInternal(raw net.Conn, cfg *Config, purpose byte, tlsOnly bool) (net.Conn, error) {
+	if cfg.Transport == TransportH3 {
+		return h3DialPurpose(raw, cfg, purpose)
+	}
 	injectedDecoy := false
 	if cfg.SNISpoof && cfg.Transport != TransportKCP && cfg.Transport != TransportICMP && cfg.Transport != TransportFakeTCP && !isDecoyRawBypassed(raw.RemoteAddr()) {
 		if injectDecoyClientHello(raw, cfg.EffectiveSpoofSNI(), cfg.SNISpoofTTL) == nil {
@@ -791,6 +802,33 @@ func wrapAccept(raw net.Conn, cfg *Config, cert *tls.Certificate, guard ...*repl
 		}
 		return h2Accept(ts, cfg)
 
+	case TransportH3:
+		if ea, ok := raw.(interface{ isEarlyAuthed() bool }); ok && ea.isEarlyAuthed() {
+			return raw, nil
+		}
+		// When CDN is enabled on an HTTP/3 tunnel, Cloudflare terminates QUIC/H3 at
+		// its edge and connects to the origin over TLS/TCP using HTTP/1.1 XHTTP.
+		serverCfg, err := cfg.serverTLS(cert)
+		if err != nil {
+			return nil, err
+		}
+		ts := tls.Server(raw, serverCfg)
+		if err := raw.SetDeadline(time.Now().Add(tlsHandshakeTimeout)); err != nil {
+			return nil, err
+		}
+		if err := ts.Handshake(); err != nil {
+			_ = raw.Close()
+			return nil, fmt.Errorf("securing the link failed: %w", err)
+		}
+		if err := raw.SetDeadline(time.Time{}); err != nil {
+			return nil, err
+		}
+		var g *replayGuard
+		if len(guard) > 0 {
+			g = guard[0]
+		}
+		return defaultXHTTPManager.AcceptConn(ts, cfg, g)
+
 	default:
 		return nil, fmt.Errorf("unknown transport %q", cfg.Transport)
 	}
@@ -798,6 +836,17 @@ func wrapAccept(raw net.Conn, cfg *Config, cert *tls.Certificate, guard ...*repl
 
 // Describe is what the startup log says about the disguise, in plain terms.
 func describeTransport(cfg *Config) string {
+	if cfg.Asymmetric {
+		upLabel := cfg.EffectiveAsymUplink()
+		if cfg.CDN {
+			upLabel += " via CDN (" + cfg.EffectiveServerName() + ")"
+		} else {
+			upLabel += " (" + cfg.EffectiveServerName() + ")"
+		}
+		return fmt.Sprintf("asymmetric dual-path hybrid (uplink: %s -> reverse downlink: %s on port %d, auto-TLS fallback)",
+			upLabel, cfg.EffectiveAsymDownlink(), cfg.EffectiveAsymDownPort())
+	}
+
 	base := ""
 	switch cfg.Transport {
 	case TransportTLS:
@@ -835,6 +884,14 @@ func describeTransport(cfg *Config) string {
 				cfg.EffectiveServerName())
 		} else {
 			base = fmt.Sprintf("disguised as gRPC over HTTP/2 (%s)", cfg.EffectiveServerName())
+		}
+	case TransportH3:
+		if cfg.CDN {
+			base = fmt.Sprintf("disguised as QUIC/HTTP/3 (%s%s) over UDP to a CDN, so this server's address never appears on it",
+				cfg.EffectiveServerName(), cfg.effectiveXHTTPPath())
+		} else {
+			base = fmt.Sprintf("disguised as QUIC v1 / HTTP/3 (%s%s) over UDP",
+				cfg.EffectiveServerName(), cfg.effectiveH3Path())
 		}
 	case TransportKCP:
 		if cfg.PortHop {
@@ -885,6 +942,12 @@ func describeTransport(cfg *Config) string {
 	}
 
 	if cfg.Dials() {
+		if cfg.Transport == TransportH3 {
+			if len(cfg.CleanIPs) > 0 {
+				base += fmt.Sprintf(" [%d clean CF IPs]", len(cfg.CleanIPs))
+			}
+			return base
+		}
 		var stealth []string
 		backupOnly := !cfg.CDN && cfg.AltServerName != ""
 		suffix := ""

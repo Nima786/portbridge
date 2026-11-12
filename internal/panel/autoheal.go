@@ -576,7 +576,21 @@ func describeTunnelInfo(ti agent.TunnelInfo) string {
 	}
 	tr := strings.ToUpper(ti.Transport)
 	linkLower := strings.ToLower(ti.Link)
-	if ti.SIT {
+	if ti.Asymmetric {
+		up := strings.ToUpper(ti.AsymUplink)
+		if up == "" {
+			up = "XHTTP"
+		}
+		dn := strings.ToUpper(ti.AsymDownlink)
+		if dn == "" {
+			dn = "KCP-HOP"
+		}
+		if ti.CDN {
+			tr = fmt.Sprintf("ASYMMETRIC (CDN %s↑+%s↓)", up, dn)
+		} else {
+			tr = fmt.Sprintf("ASYMMETRIC (%s↑+%s↓)", up, dn)
+		}
+	} else if ti.SIT {
 		tr += " (6in4)"
 	} else if ti.CDN {
 		tr += " (CDN)"
@@ -604,6 +618,15 @@ func sameCandidateAsCurrent(c engine.ProbeCandidateResult, ti agent.TunnelInfo) 
 	}
 	curIPv6 := strings.Contains(ti.PeerIP, ":") || strings.Contains(ti.LocalIP, ":")
 	curHTTP := strings.Contains(strings.ToLower(ti.Link), "website header")
+	if c.Asymmetric != ti.Asymmetric {
+		return false
+	}
+	if c.Asymmetric {
+		return strings.EqualFold(c.Mode, ti.Mode) &&
+			c.CDN == ti.CDN &&
+			strings.EqualFold(c.AsymUplink, ti.AsymUplink) &&
+			strings.EqualFold(c.AsymDownlink, ti.AsymDownlink)
+	}
 	return strings.EqualFold(c.Mode, ti.Mode) &&
 		strings.EqualFold(c.Transport, ti.Transport) &&
 		c.IPv6 == curIPv6 &&
@@ -627,7 +650,7 @@ func (ah *autoHealer) pickBestCandidate(rep *engine.ProbeBenchmarkReport, cur ag
 		if c.Status != "ok" && c.Status != "degraded" {
 			continue
 		}
-		if c.Hybrid {
+		if c.Hybrid && !c.Asymmetric {
 			continue
 		}
 		working = append(working, c)
@@ -685,8 +708,22 @@ func (ah *autoHealer) chooseFailoverLinkPort(ctx context.Context, relayID, forei
 
 	var ask []int
 	seen := map[int]bool{}
+	needHop := best.PortHop || (best.Asymmetric && (best.AsymDownlink == "" || best.AsymDownlink == "kcp-hop"))
+	rangeAvoided := func(base int) bool {
+		if avoid[base] {
+			return true
+		}
+		if needHop {
+			for i := 0; i < engine.DefaultPortHopPorts; i++ {
+				if base+i > 65535 || avoid[base+i] {
+					return true
+				}
+			}
+		}
+		return false
+	}
 	for _, p := range candidates {
-		if p > 0 && !avoid[p] && !seen[p] {
+		if p > 0 && !rangeAvoided(p) && !seen[p] {
 			seen[p] = true
 			ask = append(ask, p)
 		}
@@ -698,18 +735,61 @@ func (ah *autoHealer) chooseFailoverLinkPort(ctx context.Context, relayID, forei
 		return 8443
 	}
 
+	queryPorts := append([]int(nil), ask...)
+	if needHop {
+		qSeen := map[int]bool{}
+		for _, p := range queryPorts {
+			qSeen[p] = true
+		}
+		for _, base := range ask {
+			for i := 1; i < engine.DefaultPortHopPorts && base+i <= 65535; i++ {
+				if !qSeen[base+i] {
+					qSeen[base+i] = true
+					queryPorts = append(queryPorts, base+i)
+				}
+			}
+		}
+	}
+
+	ownLabel := "PortBridge tunnel " + cur.Name
+	portFreeIn := func(st map[int]portState, p int, hop bool) bool {
+		if st == nil {
+			return true
+		}
+		cnt := 1
+		if hop {
+			cnt = engine.DefaultPortHopPorts
+		}
+		for i := 0; i < cnt; i++ {
+			ps, ok := st[p+i]
+			if ok && ps.State != "free" && ps.By != ownLabel {
+				return false
+			}
+		}
+		return true
+	}
+
+	if best.Asymmetric {
+		stForeign, _ := ah.p.portsThere(ctx, foreignID, ask)
+		stRelay, _ := ah.p.portsThere(ctx, relayID, queryPorts)
+		for _, p := range ask {
+			if portFreeIn(stForeign, p, false) && portFreeIn(stRelay, p, needHop) {
+				return p
+			}
+		}
+		return ask[0]
+	}
+
 	listenServerID := foreignID
 	if best.Mode == "reverse" {
 		listenServerID = relayID
 	}
-	st, err := ah.p.portsThere(ctx, listenServerID, ask)
+	st, err := ah.p.portsThere(ctx, listenServerID, queryPorts)
 	if err != nil {
 		return ask[0]
 	}
-	ownLabel := "PortBridge tunnel " + cur.Name
 	for _, p := range ask {
-		ps, ok := st[p]
-		if !ok || ps.State == "free" || ps.By == ownLabel {
+		if portFreeIn(st, p, needHop) {
 			return p
 		}
 	}
@@ -895,14 +975,18 @@ func (ah *autoHealer) healTunnel(ctx context.Context, j *job, key, name, relayID
 			serverName = cdnDomain
 		}
 	}
-	if serverName == "" && (best.Transport == "tls" || best.Transport == "wss" || best.Transport == "xhttp" || best.Transport == "grpc") {
-		serverName = "www.bing.com"
+	if serverName == "" && (best.Transport == "tls" || best.Transport == "wss" || best.Transport == "xhttp" || best.Transport == "h3" || best.Transport == "grpc") {
+		if best.Transport == "h3" || best.Transport == "grpc" {
+			serverName = "www.google.com"
+		} else {
+			serverName = "www.bing.com"
+		}
 	}
 	httpHost := ""
 	if best.WebHeader {
 		httpHost = "www.bing.com"
 	}
-	realSite := !best.CDN && (best.Transport == "tls" || best.Transport == "xhttp" || best.Transport == "grpc")
+	realSite := !best.CDN && !best.Asymmetric && (best.Transport == "tls" || best.Transport == "xhttp" || best.Transport == "grpc")
 
 	// A CDN backup route the owner set up is kept where it can still work: on a
 	// direct website-style link. It cannot be combined with showing the real
@@ -912,7 +996,7 @@ func (ah *autoHealer) healTunnel(ctx context.Context, j *job, key, name, relayID
 	switch best.Transport {
 	case "tls", "wss", "xhttp", "h2", "grpc":
 		// (IPv6 between the servers cannot be combined with a CDN route.)
-		if curInfo.AltHost != "" && !best.CDN && !best.IPv6 && best.Mode == "direct" {
+		if curInfo.AltHost != "" && !best.CDN && !best.Asymmetric && !best.IPv6 && best.Mode == "direct" {
 			altHost = curInfo.AltHost
 			realSite = false
 		}
@@ -945,6 +1029,9 @@ func (ah *autoHealer) healTunnel(ctx context.Context, j *job, key, name, relayID
 		SIT:          "off",
 		AntiFreeze:   onOff(best.AntiFreeze),
 		PortHop:      onOff(best.PortHop),
+		Asymmetric:   onOff(best.Asymmetric),
+		AsymUplink:   best.AsymUplink,
+		AsymDownlink: best.AsymDownlink,
 		Mux:          muxMode,
 		MuxLinks:     muxLinks,
 		Pool:         curInfo.PoolSize,
@@ -970,7 +1057,21 @@ func (ah *autoHealer) healTunnel(ctx context.Context, j *job, key, name, relayID
 func describeCandidate(c engine.ProbeCandidateResult) string {
 	dir := strings.ToUpper(c.Mode)
 	tr := strings.ToUpper(c.Transport)
-	if c.CDN {
+	if c.Asymmetric {
+		up := strings.ToUpper(c.AsymUplink)
+		if up == "" {
+			up = "XHTTP"
+		}
+		dn := strings.ToUpper(c.AsymDownlink)
+		if dn == "" {
+			dn = "KCP-HOP"
+		}
+		if c.CDN {
+			tr = fmt.Sprintf("ASYMMETRIC (CDN %s↑+%s↓)", up, dn)
+		} else {
+			tr = fmt.Sprintf("ASYMMETRIC (%s↑+%s↓)", up, dn)
+		}
+	} else if c.CDN {
 		tr += " (CDN)"
 	} else if c.IPSpoof {
 		tr += " (IP Spoof)"

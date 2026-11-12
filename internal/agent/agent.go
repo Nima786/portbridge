@@ -84,6 +84,10 @@ type PairingData struct {
 	AntiFreeze   string
 	PortHop      string
 	PortHopPorts string
+	Asymmetric   string
+	AsymUplink   string
+	AsymDownlink string
+	AsymDownPort string
 	MaxConn      string
 
 	// Website Bridge & Smart Outbound Proxy settings.
@@ -160,6 +164,10 @@ func decodePairingCode(code string) (*PairingData, error) {
 		AntiFreeze:    kv["anti_freeze"],
 		PortHop:       kv["port_hop"],
 		PortHopPorts:  kv["port_hop_ports"],
+		Asymmetric:    kv["asymmetric"],
+		AsymUplink:    kv["asym_uplink"],
+		AsymDownlink:  kv["asym_downlink"],
+		AsymDownPort:  kv["asym_down_port"],
 		MaxConn:       kv["max_conn"],
 
 		WebsiteBridge:         kv["website_bridge"],
@@ -293,8 +301,8 @@ func applyPairingWarn(p *PairingData, confDir string, warns *[]string) error {
 		return fmt.Errorf("validating secret: %w", err)
 	}
 
-	// In direct mode with TLS, origin is listening, so ensure certificate is prepared
-	if cfg.Transport != engine.TransportPlain && !engine.IsKCPFamily(cfg.Transport) && cfg.Mode == engine.ModeDirect {
+	// In direct mode with TLS/H3/Asymmetric, origin needs a certificate prepared.
+	if (cfg.Transport != engine.TransportPlain && !engine.IsKCPFamily(cfg.Transport) && cfg.Mode == engine.ModeDirect) || cfg.Asymmetric {
 		if _, err := engine.EnsureCert(certFile, keyFile, cfg.EffectiveServerName()); err != nil {
 			undo()
 			return fmt.Errorf("preparing the certificate: %w", err)

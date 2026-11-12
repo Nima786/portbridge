@@ -72,6 +72,10 @@ type TunnelInfo struct {
 	AntiFreeze            bool        `json:"anti_freeze"`
 	PortHop               bool        `json:"port_hop"`
 	PortHopPorts          int         `json:"port_hop_ports,omitempty"`
+	Asymmetric            bool        `json:"asymmetric,omitempty"`
+	AsymUplink            string      `json:"asym_uplink,omitempty"`
+	AsymDownlink          string      `json:"asym_downlink,omitempty"`
+	AsymDownPort          int         `json:"asym_down_port,omitempty"`
 	ProxyProtocol         string      `json:"proxy_protocol"`
 	WebsiteBridge         bool        `json:"website_bridge,omitempty"`
 	WebsiteDomains        string      `json:"website_domains,omitempty"`
@@ -168,6 +172,12 @@ func tunnelInfo(path string, host agentHost) TunnelInfo {
 	ti.PortHop = cfg.PortHop
 	if cfg.PortHop {
 		ti.PortHopPorts = cfg.EffectivePortHopPorts()
+	}
+	ti.Asymmetric = cfg.Asymmetric
+	if cfg.Asymmetric {
+		ti.AsymUplink = cfg.EffectiveAsymUplink()
+		ti.AsymDownlink = cfg.EffectiveAsymDownlink()
+		ti.AsymDownPort = cfg.EffectiveAsymDownPort()
 	}
 	ti.WebsiteBridge = cfg.WebsiteBridge
 	ti.WebsiteDomains = cfg.WebsiteDomains

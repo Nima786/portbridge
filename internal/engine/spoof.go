@@ -726,6 +726,14 @@ func (c *spoofPacketConn) SetWriteDeadline(t time.Time) error {
 	return c.udpConn.SetWriteDeadline(t)
 }
 
+func (c *spoofPacketConn) SetReadBuffer(bytes int) error {
+	return c.udpConn.SetReadBuffer(bytes)
+}
+
+func (c *spoofPacketConn) SetWriteBuffer(bytes int) error {
+	return c.udpConn.SetWriteBuffer(bytes)
+}
+
 // SNIScanResult reports whether a candidate whitelisted SNI passed DPI inspection
 // and how fast the handshake completed.
 type SNIScanResult struct {

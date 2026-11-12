@@ -27,23 +27,27 @@ This document tracks the gradual rollout of PortBridge's six next-generation ant
 
 ---
 
-## Phase 2 (Planned — Next After Live Testing of Phase 1)
+## Phase 2 (Implemented — Next Live Testing Rollout)
 
-### 3. Asymmetric Dual-Path Hybrid (`asymmetric` — Separate Uplink & Downlink Transports)
-- **Status**: 📋 Planned (Phase 2)
-- **Problem Solved**: Cross-border filtering is strongly asymmetric — Direct outbound traffic (`Relay -> Foreign`) faces strict DPI / byte-cap freezes, whereas Reverse inbound traffic (`Foreign -> Relay`) or UDP/Spoofed traffic often runs at full line rate. Conversely, CDNs guarantee unblockable upload reachability while direct/reverse paths offer much lower download latency and higher throughput.
+### 3. Asymmetric Dual-Path Hybrid (`asymmetric` & `asymmetric-cdn` / `asymmetric = on`)
+- **Status**: ✅ Implemented (Phase 2)
+- **Problem Solved**: Cross-border filtering is strongly asymmetric — Direct outbound traffic (`Relay -> Foreign`) faces strict DPI / byte-cap freezes, whereas Reverse inbound traffic (`Foreign -> Relay`) or UDP Port-Hopping traffic runs at full line rate. Conversely, CDNs guarantee unblockable upload reachability while reverse direct paths deliver dramatically lower download latency and multi-hundred-Mbps download throughput.
 - **Architecture**:
-  - Pair two independent transport legs inside a unified `net.Conn` / `Mux` carrier:
-    - **Uplink Leg (`Relay -> Foreign`)**: e.g. `xhttp-cdn` / `wss-cdn` / `split-tls`.
-    - **Downlink Leg (`Foreign -> Relay`)**: e.g. Reverse `kcp-hop`, Reverse `tls`, or `ip-spoof`.
-  - Session pairing token binds both directional pipes at the `smux` carrier layer.
+  - Pairs two independent directional transport legs inside a unified `net.Conn` / `Mux` carrier (`internal/engine/asymmetric.go`):
+    - **Uplink Leg (`Relay -> Foreign`)**: `xhttp` (Direct Stealth SplitHTTP, default), `xhttp` via Cloudflare/CDN (`asymmetric-cdn`), `split`, `wss`, `tls`, or `h3`.
+    - **Downlink Leg (`Foreign -> Relay`)**: Reverse `kcp-hop` (8-port UDP Port-Hopping + Reed-Solomon FEC, default), `kcp`, `h3`, or `tls`.
+  - **Cryptographic Session Pairing**: 64-byte HMAC-SHA256 + timestamp + replay-guarded prefaces (`ASYMU1` on Uplink, `ASYMD1` on Reverse Downlink) with a 1-byte `0xA5` ready ACK before end-to-end `v2` purpose authentication.
+  - **Automatic UDP-Blackhole Fallback**: `asymEdgeRuntime` listens simultaneously for Port-Hop KCP, HTTP/3, and TLS-over-TCP on the same port. If an ISP or cloud firewall blackholes UDP packets (`3s` ACK timeout), `asymOriginRuntime` automatically dials Reverse TLS over TCP on the exact same port and caches the TCP fallback for `2m` so zero manual reconfiguration is needed.
+  - **Smart Connection Finder & Auto-Heal**: Synthesizes `direct-asymmetric` and `direct-asymmetric-cdn` from measured directional speeds and allows Auto-Heal to fail over to them automatically.
 
-### 4. Native QUIC / HTTP/3 Masquerade (`h3` & `h3-cdn`)
-- **Status**: 📋 Planned (Phase 2)
-- **Problem Solved**: Over 30% of real browser web traffic (Chrome, YouTube, Instagram, Cloudflare) now uses HTTP/3 over UDP `:443`.
+### 4. Native QUIC / HTTP/3 Masquerade (`h3` & `h3-cdn` / `transport = h3`)
+- **Status**: ✅ Implemented (Phase 2)
+- **Problem Solved**: Over 30% of real browser web traffic (Chrome, YouTube, Instagram, Cloudflare) uses HTTP/3 over UDP, eliminating TCP head-of-line blocking and TCP `RST` injection.
 - **Architecture**:
-  - Real QUIC v1 handshake with genuine TLS 1.3 + HTTP/3 `SETTINGS` frames and `CONNECT` / datagram streams (`quic-go`), eliminating TCP head-of-line blocking while blending into ordinary UDP `:443` browser traffic and supporting Cloudflare HTTP/3 edge proxying.
-  - Built-in QUIC connection migration support (survives NAT rebinds and port rotation natively).
+  - Genuine RFC 9000 QUIC v1 + TLS 1.3 (`ALPN: h3`) + RFC 9114 HTTP/3 transport (`internal/engine/h3.go`, powered by `quic-go`):
+    - **Direct & Reverse (`h3`)**: Full-duplex HTTP/3 `POST` request stream with HMAC-SHA256 `X-Session-Token` + server hello proof, serving a realistic nginx `404 Not Found` HTML page to unauthenticated active probes.
+    - **Cloudflare / CDN (`h3-cdn`)**: Runs SplitHTTP/XHTTP over HTTP/3 (`GET` downlink stream + sequenced `POST` uplink streams) from Relay to Cloudflare's UDP `:443` QUIC edge, while `h3Listen` binds a combined UDP HTTP/3 + TCP TLS listener on the Origin server so Cloudflare can forward standard HTTP/1.1 `GET` + `POST` over TLS/TCP with zero special origin settings.
+  - **Single-Port UDP Demultiplexer (`demuxQUICAndPacketConn`)**: Classifies RFC 9000 `>=1200B` Long Header Initial packets so HTTP/3, Port-Hop KCP, and IP-Spoof KCP coexist on a single UDP socket in both `ProbeListener` and `asymEdgeRuntime`.
 
 ---
 

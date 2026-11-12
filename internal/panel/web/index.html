@@ -553,7 +553,7 @@
           <div class="probe-head">
             <div>
               <strong>Smart Route &amp; Transport Benchmark</strong>
-              <p class="muted small">Not sure which mode works best between these two servers? Test Direct, Reverse, Fake TLS, Stealth, gRPC, KCP, FakeTCP, and Cloudflare CDN to find the best route.</p>
+              <p class="muted small">Not sure which mode works best between these two servers? Test Direct, Reverse, Fake TLS, SplitHTTP/XHTTP, QUIC/HTTP/3, Asymmetric Hybrid, gRPC, KCP Port-Hop, FakeTCP, and Cloudflare CDN to find the best route.</p>
             </div>
             <button type="button" id="tn-probe-btn" class="primary">Find Best Tunnel Mode</button>
           </div>
@@ -712,10 +712,10 @@
             <input type="radio" name="tn-link" value="xhttp">
             <div class="choice-body">
               <div class="choice-top">
-                <strong>SplitHTTP / XHTTP Stream</strong>
+                <strong>SplitHTTP / XHTTP Stream (Direct)</strong>
                 <span class="pill-tag tag-good">GET + POST</span>
               </div>
-              <span class="choice-desc">Splits traffic into a chunked HTTP/1.1 GET downlink and sequenced keep-alive POST uplinks with zero WebSocket Upgrade headers.</span>
+              <span class="choice-desc">Direct server-to-server HTTP/1.1 chunked GET downlink + sequenced keep-alive POST uplinks with zero WebSocket Upgrade headers.</span>
             </div>
           </label>
 
@@ -727,6 +727,50 @@
                 <span class="pill-tag tag-good">CDN · No Upgrade</span>
               </div>
               <span class="choice-desc">Standard HTTP/1.1 GET + POST streaming through any Cloudflare / CDN plan with zero WebSocket or gRPC toggle needed.</span>
+            </div>
+          </label>
+
+          <label class="choice-card" id="tn-asym-choice">
+            <input type="radio" name="tn-link" value="asymmetric">
+            <div class="choice-body">
+              <div class="choice-top">
+                <strong>Asymmetric Hybrid (Stealth XHTTP ↑ + KCP-Hop ↓)</strong>
+                <span class="pill-tag tag-good">Dual-Path · Anti-Throttle</span>
+              </div>
+              <span class="choice-desc">Splits upload and download onto independent paths: stealth Direct XHTTP uplink paired with Reverse UDP Port-Hopping + FEC downlink (auto-TLS fallback).</span>
+            </div>
+          </label>
+
+          <label class="choice-card" id="tn-asym-cdn-choice">
+            <input type="radio" name="tn-link" value="asymmetric-cdn">
+            <div class="choice-body">
+              <div class="choice-top">
+                <strong>Asymmetric CDN Hybrid (CDN XHTTP ↑ + KCP-Hop ↓)</strong>
+                <span class="pill-tag tag-accent">CDN ↑ + UDP ↓</span>
+              </div>
+              <span class="choice-desc">Unblockable Cloudflare / CDN XHTTP uplink paired with a direct Reverse UDP Port-Hopping + FEC downlink so downloads bypass CDN bandwidth caps.</span>
+            </div>
+          </label>
+
+          <label class="choice-card">
+            <input type="radio" name="tn-link" value="h3">
+            <div class="choice-body">
+              <div class="choice-top">
+                <strong>QUIC / HTTP/3 Masquerade (Direct UDP)</strong>
+                <span class="pill-tag tag-good">HTTP/3 · 0-HOL</span>
+              </div>
+              <span class="choice-desc">Genuine HTTP/3 over QUIC v1 (RFC 9000 + TLS 1.3 ALPN h3) directly over UDP between servers with zero TCP head-of-line blocking.</span>
+            </div>
+          </label>
+
+          <label class="choice-card">
+            <input type="radio" name="tn-link" value="h3-cdn">
+            <div class="choice-body">
+              <div class="choice-top">
+                <strong>QUIC / HTTP/3 via Cloudflare / CDN</strong>
+                <span class="pill-tag">CDN · HTTP/3</span>
+              </div>
+              <span class="choice-desc">Connects from the Relay to Cloudflare Edge over QUIC / HTTP/3 (UDP) with SplitHTTP streaming to your Foreign server.</span>
             </div>
           </label>
 
@@ -2060,10 +2104,14 @@
               <label for="wb-link">Inter-Server Disguise</label>
               <select id="wb-link">
                 <option value="website">Fake TLS Website + Stealth (Recommended)</option>
+                <option value="xhttp">SplitHTTP / XHTTP Stream (Direct)</option>
+                <option value="asymmetric">Asymmetric Hybrid (Stealth XHTTP ↑ + KCP-Hop ↓)</option>
+                <option value="h3">QUIC / HTTP/3 Masquerade (Direct UDP)</option>
                 <option value="sni-spoof">Decoy Whitelisted SNI Spoof (challenges.cloudflare.com)</option>
                 <option value="split">Split-Stream TLS (Anti-Freeze Rotation)</option>
-                <option value="plain">Raw TCP (Fastest on clean routes)</option>
+                <option value="kcp-hop">KCP Port-Hopping UDP (8-Port Pool + FEC)</option>
                 <option value="kcp">KCP over UDP (Packet-loss repair)</option>
+                <option value="plain">Raw TCP (Fastest on clean routes)</option>
               </select>
               <label for="wb-sni" class="small muted">Camouflage SNI / Host</label>
               <input id="wb-sni" value="www.bing.com" autocapitalize="none" spellcheck="false">

@@ -2,6 +2,7 @@ package engine
 
 import (
 	"bufio"
+	"context"
 	"crypto/rand"
 	"encoding/binary"
 	"flag"
@@ -497,6 +498,37 @@ func RunSpeedtest(path string, sizeMB float64) (string, error) {
 	var buf strings.Builder
 
 	// 1. If this server dials, dial the peer and run the speedtest directly
+	// (except in Asymmetric mode when the daemon already holds the reverse
+	// downlink port, in which case we ask the running daemon via control socket first).
+	if cfg.Dials() && cfg.Asymmetric {
+		if out, ok, sockErr := runDaemonControlSpeedtest(cfg.ControlSocketPath(), sizeMB); ok {
+			return out, sockErr
+		}
+		cert, err := ensureAsymCert(cfg)
+		if err != nil {
+			return "", fmt.Errorf("asymmetric cert error: %w", err)
+		}
+		asymRT, err := newAsymEdgeRuntime(cfg, cert)
+		if err != nil {
+			return "", fmt.Errorf("asymmetric listener error: %w", err)
+		}
+		defer asymRT.Close()
+
+		routes := newRouter(cfg)
+		fmt.Fprintf(&buf, "Connecting to %s (%s)...\n", cfg.Name, routes.describe())
+		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+		defer cancel()
+		c, _, err := asymRT.Dial(ctx, routes, -1, 10*time.Second, authPurposeSpeedtest)
+		if err != nil {
+			return buf.String(), fmt.Errorf("dial error: %w", err)
+		}
+		defer c.Close()
+		if err := runSpeedtestClient(c, cfg, &buf, sizeMB); err != nil {
+			return buf.String(), fmt.Errorf("speedtest error: %w", err)
+		}
+		return buf.String(), nil
+	}
+
 	if cfg.Dials() {
 		routes := newRouter(cfg)
 		fmt.Fprintf(&buf, "Connecting to %s (%s)...\n", cfg.Name, routes.describe())
@@ -505,7 +537,9 @@ func RunSpeedtest(path string, sizeMB float64) (string, error) {
 			return buf.String(), fmt.Errorf("dial error: %w", err)
 		}
 		defer raw.Close()
-		tuneSocket(raw)
+		if !cfg.Transport.IsPacketBased() && cfg.Transport != TransportH3 {
+			tuneSocket(raw)
+		}
 
 		// Announce the purpose up front: a websocket link carries it in the
 		// upgrade request, and a speed test announced as a tunnel never works.
@@ -526,26 +560,39 @@ func RunSpeedtest(path string, sizeMB float64) (string, error) {
 	}
 
 	// 2. If this server accepts, check if the running daemon can run a speedtest via control socket
-	sockPath := cfg.ControlSocketPath()
-	if c, err := net.DialTimeout("unix", sockPath, 2*time.Second); err == nil {
-		defer c.Close()
-		_ = c.SetDeadline(time.Now().Add(120 * time.Second))
-		if _, err := fmt.Fprintln(c, "speedtest"); err == nil {
-			sc := bufio.NewScanner(c)
-			for sc.Scan() {
-				fmt.Fprintln(&buf, sc.Text())
-			}
-			out := buf.String()
-			if !strings.Contains(out, "RTT:") {
-				msg := strings.TrimSpace(out)
-				if msg == "" {
-					msg = "speedtest did not complete"
-				}
-				return out, fmt.Errorf("%s", msg)
-			}
-			return out, nil
-		}
+	if out, ok, sockErr := runDaemonControlSpeedtest(cfg.ControlSocketPath(), sizeMB); ok {
+		return out, sockErr
 	}
 
 	return "", fmt.Errorf("Tunnel %q is not running on this server, or cannot initiate a speedtest right now.", cfg.Name)
+}
+
+func runDaemonControlSpeedtest(sockPath string, sizeMB float64) (string, bool, error) {
+	c, err := net.DialTimeout("unix", sockPath, 2*time.Second)
+	if err != nil {
+		return "", false, err
+	}
+	defer c.Close()
+	_ = c.SetDeadline(time.Now().Add(120 * time.Second))
+	cmd := "speedtest"
+	if sizeMB > 0 {
+		cmd = fmt.Sprintf("speedtest %.4f", sizeMB)
+	}
+	if _, err := fmt.Fprintln(c, cmd); err != nil {
+		return "", false, err
+	}
+	var buf strings.Builder
+	sc := bufio.NewScanner(c)
+	for sc.Scan() {
+		fmt.Fprintln(&buf, sc.Text())
+	}
+	out := buf.String()
+	if !strings.Contains(out, "RTT:") {
+		msg := strings.TrimSpace(out)
+		if msg == "" {
+			msg = "speedtest did not complete"
+		}
+		return out, true, fmt.Errorf("%s", msg)
+	}
+	return out, true, nil
 }

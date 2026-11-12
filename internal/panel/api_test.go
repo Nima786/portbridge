@@ -12,12 +12,15 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/Nima786/portbridge/internal/agent"
 )
 
 const testPassword = "correct horse battery"
 
 func newTestPanel(t *testing.T) *Panel {
 	t.Helper()
+	t.Cleanup(agent.StopCallHome)
 	dir := t.TempDir()
 	st, err := openStore(dir)
 	if err != nil {

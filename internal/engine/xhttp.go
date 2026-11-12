@@ -117,10 +117,18 @@ func writeHTTPChunk(w io.Writer, payload []byte) error {
 }
 
 func writeXHTTPDownFrame(w io.Writer, ftype byte, data []byte) error {
+	return writeXHTTPDownFrameMode(w, ftype, data, false)
+}
+
+func writeXHTTPDownFrameMode(w io.Writer, ftype byte, data []byte, rawFraming bool) error {
 	frame := make([]byte, 5+len(data))
 	frame[0] = ftype
 	binary.BigEndian.PutUint32(frame[1:5], uint32(len(data)))
 	copy(frame[5:], data)
+	if rawFraming {
+		_, err := w.Write(frame)
+		return err
+	}
 	return writeHTTPChunk(w, frame)
 }
 
@@ -392,10 +400,104 @@ func (m *xhttpSessionManager) serveUplinkKeepAlive(c net.Conn, br *bufio.Reader,
 	}
 }
 
+// AcceptH3Get registers a new SplitHTTP/XHTTP session arriving over an HTTP/3
+// GET stream (where HTTP/3 DATA frames carry raw unchunked XHTTP frames).
+func (m *xhttpSessionManager) AcceptH3Get(sid [16]byte, downConn net.Conn, token string, cfg *Config, guard *replayGuard) (*xhttpServerConn, [4]byte, error) {
+	var zeroHello [4]byte
+	frame, err := base64.RawURLEncoding.DecodeString(strings.TrimSpace(token))
+	if err != nil || len(frame) == 0 {
+		return nil, zeroHello, fmt.Errorf("%w: missing session token", errXHTTPHandshake)
+	}
+	purpose, err := verifyAuthFrameBytes(frame, cfg.secret, guard)
+	if err != nil {
+		return nil, zeroHello, fmt.Errorf("%w: session auth failed: %v", errXHTTPHandshake, err)
+	}
+
+	m.mu.Lock()
+	if m.closed {
+		m.mu.Unlock()
+		return nil, zeroHello, net.ErrClosed
+	}
+	if _, dup := m.sessions[sid]; dup {
+		m.mu.Unlock()
+		return nil, zeroHello, fmt.Errorf("%w: duplicate session identifier", errXHTTPHandshake)
+	}
+	sc := newXHTTPServerConn(sid, downConn, purpose, func() {
+		m.mu.Lock()
+		delete(m.sessions, sid)
+		m.mu.Unlock()
+	})
+	sc.rawFraming = true
+	m.sessions[sid] = sc
+	m.mu.Unlock()
+
+	return sc, xhttpHelloToken(cfg.secret, sid), nil
+}
+
+// DeliverH3Post authenticates and delivers a sequenced HTTP/3 POST uplink body
+// into its matching XHTTP session.
+func (m *xhttpSessionManager) DeliverH3Post(rest string, hdr http.Header, body io.ReadCloser, cfg *Config) (int, error) {
+	if body != nil {
+		defer func() { _ = body.Close() }()
+	}
+	sidPart, seqPart, ok := strings.Cut(rest, "/")
+	if !ok {
+		return http.StatusNotFound, fmt.Errorf("%w: malformed post path", errXHTTPHandshake)
+	}
+	sidBytes, err := hex.DecodeString(sidPart)
+	if err != nil || len(sidBytes) != 16 {
+		return http.StatusNotFound, fmt.Errorf("%w: invalid post session id", errXHTTPHandshake)
+	}
+	seq, err := strconv.ParseUint(seqPart, 10, 64)
+	if err != nil {
+		return http.StatusNotFound, fmt.Errorf("%w: invalid post sequence", errXHTTPHandshake)
+	}
+	ts, err := strconv.ParseInt(strings.TrimSpace(hdr.Get("X-Request-TS")), 10, 64)
+	if err != nil {
+		return http.StatusNotFound, fmt.Errorf("%w: invalid post timestamp", errXHTTPHandshake)
+	}
+	diff := time.Now().Unix() - ts
+	if diff < -xhttpSkewSeconds || diff > xhttpSkewSeconds {
+		return http.StatusNotFound, errAuthSkew
+	}
+	fin := hdr.Get("X-Stream-Close") == "1"
+	gotMAC, err := hex.DecodeString(strings.TrimSpace(hdr.Get("X-Request-Auth")))
+	if err != nil || len(gotMAC) != 16 {
+		return http.StatusNotFound, errAuthMAC
+	}
+	var sid [16]byte
+	copy(sid[:], sidBytes)
+	wantMAC := xhttpPostMAC(cfg.secret, sid, seq, ts, fin)
+	if subtle.ConstantTimeCompare(gotMAC, wantMAC[:]) != 1 {
+		return http.StatusNotFound, errAuthMAC
+	}
+
+	var payload []byte
+	if body != nil {
+		payload, err = io.ReadAll(io.LimitReader(body, xhttpMaxPostBytes+1))
+		if err != nil {
+			return http.StatusBadRequest, err
+		}
+		if len(payload) > xhttpMaxPostBytes {
+			return http.StatusRequestEntityTooLarge, errors.New("xhttp post body exceeds limit")
+		}
+	}
+
+	sc := m.lookupSessionWait(sid)
+	if sc == nil {
+		return http.StatusNotFound, fmt.Errorf("%w: unknown or expired session", errXHTTPHandshake)
+	}
+	if err := sc.deliverUplink(seq, payload, fin); err != nil {
+		return http.StatusGone, err
+	}
+	return http.StatusOK, nil
+}
+
 type xhttpServerConn struct {
 	sid           [16]byte
 	downConn      net.Conn
 	earlyPurposeB byte
+	rawFraming    bool
 	onClose       func()
 
 	wmu        sync.Mutex
@@ -445,8 +547,16 @@ func (s *xhttpServerConn) earlyPurpose() byte  { return s.earlyPurposeB }
 func (s *xhttpServerConn) startBackground(downBr *bufio.Reader) {
 	// Watch downlink socket closure from client/CDN.
 	go func() {
-		var b [1]byte
-		_, _ = downBr.Read(b[:])
+		if dc, ok := s.downConn.(interface{ Done() <-chan struct{} }); ok {
+			<-dc.Done()
+		} else {
+			var b [1]byte
+			if downBr != nil {
+				_, _ = downBr.Read(b[:])
+			} else {
+				_, _ = s.downConn.Read(b[:])
+			}
+		}
 		// Allow brief window for any concurrently racing final POST to land.
 		timer := time.NewTimer(250 * time.Millisecond)
 		select {
@@ -476,7 +586,7 @@ func (s *xhttpServerConn) startBackground(downBr *bufio.Reader) {
 				s.wmu.Lock()
 				if !s.closed.Load() && !s.writeEnded {
 					_ = s.downConn.SetWriteDeadline(time.Now().Add(10 * time.Second))
-					err := writeXHTTPDownFrame(s.downConn, xhttpFrameKeepAlive, nil)
+					err := writeXHTTPDownFrameMode(s.downConn, xhttpFrameKeepAlive, nil, s.rawFraming)
 					_ = s.downConn.SetWriteDeadline(time.Time{})
 					s.lastWrite.Store(time.Now().UnixNano())
 					if err != nil {
@@ -646,7 +756,7 @@ func (s *xhttpServerConn) Write(p []byte) (int, error) {
 		if len(chunk) > xhttpMaxDownChunk {
 			chunk = chunk[:xhttpMaxDownChunk]
 		}
-		if err := writeXHTTPDownFrame(s.downConn, xhttpFrameData, chunk); err != nil {
+		if err := writeXHTTPDownFrameMode(s.downConn, xhttpFrameData, chunk, s.rawFraming); err != nil {
 			return written, err
 		}
 		s.lastWrite.Store(time.Now().UnixNano())
@@ -667,8 +777,10 @@ func (s *xhttpServerConn) Close() error {
 		if !s.writeEnded {
 			s.writeEnded = true
 			_ = s.downConn.SetWriteDeadline(time.Now().Add(1 * time.Second))
-			_ = writeXHTTPDownFrame(s.downConn, xhttpFrameClose, nil)
-			_, _ = io.WriteString(s.downConn, "0\r\n\r\n")
+			_ = writeXHTTPDownFrameMode(s.downConn, xhttpFrameClose, nil, s.rawFraming)
+			if !s.rawFraming {
+				_, _ = io.WriteString(s.downConn, "0\r\n\r\n")
+			}
 		}
 		s.wmu.Unlock()
 		_ = s.downConn.Close()
@@ -731,7 +843,9 @@ type xhttpClientConn struct {
 	readBuf  []byte
 	readEOF  bool
 
-	dialUplink func() (net.Conn, error)
+	dialUplink    func() (net.Conn, error)
+	postRoundTrip func(seq uint64, payload []byte, fin bool) error
+	onClose       func()
 
 	smu        sync.Mutex
 	sendBuf    bytes.Buffer
@@ -1145,7 +1259,51 @@ func (c *xhttpClientConn) uplinkWorker() {
 	}
 }
 
+func newXHTTPClientOverH3(
+	sid [16]byte,
+	basePath, host string,
+	secret []byte,
+	purpose byte,
+	downConn net.Conn,
+	downBody io.ReadCloser,
+	postRT func(seq uint64, payload []byte, fin bool) error,
+	onClose func(),
+) *xhttpClientConn {
+	return &xhttpClientConn{
+		sid:           sid,
+		sidHex:        hex.EncodeToString(sid[:]),
+		basePath:      basePath,
+		host:          host,
+		secret:        append([]byte(nil), secret...),
+		earlyPurposeB: purpose,
+		downConn:      downConn,
+		downBody:      downBody,
+		postRoundTrip: postRT,
+		onClose:       onClose,
+		sendNotify:    make(chan struct{}, 1),
+		spaceCh:       make(chan struct{}, 1),
+		flushedCh:     make(chan struct{}),
+		wdl:           newDeadline(),
+		closedCh:      make(chan struct{}),
+	}
+}
+
 func (c *xhttpClientConn) postChunk(sockPtr **xhttpUplinkSocket, seq uint64, payload []byte, fin bool) error {
+	if c.postRoundTrip != nil {
+		var lastErr error
+		for attempt := 0; attempt < 3; attempt++ {
+			if c.closed.Load() {
+				return net.ErrClosed
+			}
+			if err := c.postRoundTrip(seq, payload, fin); err == nil {
+				return nil
+			} else {
+				lastErr = err
+			}
+			time.Sleep(time.Duration(attempt+1) * 80 * time.Millisecond)
+		}
+		return lastErr
+	}
 	var lastErr error
 	for attempt := 0; attempt < 3; attempt++ {
 		if c.closed.Load() {
@@ -1292,6 +1450,9 @@ func (c *xhttpClientConn) Close() error {
 			_ = c.downBody.Close()
 		}
 		c.rmu.Unlock()
+		if c.onClose != nil {
+			c.onClose()
+		}
 	})
 	return nil
 }

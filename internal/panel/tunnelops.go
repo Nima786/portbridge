@@ -130,6 +130,10 @@ type createRequest struct {
 	AntiFreeze   bool   `json:"anti_freeze"`
 	PortHop      bool   `json:"port_hop"`
 	PortHopPorts int    `json:"port_hop_ports,omitempty"`
+	Asymmetric   bool   `json:"asymmetric"`
+	AsymUplink   string `json:"asym_uplink,omitempty"`
+	AsymDownlink string `json:"asym_downlink,omitempty"`
+	AsymDownPort int    `json:"asym_down_port,omitempty"`
 	SNISpoof     bool   `json:"sni_spoof"`
 	SpoofSNI     string `json:"spoof_sni"`
 	IPSpoof      bool   `json:"ip_spoof"`
@@ -337,6 +341,55 @@ func (p *Panel) toSpec(r createRequest) (agent.EdgeSpec, error) {
 		if domain == "" {
 			return s, errors.New("SplitHTTP / XHTTP through a CDN needs your domain, pointed at the CDN")
 		}
+	case "h3":
+		s.Transport, s.ServerName = "h3", claimed
+		if s.ServerName == "" {
+			s.ServerName = "www.google.com"
+		}
+	case "h3-cdn":
+		s.Transport, s.CDN, s.ServerName, s.CleanIPs = "h3", "on", domain, r.CleanIPs
+		if domain == "" {
+			return s, errors.New("QUIC / HTTP/3 through Cloudflare / CDN needs your domain, pointed at Cloudflare")
+		}
+	case "asymmetric":
+		if r.Mode != "direct" {
+			return s, errors.New("Asymmetric Dual-Path Hybrid mode is only for direct tunnels (Relay dials Uplink, Foreign dials Reverse Downlink)")
+		}
+		s.Asymmetric = "on"
+		s.AsymUplink = strings.TrimSpace(r.AsymUplink)
+		if s.AsymUplink == "" {
+			s.AsymUplink = "xhttp"
+		}
+		s.AsymDownlink = strings.TrimSpace(r.AsymDownlink)
+		if s.AsymDownlink == "" {
+			s.AsymDownlink = "kcp-hop"
+		}
+		s.AsymDownPort = r.AsymDownPort
+		s.ServerName = claimed
+		if s.ServerName == "" {
+			s.ServerName = "www.bing.com"
+		}
+		s.UTLS, s.TLSFragment = "on", "on"
+		r.Shared = true
+	case "asymmetric-cdn":
+		if r.Mode != "direct" {
+			return s, errors.New("Asymmetric CDN Hybrid mode is only for direct tunnels (Relay dials CDN Uplink, Foreign dials Reverse Downlink)")
+		}
+		if domain == "" {
+			return s, errors.New("Asymmetric CDN Hybrid needs your domain, pointed at Cloudflare / CDN")
+		}
+		s.Asymmetric = "on"
+		s.AsymUplink = strings.TrimSpace(r.AsymUplink)
+		if s.AsymUplink == "" {
+			s.AsymUplink = "xhttp"
+		}
+		s.AsymDownlink = strings.TrimSpace(r.AsymDownlink)
+		if s.AsymDownlink == "" {
+			s.AsymDownlink = "kcp-hop"
+		}
+		s.AsymDownPort = r.AsymDownPort
+		s.CDN, s.ServerName, s.CleanIPs = "on", domain, r.CleanIPs
+		r.Shared = true
 	case "grpc":
 		s.Transport, s.ServerName = "grpc", claimed
 		if s.ServerName == "" {
@@ -396,7 +449,7 @@ func (p *Panel) toSpec(r createRequest) (agent.EdgeSpec, error) {
 		if r.AntiFreeze {
 			s.AntiFreeze = "on"
 		}
-		if r.SNISpoof {
+		if r.SNISpoof && s.Transport != "h3" {
 			s.SNISpoof = "on"
 			s.SpoofSNI = strings.TrimSpace(r.SpoofSNI)
 			if s.SpoofSNI == "" {
@@ -432,7 +485,7 @@ func (p *Panel) toSpec(r createRequest) (agent.EdgeSpec, error) {
 
 	rv4, rv6 := addressesOf(relay)
 	fv4, fv6 := addressesOf(foreign)
-	if r.IPv6 && s.GRE != "on" && s.SIT != "on" {
+	if r.IPv6 && s.GRE != "on" && s.SIT != "on" && s.Asymmetric != "on" {
 		if rv6 == "" || fv6 == "" {
 			return s, errors.New("both servers need a public IPv6 address for IPv6 between them")
 		}

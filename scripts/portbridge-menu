@@ -592,6 +592,10 @@ explain_disguise() {
         say "  ${B}7) SplitHTTP / XHTTP stream${R} ${DIM}(chunked GET + sequenced POST, direct or CDN)${R}"
         say "     ${DIM}Splits the link into standard HTTP/1.1 GET + POST requests over TLS with zero${R}"
         say "     ${DIM}WebSocket Upgrade headers. Works directly or through any Cloudflare / CDN plan.${R}"
+        say ""
+        say "  ${B}8) QUIC / HTTP/3 stream${R} ${DIM}(TLS 1.3 over UDP, zero head-of-line blocking, direct or CDN)${R}"
+        say "     ${DIM}Runs genuine HTTP/3 over QUIC v1 (UDP + TLS 1.3 ALPN h3). Eliminates TCP${R}"
+        say "     ${DIM}head-of-line blocking and works directly or through Cloudflare HTTP/3.${R}"
     else
         say ""
         say "  ${B}4) HTTP/2 / gRPC stream${R}"
@@ -607,6 +611,10 @@ explain_disguise() {
         say "  ${B}6) SplitHTTP / XHTTP stream${R} ${DIM}(chunked GET + sequenced POST, direct or CDN)${R}"
         say "     ${DIM}Splits the link into standard HTTP/1.1 GET + POST requests over TLS with zero${R}"
         say "     ${DIM}WebSocket Upgrade headers. Works directly or through any Cloudflare / CDN plan.${R}"
+        say ""
+        say "  ${B}7) QUIC / HTTP/3 stream${R} ${DIM}(TLS 1.3 over UDP, zero head-of-line blocking, direct or CDN)${R}"
+        say "     ${DIM}Runs genuine HTTP/3 over QUIC v1 (UDP + TLS 1.3 ALPN h3). Eliminates TCP${R}"
+        say "     ${DIM}head-of-line blocking and works directly or through Cloudflare HTTP/3.${R}"
     fi
     hr
 }
@@ -816,13 +824,14 @@ ask_disguise() {
 
     explain_disguise "$mode"
     if [ "$mode" = direct ]; then
-        choice=$(choose "Choose 1, 2, 3, 4, 5, 6 or 7" "2" 1 2 3 4 5 6 7)
+        choice=$(choose "Choose 1, 2, 3, 4, 5, 6, 7 or 8" "2" 1 2 3 4 5 6 7 8)
     else
-        choice=$(choose "Choose 1, 2, 3, 4, 5 or 6" "2" 1 2 3 4 5 6)
+        choice=$(choose "Choose 1, 2, 3, 4, 5, 6 or 7" "2" 1 2 3 4 5 6 7)
         case "$choice" in
             4) choice=5 ;; # gRPC
             5) choice=6 ;; # KCP
             6) choice=7 ;; # XHTTP
+            7) choice=8 ;; # H3
         esac
     fi
 
@@ -868,6 +877,7 @@ ask_disguise() {
             return 0
             ;;
         7) DG_TRANSPORT=xhttp ;;
+        8) DG_TRANSPORT=h3 ;;
     esac
 
     if [ "$choice" = 3 ] || [ "$choice" = 4 ]; then
@@ -1019,6 +1029,45 @@ ask_disguise() {
                 DG_FRAGMENT=on
             fi
         fi
+    elif [ "$choice" = 8 ]; then
+        say ""
+        info "QUIC / HTTP/3 stream can connect directly over UDP to your foreign server, or"
+        info "route through Cloudflare HTTP/3 (QUIC to Cloudflare edge, HTTPS to your origin)."
+        say ""
+        say "  ${NUM}1${R}) Direct over UDP ${DIM}(claims any normal website name, e.g. www.google.com)${R}"
+        say "  ${NUM}2${R}) Through Cloudflare / CDN ${DIM}(needs your domain pointed at Cloudflare with HTTP/3 enabled)${R}"
+        local h3_choice
+        h3_choice=$(choose "Choose 1 or 2" "1" 1 2)
+        if [ "$h3_choice" = 2 ]; then
+            DG_CDN=on
+            DG_WSPATH="/api/v1/$(head -c 9 /dev/urandom | base64 | tr -dc 'a-zA-Z0-9' | head -c 8)"
+            say ""
+            info "Needs a domain you control pointed at your foreign server behind Cloudflare (SSL mode: Full)."
+            local domain
+            domain=$(ask_domain)
+            DG_SERVERNAME=$domain
+            say ""
+            info "Routing HTTP/3 through Cloudflare using $DG_SERVERNAME$DG_WSPATH"
+            if [ "$mode" = reverse ]; then
+                warn "Note: a CDN only carries connections towards your domain, so with"
+                warn "reverse this only works if the domain points at THIS Iran server."
+            fi
+            say ""
+            info "Clean Cloudflare IPs (optional): Enter one or more verified clean IPs"
+            info "(comma-separated, e.g. 104.16.12.34, 172.67.45.67). Leave blank to resolve via DNS."
+            DG_CLEAN_IPS=$(ask_clean_ips "Clean Cloudflare IPs")
+            say ""
+            warn "Two things to set on Cloudflare for HTTP/3 mode:"
+            warn "  - Network -> HTTP/3 (with QUIC) should be ON, and SSL/TLS mode must be Full."
+            warn "  - Cloudflare forwards only these ports: $CDN_PORTS"
+        else
+            DG_CDN=off
+            DG_WSPATH="/api/v3/$(head -c 9 /dev/urandom | base64 | tr -dc 'a-zA-Z0-9' | head -c 8)"
+            say ""
+            info "The direct QUIC / HTTP/3 link will claim to be an HTTPS/3 website or API."
+            DG_SERVERNAME=$(ask_site_name "Name for it to claim" "www.google.com")
+            [ -n "$DG_SERVERNAME" ] || DG_SERVERNAME=www.google.com
+        fi
     else
         say ""
         info "The link will claim to be a website. Any believable name works, and it"
@@ -1041,11 +1090,12 @@ ask_real_site() {
     DG_REAL_SITE=off
     DG_COVER_SITE=""
 
-    # Does not apply to CDN links, GRE, plain, or KCP links.
+    # Does not apply to CDN links, GRE, plain, KCP, or UDP HTTP/3 links.
     # A CDN backup route is left out too: the CDN makes its own connection to
     # this server, which cannot carry the proof, so it would be shown the real site.
     if [ "${DG_CDN:-off}" = on ] || [ -n "${DG_ALTHOST:-}" ] ||
-        [ "${DG_TRANSPORT:-plain}" = plain ] || [ "${DG_TRANSPORT:-plain}" = kcp ]; then
+        [ "${DG_TRANSPORT:-plain}" = plain ] || [ "${DG_TRANSPORT:-plain}" = kcp ] ||
+        [ "${DG_TRANSPORT:-plain}" = h3 ]; then
         return 0
     fi
 
@@ -1117,6 +1167,8 @@ describe_disguise() {
         tls:*) printf 'looks like a normal website' ;;
         xhttp:on) printf 'SplitHTTP / XHTTP stream through a CDN' ;;
         xhttp:*) printf 'SplitHTTP / XHTTP stream (GET + POST)' ;;
+        h3:on) printf 'QUIC / HTTP/3 stream through a CDN' ;;
+        h3:*) printf 'QUIC / HTTP/3 stream (UDP)' ;;
         h2:on) printf 'HTTP/2 stream through Cloudflare' ;;
         h2:*) printf 'looks like HTTP/2 web traffic' ;;
         grpc:on) printf 'gRPC stream through Cloudflare' ;;
@@ -1459,7 +1511,7 @@ explain_sharing() {
     local transport=${DG_TRANSPORT:-plain} rec_one="" rec_two=""
     # The two choices are always numbered the same way, so "2" never means
     # something different from one screen to the next. Only the suggestion moves.
-    if [ "$transport" = kcp ] || [ "$transport" = wss ] || [ "$transport" = xhttp ] || [ "$transport" = grpc ]; then
+    if [ "$transport" = kcp ] || [ "$transport" = wss ] || [ "$transport" = xhttp ] || [ "$transport" = h3 ] || [ "$transport" = grpc ]; then
         rec_two=" ${DIM}(recommended for $transport)${R}"
     else
         rec_one=" ${DIM}(recommended)${R}"
@@ -1501,7 +1553,7 @@ ask_mux_links() {
 ask_sharing() {
     explain_sharing
     local transport=${DG_TRANSPORT:-plain} def=1
-    if [ "$transport" = kcp ] || [ "$transport" = wss ] || [ "$transport" = xhttp ] || [ "$transport" = grpc ]; then
+    if [ "$transport" = kcp ] || [ "$transport" = wss ] || [ "$transport" = xhttp ] || [ "$transport" = h3 ] || [ "$transport" = grpc ]; then
         def=2
     fi
     case "$(choose "Choose 1 or 2" "$def" 1 2)" in
@@ -2135,7 +2187,7 @@ create_tunnel() {
         say "${DIM}IPv6 is not offered through a CDN, which reaches your server by name.${R}"
     else
         case "$DG_TRANSPORT" in
-            plain | tls | xhttp | h2 | grpc | kcp)
+            plain | tls | xhttp | h3 | h2 | grpc | kcp)
                 # A foreign server that was given by its IPv6 address is that
                 # address already, so it is not asked for again.
                 case "$peer" in
@@ -2234,7 +2286,9 @@ create_tunnel() {
         if [ "$mode" = reverse ]; then
             # Reverse: it is opened here on the Iran server, so check it here.
             local link_proto=tcp
-            [ "$DG_TRANSPORT" = kcp ] && link_proto=udp
+            if [ "$DG_TRANSPORT" = kcp ] || { [ "$DG_TRANSPORT" = h3 ] && [ "${DG_CDN:-off}" != on ]; }; then
+                link_proto=udp
+            fi
             tport=$(ask_port "Port between the two servers" "${PORT_BEST:-$DEFAULT_TUNNEL_PORT}" "" link "$link_proto")
             if printf ',%s,' "$uport" | tr -d ' ' | grep -q ",$tport,"; then
                 err "  It cannot be the same as your users' port."
@@ -2479,7 +2533,7 @@ join_tunnel() {
         return 1
     fi
     case "$mode" in direct | reverse) ;; *) err "That code has an unknown mode."; return 1 ;; esac
-    case "$DG_TRANSPORT" in plain | tls | wss | xhttp | h2 | grpc | kcp | icmp | faketcp) ;; *) err "That code has an unknown link type."; return 1 ;; esac
+    case "$DG_TRANSPORT" in plain | tls | wss | xhttp | h3 | h2 | grpc | kcp | icmp | faketcp) ;; *) err "That code has an unknown link type."; return 1 ;; esac
     case "$DG_CDN" in on | off) ;; *) err "That code has a bad CDN setting."; return 1 ;; esac
     case "$MX_MUX" in on | off) ;; *) err "That code has a bad sharing setting."; return 1 ;; esac
     case "$DG_HTTPHEADER" in on | off) ;; *) err "That code has a bad web header setting."; return 1 ;; esac
@@ -2646,7 +2700,9 @@ join_tunnel() {
     fi
     if [ "$mode" = direct ]; then
         local link_proto=tcp
-        [ "$DG_TRANSPORT" = kcp ] && link_proto=udp
+        if [ "$DG_TRANSPORT" = kcp ] || { [ "$DG_TRANSPORT" = h3 ] && [ "${DG_CDN:-off}" != on ]; }; then
+            link_proto=udp
+        fi
         if port_in_use_by_system "$tport" "$link_proto" || port_owner "$tport" >/dev/null; then
             err "Port $tport is already in use on this server, so the Iran server could"
             err "not connect to it. On the Iran server choose Edit a tunnel, then Change ports,"
@@ -2749,6 +2805,8 @@ status_line() {
         tls:*) look=website ;;
         xhttp:on) look=xhttp-cdn ;;
         xhttp:*) look=xhttp ;;
+        h3:on) look=h3-cdn ;;
+        h3:*) look=h3-quic ;;
         h2:*) look=http2 ;;
         grpc:*) look=grpc ;;
         kcp:*) look=kcp-udp ;;
@@ -2762,6 +2820,9 @@ status_line() {
             ;;
         *) look=plain ;;
     esac
+    if [ "$(read_conf "$name" asymmetric)" = on ]; then
+        if [ "$cdn" = on ]; then look=asym-cdn; else look=asymmetric; fi
+    fi
     [ "$(read_conf "$name" gre)" = on ] && look=gre
     case "$(read_conf "$name" peer_ip)" in *:*) [ "$look" = plain ] && look=ipv6 ;; esac
 
@@ -3044,7 +3105,9 @@ edit_tunnel_ports() {
     transport=$(read_conf "$name" transport); [ -n "$transport" ] || transport=plain
     alt=$(read_conf "$name" alt_target)
     proto=tcp
-    [ "$transport" = kcp ] && proto=udp
+    if [ "$transport" = kcp ] || { [ "$transport" = h3 ] && [ "$(read_conf "$name" cdn)" != on ]; }; then
+        proto=udp
+    fi
     use_foreign_agent "$(agent_for_tunnel "$name" 2>/dev/null || true)" "$name"
 
     backup=$(mktemp)
@@ -3568,7 +3631,9 @@ test_tunnel() {
 
     taddr=$(read_conf "$name" tunnel_addr)
     local link_proto=tcp
-    [ "$(read_conf "$name" transport)" = kcp ] && link_proto=udp
+    if [ "$(read_conf "$name" transport)" = kcp ] || { [ "$(read_conf "$name" transport)" = h3 ] && [ "$(read_conf "$name" cdn)" != on ]; }; then
+        link_proto=udp
+    fi
     if [ "$mode:$role" = "direct:edge" ] || [ "$mode:$role" = "reverse:origin" ]; then
         if [ "$link_proto" = udp ]; then
             # A UDP port cannot be probed by connecting to it; whether the two

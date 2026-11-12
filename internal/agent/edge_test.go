@@ -375,3 +375,125 @@ func TestCreateAndJoinXHTTPDirectAndCDN(t *testing.T) {
 		t.Fatalf("updatePairingData(xhttp-cdn): %v", err)
 	}
 }
+
+func TestCreateJoinAndEditH3AndAsymmetric(t *testing.T) {
+	// 1. Direct H3 -> Edit to H3-CDN
+	edgeDir := t.TempDir()
+	originDir := t.TempDir()
+	resH3, err := CreateEdge(EdgeSpec{
+		Name:         "th3",
+		Mode:         "direct",
+		Transport:    "h3",
+		ServerName:   "www.google.com",
+		Mux:          "on",
+		MuxLinks:     4,
+		PeerIP:       "5.6.7.8",
+		LocalIP:      "1.2.3.4",
+		LinkPort:     2053,
+		UserPorts:    "31708",
+		ServicePorts: "31708",
+	}, edgeDir)
+	if err != nil {
+		t.Fatalf("CreateEdge(h3): %v", err)
+	}
+	pH3, err := decodePairingCode(resH3.Code)
+	if err != nil {
+		t.Fatalf("decodePairingCode(h3): %v", err)
+	}
+	if pH3.Transport != "h3" || !strings.HasPrefix(pH3.WSPath, "/api/v3/") {
+		t.Fatalf("unexpected h3 pairing fields: transport=%q ws_path=%q", pH3.Transport, pH3.WSPath)
+	}
+	if err := applyPairingData(pH3, originDir); err != nil {
+		t.Fatalf("applyPairingData(h3): %v", err)
+	}
+
+	editH3CDN, err := EditEdge(EditSpec{
+		Name:       "th3",
+		Mode:       "direct",
+		Transport:  "h3",
+		CDN:        "on",
+		ServerName: "h3.example.com",
+		CleanIPs:   "104.16.12.34",
+		Mux:        "on",
+		MuxLinks:   4,
+	}, edgeDir)
+	if err != nil {
+		t.Fatalf("EditEdge(h3-cdn): %v", err)
+	}
+	pH3CDN, err := decodePairingCode(editH3CDN.Code)
+	if err != nil {
+		t.Fatalf("decodePairingCode(h3-cdn): %v", err)
+	}
+	if pH3CDN.Transport != "h3" || pH3CDN.CDN != "on" || pH3CDN.ServerName != "h3.example.com" {
+		t.Fatalf("unexpected h3-cdn pairing fields: %+v", pH3CDN)
+	}
+	if err := updatePairingData(pH3CDN, originDir, nil); err != nil {
+		t.Fatalf("updatePairingData(h3-cdn): %v", err)
+	}
+
+	// 2. Asymmetric Dual-Path Hybrid (Direct XHTTP Uplink + Reverse KCP-Hop Downlink) -> Edit to Asymmetric-CDN
+	asymEdgeDir := t.TempDir()
+	asymOriginDir := t.TempDir()
+	resAsym, err := CreateEdge(EdgeSpec{
+		Name:         "tasym",
+		Mode:         "direct",
+		Asymmetric:   "on",
+		AsymUplink:   "xhttp",
+		AsymDownlink: "kcp-hop",
+		ServerName:   "www.bing.com",
+		UTLS:         "on",
+		TLSFragment:  "on",
+		Mux:          "on",
+		MuxLinks:     4,
+		PeerIP:       "5.6.7.8",
+		LocalIP:      "1.2.3.4",
+		LinkPort:     2053,
+		UserPorts:    "31709",
+		ServicePorts: "31709",
+	}, asymEdgeDir)
+	if err != nil {
+		t.Fatalf("CreateEdge(asymmetric): %v", err)
+	}
+	pAsym, err := decodePairingCode(resAsym.Code)
+	if err != nil {
+		t.Fatalf("decodePairingCode(asymmetric): %v", err)
+	}
+	if pAsym.Asymmetric != "on" || pAsym.AsymUplink != "xhttp" || pAsym.AsymDownlink != "kcp-hop" || pAsym.RelayIP != "1.2.3.4" {
+		t.Fatalf("unexpected asymmetric pairing fields: %+v", pAsym)
+	}
+	if err := applyPairingData(pAsym, asymOriginDir); err != nil {
+		t.Fatalf("applyPairingData(asymmetric): %v", err)
+	}
+
+	repEdge := TunnelsReport(asymEdgeDir)
+	repOrigin := TunnelsReport(asymOriginDir)
+	if len(repEdge) != 1 || len(repOrigin) != 1 || !repEdge[0].Asymmetric || !repOrigin[0].Asymmetric {
+		t.Fatalf("TunnelsReport missing asymmetric metadata: edge=%+v origin=%+v", repEdge, repOrigin)
+	}
+
+	editAsymCDN, err := EditEdge(EditSpec{
+		Name:         "tasym",
+		Mode:         "direct",
+		Asymmetric:   "on",
+		AsymUplink:   "xhttp",
+		AsymDownlink: "kcp-hop",
+		CDN:          "on",
+		ServerName:   "cdn.example.com",
+		CleanIPs:     "104.16.12.34",
+		Mux:          "on",
+		MuxLinks:     4,
+	}, asymEdgeDir)
+	if err != nil {
+		t.Fatalf("EditEdge(asymmetric-cdn): %v", err)
+	}
+	pAsymCDN, err := decodePairingCode(editAsymCDN.Code)
+	if err != nil {
+		t.Fatalf("decodePairingCode(asymmetric-cdn): %v", err)
+	}
+	if pAsymCDN.Asymmetric != "on" || pAsymCDN.CDN != "on" || pAsymCDN.ServerName != "cdn.example.com" {
+		t.Fatalf("unexpected asymmetric-cdn pairing fields: %+v", pAsymCDN)
+	}
+	if err := updatePairingData(pAsymCDN, asymOriginDir, nil); err != nil {
+		t.Fatalf("updatePairingData(asymmetric-cdn): %v", err)
+	}
+}

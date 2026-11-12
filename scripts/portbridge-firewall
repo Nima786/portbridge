@@ -105,6 +105,11 @@ load() {
     fi
     TRANSPORT=$(read_conf "$conf" transport)
     [ -n "$TRANSPORT" ] || TRANSPORT=plain
+    CDN_ON=$(read_conf "$conf" cdn)
+    ASYMMETRIC=$(read_conf "$conf" asymmetric)
+    ASYM_DOWN_PORT=$(read_conf "$conf" asym_down_port)
+    EXTRA_TCP_PORT=""
+    EXTRA_UDP_PORT=""
     # Missing means on: tunnels made before this setting existed stay protected.
     ENABLED=$(read_conf "$conf" firewall)
     [ -n "$ENABLED" ] || ENABLED=on
@@ -121,6 +126,18 @@ load() {
             ;;
     esac
 
+    if [ "$ASYMMETRIC" = on ] && [ "$mode:$role" = "direct:edge" ]; then
+        LISTENS=yes
+        case "$ASYM_DOWN_PORT" in
+            '' | *[!0-9]*) ;;
+            *)
+                if [ "$ASYM_DOWN_PORT" -ge 1 ] && [ "$ASYM_DOWN_PORT" -le 65535 ]; then
+                    TPORT=$ASYM_DOWN_PORT
+                fi
+                ;;
+        esac
+    fi
+
     case "$TPORT" in
         '' | *[!0-9]*)
             echo "portbridge-firewall: tunnel $name has an unreadable tunnel port: '$tunnel_addr'" >&2
@@ -131,9 +148,22 @@ load() {
     PROTO=tcp
     [ "$TRANSPORT" = kcp ] && PROTO=udp
     [ "$TRANSPORT" = icmp ] && PROTO=icmp
+    if [ "$TRANSPORT" = h3 ]; then
+        if [ "$CDN_ON" = on ]; then
+            PROTO=tcp
+            EXTRA_UDP_PORT=$TPORT
+        else
+            PROTO=udp
+        fi
+    fi
 
     PORT_HOP=$(read_conf "$conf" port_hop)
     PORT_HOP_PORTS=$(read_conf "$conf" port_hop_ports)
+    if [ "$ASYMMETRIC" = on ] && [ "$mode:$role" = "direct:edge" ]; then
+        PROTO=udp
+        PORT_HOP=on
+        EXTRA_TCP_PORT=$TPORT
+    fi
     TPORT_SPEC=$TPORT
     TPORT_NFT=$TPORT
     if [ "$PROTO" = udp ] && [ "$PORT_HOP" = on ]; then
@@ -208,6 +238,16 @@ nft_apply_lock() {
         nft_purge_own "$name"
         return 1
     }
+    if [ -n "$EXTRA_TCP_PORT" ]; then
+        nft add rule inet portbridge "$ch" "$fam" saddr "$PEER" tcp dport "$EXTRA_TCP_PORT" accept comment "\"$tcomment\"" 2>/dev/null || true
+        nft add rule inet portbridge "$ch" "$fam" saddr "$loop" tcp dport "$EXTRA_TCP_PORT" accept comment "\"$tcomment\"" 2>/dev/null || true
+        nft add rule inet portbridge "$ch" tcp dport "$EXTRA_TCP_PORT" drop comment "\"$tcomment\"" 2>/dev/null || true
+    fi
+    if [ -n "$EXTRA_UDP_PORT" ]; then
+        nft add rule inet portbridge "$ch" "$fam" saddr "$PEER" udp dport "$EXTRA_UDP_PORT" accept comment "\"$tcomment\"" 2>/dev/null || true
+        nft add rule inet portbridge "$ch" "$fam" saddr "$loop" udp dport "$EXTRA_UDP_PORT" accept comment "\"$tcomment\"" 2>/dev/null || true
+        nft add rule inet portbridge "$ch" udp dport "$EXTRA_UDP_PORT" drop comment "\"$tcomment\"" 2>/dev/null || true
+    fi
     return 0
 }
 
@@ -236,6 +276,34 @@ add_rule() {
     have "$tool" || return 0
     rule_spec "$name" "$target" "$src"
     "$tool" -C INPUT "${RULE[@]}" 2>/dev/null || "$tool" -I INPUT 1 "${RULE[@]}"
+}
+
+add_proto_port_rule() {
+    local tool=$1 name=$2 proto=$3 port=$4 target=$5 src=${6-}
+    local r=()
+    have "$tool" || return 0
+    [ -n "$src" ] && r+=(-s "$src")
+    r+=(-p "$proto" --dport "$port" -m comment --comment "$(tag "$name")" -j "$target")
+    "$tool" -C INPUT "${r[@]}" 2>/dev/null || "$tool" -I INPUT 1 "${r[@]}"
+}
+
+lock_secondary_proto_port() {
+    local name=$1 proto=$2 port=$3
+    [ -n "$port" ] || return 0
+    if [[ "$PEER" == *:* ]]; then
+        add_proto_port_rule ip6tables "$name" "$proto" "$port" DROP
+        add_proto_port_rule ip6tables "$name" "$proto" "$port" ACCEPT ::1
+        add_proto_port_rule ip6tables "$name" "$proto" "$port" ACCEPT "$PEER"
+        add_proto_port_rule iptables "$name" "$proto" "$port" DROP
+        add_proto_port_rule iptables "$name" "$proto" "$port" ACCEPT 127.0.0.1
+    else
+        add_proto_port_rule iptables "$name" "$proto" "$port" DROP
+        add_proto_port_rule iptables "$name" "$proto" "$port" ACCEPT 127.0.0.1
+        add_proto_port_rule iptables "$name" "$proto" "$port" ACCEPT "$PEER"
+        if have ip6tables; then
+            add_proto_port_rule ip6tables "$name" "$proto" "$port" DROP
+        fi
+    fi
 }
 
 # purge_own <tool> <name> - removes every rule this tunnel added, whatever port
@@ -918,6 +986,9 @@ firewall_apply() {
         fi
         confirm_allowed iptables "$name" "$PEER" || return 0
     fi
+
+    lock_secondary_proto_port "$name" tcp "$EXTRA_TCP_PORT"
+    lock_secondary_proto_port "$name" udp "$EXTRA_UDP_PORT"
 
     echo "tunnel port $TPORT_SPEC ($PROTO) is restricted to $PEER"
 }

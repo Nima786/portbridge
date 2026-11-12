@@ -494,3 +494,111 @@ func TestProbeSessionHonorsAndAvoidsUserPorts(t *testing.T) {
 		t.Fatalf("checkProbeStep rejected server added by hostname: %v", err)
 	}
 }
+
+func TestPhase2H3AndAsymmetricTunnelSpecsAndAutoHeal(t *testing.T) {
+	p, foreignID, foreignDir := twoServers(t)
+	_ = foreignID
+
+	// 1. toSpec mappings & validation for h3, h3-cdn, asymmetric, asymmetric-cdn.
+	h3Spec, err := p.toSpec(createRequest{
+		Name: "q1", Relay: "this", Foreign: "far", Mode: "direct",
+		Link: "h3", ServicePorts: "443", UserPorts: "443", LinkPort: 8443, RelayIP: "198.51.100.1",
+	})
+	if err != nil {
+		t.Fatalf("toSpec(h3) failed: %v", err)
+	}
+	if h3Spec.Transport != "h3" || h3Spec.ServerName != "www.google.com" || h3Spec.CDN == "on" {
+		t.Fatalf("unexpected h3 spec: %+v", h3Spec)
+	}
+
+	if _, err := p.toSpec(createRequest{
+		Name: "q2", Relay: "this", Foreign: "far", Mode: "direct",
+		Link: "h3-cdn", ServicePorts: "443", LinkPort: 443, RelayIP: "198.51.100.1",
+	}); err == nil {
+		t.Fatal("expected toSpec(h3-cdn) without domain to fail")
+	}
+	h3CDNSpec, err := p.toSpec(createRequest{
+		Name: "q2", Relay: "this", Foreign: "far", Mode: "direct",
+		Link: "h3-cdn", Domain: "h3.example.com", CleanIPs: "104.16.1.1",
+		ServicePorts: "443", LinkPort: 443, RelayIP: "198.51.100.1",
+	})
+	if err != nil {
+		t.Fatalf("toSpec(h3-cdn) failed: %v", err)
+	}
+	if h3CDNSpec.Transport != "h3" || h3CDNSpec.CDN != "on" || h3CDNSpec.ServerName != "h3.example.com" {
+		t.Fatalf("unexpected h3-cdn spec: %+v", h3CDNSpec)
+	}
+
+	if _, err := p.toSpec(createRequest{
+		Name: "a0", Relay: "this", Foreign: "far", Mode: "reverse",
+		Link: "asymmetric", ServicePorts: "443", LinkPort: 2053, RelayIP: "198.51.100.1",
+	}); err == nil {
+		t.Fatal("expected toSpec(asymmetric) in reverse mode to fail")
+	}
+	asymSpec, err := p.toSpec(createRequest{
+		Name: "a1", Relay: "this", Foreign: "far", Mode: "direct",
+		Link: "asymmetric", ServicePorts: "443", LinkPort: 2053, RelayIP: "198.51.100.1",
+	})
+	if err != nil {
+		t.Fatalf("toSpec(asymmetric) failed: %v", err)
+	}
+	if asymSpec.Asymmetric != "on" || asymSpec.AsymUplink != "xhttp" || asymSpec.AsymDownlink != "kcp-hop" {
+		t.Fatalf("unexpected asymmetric spec: %+v", asymSpec)
+	}
+
+	asymCDNSpec, err := p.toSpec(createRequest{
+		Name: "a2", Relay: "this", Foreign: "far", Mode: "direct",
+		Link: "asymmetric-cdn", Domain: "cdn.example.com", AsymUplink: "h3", AsymDownPort: 24500,
+		ServicePorts: "443", LinkPort: 2083, RelayIP: "198.51.100.1",
+	})
+	if err != nil {
+		t.Fatalf("toSpec(asymmetric-cdn) failed: %v", err)
+	}
+	if asymCDNSpec.Asymmetric != "on" || asymCDNSpec.CDN != "on" || asymCDNSpec.AsymUplink != "h3" || asymCDNSpec.AsymDownPort != 24500 {
+		t.Fatalf("unexpected asymmetric-cdn spec: %+v", asymCDNSpec)
+	}
+
+	// 2. Full create/join across Relay + Foreign for asymmetric tunnel.
+	asymReq := newTunnel("asymshop")
+	asymReq.Mode = "direct"
+	asymReq.Link = "asymmetric"
+	asymReq.LinkPort = 2053
+	asymReq.AsymDownPort = 25010
+	if v := waitJob(t, p, mustCreate(t, p, asymReq)); v.Error != "" {
+		t.Fatalf("creating asymmetric tunnel failed: %s\n%s", v.Error, strings.Join(v.Lines, "\n"))
+	}
+	edges, origins := agent.TunnelsReport(p.tunnelsDir), agent.TunnelsReport(foreignDir)
+	if len(edges) != 1 || len(origins) != 1 {
+		t.Fatalf("expected 1 tunnel on each side, got %+v / %+v", edges, origins)
+	}
+	if !edges[0].Asymmetric || !origins[0].Asymmetric || edges[0].AsymUplink != "xhttp" || origins[0].AsymDownlink != "kcp-hop" {
+		t.Fatalf("asymmetric flags not paired properly: edge=%+v origin=%+v", edges[0], origins[0])
+	}
+
+	// 3. Auto-Heal pickBestCandidate selects synthesized Asymmetric Hybrid when top-ranked.
+	rep := &engine.ProbeBenchmarkReport{
+		Results: []engine.ProbeCandidateResult{
+			{
+				ProbeCandidateSpec: engine.ProbeCandidateSpec{
+					ID: "direct-asymmetric", Mode: "direct", Transport: "xhttp",
+					Asymmetric: true, AsymUplink: "xhttp", AsymDownlink: "kcp-hop", Port: 2053,
+				},
+				Hybrid: true, Status: "ok", Score: 96,
+			},
+			{
+				ProbeCandidateSpec: engine.ProbeCandidateSpec{
+					ID: "direct-tls-v4", Mode: "direct", Transport: "tls", Port: 8443,
+				},
+				Status: "ok", Score: 82,
+			},
+		},
+	}
+	cur := agent.TunnelInfo{Name: "main", Mode: "direct", Transport: "tls", LinkPort: 8443}
+	best, ok := p.healer.pickBestCandidate(rep, cur, false)
+	if !ok || best.ID != "direct-asymmetric" || !best.Asymmetric {
+		t.Fatalf("expected pickBestCandidate to select direct-asymmetric, got ok=%v best=%+v", ok, best)
+	}
+	if desc := describeCandidate(best); !strings.Contains(desc, "ASYMMETRIC") {
+		t.Fatalf("unexpected describeCandidate output: %q", desc)
+	}
+}

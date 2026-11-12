@@ -1162,7 +1162,17 @@
     const m = raw.match(/\(([^(),]+)\)/);
     const host = m ? m[1] : '';
     const sniSuffix = any.sni_spoof ? ' + Decoy SNI' : '';
+    if (any.asymmetric || /asymmetric/i.test(raw)) {
+      const up = String(any.asym_uplink || 'xhttp').toUpperCase();
+      const dn = String(any.asym_downlink || 'kcp-hop').toUpperCase();
+      if (any.cdn) return (host ? `Asymmetric CDN (${host})` : `Asymmetric (CDN ${up}↑ + ${dn}↓)`);
+      return `Asymmetric (${up}↑ + ${dn}↓)`;
+    }
     if (/CDN backup/i.test(raw)) return (host ? `HTTPS (${host}) + CDN` : 'HTTPS + CDN Backup') + sniSuffix;
+    if (any.transport === 'h3' || /HTTP\/3|QUIC/i.test(raw)) {
+      if (any.cdn || /through a CDN/i.test(raw)) return (host ? `HTTP/3 + CDN (${host})` : 'HTTP/3 + CDN') + sniSuffix;
+      return (host ? `QUIC / HTTP/3 (${host})` : 'QUIC / HTTP/3') + sniSuffix;
+    }
     if (/SplitHTTP|XHTTP/i.test(raw) || any.transport === 'xhttp') {
       if (any.cdn || /through a CDN/i.test(raw)) return (host ? `XHTTP + CDN (${host})` : 'XHTTP + CDN') + sniSuffix;
       return (host ? `XHTTP (${host})` : 'SplitHTTP / XHTTP') + sniSuffix;
@@ -1229,6 +1239,7 @@
     if (/fragmented/i.test(combinedLinkDesc)) extraTags.push('Stealth (uTLS + Frag)');
     else if (/browser TLS/i.test(combinedLinkDesc)) extraTags.push('uTLS');
     if (any.sit) extraTags.push('6in4 (Protocol 41)');
+    if (any.asymmetric) extraTags.push(`Dual-Path (${String(any.asym_uplink || 'xhttp').toUpperCase()}↑ + ${String(any.asym_downlink || 'kcp-hop').toUpperCase()}↓)`);
     if (any.anti_freeze) extraTags.push('Anti-Freeze (24KB Rotation)');
     if (any.port_hop) extraTags.push(`Port-Hop (${any.port_hop_ports || 8} UDP ports)`);
     if (any.sni_spoof) extraTags.push(`Decoy SNI (${any.spoof_sni || 'challenges.cloudflare.com'})`);
@@ -1386,23 +1397,25 @@
     if (!any) return 'website';
     if (any.gre) return 'gre';
     if (any.sit) return 'sit';
+    if (any.asymmetric) return any.cdn ? 'asymmetric-cdn' : 'asymmetric';
     if (any.ip_spoof) return 'ip-spoof';
     if (any.port_hop) return 'kcp-hop';
     if (any.anti_freeze) return 'split';
     if (any.sni_spoof && !any.cdn) return 'sni-spoof';
     if (any.cdn && any.transport === 'xhttp') return 'xhttp-cdn';
+    if (any.cdn && any.transport === 'h3') return 'h3-cdn';
     if (any.cdn && any.transport === 'grpc') return 'grpc-cdn';
     if (any.cdn && any.alt_target) return 'website-cdn-backup';
     if (any.cdn) return 'cdn';
-    if (['xhttp', 'grpc', 'kcp', 'icmp', 'faketcp', 'plain'].includes(any.transport)) return any.transport;
+    if (['xhttp', 'h3', 'grpc', 'kcp', 'icmp', 'faketcp', 'plain'].includes(any.transport)) return any.transport;
     return 'website';
   }
 
   function recommendCapacityFor(linkKey, loadPreset) {
     const preset = ['light', 'medium', 'heavy'].includes(loadPreset) ? loadPreset : 'light';
     const isRawKCP = ['icmp', 'faketcp', 'ip-spoof'].includes(linkKey);
-    const isCDN = ['cdn', 'website-cdn-backup', 'xhttp-cdn', 'grpc-cdn'].includes(linkKey);
-    const isMuxFirst = ['split', 'xhttp', 'grpc', 'kcp', 'kcp-hop'].includes(linkKey);
+    const isCDN = ['cdn', 'website-cdn-backup', 'xhttp-cdn', 'h3-cdn', 'asymmetric-cdn', 'grpc-cdn'].includes(linkKey);
+    const isMuxFirst = ['split', 'xhttp', 'h3', 'asymmetric', 'grpc', 'kcp', 'kcp-hop'].includes(linkKey);
 
     if (isRawKCP) {
       if (preset === 'heavy') return { shared: true, muxLinks: 4, pool: 100, maxConn: 8000 };
@@ -1438,7 +1451,7 @@
 
   function describeCapacityAdvice(linkKey, isShared, poolSize, muxLinks, maxConn) {
     const isRawKCP = ['icmp', 'faketcp', 'ip-spoof'].includes(linkKey);
-    const isCDN = ['cdn', 'website-cdn-backup', 'xhttp-cdn', 'grpc-cdn'].includes(linkKey);
+    const isCDN = ['cdn', 'website-cdn-backup', 'xhttp-cdn', 'h3-cdn', 'asymmetric-cdn', 'grpc-cdn'].includes(linkKey);
     const sessions = (maxConn || 2000).toLocaleString();
     if (isRawKCP) {
       if (!isShared) {
@@ -2802,18 +2815,22 @@
     $('tn-links').hidden = gre;
     const backup = $('tn-backup-choice');
     backup.hidden = mode !== 'direct';
-    if (mode !== 'direct' && radio('tn-link') === 'website-cdn-backup') setRadio('tn-link', 'website');
+    if ($('tn-asym-choice')) $('tn-asym-choice').hidden = mode !== 'direct';
+    if ($('tn-asym-cdn-choice')) $('tn-asym-cdn-choice').hidden = mode !== 'direct';
+    if (mode !== 'direct' && ['website-cdn-backup', 'asymmetric', 'asymmetric-cdn'].includes(radio('tn-link'))) {
+      setRadio('tn-link', 'website');
+    }
     const link = gre ? 'plain' : radio('tn-link');
     $('tn-opt-webheader').hidden = gre || link !== 'plain';
     $('tn-webhost').disabled = !$('tn-webheader').checked;
-    $('tn-opt-claim').hidden = !['website', 'split', 'sit', 'website-cdn-backup', 'xhttp', 'grpc'].includes(link);
-    const needDomain = ['cdn', 'website-cdn-backup', 'xhttp-cdn', 'grpc-cdn'].includes(link);
+    $('tn-opt-claim').hidden = !['website', 'split', 'sit', 'website-cdn-backup', 'xhttp', 'h3', 'asymmetric', 'grpc'].includes(link);
+    const needDomain = ['cdn', 'website-cdn-backup', 'xhttp-cdn', 'h3-cdn', 'asymmetric-cdn', 'grpc-cdn'].includes(link);
     $('tn-opt-domain').hidden = !needDomain;
     if (needDomain) ensureTunnelCFHelper();
-    $('tn-opt-clean').hidden = !['cdn', 'xhttp-cdn', 'grpc-cdn'].includes(link);
+    $('tn-opt-clean').hidden = !['cdn', 'xhttp-cdn', 'h3-cdn', 'asymmetric-cdn', 'grpc-cdn'].includes(link);
     $('tn-opt-stealth').hidden = !['website', 'split', 'sit', 'sni-spoof', 'xhttp', 'grpc'].includes(link);
     if ($('tn-opt-snispoof')) {
-      $('tn-opt-snispoof').hidden = gre || ['kcp', 'kcp-hop', 'icmp', 'faketcp', 'sit'].includes(link);
+      $('tn-opt-snispoof').hidden = gre || ['kcp', 'kcp-hop', 'h3', 'h3-cdn', 'asymmetric', 'asymmetric-cdn', 'icmp', 'faketcp', 'sit'].includes(link);
       if (link === 'ip-spoof' || link === 'sni-spoof') {
         $('tn-snispoof').checked = true;
         $('tn-snispoof').disabled = true;
@@ -2826,9 +2843,9 @@
     if ($('tn-opt-ipspoof')) {
       $('tn-opt-ipspoof').hidden = gre || link !== 'ip-spoof';
     }
-    if (link === 'grpc' && $('tn-claim').value === 'www.bing.com') $('tn-claim').value = 'www.google.com';
-    if (link !== 'grpc' && $('tn-claim').value === 'www.google.com') $('tn-claim').value = 'www.bing.com';
-    const v6ok = !gre && ['plain', 'website', 'split', 'sni-spoof', 'xhttp', 'grpc', 'kcp', 'kcp-hop'].includes(link) &&
+    if (['grpc', 'h3'].includes(link) && $('tn-claim').value === 'www.bing.com') $('tn-claim').value = 'www.google.com';
+    if (!['grpc', 'h3'].includes(link) && $('tn-claim').value === 'www.google.com') $('tn-claim').value = 'www.bing.com';
+    const v6ok = !gre && ['plain', 'website', 'split', 'sni-spoof', 'xhttp', 'h3', 'grpc', 'kcp', 'kcp-hop'].includes(link) &&
       hasIPv6(serverById($('tn-relay').value)) && hasIPv6(serverById($('tn-foreign').value));
     $('tn-ipv6-row').hidden = !v6ok;
     if (!v6ok) $('tn-ipv6').checked = false;
@@ -2836,6 +2853,9 @@
     const loadPreset = radio('tn-load') || 'light';
     if (!sharingTouched && loadPreset !== 'custom') {
       applyCreateLoadPreset(loadPreset);
+    }
+    if (['asymmetric', 'asymmetric-cdn'].includes(link)) {
+      setRadio('tn-shared', 'shared');
     }
     const isShared = radio('tn-shared') === 'shared';
     if ($('tn-pool-wrap')) $('tn-pool-wrap').hidden = isShared;
@@ -3319,7 +3339,10 @@
     }
     $('tn-gre').checked = false;
     setRadio('tn-mode', cand.mode === 'reverse' ? 'reverse' : 'direct');
-    setRadio('tn-link', cand.ip_spoof ? 'ip-spoof' : (cand.port_hop ? 'kcp-hop' : (cand.anti_freeze ? 'split' : (cand.sni_spoof ? 'sni-spoof' : (cand.link || 'website')))));
+    const resolvedLink = cand.asymmetric
+      ? (cand.cdn ? 'asymmetric-cdn' : 'asymmetric')
+      : (cand.ip_spoof ? 'ip-spoof' : (cand.port_hop ? 'kcp-hop' : (cand.anti_freeze ? 'split' : (cand.sni_spoof ? 'sni-spoof' : (cand.link || 'website')))));
+    setRadio('tn-link', resolvedLink);
     $('tn-stealth').checked = !!cand.stealth;
     $('tn-webheader').checked = !!cand.web_header;
     $('tn-ipv6').checked = !!cand.ipv6;
@@ -3332,7 +3355,7 @@
     if (cand.spoof_ip && $('tn-spoofip')) {
       $('tn-spoofip').value = cand.spoof_ip;
     }
-    if (cand.server_name && ['website', 'split', 'sit', 'website-cdn-backup', 'xhttp', 'grpc'].includes(cand.link)) {
+    if (cand.server_name && ['website', 'split', 'sit', 'website-cdn-backup', 'xhttp', 'h3', 'asymmetric', 'grpc'].includes(resolvedLink)) {
       $('tn-claim').value = cand.server_name;
     }
     if (cand.domain) {
@@ -3752,12 +3775,14 @@
   function tunnelRequest() {
     const gre = $('tn-gre').checked;
     const link = gre ? 'plain' : radio('tn-link');
-    const shared = radio('tn-shared') === 'shared';
+    const asymmetric = !gre && (link === 'asymmetric' || link === 'asymmetric-cdn');
+    const shared = asymmetric || radio('tn-shared') === 'shared';
     const ipSpoof = !gre && link === 'ip-spoof';
     const sit = !gre && link === 'sit';
     const antiFreeze = !gre && link === 'split';
     const portHop = !gre && link === 'kcp-hop';
-    const sniSpoof = !gre && !sit && !portHop && (ipSpoof || link === 'sni-spoof' || ($('tn-snispoof') && !$('tn-opt-snispoof').hidden && $('tn-snispoof').checked));
+    const isH3 = !gre && (link === 'h3' || link === 'h3-cdn');
+    const sniSpoof = !gre && !sit && !portHop && !asymmetric && !isH3 && (ipSpoof || link === 'sni-spoof' || ($('tn-snispoof') && !$('tn-opt-snispoof').hidden && $('tn-snispoof').checked));
     return {
       name: $('tn-name').value.trim(),
       relay: $('tn-relay').value,
@@ -3767,10 +3792,10 @@
       server_name: $('tn-claim').value.trim(),
       domain: $('tn-domain').value.trim(),
       clean_ips: $('tn-cleanips').value.replace(/\s+/g, ''),
-      stealth: ['sni-spoof', 'split'].includes(link) || $('tn-stealth').checked,
+      stealth: ['sni-spoof', 'split', 'asymmetric'].includes(link) || $('tn-stealth').checked,
       web_header: !gre && $('tn-webheader').checked,
       web_host: $('tn-webhost').value.trim(),
-      real_site: $('tn-realsite').checked,
+      real_site: !asymmetric && !isH3 && $('tn-realsite').checked,
       sni_spoof: sniSpoof,
       spoof_sni: $('tn-spoofsni') ? $('tn-spoofsni').value.trim() : '',
       ip_spoof: ipSpoof,
@@ -3779,6 +3804,7 @@
       sit,
       anti_freeze: antiFreeze,
       port_hop: portHop,
+      asymmetric,
       ipv6: $('tn-ipv6').checked,
       shared,
       shared_links: shared ? Number($('tn-links-n').value || 4) : 0,
@@ -3953,7 +3979,7 @@
       return;
     }
     out.replaceChildren(h('li', null, 'Checking ports on both servers...'));
-    const relayPorts = users + (r.mode === 'reverse' ? ',' + r.link_port : '');
+    const relayPorts = users + ((r.mode === 'reverse' || r.asymmetric) ? ',' + r.link_port : '');
     const foreignPorts = r.service_ports + (r.mode === 'direct' ? ',' + r.link_port : '');
     const describe = async (server, list, role) => {
       const s = serverById(server);
@@ -3961,7 +3987,7 @@
         const res = await api('POST', '/api/ports', { server, ports: list });
         return res.ports.map((p) => {
           let what = 'User listen port';
-          if (p.port === r.link_port && ((role === 'relay' && r.mode === 'reverse') || (role === 'foreign' && r.mode === 'direct'))) what = 'Tunnel bridge port';
+          if (p.port === r.link_port && ((role === 'relay' && (r.mode === 'reverse' || r.asymmetric)) || (role === 'foreign' && r.mode === 'direct'))) what = 'Tunnel bridge port';
           else if (role === 'foreign') what = 'Inbound port';
           const by = p.by ? ` (${p.by.replace(/^PortBridge /, '')})` : '';
           let cls = 'good', text;
@@ -3997,7 +4023,7 @@
       return fail('The number of User Listen Ports must match the number of Inbound Ports.', $('tn-users'));
     }
     if (!(r.link_port >= 1 && r.link_port <= 65535)) return fail('Tunnel Bridge Port must be between 1 and 65535.', $('tn-linkport'));
-    if (['cdn', 'website-cdn-backup', 'xhttp-cdn', 'grpc-cdn'].includes(r.link) && !r.domain) return fail('Enter your CDN domain.', $('tn-domain'));
+    if (['cdn', 'website-cdn-backup', 'xhttp-cdn', 'h3-cdn', 'asymmetric-cdn', 'grpc-cdn'].includes(r.link) && !r.domain) return fail('Enter your CDN domain.', $('tn-domain'));
     if (!r.shared && !(r.pool >= 1 && r.pool <= 10000)) return fail('Connection Pool Size must be between 1 and 10000.', $('tn-pool'));
     if (r.shared && !(r.shared_links >= 1 && r.shared_links <= 16)) return fail('Number of shared Mux connections must be between 1 and 16.', $('tn-links-n'));
     if (!(r.max_conn >= 1 && r.max_conn <= 100000)) return fail('Max Concurrent User Sessions must be between 1 and 100000.', $('tn-max-conn'));
@@ -4887,12 +4913,14 @@
             name,
             relay,
             foreign,
-            mode: radio('wb-mode') || 'direct',
+            mode: link === 'asymmetric' ? 'direct' : (radio('wb-mode') || 'direct'),
             link,
+            asymmetric: link === 'asymmetric',
+            port_hop: link === 'kcp-hop',
             server_name: sni,
             spoof_sni: link === 'sni-spoof' ? sni : '',
             stealth: true,
-            real_site: true,
+            real_site: !['asymmetric', 'h3', 'kcp', 'kcp-hop', 'plain'].includes(link),
             shared: true,
             shared_links: muxLinks,
             max_conn: maxConn,
@@ -4900,7 +4928,7 @@
             user_ports: webPorts,
             link_port: linkPort,
             proxy_protocol: proxyProto,
-            ipv6: !!($('wb-ipv6') && $('wb-ipv6').checked),
+            ipv6: link === 'asymmetric' ? false : !!($('wb-ipv6') && $('wb-ipv6').checked),
             auto_heal: $('wb-autoheal').checked,
             website_bridge: true,
             website_domains: domains,

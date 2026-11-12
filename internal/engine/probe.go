@@ -34,27 +34,30 @@ var CDNHTTPSPorts = []int{2053, 2083, 2087, 2096, 8443, 443}
 
 // ProbeCandidateSpec describes one tunnel configuration to benchmark.
 type ProbeCandidateSpec struct {
-	ID         string `json:"id"`
-	Label      string `json:"label"`
-	Mode       string `json:"mode"`       // "direct" or "reverse"
-	Link       string `json:"link"`       // panel/CLI link key: "website", "sni-spoof", "split", "website-cdn-backup", "cdn", "grpc", "grpc-cdn", "kcp", "ip-spoof", "faketcp", "icmp", "plain"
-	Transport  string `json:"transport"`  // engine transport: "tls", "wss", "grpc", "kcp", "icmp", "faketcp", "plain"
-	Stealth    bool   `json:"stealth"`    // uTLS browser fingerprint + ClientHello fragmentation
-	WebHeader  bool   `json:"web_header"` // HTTP header obfuscation on plain TCP
-	SNISpoof   bool   `json:"sni_spoof,omitempty"`
-	SpoofSNI   string `json:"spoof_sni,omitempty"`
-	IPSpoof    bool   `json:"ip_spoof,omitempty"`
-	SpoofIP    string `json:"spoof_ip,omitempty"`
-	AntiFreeze bool   `json:"anti_freeze,omitempty"`
-	PortHop    bool   `json:"port_hop,omitempty"`
-	CDN        bool   `json:"cdn"`
-	IPv6       bool   `json:"ipv6"`
-	Shared     bool   `json:"shared"` // recommended pooling mode (mux vs pool)
-	Gaming     bool   `json:"gaming,omitempty"`
-	ServerName string `json:"server_name,omitempty"`
-	Domain     string `json:"domain,omitempty"`
-	TargetAddr string `json:"target_addr"` // host:port to dial
-	Port       int    `json:"port"`
+	ID           string `json:"id"`
+	Label        string `json:"label"`
+	Mode         string `json:"mode"`       // "direct" or "reverse"
+	Link         string `json:"link"`       // panel/CLI link key: "website", "sni-spoof", "split", "website-cdn-backup", "cdn", "grpc", "grpc-cdn", "kcp", "ip-spoof", "faketcp", "icmp", "plain"
+	Transport    string `json:"transport"`  // engine transport: "tls", "wss", "grpc", "kcp", "icmp", "faketcp", "plain"
+	Stealth      bool   `json:"stealth"`    // uTLS browser fingerprint + ClientHello fragmentation
+	WebHeader    bool   `json:"web_header"` // HTTP header obfuscation on plain TCP
+	SNISpoof     bool   `json:"sni_spoof,omitempty"`
+	SpoofSNI     string `json:"spoof_sni,omitempty"`
+	IPSpoof      bool   `json:"ip_spoof,omitempty"`
+	SpoofIP      string `json:"spoof_ip,omitempty"`
+	AntiFreeze   bool   `json:"anti_freeze,omitempty"`
+	PortHop      bool   `json:"port_hop,omitempty"`
+	Asymmetric   bool   `json:"asymmetric,omitempty"`
+	AsymUplink   string `json:"asym_uplink,omitempty"`
+	AsymDownlink string `json:"asym_downlink,omitempty"`
+	CDN          bool   `json:"cdn"`
+	IPv6         bool   `json:"ipv6"`
+	Shared       bool   `json:"shared"` // recommended pooling mode (mux vs pool)
+	Gaming       bool   `json:"gaming,omitempty"`
+	ServerName   string `json:"server_name,omitempty"`
+	Domain       string `json:"domain,omitempty"`
+	TargetAddr   string `json:"target_addr"` // host:port to dial
+	Port         int    `json:"port"`
 }
 
 // ProbeCandidateResult holds the measured metrics and computed score for one candidate.
@@ -95,6 +98,8 @@ type ProbeListener struct {
 	tcpLn     net.Listener
 	kcpLn     net.Listener
 	kcp6Ln    net.Listener // IPv6-only UDP; nil when bound to one address
+	h3Ln      net.Listener
+	h36Ln     net.Listener
 	icmpLn    net.Listener
 	fakeTCPLn net.Listener
 	splitMgr  *splitSessionManager
@@ -204,6 +209,11 @@ func StartProbeListenerAvoiding(bindHost string, preferredPort int, avoid map[in
 	}
 	probeKCPDefaults(kcpCfg)
 
+	h3Cfg := &Config{
+		Transport: TransportH3,
+		secret:    secret,
+	}
+
 	listenHost := bindHost
 	if listenHost == "0.0.0.0" {
 		listenHost = ""
@@ -211,6 +221,7 @@ func StartProbeListenerAvoiding(bindHost string, preferredPort int, avoid map[in
 
 	var tcpLn net.Listener
 	var kcpLn net.Listener
+	var h3Ln net.Listener
 	var chosenPort int
 
 	for _, port := range candidates {
@@ -225,13 +236,45 @@ func StartProbeListenerAvoiding(bindHost string, preferredPort int, avoid map[in
 			continue
 		}
 		uaddr := net.JoinHostPort(listenHost, strconv.Itoa(actualPort))
-		uln, err := kcpListen(uaddr, kcpCfg)
+		laddr4, err := net.ResolveUDPAddr("udp4", uaddr)
 		if err != nil {
+			_ = tln.Close()
+			continue
+		}
+		u4, err := net.ListenUDP("udp4", laddr4)
+		if err != nil {
+			_ = tln.Close()
+			continue
+		}
+		tuneUDPSocket(u4)
+		spoofPC, err := newSpoofPacketConn(u4, kcpCfg, nil)
+		if err != nil {
+			_ = u4.Close()
+			_ = tln.Close()
+			continue
+		}
+		quicPC4, otherPC4 := demuxQUICAndPacketConn(spoofPC)
+		var kcpPC4 net.PacketConn = otherPC4
+		if hop4, hopErr := wrapPortHopListenConn(otherPC4, "udp4", 4, secret, true, avoid); hopErr == nil {
+			kcpPC4 = hop4
+		}
+		uln, err := kcpServePacketConn(kcpPC4, kcpCfg)
+		if err != nil {
+			_ = quicPC4.Close()
+			_ = kcpPC4.Close()
+			_ = tln.Close()
+			continue
+		}
+		hln4, err := h3ListenPacketConn(quicPC4, true, h3Cfg, &cert, nil)
+		if err != nil {
+			_ = quicPC4.Close()
+			_ = uln.Close()
 			_ = tln.Close()
 			continue
 		}
 		tcpLn = tln
 		kcpLn = uln
+		h3Ln = hln4
 		chosenPort = actualPort
 		break
 	}
@@ -262,8 +305,10 @@ func StartProbeListenerAvoiding(bindHost string, preferredPort int, avoid map[in
 	// UDP socket on the same port. Without it the IPv6 KCP candidate always
 	// timed out, though a real KCP tunnel over IPv6 works.
 	var kcp6Ln net.Listener
+	var h36Ln net.Listener
 	if listenHost == "" {
 		if u6, err := net.ListenUDP("udp6", &net.UDPAddr{IP: net.IPv6unspecified, Port: chosenPort}); err == nil {
+			tuneUDPSocket(u6)
 			kcp6Cfg := &Config{
 				Transport:       TransportKCP,
 				secret:          secret,
@@ -272,14 +317,20 @@ func StartProbeListenerAvoiding(bindHost string, preferredPort int, avoid map[in
 				allowPlainKCP:   true,
 			}
 			probeKCPDefaults(kcp6Cfg)
-			var pc6 net.PacketConn = u6
-			if hop6, hopErr := wrapPortHopListenConn(u6, "udp6", 4, secret, true, avoid); hopErr == nil {
+			quicPC6, otherPC6 := demuxQUICAndPacketConn(u6)
+			var pc6 net.PacketConn = otherPC6
+			if hop6, hopErr := wrapPortHopListenConn(otherPC6, "udp6", 4, secret, true, avoid); hopErr == nil {
 				pc6 = hop6
 			}
 			if ln6, err := kcpServePacketConn(pc6, kcp6Cfg); err == nil {
 				kcp6Ln = ln6
 			} else {
 				_ = pc6.Close()
+			}
+			if hln6, err := h3ListenPacketConn(quicPC6, true, h3Cfg, &cert, nil); err == nil {
+				h36Ln = hln6
+			} else {
+				_ = quicPC6.Close()
 			}
 		}
 	}
@@ -290,6 +341,8 @@ func StartProbeListenerAvoiding(bindHost string, preferredPort int, avoid map[in
 		tcpLn:     tcpLn,
 		kcpLn:     kcpLn,
 		kcp6Ln:    kcp6Ln,
+		h3Ln:      h3Ln,
+		h36Ln:     h36Ln,
 		icmpLn:    icmpLn,
 		fakeTCPLn: fakeTCPLn,
 		splitMgr:  newSplitSessionManager(),
@@ -302,6 +355,12 @@ func StartProbeListenerAvoiding(bindHost string, preferredPort int, avoid map[in
 	go pl.servePacketLn(pl.kcpLn)
 	if pl.kcp6Ln != nil {
 		go pl.servePacketLn(pl.kcp6Ln)
+	}
+	if pl.h3Ln != nil {
+		go pl.servePacketLn(pl.h3Ln)
+	}
+	if pl.h36Ln != nil {
+		go pl.servePacketLn(pl.h36Ln)
 	}
 	if pl.icmpLn != nil {
 		go pl.servePacketLn(pl.icmpLn)
@@ -326,6 +385,12 @@ func (pl *ProbeListener) Close() {
 		}
 		if pl.kcp6Ln != nil {
 			_ = pl.kcp6Ln.Close()
+		}
+		if pl.h3Ln != nil {
+			_ = pl.h3Ln.Close()
+		}
+		if pl.h36Ln != nil {
+			_ = pl.h36Ln.Close()
 		}
 		if pl.icmpLn != nil {
 			_ = pl.icmpLn.Close()
@@ -647,6 +712,17 @@ func BuildProbeCandidates(mode, ipv4, ipv6 string, port int, cdnDomain string) [
 				Port:       port,
 			},
 			ProbeCandidateSpec{
+				ID:         mode + "-h3",
+				Label:      v4Label + " · QUIC / HTTP/3 Masquerade (UDP)",
+				Mode:       mode,
+				Link:       "h3",
+				Transport:  string(TransportH3),
+				Shared:     true,
+				ServerName: "www.google.com",
+				TargetAddr: addr4,
+				Port:       port,
+			},
+			ProbeCandidateSpec{
 				ID:         mode + "-kcp",
 				Label:      v4Label + " · KCP over UDP (FEC)",
 				Mode:       mode,
@@ -842,6 +918,18 @@ func BuildProbeCandidates(mode, ipv4, ipv6 string, port int, cdnDomain string) [
 				Port:       port,
 			},
 			ProbeCandidateSpec{
+				ID:         mode + "-ipv6-h3",
+				Label:      dirLabel + " (IPv6) · QUIC / HTTP/3 Masquerade (UDP)",
+				Mode:       mode,
+				Link:       "h3",
+				Transport:  string(TransportH3),
+				IPv6:       true,
+				Shared:     true,
+				ServerName: "www.google.com",
+				TargetAddr: addr6,
+				Port:       port,
+			},
+			ProbeCandidateSpec{
 				ID:         mode + "-ipv6-split",
 				Label:      dirLabel + " (IPv6) · Split-Stream TLS (Anti-Freeze Rotation)",
 				Mode:       mode,
@@ -906,6 +994,19 @@ func BuildProbeCandidates(mode, ipv4, ipv6 string, port int, cdnDomain string) [
 				Port:       port,
 			},
 			ProbeCandidateSpec{
+				ID:         "direct-cdn-h3",
+				Label:      "Direct · Cloudflare CDN (QUIC / HTTP/3)",
+				Mode:       "direct",
+				Link:       "h3-cdn",
+				Transport:  string(TransportH3),
+				CDN:        true,
+				Shared:     true,
+				ServerName: cdnDomain,
+				Domain:     cdnDomain,
+				TargetAddr: cdnAddr,
+				Port:       port,
+			},
+			ProbeCandidateSpec{
 				ID:         "direct-cdn-grpc",
 				Label:      "Direct · Cloudflare CDN (gRPC)",
 				Mode:       "direct",
@@ -938,7 +1039,7 @@ func RunProbeDialer(ctx context.Context, specs []ProbeCandidateSpec, secret []by
 		if ctx.Err() != nil {
 			break
 		}
-		isTCPDirect := !spec.CDN && !Transport(spec.Transport).IsPacketBased() && spec.TargetAddr != ""
+		isTCPDirect := !spec.CDN && !Transport(spec.Transport).IsPacketBased() && spec.Transport != string(TransportH3) && spec.TargetAddr != ""
 		if isTCPDirect && deadTCP[spec.TargetAddr] >= 2 {
 			results = append(results, ProbeCandidateResult{
 				ProbeCandidateSpec: spec,
@@ -1191,7 +1292,9 @@ func runSingleProbeAttempt(parentCtx context.Context, cfg *Config, routes *route
 		return 0, nil, 0, 0, "", fmt.Errorf("tcp dial: %w", err)
 	}
 	defer raw.Close()
-	tuneSocket(raw)
+	if !cfg.Transport.IsPacketBased() && cfg.Transport != TransportH3 {
+		tuneSocket(raw)
+	}
 
 	// Ensure that if ctx expires, raw is immediately interrupted even if wrapDialTLSOnce
 	// sets a longer internal deadline during the TLS handshake.
@@ -1661,6 +1764,9 @@ func FinalizeProbeReport(results []ProbeCandidateResult, cdnDomain string) *Prob
 	// (skipped in Gaming mode where lowest ping & jitter without CDN hops wins).
 	var bestDirectTLS *ProbeCandidateResult
 	var bestCDNWS *ProbeCandidateResult
+	var bestDirectAsymUp *ProbeCandidateResult
+	var bestCDNAsymUp *ProbeCandidateResult
+	var bestRevAsymDown *ProbeCandidateResult
 	if !isGaming {
 		for i := range results {
 			r := &results[i]
@@ -1674,6 +1780,24 @@ func FinalizeProbeReport(results []ProbeCandidateResult, cdnDomain string) *Prob
 			}
 			if r.Mode == "direct" && r.Link == "cdn" {
 				bestCDNWS = r
+			}
+			if r.Mode == "direct" && !r.CDN && !r.IPv6 &&
+				(r.Link == "xhttp" || r.Link == "split" || r.Link == "website" || r.Link == "sni-spoof" || r.Link == "h3") {
+				if bestDirectAsymUp == nil || asymUpPreference(r) > asymUpPreference(bestDirectAsymUp) {
+					bestDirectAsymUp = r
+				}
+			}
+			if r.Mode == "direct" && r.CDN &&
+				(r.Link == "xhttp-cdn" || r.Link == "cdn" || r.Link == "h3-cdn") {
+				if bestCDNAsymUp == nil || asymUpPreference(r) > asymUpPreference(bestCDNAsymUp) {
+					bestCDNAsymUp = r
+				}
+			}
+			if r.Mode == "reverse" && !r.IPv6 &&
+				(r.Link == "kcp-hop" || r.Link == "kcp" || r.Link == "h3" || r.Link == "website") {
+				if bestRevAsymDown == nil || asymDownPreference(r) > asymDownPreference(bestRevAsymDown) {
+					bestRevAsymDown = r
+				}
 			}
 		}
 	}
@@ -1719,6 +1843,111 @@ func FinalizeProbeReport(results []ProbeCandidateResult, cdnDomain string) *Prob
 				bestDirectTLS.AvgMbps, dom),
 		}
 		results = append(results, hybrid)
+	}
+
+	// Synthesize Asymmetric Dual-Path Hybrid (Direct Stealth Uplink + Reverse Downlink)
+	// when both directions were tested and pairing yields strong dual-path performance.
+	if bestDirectAsymUp != nil && bestRevAsymDown != nil {
+		upProto := mapLinkToAsymUplink(bestDirectAsymUp.Link)
+		dnProto := mapLinkToAsymDownlink(bestRevAsymDown.Link)
+		dl := bestRevAsymDown.DownMbps
+		ul := bestDirectAsymUp.UpMbps
+		avg := round1((dl + ul) / 2.0)
+		asym := ProbeCandidateResult{
+			ProbeCandidateSpec: ProbeCandidateSpec{
+				ID:           "direct-asymmetric",
+				Label:        fmt.Sprintf("Direct · Asymmetric Hybrid (%s ↑ + Reverse %s ↓)", strings.ToUpper(upProto), strings.ToUpper(dnProto)),
+				Mode:         "direct",
+				Link:         "asymmetric",
+				Transport:    bestDirectAsymUp.Transport,
+				Stealth:      bestDirectAsymUp.Stealth,
+				Asymmetric:   true,
+				AsymUplink:   upProto,
+				AsymDownlink: dnProto,
+				Shared:       true,
+				ServerName:   bestDirectAsymUp.ServerName,
+				TargetAddr:   bestDirectAsymUp.TargetAddr,
+				Port:         bestDirectAsymUp.Port,
+			},
+			Status:      "ok",
+			Attempts:    bestDirectAsymUp.Attempts + bestRevAsymDown.Attempts,
+			Successes:   bestDirectAsymUp.Successes + bestRevAsymDown.Successes,
+			HandshakeMS: round2(math.Max(bestDirectAsymUp.HandshakeMS, bestRevAsymDown.HandshakeMS)),
+			RTTMS:       round2((bestDirectAsymUp.RTTMS + bestRevAsymDown.RTTMS) / 2.0),
+			JitterMS:    round2((bestDirectAsymUp.JitterMS + bestRevAsymDown.JitterMS) / 2.0),
+			DownMbps:    dl,
+			UpMbps:      ul,
+			AvgMbps:     avg,
+			Hybrid:      true,
+			Summary: fmt.Sprintf("Dual-path hybrid: ↑%.1f Mbps %s uplink + ↓%.1f Mbps Reverse %s downlink (auto-TLS fallback)",
+				ul, strings.ToUpper(upProto), dl, strings.ToUpper(dnProto)),
+		}
+		eff := effectiveProbeMbps(&asym)
+		scoreMax := maxMbps
+		if eff > scoreMax {
+			scoreMax = eff
+		}
+		sc := scoreCandidate(&asym, scoreMax)
+		if dl > bestDirectAsymUp.DownMbps*1.15 && sc < 99 {
+			sc = minInt(99, sc+2)
+		}
+		asym.Score = sc
+		results = append(results, asym)
+	}
+
+	// Synthesize Asymmetric CDN Hybrid (Cloudflare CDN Uplink + Direct Reverse Downlink).
+	if bestCDNAsymUp != nil && bestRevAsymDown != nil {
+		upProto := mapLinkToAsymUplink(bestCDNAsymUp.Link)
+		dnProto := mapLinkToAsymDownlink(bestRevAsymDown.Link)
+		dl := bestRevAsymDown.DownMbps
+		ul := bestCDNAsymUp.UpMbps
+		avg := round1((dl + ul) / 2.0)
+		dom := bestCDNAsymUp.Domain
+		if dom == "" {
+			dom = cdnDomain
+		}
+		asymCDN := ProbeCandidateResult{
+			ProbeCandidateSpec: ProbeCandidateSpec{
+				ID:           "direct-asymmetric-cdn",
+				Label:        fmt.Sprintf("Direct · Asymmetric CDN Hybrid (CDN %s ↑ + Reverse %s ↓)", strings.ToUpper(upProto), strings.ToUpper(dnProto)),
+				Mode:         "direct",
+				Link:         "asymmetric-cdn",
+				Transport:    bestCDNAsymUp.Transport,
+				Stealth:      true,
+				CDN:          true,
+				Asymmetric:   true,
+				AsymUplink:   upProto,
+				AsymDownlink: dnProto,
+				Shared:       true,
+				ServerName:   dom,
+				Domain:       dom,
+				TargetAddr:   bestCDNAsymUp.TargetAddr,
+				Port:         bestCDNAsymUp.Port,
+			},
+			Status:      "ok",
+			Attempts:    bestCDNAsymUp.Attempts + bestRevAsymDown.Attempts,
+			Successes:   bestCDNAsymUp.Successes + bestRevAsymDown.Successes,
+			HandshakeMS: round2(math.Max(bestCDNAsymUp.HandshakeMS, bestRevAsymDown.HandshakeMS)),
+			RTTMS:       round2((bestCDNAsymUp.RTTMS + bestRevAsymDown.RTTMS) / 2.0),
+			JitterMS:    round2((bestCDNAsymUp.JitterMS + bestRevAsymDown.JitterMS) / 2.0),
+			DownMbps:    dl,
+			UpMbps:      ul,
+			AvgMbps:     avg,
+			Hybrid:      true,
+			Summary: fmt.Sprintf("Unblockable CDN %s uplink (↑%.1f Mbps via %s) + fast Reverse %s downlink (↓%.1f Mbps)",
+				strings.ToUpper(upProto), ul, dom, strings.ToUpper(dnProto), dl),
+		}
+		eff := effectiveProbeMbps(&asymCDN)
+		scoreMax := maxMbps
+		if eff > scoreMax {
+			scoreMax = eff
+		}
+		sc := scoreCandidate(&asymCDN, scoreMax)
+		if dl > bestCDNAsymUp.DownMbps*1.15 && sc < 99 {
+			sc = minInt(99, sc+2)
+		}
+		asymCDN.Score = sc
+		results = append(results, asymCDN)
 	}
 
 	sort.SliceStable(results, func(i, j int) bool {
@@ -1784,11 +2013,11 @@ func scoreCandidate(r *ProbeCandidateResult, maxMbps float64) int {
 	// 4. DPI Resistance & Transport Efficiency Bonus (0..10)
 	var dpiBonus float64
 	switch {
-	case (r.Link == "website" && r.Stealth) || r.Link == "sni-spoof" || r.Link == "split":
+	case (r.Link == "website" && r.Stealth) || r.Link == "sni-spoof" || r.Link == "split" || r.Link == "asymmetric" || r.Link == "asymmetric-cdn":
 		dpiBonus = 10.0
-	case r.Link == "xhttp":
+	case r.Link == "xhttp" || r.Link == "h3":
 		dpiBonus = 9.5
-	case r.Link == "website" || r.Link == "grpc":
+	case r.Link == "website" || r.Link == "grpc" || r.Link == "h3-cdn":
 		dpiBonus = 9.0
 	case r.Link == "xhttp-cdn":
 		dpiBonus = 8.8
@@ -1844,12 +2073,16 @@ func scoreGamingCandidate(r *ProbeCandidateResult) int {
 	switch {
 	case r.Link == "kcp" || r.Link == "kcp-hop" || r.Link == "ip-spoof" || r.Link == "faketcp":
 		gamingBonus = 8.0
+	case r.Link == "h3":
+		gamingBonus = 7.5
 	case r.Link == "plain" && !r.WebHeader:
 		gamingBonus = 7.0
 	case r.Link == "plain" && r.WebHeader:
 		gamingBonus = 6.5
 	case r.Link == "website" && !r.Stealth:
 		gamingBonus = 6.0
+	case r.Link == "asymmetric":
+		gamingBonus = 5.5
 	case (r.Link == "website" && r.Stealth) || r.Link == "sni-spoof":
 		gamingBonus = 4.5
 	case r.Link == "icmp":
@@ -1858,7 +2091,7 @@ func scoreGamingCandidate(r *ProbeCandidateResult) int {
 		gamingBonus = 3.5
 	case r.Link == "grpc":
 		gamingBonus = 3.0
-	case r.Link == "split":
+	case r.Link == "split" || r.Link == "h3-cdn" || r.Link == "asymmetric-cdn":
 		gamingBonus = 1.5
 	case r.Link == "cdn" || r.Link == "grpc-cdn" || r.Link == "xhttp-cdn":
 		gamingBonus = 1.0
@@ -1897,6 +2130,69 @@ func maxInt(a, b int) int {
 		return a
 	}
 	return b
+}
+
+func minInt(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+func asymUpPreference(r *ProbeCandidateResult) float64 {
+	bonus := 0.0
+	switch r.Link {
+	case "xhttp", "xhttp-cdn":
+		bonus = 6.0
+	case "h3", "h3-cdn":
+		bonus = 5.0
+	case "split":
+		bonus = 4.0
+	case "cdn", "sni-spoof":
+		bonus = 2.0
+	}
+	return r.UpMbps + float64(r.Score)*0.25 + bonus
+}
+
+func asymDownPreference(r *ProbeCandidateResult) float64 {
+	bonus := 0.0
+	switch r.Link {
+	case "kcp-hop":
+		bonus = 6.0
+	case "h3":
+		bonus = 4.0
+	case "kcp":
+		bonus = 3.0
+	}
+	return r.DownMbps + float64(r.Score)*0.25 + bonus
+}
+
+func mapLinkToAsymUplink(link string) string {
+	switch link {
+	case "xhttp", "xhttp-cdn":
+		return "xhttp"
+	case "split":
+		return "split"
+	case "cdn":
+		return "wss"
+	case "h3", "h3-cdn":
+		return "h3"
+	default:
+		return "tls"
+	}
+}
+
+func mapLinkToAsymDownlink(link string) string {
+	switch link {
+	case "kcp-hop":
+		return "kcp-hop"
+	case "kcp":
+		return "kcp"
+	case "h3":
+		return "h3"
+	default:
+		return "tls"
+	}
 }
 
 func round1(v float64) float64 {

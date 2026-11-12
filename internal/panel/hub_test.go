@@ -38,7 +38,15 @@ func TestAServerThatCallsInIsReached(t *testing.T) {
 	if _, _, err := p.hub.do(ctx, srv.ID, http.MethodGet, "/api/overview", nil); !errors.Is(err, errNotCalling) {
 		t.Fatalf("before it calls, asking it should say it is not calling, not %v", err)
 	}
-	go agent.CallHome(ctx, ts.URL, p.ownFingerprint(), token, agent.NewHandler(token, t.TempDir(), nil))
+	callDone := make(chan struct{})
+	go func() {
+		defer close(callDone)
+		agent.CallHome(ctx, ts.URL, p.ownFingerprint(), token, agent.NewHandler(token, t.TempDir(), nil))
+	}()
+	t.Cleanup(func() {
+		cancel()
+		<-callDone
+	})
 
 	deadline := time.Now().Add(10 * time.Second)
 	for !p.hub.connected(srv.ID) {

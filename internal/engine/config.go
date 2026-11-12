@@ -231,6 +231,14 @@ type Config struct {
 	PortHopPorts    int
 	PortHopInterval time.Duration
 
+	// Asymmetric pairs an independent Uplink leg (Relay -> Foreign, e.g. XHTTP /
+	// XHTTP-CDN) with a Reverse Downlink leg (Foreign -> Relay, e.g. KCP-Hop UDP
+	// with automatic Reverse TLS TCP fallback) inside a single unified net.Conn.
+	Asymmetric   bool
+	AsymUplink   string
+	AsymDownlink string
+	AsymDownPort int
+
 	// ProxyProtocol passes each user's real address to the service in the
 	// standard PROXY protocol header: proxyProtocolOff, or the version written
 	// (1 or 2). On the edge any version means "send users' addresses across"; on
@@ -808,6 +816,29 @@ func (c *Config) Set(key, val string) error {
 		return num(&c.PortHopPorts)
 	case "port_hop_interval":
 		return dur(&c.PortHopInterval)
+	case "asymmetric":
+		switch strings.ToLower(strings.TrimSpace(val)) {
+		case "on", "yes", "true":
+			c.Asymmetric = true
+		case "off", "no", "false":
+			c.Asymmetric = false
+		default:
+			return fmt.Errorf("asymmetric must be on or off, got %q", val)
+		}
+	case "asym_uplink":
+		u := strings.ToLower(strings.TrimSpace(val))
+		if !ValidAsymUplink(u) {
+			return fmt.Errorf("asym_uplink must be xhttp, split, wss, tls or h3, got %q", val)
+		}
+		c.AsymUplink = u
+	case "asym_downlink":
+		d := strings.ToLower(strings.TrimSpace(val))
+		if !ValidAsymDownlink(d) {
+			return fmt.Errorf("asym_downlink must be kcp-hop, kcp, tls or h3, got %q", val)
+		}
+		c.AsymDownlink = d
+	case "asym_down_port":
+		return num(&c.AsymDownPort)
 	case "website_bridge":
 		switch strings.ToLower(strings.TrimSpace(val)) {
 		case "on", "yes", "true":
@@ -854,6 +885,46 @@ func (c *Config) Set(key, val string) error {
 // Validate catches the mistakes that would otherwise show up as a tunnel that
 // silently does nothing.
 func (c *Config) Validate() error {
+	if c.Asymmetric {
+		if c.Mode != ModeDirect {
+			return fmt.Errorf("asymmetric mode requires direct mode, got %q", c.Mode)
+		}
+		if !ValidAsymUplink(c.AsymUplink) {
+			return fmt.Errorf("asym_uplink must be xhttp, split, wss, tls or h3, got %q", c.AsymUplink)
+		}
+		if !ValidAsymDownlink(c.AsymDownlink) {
+			return fmt.Errorf("asym_downlink must be kcp-hop, kcp, tls or h3, got %q", c.AsymDownlink)
+		}
+		if c.AsymDownPort < 0 || c.AsymDownPort > 65535 {
+			return fmt.Errorf("asym_down_port must be between 0 and 65535, got %d", c.AsymDownPort)
+		}
+		if c.AsymUplink == "" {
+			if c.Transport == TransportTLS && c.AntiFreeze {
+				c.AsymUplink = "split"
+			} else if c.Transport != TransportPlain && ValidAsymUplink(string(c.Transport)) {
+				c.AsymUplink = string(c.Transport)
+			} else {
+				c.AsymUplink = "xhttp"
+			}
+		}
+		switch c.EffectiveAsymUplink() {
+		case "xhttp":
+			c.Transport = TransportXHTTP
+			c.AntiFreeze = false
+		case "split":
+			c.Transport = TransportTLS
+			c.AntiFreeze = true
+		case "wss":
+			c.Transport = TransportWSS
+			c.AntiFreeze = false
+		case "tls":
+			c.Transport = TransportTLS
+			c.AntiFreeze = false
+		case "h3":
+			c.Transport = TransportH3
+			c.AntiFreeze = false
+		}
+	}
 	if c.CDN {
 		if !c.utlsSet {
 			c.UTLS = true
@@ -877,8 +948,8 @@ func (c *Config) Validate() error {
 		// Said out loud rather than quietly doing nothing, or worse, quietly
 		// sending a CDN's connection to the real website instead of to us.
 		switch {
-		case c.Transport == TransportPlain || c.Transport.IsPacketBased():
-			return fmt.Errorf("real_site needs a website-style link (tls, wss, xhttp, h2 or grpc); the %s link has no handshake to hide behind", c.Transport)
+		case c.Transport == TransportPlain || c.Transport.IsPacketBased() || c.Transport == TransportH3:
+			return fmt.Errorf("real_site needs a website-style TCP link (tls, wss, xhttp, h2 or grpc); the %s link has no TCP TLS handshake to hide behind", c.Transport)
 		case c.CDN:
 			return fmt.Errorf("real_site cannot be used with cdn = on: a CDN makes its own connection and cannot carry the proof")
 		case c.AltTarget != "":
@@ -1017,6 +1088,12 @@ func (c *Config) Validate() error {
 		if len(listens) > 0 {
 			c.defaultTarget = c.listenToPort[listens[0]]
 		}
+		if c.Asymmetric {
+			dp := strconv.Itoa(c.EffectiveAsymDownPort())
+			if seenPorts[dp] {
+				return fmt.Errorf("user_listen port %s cannot be the same as asymmetric downlink port %s", dp, dp)
+			}
+		}
 
 	case RoleOrigin:
 		if c.InboundAddr == "" {
@@ -1076,8 +1153,8 @@ func (c *Config) Validate() error {
 	}
 
 	if !ValidTransport(c.Transport) {
-		return fmt.Errorf("transport must be %q, %q, %q, %q, %q, %q, %q, %q or %q, got %q",
-			TransportPlain, TransportTLS, TransportWSS, TransportXHTTP, TransportH2, TransportGRPC, TransportKCP, TransportICMP, TransportFakeTCP, c.Transport)
+		return fmt.Errorf("transport must be %q, %q, %q, %q, %q, %q, %q, %q, %q or %q, got %q",
+			TransportPlain, TransportTLS, TransportWSS, TransportXHTTP, TransportH2, TransportGRPC, TransportH3, TransportKCP, TransportICMP, TransportFakeTCP, c.Transport)
 	}
 	if c.Transport != TransportPlain && !c.Transport.IsPacketBased() {
 		// Only the accepting side presents a certificate, and it is created on
@@ -1116,9 +1193,9 @@ func (c *Config) Validate() error {
 		}
 	}
 	if c.CDN {
-		if c.Transport != TransportWSS && c.Transport != TransportXHTTP && c.Transport != TransportH2 && c.Transport != TransportGRPC {
-			return fmt.Errorf("cdn needs transport %q, %q, %q or %q, got %q",
-				TransportWSS, TransportXHTTP, TransportH2, TransportGRPC, c.Transport)
+		if c.Transport != TransportWSS && c.Transport != TransportXHTTP && c.Transport != TransportH2 && c.Transport != TransportGRPC && c.Transport != TransportH3 {
+			return fmt.Errorf("cdn needs transport %q, %q, %q, %q or %q, got %q",
+				TransportWSS, TransportXHTTP, TransportH2, TransportGRPC, TransportH3, c.Transport)
 		}
 		// It also routes by hostname, so an address cannot stand in for one.
 		if c.ServerName == "" {

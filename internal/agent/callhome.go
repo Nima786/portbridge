@@ -144,6 +144,7 @@ func verifyChainFor(raw [][]byte, host string) error {
 var (
 	callHomeMu     sync.Mutex
 	callHomeCancel context.CancelFunc
+	callHomeDone   chan struct{}
 	callHomeSpec   string
 )
 
@@ -173,27 +174,63 @@ func configureCallHome(panelURL, fingerprint, token, confDir string, h http.Hand
 	}
 
 	callHomeMu.Lock()
-	defer callHomeMu.Unlock()
 	spec := panelURL + "|" + fingerprint
 	if panelURL == "" || panelURL == "off" {
-		if callHomeCancel != nil {
-			callHomeCancel()
-			callHomeCancel = nil
-		}
+		prevCancel := callHomeCancel
+		prevDone := callHomeDone
+		callHomeCancel = nil
+		callHomeDone = nil
 		callHomeSpec = ""
+		callHomeMu.Unlock()
+		if prevCancel != nil {
+			prevCancel()
+		}
+		if prevDone != nil {
+			<-prevDone
+		}
 		return nil
 	}
 	if callHomeSpec == spec && callHomeCancel != nil {
+		callHomeMu.Unlock()
 		return nil
 	}
-	if callHomeCancel != nil {
-		callHomeCancel()
-	}
+	prevCancel := callHomeCancel
+	prevDone := callHomeDone
 	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
 	callHomeCancel = cancel
+	callHomeDone = done
 	callHomeSpec = spec
-	go callHome(ctx, panelURL, fingerprint, token, h)
+	callHomeMu.Unlock()
+	if prevCancel != nil {
+		prevCancel()
+	}
+	if prevDone != nil {
+		<-prevDone
+	}
+	go func() {
+		defer close(done)
+		callHome(ctx, panelURL, fingerprint, token, h)
+	}()
 	return nil
+}
+
+// StopCallHome cancels any background callHome loop started by configureCallHome
+// and waits for it to exit.
+func StopCallHome() {
+	callHomeMu.Lock()
+	cancel := callHomeCancel
+	done := callHomeDone
+	callHomeCancel = nil
+	callHomeDone = nil
+	callHomeSpec = ""
+	callHomeMu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+	if done != nil {
+		<-done
+	}
 }
 
 // CallHome is callHome, for the panel's tests.

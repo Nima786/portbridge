@@ -85,8 +85,10 @@ type edge struct {
 	pending chan struct{}
 	wg      sync.WaitGroup
 
-	guard *replayGuard
-	cert  *tls.Certificate
+	guard  *replayGuard
+	cert   *tls.Certificate
+	asym   *asymEdgeRuntime
+	routes *router
 
 	// health is what this side believes about whether data really flows.
 	health *pathHealth
@@ -128,6 +130,12 @@ func runEdge(ctx context.Context, cfg *Config, st *status) error {
 			return fmt.Errorf("preparing the disguise: %w", err)
 		}
 		e.cert = &cert
+	} else if cfg.Mode == ModeDirect && cfg.Asymmetric {
+		cert, err := ensureAsymCert(cfg)
+		if err != nil {
+			return fmt.Errorf("preparing asymmetric downlink certificate: %w", err)
+		}
+		e.cert = &cert
 	}
 	cfg.prepareTLS(e.cert)
 
@@ -137,33 +145,54 @@ func runEdge(ctx context.Context, cfg *Config, st *status) error {
 	var routes *router
 	if cfg.Mode == ModeDirect {
 		routes = newRouter(cfg)
+		e.routes = routes
 		st.routes = routes
 		log.Printf("reaching the other server at %s", routes.describe())
-		dial = func() (net.Conn, error) {
-			raw, idx, err := routes.dialIdx(5 * time.Second)
+		if cfg.Asymmetric {
+			asymRT, err := newAsymEdgeRuntime(cfg, *e.cert)
 			if err != nil {
-				return nil, err
+				return err
 			}
-			tuneSocket(raw)
-			// Apply the disguise before anything of ours is sent, so the first
-			// thing on the wire is whatever the transport expects. The name and
-			// the CDN defaults come from the route, because a fallback route may
-			// have to claim a different name and is the one that goes through a
-			// CDN.
-			purpose := tunnelPurposeFor(cfg)
-			c, err := wrapDialPurpose(raw, routes.routeConfig(idx), purpose)
-			if err != nil {
-				_ = raw.Close()
-				routes.handshakeFailed(idx, err)
-				return nil, err
+			e.asym = asymRT
+			defer asymRT.Close()
+			go func() {
+				<-ctx.Done()
+				_ = asymRT.Close()
+			}()
+			log.Printf("asymmetric reverse downlink listening on port %d (UDP port-hop + H3 + TCP TLS fallback)", asymRT.BoundPort())
+			dial = func() (net.Conn, error) {
+				c, _, err := e.asym.Dial(ctx, routes, -1, 6*time.Second, tunnelPurposeFor(cfg))
+				return c, err
 			}
-			if err := sendAuthPurpose(c, cfg.secret, purpose); err != nil {
-				_ = c.Close()
-				routes.handshakeFailed(idx, err)
-				return nil, err
+		} else {
+			dial = func() (net.Conn, error) {
+				raw, idx, err := routes.dialIdx(5 * time.Second)
+				if err != nil {
+					return nil, err
+				}
+				if !cfg.Transport.IsPacketBased() && cfg.Transport != TransportH3 {
+					tuneSocket(raw)
+				}
+				// Apply the disguise before anything of ours is sent, so the first
+				// thing on the wire is whatever the transport expects. The name and
+				// the CDN defaults come from the route, because a fallback route may
+				// have to claim a different name and is the one that goes through a
+				// CDN.
+				purpose := tunnelPurposeFor(cfg)
+				c, err := wrapDialPurpose(raw, routes.routeConfig(idx), purpose)
+				if err != nil {
+					_ = raw.Close()
+					routes.handshakeFailed(idx, err)
+					return nil, err
+				}
+				if err := sendAuthPurpose(c, cfg.secret, purpose); err != nil {
+					_ = c.Close()
+					routes.handshakeFailed(idx, err)
+					return nil, err
+				}
+				routes.handshakeOK(idx)
+				return c, nil
 			}
-			routes.handshakeOK(idx)
-			return c, nil
 		}
 	}
 
@@ -196,6 +225,12 @@ func runEdge(ctx context.Context, cfg *Config, st *status) error {
 				e.links.dropAll(errRouteChanged)
 			}
 		})
+		if e.asym != nil {
+			pr.dialCheck = func(i int) (net.Conn, error) {
+				c, _, err := e.asym.Dial(ctx, routes, i, 6*time.Second, authPurposeSpeedtest)
+				return c, err
+			}
+		}
 		go pr.run(ctx)
 	}
 
@@ -211,6 +246,8 @@ func runEdge(ctx context.Context, cfg *Config, st *status) error {
 		var tunnelLn net.Listener
 		if cfg.Transport.IsPacketBased() {
 			tunnelLn, err = kcpListen(cfg.TunnelAddr, cfg)
+		} else if cfg.Transport == TransportH3 {
+			tunnelLn, err = h3Listen(cfg.TunnelAddr, cfg, e.cert, e.guard)
 		} else {
 			tunnelLn, err = net.Listen("tcp", cfg.TunnelAddr)
 		}
@@ -709,7 +746,8 @@ func handleControlConn(c net.Conn, e *edge) {
 	if err != nil {
 		return
 	}
-	cmd := strings.TrimSpace(string(buf[:n]))
+	cmdLine := strings.TrimSpace(string(buf[:n]))
+	cmd, cmdArg, _ := strings.Cut(cmdLine, " ")
 	switch cmd {
 	case "teardown":
 		ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
@@ -721,7 +759,28 @@ func handleControlConn(c net.Conn, e *edge) {
 		_, _ = fmt.Fprintln(c, "ok")
 	case "speedtest":
 		_ = c.SetDeadline(time.Now().Add(120 * time.Second))
+		var sizeOpt []float64
+		if mb, err := parsePositiveSmallFloat(strings.TrimSpace(cmdArg)); err == nil && mb > 0 {
+			sizeOpt = []float64{mb}
+		}
 		if e.cfg.Mode == ModeDirect {
+			if e.asym != nil {
+				routes := e.routes
+				if routes == nil {
+					routes = newRouter(e.cfg)
+				}
+				_, _ = fmt.Fprintf(c, "Connecting to %s (%s)...\n", e.cfg.Name, routes.describe())
+				ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+				defer cancel()
+				tc, _, err := e.asym.Dial(ctx, routes, -1, 10*time.Second, authPurposeSpeedtest)
+				if err != nil {
+					_, _ = fmt.Fprintf(c, "dial error: %v\n", err)
+					return
+				}
+				defer tc.Close()
+				_ = runSpeedtestClient(tc, e.cfg, c, sizeOpt...)
+				return
+			}
 			routes := newRouter(e.cfg)
 			raw, claim, err := routes.dial(5 * time.Second)
 			if err != nil {
@@ -729,7 +788,9 @@ func handleControlConn(c net.Conn, e *edge) {
 				return
 			}
 			defer raw.Close()
-			tuneSocket(raw)
+			if !e.cfg.Transport.IsPacketBased() && e.cfg.Transport != TransportH3 {
+				tuneSocket(raw)
+			}
 			// The purpose is said here too: a websocket link announces it in the
 			// upgrade request, and a speed test announced as a tunnel never works.
 			tc, err := wrapDialPurpose(raw, e.cfg.withClaimedName(claim), authPurposeSpeedtest)
@@ -742,7 +803,7 @@ func handleControlConn(c net.Conn, e *edge) {
 				_, _ = fmt.Fprintf(c, "auth error: %v\n", err)
 				return
 			}
-			_ = runSpeedtestClient(tc, e.cfg, c)
+			_ = runSpeedtestClient(tc, e.cfg, c, sizeOpt...)
 			return
 		}
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -759,8 +820,37 @@ func handleControlConn(c net.Conn, e *edge) {
 			return
 		}
 		_ = tc.SetWriteDeadline(time.Time{})
-		_ = runSpeedtestClient(tc, e.cfg, c)
+		_ = runSpeedtestClient(tc, e.cfg, c, sizeOpt...)
 	default:
 		_, _ = fmt.Fprintln(c, "unknown command")
 	}
+}
+
+func parsePositiveSmallFloat(s string) (float64, error) {
+	if s == "" {
+		return 0, errors.New("empty")
+	}
+	var whole, frac float64
+	fracDiv := 1.0
+	seenDot := false
+	for i := 0; i < len(s); i++ {
+		if s[i] == '.' && !seenDot {
+			seenDot = true
+			continue
+		}
+		if s[i] < '0' || s[i] > '9' {
+			return 0, errors.New("not a number")
+		}
+		d := float64(s[i] - '0')
+		if !seenDot {
+			whole = whole*10 + d
+			if whole > 1024 {
+				return 0, errors.New("too large")
+			}
+		} else {
+			fracDiv *= 10
+			frac += d / fracDiv
+		}
+	}
+	return whole + frac, nil
 }

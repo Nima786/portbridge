@@ -463,6 +463,9 @@ func (r *router) dialRoute(i int, timeout time.Duration) (net.Conn, error) {
 	if r.cfg != nil && r.cfg.Transport.IsPacketBased() {
 		return kcpDial(r.targets[i].addr, r.cfg)
 	}
+	if r.cfg != nil && r.cfg.Transport == TransportH3 {
+		return dialH3QUIC(r.targets[i].addr, r.routeConfig(i), timeout)
+	}
 	d := net.Dialer{Timeout: timeout}
 	if r.cfg != nil {
 		d.LocalAddr = r.cfg.sourceFor(r.targets[i].addr)
@@ -489,6 +492,22 @@ func (c *Config) sourceFor(target string) net.Addr {
 		return nil
 	}
 	return &net.TCPAddr{IP: local}
+}
+
+func (c *Config) sourceForUDP(target string) *net.UDPAddr {
+	local := net.ParseIP(c.LocalIP)
+	if local == nil || local.To4() != nil {
+		return nil
+	}
+	host, _, err := net.SplitHostPort(target)
+	if err != nil {
+		return nil
+	}
+	dst := net.ParseIP(host)
+	if dst == nil || dst.To4() != nil {
+		return nil
+	}
+	return &net.UDPAddr{IP: local}
 }
 
 // dialIdx tries each route in turn, beginning with the preferred one, and

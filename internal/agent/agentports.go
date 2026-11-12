@@ -170,6 +170,18 @@ func buildOriginConf(p *PairingData, secretFile, certFile, keyFile string) strin
 			fmt.Fprintf(&b, "port_hop_ports = %s\n", php)
 		}
 	}
+	if p.Asymmetric == "on" {
+		fmt.Fprintf(&b, "asymmetric = on\n")
+		if up := strings.TrimSpace(p.AsymUplink); up != "" {
+			fmt.Fprintf(&b, "asym_uplink = %s\n", up)
+		}
+		if dn := strings.TrimSpace(p.AsymDownlink); dn != "" {
+			fmt.Fprintf(&b, "asym_downlink = %s\n", dn)
+		}
+		if dp := strings.TrimSpace(p.AsymDownPort); dp != "" {
+			fmt.Fprintf(&b, "asym_down_port = %s\n", dp)
+		}
+	}
 	if p.ProxyProtocol == "v1" || p.ProxyProtocol == "v2" {
 		fmt.Fprintf(&b, "\n# Tell the service each user's real address; it must be set to expect it.\n")
 		fmt.Fprintf(&b, "proxy_protocol = %s\n", p.ProxyProtocol)
@@ -266,6 +278,9 @@ func portsClaimedByOthers(confDir, except string) []claimedPort {
 			for _, p := range portsIn(cfg.UserListen) {
 				out = append(out, claimedPort{p, name, "its users"})
 			}
+			if cfg.Asymmetric {
+				out = append(out, claimedPort{cfg.EffectiveAsymDownPort(), name, "its asymmetric downlink"})
+			}
 		}
 		if cfg.Role == engine.RoleOrigin && cfg.OutboundProxy && cfg.OutboundProxyPort > 0 {
 			out = append(out, claimedPort{cfg.OutboundProxyPort, name, "its website outbound proxy"})
@@ -321,7 +336,11 @@ func checkPairingPorts(p *PairingData, confDir string, host agentHost, _ string)
 			}
 		}
 		if tport != currentLink {
-			if err := host.PortFree(engine.Transport(p.Transport), tport); err != nil {
+			err := host.PortFree(engine.Transport(p.Transport), tport)
+			if err == nil && p.Transport == "h3" && p.CDN == "on" {
+				err = host.PortFree(engine.TransportPlain, tport)
+			}
+			if err != nil {
 				problems = append(problems, fmt.Sprintf(
 					"the port between the servers, %d, is busy on this server: something else is using it", tport))
 			}
@@ -457,7 +476,7 @@ func updatePairingData(p *PairingData, confDir string, warns *[]string) error {
 		_ = writeFileAtomic(confFile, oldConf, 0o600)
 		return fmt.Errorf("validating config: %w", err)
 	}
-	if cfg.Transport != engine.TransportPlain && !engine.IsKCPFamily(cfg.Transport) && cfg.Mode == engine.ModeDirect {
+	if (cfg.Transport != engine.TransportPlain && !engine.IsKCPFamily(cfg.Transport) && cfg.Mode == engine.ModeDirect) || cfg.Asymmetric {
 		if _, err := engine.EnsureCert(certFile, keyFile, cfg.EffectiveServerName()); err != nil {
 			_ = writeFileAtomic(confFile, oldConf, 0o600)
 			return fmt.Errorf("preparing the certificate: %w", err)

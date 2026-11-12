@@ -56,6 +56,10 @@ type EdgeSpec struct {
 	AntiFreeze   string `json:"anti_freeze,omitempty"` // multi-connection split-stream leg rotation
 	PortHop      string `json:"port_hop,omitempty"`    // dynamic UDP port hopping over KCP
 	PortHopPorts int    `json:"port_hop_ports,omitempty"`
+	Asymmetric   string `json:"asymmetric,omitempty"` // asymmetric dual-path hybrid mode
+	AsymUplink   string `json:"asym_uplink,omitempty"`
+	AsymDownlink string `json:"asym_downlink,omitempty"`
+	AsymDownPort int    `json:"asym_down_port,omitempty"`
 
 	ProxyProtocol string `json:"proxy_protocol,omitempty"` // off, v1 or v2
 	Mux           string `json:"mux,omitempty"`
@@ -109,6 +113,42 @@ func (s *EdgeSpec) normalise() {
 			*v = d
 		}
 	}
+	if s.Asymmetric == "on" {
+		if strings.TrimSpace(s.Mode) == "" {
+			s.Mode = "direct"
+		}
+		if strings.TrimSpace(s.Mux) == "" {
+			s.Mux = "on"
+		}
+		if strings.TrimSpace(s.AsymUplink) == "" {
+			s.AsymUplink = "xhttp"
+		}
+		if strings.TrimSpace(s.AsymDownlink) == "" {
+			s.AsymDownlink = "kcp-hop"
+		}
+		switch strings.ToLower(strings.TrimSpace(s.AsymUplink)) {
+		case "xhttp":
+			s.Transport = "xhttp"
+			s.AntiFreeze = "off"
+		case "split":
+			s.Transport = "tls"
+			s.AntiFreeze = "on"
+			s.CDN = "off"
+		case "wss":
+			s.Transport = "wss"
+			s.AntiFreeze = "off"
+		case "tls":
+			s.Transport = "tls"
+			s.AntiFreeze = "off"
+			s.CDN = "off"
+		case "h3":
+			s.Transport = "h3"
+			s.AntiFreeze = "off"
+		}
+		s.PortHop = "off"
+		s.IPSpoof = "off"
+		s.RealSite = "off"
+	}
 	def(&s.Transport, "plain")
 	def(&s.CDN, "off")
 	def(&s.Mux, "off")
@@ -152,6 +192,7 @@ func (s *EdgeSpec) normalise() {
 		s.UTLS, s.TLSFragment, s.HTTPHeader, s.HTTPHost, s.RealSite, s.CoverSite = "", "", "", "", "", ""
 		s.SNISpoof, s.SpoofSNI, s.IPSpoof, s.SpoofIP, s.AntiFreeze, s.PortHop = "", "", "", "", "", ""
 		s.PortHopPorts = 0
+		s.Asymmetric, s.AsymUplink, s.AsymDownlink, s.AsymDownPort = "", "", "", 0
 	}
 	if s.SIT == "on" {
 		s.Transport = "plain"
@@ -160,6 +201,7 @@ func (s *EdgeSpec) normalise() {
 		s.UTLS, s.TLSFragment, s.HTTPHeader, s.HTTPHost, s.RealSite, s.CoverSite = "", "", "", "", "", ""
 		s.SNISpoof, s.SpoofSNI, s.IPSpoof, s.SpoofIP, s.AntiFreeze, s.PortHop = "", "", "", "", "", ""
 		s.PortHopPorts = 0
+		s.Asymmetric, s.AsymUplink, s.AsymDownlink, s.AsymDownPort = "", "", "", 0
 	}
 	if s.PortHop == "on" {
 		s.Transport = "kcp"
@@ -198,6 +240,13 @@ func (s *EdgeSpec) normalise() {
 	}
 	if s.Transport == "xhttp" && s.WSPath == "" {
 		s.WSPath = "/api/v1/" + randomAlnum(8)
+	}
+	if s.Transport == "h3" && s.WSPath == "" {
+		if s.CDN == "on" {
+			s.WSPath = "/api/v1/" + randomAlnum(8)
+		} else {
+			s.WSPath = "/api/v3/" + randomAlnum(8)
+		}
 	}
 	// As the menu does: showing the real website goes with a browser's hello.
 	if s.RealSite == "on" {
@@ -253,18 +302,36 @@ func (s *EdgeSpec) check() error {
 		return fmt.Errorf("mode %q is not direct or reverse", s.Mode)
 	}
 	switch s.Transport {
-	case "plain", "tls", "wss", "xhttp", "grpc", "kcp", "icmp", "faketcp":
+	case "plain", "tls", "wss", "xhttp", "h3", "grpc", "kcp", "icmp", "faketcp":
 	default:
-		return fmt.Errorf("link type %q is not one of plain, tls, wss, xhttp, grpc, kcp, icmp or faketcp", s.Transport)
+		return fmt.Errorf("link type %q is not one of plain, tls, wss, xhttp, h3, grpc, kcp, icmp or faketcp", s.Transport)
 	}
 	for _, f := range []struct{ name, val string }{
 		{"cdn", s.CDN}, {"mux", s.Mux}, {"utls", s.UTLS}, {"tls_fragment", s.TLSFragment},
 		{"http_header", s.HTTPHeader}, {"gre", s.GRE}, {"sit", s.SIT}, {"real_site", s.RealSite},
 		{"sni_spoof", s.SNISpoof}, {"ip_spoof", s.IPSpoof}, {"anti_freeze", s.AntiFreeze},
-		{"port_hop", s.PortHop}, {"website_bridge", s.WebsiteBridge}, {"outbound_proxy", s.OutboundProxy},
+		{"port_hop", s.PortHop}, {"asymmetric", s.Asymmetric}, {"website_bridge", s.WebsiteBridge},
+		{"outbound_proxy", s.OutboundProxy},
 	} {
 		if f.val != "" && f.val != "on" && f.val != "off" {
 			return fmt.Errorf("%s must be on or off, got %q", f.name, f.val)
+		}
+	}
+	if !engine.ValidAsymUplink(s.AsymUplink) {
+		return fmt.Errorf("asym_uplink %q is not supported", s.AsymUplink)
+	}
+	if !engine.ValidAsymDownlink(s.AsymDownlink) {
+		return fmt.Errorf("asym_downlink %q is not supported", s.AsymDownlink)
+	}
+	if s.AsymDownPort != 0 && (s.AsymDownPort < 1 || s.AsymDownPort > 65535) {
+		return errors.New("asym_down_port must be from 1 to 65535")
+	}
+	if s.Asymmetric == "on" {
+		if s.Mode != "direct" {
+			return errors.New("asymmetric hybrid mode requires direct mode")
+		}
+		if s.GRE == "on" || s.SIT == "on" {
+			return errors.New("asymmetric hybrid mode cannot be combined with GRE or 6in4 (SIT)")
 		}
 	}
 	if s.OutboundProxy == "on" {
@@ -300,6 +367,15 @@ func (s *EdgeSpec) check() error {
 	for _, u := range users {
 		if s.Mode == "reverse" && u == s.LinkPort {
 			return fmt.Errorf("the port between the servers cannot also be a users' port (%d)", u)
+		}
+		if s.Asymmetric == "on" {
+			downPort := s.AsymDownPort
+			if downPort <= 0 {
+				downPort = s.LinkPort
+			}
+			if u == downPort {
+				return fmt.Errorf("the asymmetric downlink port (%d) cannot also be a users' port on this server", u)
+			}
 		}
 	}
 	if s.Mode == "direct" {
@@ -365,7 +441,7 @@ func (s *EdgeSpec) check() error {
 	if s.HTTPHeader == "on" && s.Transport != "plain" {
 		return errors.New("the web header only applies to a plain link")
 	}
-	if s.RealSite == "on" && (s.cdnInvolved() || s.Transport == "plain" || engine.IsKCPFamily(engine.Transport(s.Transport))) {
+	if s.RealSite == "on" && (s.cdnInvolved() || s.Asymmetric == "on" || s.Transport == "plain" || s.Transport == "h3" || engine.IsKCPFamily(engine.Transport(s.Transport))) {
 		return errors.New("showing strangers the real website works only with the website or HTTP/2 link, without a CDN")
 	}
 	if s.IPv6 {
@@ -467,7 +543,7 @@ func buildEdgeConf(s *EdgeSpec, l edgeLayout, confDir string, now time.Time) str
 	case s.SIT == "on":
 		w("# off because the port can only be reached through the private 6in4 (SIT) link.\n")
 		w("firewall = off\n")
-	case s.cdnInvolved():
+	case s.cdnInvolved() && s.Asymmetric != "on":
 		w("# off because the link can arrive from a CDN, whose address is not\n")
 		w("# the other server, so the port cannot be locked to one address.\n")
 		w("firewall = off\n")
@@ -558,6 +634,18 @@ func buildEdgeConf(s *EdgeSpec, l edgeLayout, confDir string, now time.Time) str
 		w("port_hop = on\n")
 		if s.PortHopPorts > 0 {
 			w("port_hop_ports = %d\n", s.PortHopPorts)
+		}
+	}
+	if s.Asymmetric == "on" {
+		w("asymmetric = on\n")
+		if s.AsymUplink != "" {
+			w("asym_uplink = %s\n", s.AsymUplink)
+		}
+		if s.AsymDownlink != "" {
+			w("asym_downlink = %s\n", s.AsymDownlink)
+		}
+		if s.AsymDownPort > 0 {
+			w("asym_down_port = %d\n", s.AsymDownPort)
 		}
 	}
 	if s.ProxyProtocol == "v1" || s.ProxyProtocol == "v2" {
@@ -691,6 +779,19 @@ func EncodePairingCode(p *PairingData) string {
 		}
 		v = max(v, 10)
 	}
+	if p.Asymmetric == "on" {
+		extra.WriteString("asymmetric=on\n")
+		if up := strings.TrimSpace(p.AsymUplink); up != "" {
+			fmt.Fprintf(&extra, "asym_uplink=%s\n", up)
+		}
+		if dn := strings.TrimSpace(p.AsymDownlink); dn != "" {
+			fmt.Fprintf(&extra, "asym_downlink=%s\n", dn)
+		}
+		if dp := strings.TrimSpace(p.AsymDownPort); dp != "" {
+			fmt.Fprintf(&extra, "asym_down_port=%s\n", dp)
+		}
+		v = max(v, 10)
+	}
 	if mc := strings.TrimSpace(p.MaxConn); mc != "" && mc != "2000" {
 		fmt.Fprintf(&extra, "max_conn=%s\n", mc)
 		v = max(v, 10)
@@ -787,7 +888,9 @@ func edgePairingCode(confDir, name string) (string, error) {
 		HTTPHeader: kv["http_header"], HTTPHost: kv["http_host"], GRE: kv["gre"], SIT: kv["sit"],
 		RealSite: kv["real_site"], CoverSite: kv["cover_site"], ProxyProtocol: kv["proxy_protocol"],
 		SNISpoof: kv["sni_spoof"], SpoofSNI: kv["spoof_sni"], IPSpoof: kv["ip_spoof"], SpoofIP: kv["spoof_ip"],
-		AntiFreeze: kv["anti_freeze"], PortHop: kv["port_hop"], PortHopPorts: kv["port_hop_ports"], MaxConn: kv["max_conn"],
+		AntiFreeze: kv["anti_freeze"], PortHop: kv["port_hop"], PortHopPorts: kv["port_hop_ports"],
+		Asymmetric: kv["asymmetric"], AsymUplink: kv["asym_uplink"], AsymDownlink: kv["asym_downlink"], AsymDownPort: kv["asym_down_port"],
+		MaxConn:       kv["max_conn"],
 		WebsiteBridge: kv["website_bridge"], WebsiteDomains: kv["website_domains"],
 		OutboundProxy: kv["outbound_proxy"], OutboundProxyPort: kv["outbound_proxy_port"],
 		OutboundProxyMode: kv["outbound_proxy_mode"], OutboundIranDomains: kv["outbound_iran_domains"],
@@ -832,13 +935,27 @@ func checkEdgePorts(s *EdgeSpec, confDir string, host agentHost) error {
 	}
 	if !s.dialsOut() {
 		t := engine.Transport(s.Transport)
-		if !engine.IsKCPFamily(t) {
+		if !engine.IsKCPFamily(t) && t != engine.TransportH3 {
 			t = engine.TransportPlain
 		}
 		if o := owner(s.LinkPort); o != "" {
 			problems = append(problems, fmt.Sprintf("the port between the servers, %d, is already used on this server by %s", s.LinkPort, o))
 		} else if err := host.PortFree(t, s.LinkPort); err != nil {
 			problems = append(problems, fmt.Sprintf("the port between the servers, %d, is already in use on this server", s.LinkPort))
+		}
+	} else if s.Asymmetric == "on" {
+		downPort := s.AsymDownPort
+		if downPort <= 0 {
+			downPort = s.LinkPort
+		}
+		if o := owner(downPort); o != "" {
+			problems = append(problems, fmt.Sprintf("the asymmetric downlink port, %d, is already used on this server by %s", downPort, o))
+		} else {
+			if err := host.PortFree(engine.TransportKCP, downPort); err != nil {
+				problems = append(problems, fmt.Sprintf("the asymmetric downlink UDP port, %d, is already in use on this server", downPort))
+			} else if err := host.PortFree(engine.TransportPlain, downPort); err != nil {
+				problems = append(problems, fmt.Sprintf("the asymmetric downlink TCP fallback port, %d, is already in use on this server", downPort))
+			}
 		}
 	}
 	if len(problems) > 0 {
@@ -1114,6 +1231,10 @@ type EditSpec struct {
 	AntiFreeze   string `json:"anti_freeze,omitempty"`  // "on" or "off"
 	PortHop      string `json:"port_hop,omitempty"`     // "on" or "off"
 	PortHopPorts int    `json:"port_hop_ports,omitempty"`
+	Asymmetric   string `json:"asymmetric,omitempty"` // "on" or "off"
+	AsymUplink   string `json:"asym_uplink,omitempty"`
+	AsymDownlink string `json:"asym_downlink,omitempty"`
+	AsymDownPort int    `json:"asym_down_port,omitempty"`
 	IPv6         *bool  `json:"ipv6,omitempty"` // true for IPv6 bridge, false for IPv4
 	Mux          string `json:"mux,omitempty"`  // "on" or "off"
 
@@ -1260,7 +1381,7 @@ func EditEdge(spec EditSpec, confDir string) (EdgeResult, error) {
 			restore()
 			return res, err
 		}
-		if cfg.Transport != engine.TransportPlain && !engine.IsKCPFamily(cfg.Transport) && !cfg.Dials() {
+		if (cfg.Transport != engine.TransportPlain && !engine.IsKCPFamily(cfg.Transport) && !cfg.Dials()) || cfg.Asymmetric {
 			if _, err := engine.EnsureCert(certFile, keyFile, cfg.EffectiveServerName()); err != nil {
 				restore()
 				return res, fmt.Errorf("preparing the certificate: %w", err)
@@ -1305,7 +1426,7 @@ func EditEdge(spec EditSpec, confDir string) (EdgeResult, error) {
 
 	text := oldConf
 
-	if curCfg.Role == engine.RoleEdge && (spec.Mode != "" || spec.Transport != "") {
+	if curCfg.Role == engine.RoleEdge && (spec.Mode != "" || spec.Transport != "" || spec.Asymmetric != "") {
 		// Full mode / transport replacement while preserving user ports, service ports,
 		// secret, proxy_protocol, pool, max_conn, spare_ttl, and drain.
 		curUsers := portsIn(curCfg.UserListen)
@@ -1431,6 +1552,10 @@ func EditEdge(spec EditSpec, confDir string) (EdgeResult, error) {
 			AntiFreeze:            spec.AntiFreeze,
 			PortHop:               spec.PortHop,
 			PortHopPorts:          spec.PortHopPorts,
+			Asymmetric:            spec.Asymmetric,
+			AsymUplink:            spec.AsymUplink,
+			AsymDownlink:          spec.AsymDownlink,
+			AsymDownPort:          spec.AsymDownPort,
 			ProxyProtocol:         pp,
 			Mux:                   mux,
 			MuxLinks:              muxLinks,
@@ -1476,7 +1601,7 @@ func EditEdge(spec EditSpec, confDir string) (EdgeResult, error) {
 		}
 		if !es.dialsOut() {
 			t := engine.Transport(es.Transport)
-			if !engine.IsKCPFamily(t) {
+			if !engine.IsKCPFamily(t) && t != engine.TransportH3 {
 				t = engine.TransportPlain
 			}
 			if o := owner(es.LinkPort); o != "" {
@@ -1484,6 +1609,22 @@ func EditEdge(spec EditSpec, confDir string) (EdgeResult, error) {
 			} else if !(curCfg.Mode == engine.ModeReverse && es.LinkPort == curLink) && !intInSlice(es.LinkPort, curUsers) {
 				if err := host.PortFree(t, es.LinkPort); err != nil {
 					problems = append(problems, fmt.Sprintf("the port between the servers, %d, is already in use on this server", es.LinkPort))
+				}
+			}
+		} else if es.Asymmetric == "on" {
+			downPort := es.AsymDownPort
+			if downPort <= 0 {
+				downPort = es.LinkPort
+			}
+			alreadyDown := (curCfg.Asymmetric && downPort == curCfg.EffectiveAsymDownPort()) ||
+				(curCfg.Mode == engine.ModeReverse && downPort == curLink)
+			if o := owner(downPort); o != "" {
+				problems = append(problems, fmt.Sprintf("the asymmetric downlink port, %d, is already used on this server by %s", downPort, o))
+			} else if !alreadyDown && !intInSlice(downPort, curUsers) {
+				if err := host.PortFree(engine.TransportKCP, downPort); err != nil {
+					problems = append(problems, fmt.Sprintf("the asymmetric downlink UDP port, %d, is already in use on this server", downPort))
+				} else if err := host.PortFree(engine.TransportPlain, downPort); err != nil {
+					problems = append(problems, fmt.Sprintf("the asymmetric downlink TCP fallback port, %d, is already in use on this server", downPort))
 				}
 			}
 		}
@@ -1564,6 +1705,15 @@ func EditEdge(spec EditSpec, confDir string) (EdgeResult, error) {
 			if curCfg.Mode == engine.ModeReverse && u == linkPort {
 				return res, fmt.Errorf("the port between the servers cannot also be a user listen port (%d)", u)
 			}
+			if curCfg.Asymmetric {
+				dp := curCfg.AsymDownPort
+				if dp <= 0 {
+					dp = linkPort
+				}
+				if u == dp {
+					return res, fmt.Errorf("the asymmetric downlink port (%d) cannot also be a user listen port on this server", u)
+				}
+			}
 		}
 		if curCfg.Mode == engine.ModeDirect {
 			for _, sv := range services {
@@ -1595,7 +1745,7 @@ func EditEdge(spec EditSpec, confDir string) (EdgeResult, error) {
 		}
 		if curCfg.Mode == engine.ModeReverse {
 			t := curCfg.Transport
-			if !engine.IsKCPFamily(t) {
+			if !engine.IsKCPFamily(t) && t != engine.TransportH3 {
 				t = engine.TransportPlain
 			}
 			if o := owner(linkPort); o != "" {
@@ -1726,7 +1876,9 @@ func EditEdge(spec EditSpec, confDir string) (EdgeResult, error) {
 	if spec.Firewall != "" {
 		switch spec.Firewall {
 		case "on":
-			if curCfg.CDN || curCfg.AltTarget != "" || curCfg.GRE || curCfg.SIT || spec.CDN == "on" || spec.AltHost != "" || spec.GRE == "on" || spec.SIT == "on" {
+			asymEdge := curCfg.Role == engine.RoleEdge && (curCfg.Asymmetric || spec.Asymmetric == "on")
+			if curCfg.GRE || curCfg.SIT || spec.GRE == "on" || spec.SIT == "on" ||
+				(!asymEdge && (curCfg.CDN || curCfg.AltTarget != "" || spec.CDN == "on" || spec.AltHost != "")) {
 				res.Warnings = append(res.Warnings, "firewall stays off for CDN, GRE and 6in4 (SIT) tunnels")
 			} else {
 				text = setConfKey(text, "firewall", "on")
@@ -1752,7 +1904,7 @@ func EditEdge(spec EditSpec, confDir string) (EdgeResult, error) {
 		_ = writeFileAtomic(confFile, []byte(oldConf), 0o600)
 		return res, fmt.Errorf("those settings were refused: %w", err)
 	}
-	if newCfg.Transport != engine.TransportPlain && !engine.IsKCPFamily(newCfg.Transport) && !newCfg.Dials() {
+	if (newCfg.Transport != engine.TransportPlain && !engine.IsKCPFamily(newCfg.Transport) && !newCfg.Dials()) || newCfg.Asymmetric {
 		if _, err := engine.EnsureCert(certFile, keyFile, newCfg.EffectiveServerName()); err != nil {
 			_ = writeFileAtomic(confFile, []byte(oldConf), 0o600)
 			return res, fmt.Errorf("preparing the certificate: %w", err)
@@ -1924,7 +2076,7 @@ func CheckTunnel(confDir, name string) (TunnelCheckReport, error) {
 	}
 
 	if cfg.Dials() {
-		if engine.IsKCPFamily(cfg.Transport) {
+		if engine.IsKCPFamily(cfg.Transport) || (cfg.Transport == engine.TransportH3 && !cfg.CDN) {
 			add("Peer bridge port", "note", fmt.Sprintf("%s (%s) — verified by link state below", strings.ToUpper(string(cfg.Transport)), cfg.TunnelAddr), "")
 		} else if _, isSys := host.(systemHost); isSys {
 			c, err := net.DialTimeout("tcp", cfg.TunnelAddr, 3*time.Second)
@@ -1936,6 +2088,18 @@ func CheckTunnel(confDir, name string) (TunnelCheckReport, error) {
 			}
 		} else {
 			add("Peer bridge port", "ok", fmt.Sprintf("Configured (%s)", cfg.TunnelAddr), "")
+		}
+		if cfg.Asymmetric && cfg.Role == engine.RoleEdge {
+			dp := cfg.EffectiveAsymDownPort()
+			busy := host.PortFree(engine.TransportKCP, dp) != nil
+			if _, isNo := host.(noHost); isNo {
+				busy = ti.Running
+			}
+			if busy {
+				add("Asymmetric downlink listener", "ok", fmt.Sprintf("Listening for reverse downlink on port %d (UDP + TCP fallback)", dp), "")
+			} else {
+				add("Asymmetric downlink listener", "bad", fmt.Sprintf("Not listening on asymmetric downlink port %d", dp), "")
+			}
 		}
 	} else {
 		busy := host.PortFree(cfg.Transport, ti.LinkPort) != nil
@@ -1992,7 +2156,7 @@ func CheckTunnel(confDir, name string) (TunnelCheckReport, error) {
 		}
 	}
 
-	if !cfg.Dials() {
+	if !cfg.Dials() || (cfg.Asymmetric && cfg.Role == engine.RoleEdge) {
 		if ti.Firewall {
 			add("Bridge port firewall", "ok", fmt.Sprintf("Enabled (bridge port locked to %s)", ti.PeerIP), "")
 		} else {
@@ -2194,16 +2358,20 @@ func readFirewallStatus(confDir string) FirewallInfo {
 		cfg, err := engine.LoadConfig(filepath.Join(confDir, ti.Name+".conf"))
 		dials := false
 		cdnOrGRE := ti.CDN || ti.GRE || ti.SIT
+		linkPort := ti.LinkPort
 		if err == nil {
-			dials = cfg.Dials()
-			cdnOrGRE = cdnOrGRE || cfg.AltTarget != ""
+			dials = cfg.Dials() && !(cfg.Asymmetric && cfg.Role == engine.RoleEdge)
+			cdnOrGRE = (cdnOrGRE || cfg.AltTarget != "") && !(cfg.Asymmetric && cfg.Role == engine.RoleEdge && !cfg.GRE && !cfg.SIT)
+			if cfg.Asymmetric && cfg.Role == engine.RoleEdge {
+				linkPort = cfg.EffectiveAsymDownPort()
+			}
 		}
 		rules = append(rules, FirewallTunnelRule{
 			Name:     ti.Name,
 			Role:     ti.Role,
 			Mode:     ti.Mode,
 			DialsOut: dials,
-			LinkPort: ti.LinkPort,
+			LinkPort: linkPort,
 			PeerIP:   ti.PeerIP,
 			Locked:   ti.Firewall && !dials && !cdnOrGRE,
 			CDNOrGRE: cdnOrGRE,
@@ -2276,7 +2444,8 @@ func applyFirewallAction(confDir, action string) (FirewallInfo, error) {
 			if err != nil {
 				continue
 			}
-			if val == "on" && (cfg.CDN || cfg.AltTarget != "" || cfg.GRE || cfg.SIT) {
+			asymEdge := cfg.Asymmetric && cfg.Role == engine.RoleEdge
+			if val == "on" && (cfg.GRE || cfg.SIT || (!asymEdge && (cfg.CDN || cfg.AltTarget != ""))) {
 				continue
 			}
 			raw, err := os.ReadFile(confPath)
@@ -2448,7 +2617,7 @@ func ImportTunnel(snap TunnelSnapshot, confDir string, overwrite bool, newLocalI
 
 	cfg, err := engine.LoadConfig(confFile)
 	if err == nil {
-		if cfg.Transport != engine.TransportPlain && !engine.IsKCPFamily(cfg.Transport) && !cfg.Dials() {
+		if (cfg.Transport != engine.TransportPlain && !engine.IsKCPFamily(cfg.Transport) && !cfg.Dials()) || cfg.Asymmetric {
 			_, _ = engine.EnsureCert(certFile, keyFile, cfg.EffectiveServerName())
 		}
 		err = cfg.Validate()

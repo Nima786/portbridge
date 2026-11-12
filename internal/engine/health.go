@@ -407,7 +407,8 @@ type prober struct {
 
 	// onSwitch is called when the route in use changed, so connections already
 	// made over the old one can be dropped and rebuilt over the new one.
-	onSwitch func()
+	onSwitch  func()
+	dialCheck func(routeIdx int) (net.Conn, error)
 
 	stalls []int32 // per route: consecutive stalled checks
 	rng    *rand.Rand
@@ -429,6 +430,14 @@ func newProber(cfg *Config, routes *router, health *pathHealth, onSwitch func())
 // checkRoute runs one transfer check over route i.
 func (p *prober) checkRoute(i int) probeOutcome {
 	started := time.Now()
+	if p.dialCheck != nil {
+		c, err := p.dialCheck(i)
+		if err != nil {
+			return classifyHandshake(err)
+		}
+		defer c.Close()
+		return classifyProbe(runPathCheck(c), time.Since(started))
+	}
 	raw, err := p.routes.dialRoute(i, 6*time.Second)
 	if err != nil {
 		// Could not even connect: that is the easy kind of block, and the

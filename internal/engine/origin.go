@@ -63,6 +63,7 @@ type origin struct {
 
 	guard *replayGuard
 	cert  *tls.Certificate
+	asym  *asymOriginRuntime
 
 	logAccept   *throttled
 	logAuth     *throttled
@@ -158,6 +159,9 @@ func (o *origin) runDirect(ctx context.Context) error {
 		o.cert = &cert
 	}
 	o.cfg.prepareTLS(o.cert)
+	if o.cfg.Asymmetric {
+		o.asym = newAsymOriginRuntime(ctx, o.cfg)
+	}
 
 	if o.cfg.Mux {
 		// The edge starts the sessions, so this side only has to receive them.
@@ -177,6 +181,8 @@ func (o *origin) runDirect(ctx context.Context) error {
 	var ln net.Listener
 	if o.cfg.Transport.IsPacketBased() {
 		ln, err = kcpListen(o.cfg.TunnelAddr, o.cfg)
+	} else if o.cfg.Transport == TransportH3 {
+		ln, err = h3Listen(o.cfg.TunnelAddr, o.cfg, o.cert, o.guard)
 	} else {
 		ln, err = net.Listen("tcp", o.cfg.TunnelAddr)
 	}
@@ -222,6 +228,15 @@ func (o *origin) runDirect(ctx context.Context) error {
 					o.logAuth.printf("refused a tunnel connection from %s: %v", raw.RemoteAddr(), err)
 					_ = raw.Close()
 					return
+				}
+				if o.asym != nil {
+					paired, err := o.asym.PairAcceptedUplink(ctx, c)
+					if err != nil {
+						o.logAuth.printf("asymmetric downlink pairing with %s failed: %v", c.RemoteAddr(), err)
+						_ = c.Close()
+						return
+					}
+					c = paired
 				}
 				purpose, err := recvAuthPurpose(c, o.cfg.secret, o.guard)
 				if err != nil {
