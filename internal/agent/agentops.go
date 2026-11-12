@@ -138,7 +138,7 @@ func (systemHost) PortFree(t engine.Transport, port int) error {
 		return nil
 	}
 	addr := ":" + strconv.Itoa(port)
-	if t == engine.TransportKCP || t == engine.TransportH3 {
+	if t == engine.TransportKCP || t == engine.TransportWebRTC || t == engine.TransportH3 {
 		pc, err := net.ListenPacket("udp", addr)
 		if err != nil {
 			return fmt.Errorf("UDP port %d is already in use on this server: %w", port, err)
@@ -349,8 +349,8 @@ func validatePairing(p *PairingData) error {
 		{"cdn", p.CDN}, {"mux", p.Mux}, {"utls", p.UTLS}, {"tls_fragment", p.TLSFragment},
 		{"ech", p.ECH}, {"http_header", p.HTTPHeader}, {"gre", p.GRE}, {"sit", p.SIT},
 		{"real_site", p.RealSite}, {"sni_spoof", p.SNISpoof}, {"ip_spoof", p.IPSpoof},
-		{"anti_freeze", p.AntiFreeze}, {"port_hop", p.PortHop}, {"asymmetric", p.Asymmetric},
-		{"website_bridge", p.WebsiteBridge}, {"outbound_proxy", p.OutboundProxy},
+		{"anti_freeze", p.AntiFreeze}, {"port_hop", p.PortHop}, {"twin_path", p.TwinPath},
+		{"asymmetric", p.Asymmetric}, {"website_bridge", p.WebsiteBridge}, {"outbound_proxy", p.OutboundProxy},
 	} {
 		if f.val != "" && f.val != "on" && f.val != "off" {
 			return fmt.Errorf("%s must be on or off, got %q", f.name, f.val)
@@ -383,8 +383,11 @@ func validatePairing(p *PairingData) error {
 	if p.OutboundProxyMode != "" && p.OutboundProxyMode != "split" && p.OutboundProxyMode != "all" {
 		return fmt.Errorf("outbound_proxy_mode must be split or all, got %q", p.OutboundProxyMode)
 	}
-	if p.PortHop == "on" && p.Transport != "kcp" {
-		return errors.New("port_hop requires transport kcp")
+	if p.PortHop == "on" && p.Transport != "kcp" && p.Transport != "webrtc" {
+		return errors.New("port_hop requires transport kcp or webrtc")
+	}
+	if p.TwinPath == "on" && p.Transport != "kcp" && p.Transport != "webrtc" {
+		return errors.New("twin_path requires transport kcp or webrtc")
 	}
 	if php := strings.TrimSpace(p.PortHopPorts); php != "" {
 		if n, err := strconv.Atoi(php); err != nil || n < 1 || n > 64 {

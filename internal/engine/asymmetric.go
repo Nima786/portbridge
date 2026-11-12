@@ -37,6 +37,8 @@ const (
 	asymLegKCP    byte = 2
 	asymLegTLS    byte = 3
 	asymLegH3     byte = 4
+	asymLegWebRTC byte = 5
+	asymLegTwin   byte = 6
 )
 
 var errAsymHandshake = errors.New("asymmetric pairing handshake failed")
@@ -53,7 +55,7 @@ func ValidAsymUplink(s string) bool {
 // ValidAsymDownlink reports whether s is a supported Asymmetric downlink leg transport.
 func ValidAsymDownlink(s string) bool {
 	switch strings.ToLower(strings.TrimSpace(s)) {
-	case "", "kcp-hop", "kcp", "tls", "h3":
+	case "", "kcp-hop", "kcp", "webrtc", "twin", "tls", "h3":
 		return true
 	}
 	return false
@@ -759,8 +761,27 @@ func (ao *asymOriginRuntime) dialOneDownlink(ctx context.Context, targetAddr str
 		dnCfg.CDN = false
 		dnCfg.Transport = TransportKCP
 		dnCfg.PortHop = false
+		dnCfg.TwinPath = false
 		c, err := kcpDial(targetAddr, &dnCfg)
 		return c, asymLegKCP, err
+
+	case "webrtc":
+		dnCfg := *ao.cfg
+		dnCfg.Asymmetric = false
+		dnCfg.CDN = false
+		dnCfg.Transport = TransportWebRTC
+		dnCfg.PortHop = true
+		c, err := kcpDial(targetAddr, &dnCfg)
+		return c, asymLegWebRTC, err
+
+	case "twin":
+		dnCfg := *ao.cfg
+		dnCfg.Asymmetric = false
+		dnCfg.CDN = false
+		dnCfg.Transport = TransportKCP
+		dnCfg.TwinPath = true
+		c, err := kcpDial(targetAddr, &dnCfg)
+		return c, asymLegTwin, err
 
 	case "h3":
 		dnCfg := *ao.cfg

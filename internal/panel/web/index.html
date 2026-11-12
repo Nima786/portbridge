@@ -524,13 +524,13 @@
     </div>
 
     <div class="dialog-body">
-      <!-- STEP 1: Servers & Name -->
+      <!-- STEP 1: Servers, Name & Smart Benchmark -->
       <section class="step-section">
         <div class="step-header">
           <span class="step-num">1</span>
           <div>
-            <h3>Servers &amp; Tunnel Name</h3>
-            <p class="muted small">Select the Relay (entry) and Foreign (exit) servers and give this tunnel a name.</p>
+            <h3>Servers, Tunnel Name &amp; Route Benchmark</h3>
+            <p class="muted small">Choose your Relay (Iran) and Foreign servers, name the tunnel, and optionally benchmark which tunnel mode works best right now.</p>
           </div>
         </div>
         <div class="row2">
@@ -550,46 +550,87 @@
 
         <!-- Smart Route & Transport Benchmark -->
         <div id="tn-probe-box" class="probe-box">
-          <div class="probe-head">
-            <div>
+          <div class="probe-banner-head">
+            <div class="probe-title-row">
               <strong>Smart Route &amp; Transport Benchmark</strong>
-              <p class="muted small">Not sure which mode works best between these two servers? Test Direct, Reverse, Fake TLS, SplitHTTP/XHTTP, QUIC/HTTP/3, Asymmetric Hybrid, gRPC, KCP Port-Hop, FakeTCP, and Cloudflare CDN to find the best route.</p>
+              <span class="pill-tag tag-accent">Auto-Recommend</span>
             </div>
-            <button type="button" id="tn-probe-btn" class="primary">Find Best Tunnel Mode</button>
+            <p class="muted small">Not sure which tunnel mode works best between these two servers? Configure optional test ports &amp; goal below, then click <strong>Find Best Tunnel Mode</strong> to test Direct, Reverse, IPv4/IPv6, HTTPS/TLS, SplitHTTP/XHTTP, QUIC/HTTP/3, Asymmetric Dual-Path, WebRTC Video-Call, Twin-Path 1+1 Gaming, KCP Port-Hop, FakeTCP, ICMP, and Cloudflare CDN.</p>
           </div>
-          <div class="probe-goal-row" role="radiogroup" aria-label="Benchmark Optimization Goal">
-            <span class="probe-goal-label">Optimize for:</span>
-            <label class="probe-goal-pill">
-              <input type="radio" name="tn-probe-goal" value="general" checked>
-              <span><strong>General (Speed &amp; Stealth)</strong> — Max download/upload Mbps &amp; DPI resistance</span>
-            </label>
-            <label class="probe-goal-pill">
-              <input type="radio" name="tn-probe-goal" value="gaming">
-              <span><strong>Gaming (Lowest Ping &amp; Jitter)</strong> — 20 rapid game-tick pings, FEC &amp; zero HoL blocking</span>
-            </label>
-          </div>
-          <div class="probe-ports-row">
-            <div class="probe-port-field">
-              <label for="tn-probe-service">Inbound Port(s) <span class="muted">(Foreign · e.g. X-UI / V2Ray)</span></label>
-              <input id="tn-probe-service" inputmode="numeric" placeholder="e.g. 443, 2096">
+
+          <div class="probe-subblock">
+            <div class="probe-subhead-row">
+              <span class="probe-subhead">1. Ports to Forward &amp; Test On</span>
+              <span class="pill-tag">Optional for test · Syncs with Step 2</span>
             </div>
-            <div class="probe-port-field">
-              <label for="tn-probe-linkport">Tunnel Bridge Port <span class="muted">(internal server-to-server port)</span></label>
-              <input id="tn-probe-linkport" type="number" min="1" max="65535" value="2053" placeholder="2053 (or empty for auto)" inputmode="numeric">
+            <div class="probe-ports-row">
+              <div class="port-box probe-port-card">
+                <label for="tn-probe-service">Inbound Port(s) <span class="muted">(Foreign)</span></label>
+                <span class="field-hint">Your X-UI / V2Ray port(s), e.g. 443, 2096</span>
+                <input id="tn-probe-service" inputmode="numeric" placeholder="e.g. 443, 2096">
+              </div>
+              <div class="port-box probe-port-card">
+                <label for="tn-probe-linkport">Tunnel Bridge Port <span class="muted">(Server-to-Server)</span></label>
+                <span class="field-hint">Internal port tested between servers (empty = auto)</span>
+                <input id="tn-probe-linkport" type="number" min="1" max="65535" value="2053" placeholder="2053 (or empty for auto)" inputmode="numeric">
+              </div>
             </div>
           </div>
-          <div class="probe-cdn-row">
-            <div class="probe-cdn-input">
-              <label for="tn-probe-cdn">Optional CDN Subdomain to include in benchmark <span class="muted">(pointed at Foreign server with Cloudflare Proxy ON)</span></label>
-              <input id="tn-probe-cdn" placeholder="e.g. edge1.example.com (leave empty to test direct/reverse only)" autocapitalize="none" spellcheck="false">
+
+          <div class="probe-subblock" role="radiogroup" aria-label="Benchmark Testing Mode">
+            <div class="probe-subhead-row">
+              <span class="probe-subhead">2. Testing Mode (Optimize Benchmark For)</span>
             </div>
-            <div id="tn-probe-cf-wrap" class="probe-cdn-pick" hidden>
-              <label for="tn-probe-cf-pick">Or pick from Cloudflare DNS</label>
-              <select id="tn-probe-cf-pick">
-                <option value="">— Select Cloudflare record —</option>
-              </select>
+            <div class="probe-goal-stack">
+              <label class="choice-card probe-goal-card">
+                <input type="radio" name="tn-probe-goal" value="general" checked>
+                <div class="choice-body">
+                  <div class="choice-top">
+                    <strong>General — Speed, Stability &amp; Anti-DPI Stealth</strong>
+                    <span class="pill-tag tag-good">Default · Speed + Stealth</span>
+                  </div>
+                  <span class="choice-desc">Measures sustained download &amp; upload Mbps, handshake time, and DPI byte-cap resistance to pick the fastest stealth route for browsing &amp; streaming.</span>
+                </div>
+              </label>
+              <label class="choice-card probe-goal-card">
+                <input type="radio" name="tn-probe-goal" value="gaming">
+                <div class="choice-body">
+                  <div class="choice-top">
+                    <strong>Gaming &amp; VoIP — Lowest Ping &amp; Zero Jitter</strong>
+                    <span class="pill-tag tag-accent">Low Ping · Zero-Lag</span>
+                  </div>
+                  <span class="choice-desc">Runs 20 rapid game-tick pings + 64 KB anti-freeze check, prioritizing Twin-Path 1+1 UDP, WebRTC Video-Call, QUIC/HTTP/3, and KCP+FEC with zero TCP stalls.</span>
+                </div>
+              </label>
             </div>
           </div>
+
+          <div class="probe-subblock">
+            <div class="probe-subhead-row">
+              <span class="probe-subhead">3. Optional Cloudflare / CDN Domain</span>
+              <span class="pill-tag">Leave empty for Direct / Reverse only</span>
+            </div>
+            <div class="probe-cdn-row">
+              <div class="port-box probe-port-card">
+                <label for="tn-probe-cdn">CDN Subdomain to Include in Benchmark</label>
+                <span class="field-hint">Pointed at Foreign server with Cloudflare Proxy (Orange Cloud) ON</span>
+                <input id="tn-probe-cdn" placeholder="e.g. edge1.example.com (optional)" autocapitalize="none" spellcheck="false">
+              </div>
+              <div id="tn-probe-cf-wrap" class="port-box probe-port-card" hidden>
+                <label for="tn-probe-cf-pick">Or Pick from Cloudflare DNS</label>
+                <span class="field-hint">Quick-fill an existing record from your Cloudflare zone</span>
+                <select id="tn-probe-cf-pick">
+                  <option value="">— Select Cloudflare record —</option>
+                </select>
+              </div>
+            </div>
+          </div>
+
+          <div class="probe-cta-bar">
+            <button type="button" id="tn-probe-btn" class="primary probe-cta-btn">Find Best Tunnel Mode</button>
+            <span class="muted small probe-cta-note">Tests all compatible routes safely on temporary ports and auto-fills the tunnel settings below.</span>
+          </div>
+
           <div id="tn-probe-live" class="probe-live-box" hidden>
             <div class="probe-live-head">
               <span class="probe-spinner" aria-hidden="true"></span>
@@ -607,8 +648,11 @@
         <div id="tn-explore-box" class="probe-box explore-box">
           <div class="probe-head">
             <div>
-              <strong>Deep Scan: what can get through</strong>
-              <p class="muted small">Optional. From the Relay, checks which ports, protocols and domain names reach the Foreign server, and which well-known providers the Relay can connect to at all. Takes about a minute. Use it when the search above finds little that works, or just to see what a filter allows.</p>
+              <div class="probe-title-row">
+                <strong>Deep Network Scan: Open Ports, SNIs &amp; Reachability</strong>
+                <span class="pill-tag">Optional Diagnostic</span>
+              </div>
+              <p class="muted small">Checks which TCP/UDP ports, camouflage domain names (SNIs), and global providers can get through from the Relay (~1 min). Useful when normal routes are heavily filtered.</p>
             </div>
             <button type="button" id="tn-explore-btn">Run Deep Scan</button>
           </div>
@@ -623,13 +667,46 @@
         </div>
       </section>
 
-      <!-- STEP 2: Direction -->
+      <!-- STEP 2: Ports -->
       <fieldset class="step-section">
         <legend class="step-header">
           <span class="step-num">2</span>
           <span>
-            <span class="step-title">Tunnel Mode (Connection Direction)</span>
-            <span class="step-sub">Choose which server initiates the tunnel connection.</span>
+            <span class="step-title">Port Configuration</span>
+            <span class="step-sub">Set your Foreign inbound port(s), Relay user listen port(s), and internal server-to-server bridge port.</span>
+          </span>
+        </legend>
+        <div class="ports-grid">
+          <div class="port-box">
+            <label for="tn-service">Inbound Port(s) <span class="muted">(Foreign · Required)</span></label>
+            <span class="field-hint">Your X-UI / V2Ray inbound port(s), e.g. 443, 2096</span>
+            <input id="tn-service" inputmode="numeric" required placeholder="443, 2096">
+          </div>
+          <div class="port-box">
+            <label for="tn-users">User Listen Port(s) <span class="muted">(Relay · Optional)</span></label>
+            <span class="field-hint">Port(s) users connect to (empty = same as Inbound)</span>
+            <input id="tn-users" inputmode="numeric" placeholder="Same as Inbound Port(s)">
+          </div>
+          <div class="port-box">
+            <label for="tn-linkport">Tunnel Bridge Port <span class="muted">(Internal)</span></label>
+            <span class="field-hint">Internal server-to-server port (e.g. 2053, 8443)</span>
+            <input id="tn-linkport" type="number" min="1" max="65535" value="2053" inputmode="numeric">
+          </div>
+        </div>
+        <div class="actions left port-check-bar">
+          <button type="button" id="tn-check">Test &amp; Verify Ports on Both Servers</button>
+          <button type="button" id="tn-scan-cdn">Scan Free CDN Ports</button>
+        </div>
+        <ul id="tn-ports-result" class="ports-result" aria-live="polite"></ul>
+      </fieldset>
+
+      <!-- STEP 3: Direction -->
+      <fieldset class="step-section">
+        <legend class="step-header">
+          <span class="step-num">3</span>
+          <span>
+            <span class="step-title">Connection Direction</span>
+            <span class="step-sub">Choose which server initiates the inter-server tunnel link.</span>
           </span>
         </legend>
         <div class="choice-grid cols-2">
@@ -637,264 +714,325 @@
             <input type="radio" name="tn-mode" value="direct" checked>
             <div class="choice-body">
               <div class="choice-top">
-                <strong>Direct Mode</strong>
+                <strong>Direct Mode (Relay → Foreign)</strong>
                 <span class="pill-tag tag-good">Recommended</span>
               </div>
-              <span class="choice-desc">Relay (Iran) dials out to the Foreign server. Best performance and lowest latency.</span>
+              <span class="choice-desc">Relay (Iran) dials out to the Foreign server. Lowest latency and required for CDN &amp; Asymmetric Hybrid modes.</span>
             </div>
           </label>
           <label class="choice-card">
             <input type="radio" name="tn-mode" value="reverse">
             <div class="choice-body">
               <div class="choice-top">
-                <strong>Reverse Mode</strong>
-                <span class="pill-tag">Fallback</span>
+                <strong>Reverse Mode (Foreign → Relay)</strong>
+                <span class="pill-tag">Outbound-Block Bypass</span>
               </div>
-              <span class="choice-desc">Foreign server dials in to the Relay. Use when outbound connections from Iran are blocked.</span>
+              <span class="choice-desc">Foreign server dials in to the Relay. Use when outbound connections from the Iran VPS are blocked or throttled.</span>
             </div>
           </label>
         </div>
       </fieldset>
 
-      <!-- STEP 3: Link Disguise / Transport -->
+      <!-- STEP 4: Link Disguise / Transport -->
       <fieldset class="step-section">
         <legend class="step-header">
-          <span class="step-num">3</span>
-          <span>
-            <span class="step-title">Transport &amp; Traffic Disguise</span>
-            <span class="step-sub">Choose how tunnel traffic between the two servers is disguised against DPI filters.</span>
+          <span class="step-num">4</span>
+          <span class="step-header-flex">
+            <span>
+              <span class="step-title">Tunnel Transport &amp; Traffic Disguise</span>
+              <span class="step-sub">Grouped by how traffic travels so you can easily pick Direct Server-to-Server, UDP/Gaming, Cloudflare CDN, or Special Raw modes.</span>
+            </span>
+            <span id="tn-selected-mode-pill" class="pill-tag tag-accent">Selected: Fake TLS Website</span>
           </span>
         </legend>
 
-        <label class="check-card">
+        <div id="tn-links" class="transport-groups">
+          <!-- Group 1: Direct Server-to-Server HTTPS, TLS & Dual-Path -->
+          <div class="transport-group">
+            <div class="transport-group-head">
+              <strong>Direct Server-to-Server — HTTPS, TLS &amp; Dual-Path</strong>
+              <span class="transport-group-sub">Connects directly between your Relay and Foreign server IPs — <strong>no domain or Cloudflare account needed</strong>.</span>
+            </div>
+            <div class="choice-grid cols-2">
+              <label class="choice-card">
+                <input type="radio" name="tn-link" value="website" checked>
+                <div class="choice-body">
+                  <div class="choice-top">
+                    <strong>Fake TLS Website (HTTPS SNI Disguise)</strong>
+                    <span class="pill-tag tag-good">Recommended · Direct TLS</span>
+                  </div>
+                  <span class="choice-desc">Disguises tunnel traffic as normal HTTPS visits to a popular site (e.g. bing.com) with active anti-probe website cover. No domain needed.</span>
+                </div>
+              </label>
+
+              <label class="choice-card">
+                <input type="radio" name="tn-link" value="xhttp">
+                <div class="choice-body">
+                  <div class="choice-top">
+                    <strong>SplitHTTP / XHTTP (Direct Server-to-Server)</strong>
+                    <span class="pill-tag tag-good">No CDN Needed · GET + POST</span>
+                  </div>
+                  <span class="choice-desc">Disguises traffic as standard HTTPS page downloads (GET) and form uploads (POST) directly between your two servers—zero WebSocket Upgrade headers.</span>
+                </div>
+              </label>
+
+              <label class="choice-card" id="tn-asym-choice">
+                <input type="radio" name="tn-link" value="asymmetric">
+                <div class="choice-body">
+                  <div class="choice-top">
+                    <strong>Asymmetric Dual-Path (Direct XHTTP ↑ + Reverse UDP ↓)</strong>
+                    <span class="pill-tag tag-good">Direct ↑ + Reverse ↓</span>
+                  </div>
+                  <span class="choice-desc">Sends uploads out via stealth HTTPS (XHTTP) while receiving downloads back via fast Reverse UDP Port-Hopping + FEC (auto-TLS fallback)—beating one-way ISP throttling.</span>
+                </div>
+              </label>
+
+              <label class="choice-card">
+                <input type="radio" name="tn-link" value="sni-spoof">
+                <div class="choice-body">
+                  <div class="choice-top">
+                    <strong>Decoy Whitelisted SNI Spoof</strong>
+                    <span class="pill-tag tag-good">Works on All VPS</span>
+                  </div>
+                  <span class="choice-desc">Sends a low-TTL decoy TLS 1.3 ClientHello (challenges.cloudflare.com / reCAPTCHA) so ISP DPI whitelists the connection while your peer drops the decoy.</span>
+                </div>
+              </label>
+
+              <label class="choice-card">
+                <input type="radio" name="tn-link" value="split">
+                <div class="choice-body">
+                  <div class="choice-top">
+                    <strong>Split-Stream TLS (14 KB Anti-Freeze Rotation)</strong>
+                    <span class="pill-tag tag-good">Byte-Cap Bypass</span>
+                  </div>
+                  <span class="choice-desc">Continuously rotates pre-warmed TLS sockets every 14 KB so ISP byte-counter filters that freeze connections mid-stream never trigger.</span>
+                </div>
+              </label>
+
+              <label class="choice-card">
+                <input type="radio" name="tn-link" value="grpc">
+                <div class="choice-body">
+                  <div class="choice-top">
+                    <strong>gRPC Stream (Direct HTTP/2)</strong>
+                    <span class="pill-tag">No CDN Needed · HTTP/2</span>
+                  </div>
+                  <span class="choice-desc">Multiplexes user streams inside standard HTTP/2 gRPC frames directly between the Relay and Foreign servers without a CDN.</span>
+                </div>
+              </label>
+            </div>
+          </div>
+
+          <!-- Group 2: UDP, Gaming & VoIP Disguises -->
+          <div class="transport-group">
+            <div class="transport-group-head">
+              <strong>UDP, Gaming &amp; VoIP Call Disguises</strong>
+              <span class="transport-group-sub">Direct UDP transports immune to TCP RST blocks and TCP packet-loss stalls — <strong>no domain needed</strong>.</span>
+            </div>
+            <div class="choice-grid cols-2">
+              <label class="choice-card">
+                <input type="radio" name="tn-link" value="h3">
+                <div class="choice-body">
+                  <div class="choice-top">
+                    <strong>QUIC / HTTP/3 Masquerade (Direct UDP)</strong>
+                    <span class="pill-tag tag-good">UDP · Modern HTTPS</span>
+                  </div>
+                  <span class="choice-desc">Looks like genuine Chrome/Cloudflare HTTP/3 (QUIC v1 + TLS 1.3 ALPN h3) directly over UDP between servers—zero TCP head-of-line stalls.</span>
+                </div>
+              </label>
+
+              <label class="choice-card">
+                <input type="radio" name="tn-link" value="webrtc">
+                <div class="choice-body">
+                  <div class="choice-top">
+                    <strong>WebRTC Video-Call Disguise (STUN + SRTP)</strong>
+                    <span class="pill-tag tag-good">UDP · Video/Voice Call</span>
+                  </div>
+                  <span class="choice-desc">Opens with a real ICE STUN handshake and wraps KCP+FEC inside SRTP Opus/VP8 call packets—ideal when ISPs throttle VPNs/QUIC but keep WhatsApp/Meet calls open.</span>
+                </div>
+              </label>
+
+              <label class="choice-card">
+                <input type="radio" name="tn-link" value="twin">
+                <div class="choice-body">
+                  <div class="choice-top">
+                    <strong>Twin-Path 1+1 Gaming UDP (Zero-Lag Duplication)</strong>
+                    <span class="pill-tag tag-accent">Best for Gaming · 1+1 UDP</span>
+                  </div>
+                  <span class="choice-desc">Sends latency-critical game/VoIP/ACK packets (≤700 B) across two separate UDP ports simultaneously and uses whichever arrives first (0 ms loss spikes; bulk downloads use 1 leg).</span>
+                </div>
+              </label>
+
+              <label class="choice-card">
+                <input type="radio" name="tn-link" value="kcp-hop">
+                <div class="choice-body">
+                  <div class="choice-top">
+                    <strong>KCP Port-Hopping UDP (8-Port Rotation + FEC)</strong>
+                    <span class="pill-tag tag-good">Anti-QoS · 8 UDP Ports</span>
+                  </div>
+                  <span class="choice-desc">Hops smoothly across 8 UDP ports every 15 seconds with packet-loss repair (FEC) so ISP per-port speed throttles cannot lock onto the tunnel.</span>
+                </div>
+              </label>
+
+              <label class="choice-card">
+                <input type="radio" name="tn-link" value="kcp">
+                <div class="choice-body">
+                  <div class="choice-top">
+                    <strong>KCP Accelerated UDP (Single-Port + FEC)</strong>
+                    <span class="pill-tag">UDP + Loss Repair</span>
+                  </div>
+                  <span class="choice-desc">Fast single-port encrypted UDP with Reed-Solomon FEC that repairs lost packets on unstable routes without waiting for TCP retransmissions.</span>
+                </div>
+              </label>
+            </div>
+          </div>
+
+          <!-- Group 3: Cloudflare / CDN Domain Modes -->
+          <div class="transport-group">
+            <div class="transport-group-head">
+              <strong>Cloudflare / CDN Domain Modes</strong>
+              <span class="transport-group-sub">Hides your Foreign server IP behind Cloudflare Edge — <strong>requires your own domain with Cloudflare Proxy (Orange Cloud) ON</strong>.</span>
+            </div>
+            <div class="choice-grid cols-2">
+              <label class="choice-card" id="tn-backup-choice">
+                <input type="radio" name="tn-link" value="website-cdn-backup">
+                <div class="choice-body">
+                  <div class="choice-top">
+                    <strong>Fake TLS + Cloudflare CDN Auto-Fallback</strong>
+                    <span class="pill-tag tag-accent">Auto-Failover · Direct + CDN</span>
+                  </div>
+                  <span class="choice-desc">Runs at full Direct Fake TLS speed normally, and automatically fails over to your Cloudflare/CDN domain if direct server-to-server traffic is blocked.</span>
+                </div>
+              </label>
+
+              <label class="choice-card">
+                <input type="radio" name="tn-link" value="xhttp-cdn">
+                <div class="choice-body">
+                  <div class="choice-top">
+                    <strong>SplitHTTP / XHTTP via Cloudflare CDN</strong>
+                    <span class="pill-tag tag-good">CDN · Works on Free Plan</span>
+                  </div>
+                  <span class="choice-desc">Streams standard HTTP GET + POST through your Cloudflare/CDN domain—requires zero WebSocket or gRPC toggles in Cloudflare.</span>
+                </div>
+              </label>
+
+              <label class="choice-card" id="tn-asym-cdn-choice">
+                <input type="radio" name="tn-link" value="asymmetric-cdn">
+                <div class="choice-body">
+                  <div class="choice-top">
+                    <strong>Asymmetric CDN Hybrid (Cloudflare ↑ + Reverse UDP ↓)</strong>
+                    <span class="pill-tag tag-accent">CDN ↑ + Fast UDP ↓</span>
+                  </div>
+                  <span class="choice-desc">Sends uploads through your unblockable Cloudflare CDN domain while pulling downloads directly via Reverse UDP Port-Hopping—bypassing slow CDN download speeds.</span>
+                </div>
+              </label>
+
+              <label class="choice-card">
+                <input type="radio" name="tn-link" value="cdn">
+                <div class="choice-body">
+                  <div class="choice-top">
+                    <strong>WebSocket via Cloudflare CDN (WSS)</strong>
+                    <span class="pill-tag">CDN · Classic WSS</span>
+                  </div>
+                  <span class="choice-desc">Classic HTTPS WebSocket tunnel through your proxied Cloudflare/CDN domain when direct connections to your Foreign IP are blocked.</span>
+                </div>
+              </label>
+
+              <label class="choice-card">
+                <input type="radio" name="tn-link" value="h3-cdn">
+                <div class="choice-body">
+                  <div class="choice-top">
+                    <strong>QUIC / HTTP/3 via Cloudflare CDN</strong>
+                    <span class="pill-tag">CDN · UDP HTTP/3</span>
+                  </div>
+                  <span class="choice-desc">Relay connects to Cloudflare Edge over UDP QUIC / HTTP/3 (requires HTTP/3 enabled on Cloudflare) and streams cleanly to your Foreign server.</span>
+                </div>
+              </label>
+
+              <label class="choice-card">
+                <input type="radio" name="tn-link" value="grpc-cdn">
+                <div class="choice-body">
+                  <div class="choice-top">
+                    <strong>gRPC via Cloudflare CDN</strong>
+                    <span class="pill-tag">CDN · HTTP/2 gRPC</span>
+                  </div>
+                  <span class="choice-desc">Routes multiplexed HTTP/2 gRPC through your Cloudflare domain (requires gRPC enabled under Cloudflare Network settings).</span>
+                </div>
+              </label>
+            </div>
+          </div>
+
+          <!-- Group 4: Emergency Raw-Socket, Layer-3 & Unfiltered Modes -->
+          <div class="transport-group">
+            <div class="transport-group-head">
+              <strong>Special Raw-Socket, Layer-3 &amp; Unfiltered Modes</strong>
+              <span class="transport-group-sub">Low-level packet encapsulations when normal TCP/UDP ports are heavily blocked, plus Raw TCP for clean routes.</span>
+            </div>
+            <div class="choice-grid cols-2">
+              <label class="choice-card">
+                <input type="radio" name="tn-link" value="faketcp">
+                <div class="choice-body">
+                  <div class="choice-top">
+                    <strong>Raw FakeTCP · Paqet-Style (KCP+FEC)</strong>
+                    <span class="pill-tag tag-accent">Paqet · Raw TCP</span>
+                  </div>
+                  <span class="choice-desc">Wraps KCP+FEC inside raw TCP PSH|ACK segments with source-port rotation and low-TTL SYN decoys—bypasses UDP throttles while ignoring ISP TCP RST injection (IPv4).</span>
+                </div>
+              </label>
+
+              <label class="choice-card">
+                <input type="radio" name="tn-link" value="icmp">
+                <div class="choice-body">
+                  <div class="choice-top">
+                    <strong>ICMP Ping Tunnel (KCP+FEC)</strong>
+                    <span class="pill-tag">ICMP Echo / Ping</span>
+                  </div>
+                  <span class="choice-desc">Carries KCP+FEC inside ICMP Echo Request &amp; Reply (ping) packets when both TCP and UDP ports are heavily filtered between servers (IPv4).</span>
+                </div>
+              </label>
+
+              <label class="choice-card">
+                <input type="radio" name="tn-link" value="ip-spoof">
+                <div class="choice-body">
+                  <div class="choice-top">
+                    <strong>Source IP + Whitelisted SNI Spoof</strong>
+                    <span class="pill-tag tag-accent">Raw IP + SNI</span>
+                  </div>
+                  <span class="choice-desc">Forges a whitelisted source IPv4 (104.18.4.130) + decoy TLS ClientHello over KCP/UDP. Requires at least one VPS that permits outbound source IP spoofing.</span>
+                </div>
+              </label>
+
+              <label class="choice-card">
+                <input type="radio" name="tn-link" value="sit">
+                <div class="choice-body">
+                  <div class="choice-top">
+                    <strong>Private 6in4 Link (SIT Protocol 41)</strong>
+                    <span class="pill-tag">IP Protocol 41</span>
+                  </div>
+                  <span class="choice-desc">Builds a private IPv6-in-IPv4 link (fd99::/64 over IP protocol 41) between IPv4 servers when standard TCP/UDP ports are filtered.</span>
+                </div>
+              </label>
+
+              <label class="choice-card">
+                <input type="radio" name="tn-link" value="plain">
+                <div class="choice-body">
+                  <div class="choice-top">
+                    <strong>Raw TCP (No Disguise)</strong>
+                    <span class="pill-tag">Fastest · Clean Routes</span>
+                  </div>
+                  <span class="choice-desc">Lowest CPU overhead and maximum raw TCP throughput (optional HTTP header obfuscation below)—best only on clean, unfiltered routes.</span>
+                </div>
+              </label>
+            </div>
+          </div>
+        </div>
+
+        <label class="check-card gre-override-card">
           <input type="checkbox" id="tn-gre">
           <span>
-            <strong>Use Private GRE Tunnel</strong>
-            <span class="muted"> — Layer-3 IP tunnel useful when normal TCP/UDP handshakes connect but data is dropped. Not disguised; requires public IPv4 on both servers.</span>
+            <strong>Override with Private GRE Layer-3 Tunnel (Protocol 47)</strong>
+            <span class="muted"> — Kernel IP-in-IP GRE link useful when TCP/UDP handshakes connect but payload data is dropped. Not disguised; requires public IPv4 on both servers.</span>
           </span>
         </label>
-
-        <div id="tn-links" class="choice-grid cols-2">
-          <label class="choice-card">
-            <input type="radio" name="tn-link" value="website" checked>
-            <div class="choice-body">
-              <div class="choice-top">
-                <strong>Fake TLS Website (SNI Disguise)</strong>
-                <span class="pill-tag tag-good">Recommended</span>
-              </div>
-              <span class="choice-desc">Looks like normal HTTPS traffic to a popular website, with real-site anti-probe cover.</span>
-            </div>
-          </label>
-
-          <label class="choice-card" id="tn-backup-choice">
-            <input type="radio" name="tn-link" value="website-cdn-backup">
-            <div class="choice-body">
-              <div class="choice-top">
-                <strong>Fake TLS + CDN Auto-Fallback</strong>
-                <span class="pill-tag tag-accent">Auto-Failover</span>
-              </div>
-              <span class="choice-desc">Uses direct Fake TLS normally, and automatically switches to your CDN domain if blocked.</span>
-            </div>
-          </label>
-
-          <label class="choice-card">
-            <input type="radio" name="tn-link" value="cdn">
-            <div class="choice-body">
-              <div class="choice-top">
-                <strong>Cloudflare / CDN WebSocket</strong>
-                <span class="pill-tag">CDN</span>
-              </div>
-              <span class="choice-desc">Routes traffic through your domain behind Cloudflare or another CDN proxy.</span>
-            </div>
-          </label>
-
-          <label class="choice-card">
-            <input type="radio" name="tn-link" value="xhttp">
-            <div class="choice-body">
-              <div class="choice-top">
-                <strong>SplitHTTP / XHTTP Stream (Direct)</strong>
-                <span class="pill-tag tag-good">GET + POST</span>
-              </div>
-              <span class="choice-desc">Direct server-to-server HTTP/1.1 chunked GET downlink + sequenced keep-alive POST uplinks with zero WebSocket Upgrade headers.</span>
-            </div>
-          </label>
-
-          <label class="choice-card">
-            <input type="radio" name="tn-link" value="xhttp-cdn">
-            <div class="choice-body">
-              <div class="choice-top">
-                <strong>SplitHTTP / XHTTP via Cloudflare / CDN</strong>
-                <span class="pill-tag tag-good">CDN · No Upgrade</span>
-              </div>
-              <span class="choice-desc">Standard HTTP/1.1 GET + POST streaming through any Cloudflare / CDN plan with zero WebSocket or gRPC toggle needed.</span>
-            </div>
-          </label>
-
-          <label class="choice-card" id="tn-asym-choice">
-            <input type="radio" name="tn-link" value="asymmetric">
-            <div class="choice-body">
-              <div class="choice-top">
-                <strong>Asymmetric Hybrid (Stealth XHTTP ↑ + KCP-Hop ↓)</strong>
-                <span class="pill-tag tag-good">Dual-Path · Anti-Throttle</span>
-              </div>
-              <span class="choice-desc">Splits upload and download onto independent paths: stealth Direct XHTTP uplink paired with Reverse UDP Port-Hopping + FEC downlink (auto-TLS fallback).</span>
-            </div>
-          </label>
-
-          <label class="choice-card" id="tn-asym-cdn-choice">
-            <input type="radio" name="tn-link" value="asymmetric-cdn">
-            <div class="choice-body">
-              <div class="choice-top">
-                <strong>Asymmetric CDN Hybrid (CDN XHTTP ↑ + KCP-Hop ↓)</strong>
-                <span class="pill-tag tag-accent">CDN ↑ + UDP ↓</span>
-              </div>
-              <span class="choice-desc">Unblockable Cloudflare / CDN XHTTP uplink paired with a direct Reverse UDP Port-Hopping + FEC downlink so downloads bypass CDN bandwidth caps.</span>
-            </div>
-          </label>
-
-          <label class="choice-card">
-            <input type="radio" name="tn-link" value="h3">
-            <div class="choice-body">
-              <div class="choice-top">
-                <strong>QUIC / HTTP/3 Masquerade (Direct UDP)</strong>
-                <span class="pill-tag tag-good">HTTP/3 · 0-HOL</span>
-              </div>
-              <span class="choice-desc">Genuine HTTP/3 over QUIC v1 (RFC 9000 + TLS 1.3 ALPN h3) directly over UDP between servers with zero TCP head-of-line blocking.</span>
-            </div>
-          </label>
-
-          <label class="choice-card">
-            <input type="radio" name="tn-link" value="h3-cdn">
-            <div class="choice-body">
-              <div class="choice-top">
-                <strong>QUIC / HTTP/3 via Cloudflare / CDN</strong>
-                <span class="pill-tag">CDN · HTTP/3</span>
-              </div>
-              <span class="choice-desc">Connects from the Relay to Cloudflare Edge over QUIC / HTTP/3 (UDP) with SplitHTTP streaming to your Foreign server.</span>
-            </div>
-          </label>
-
-          <label class="choice-card">
-            <input type="radio" name="tn-link" value="grpc">
-            <div class="choice-body">
-              <div class="choice-top">
-                <strong>gRPC Stream (Direct HTTP/2)</strong>
-                <span class="pill-tag">HTTP/2</span>
-              </div>
-              <span class="choice-desc">Multiplexed HTTP/2 gRPC streams directly between the Relay and Foreign servers.</span>
-            </div>
-          </label>
-
-          <label class="choice-card">
-            <input type="radio" name="tn-link" value="grpc-cdn">
-            <div class="choice-body">
-              <div class="choice-top">
-                <strong>gRPC via Cloudflare / CDN</strong>
-                <span class="pill-tag">CDN gRPC</span>
-              </div>
-              <span class="choice-desc">Routes HTTP/2 gRPC through Cloudflare (requires gRPC enabled in Cloudflare Network settings).</span>
-            </div>
-          </label>
-
-          <label class="choice-card">
-            <input type="radio" name="tn-link" value="kcp">
-            <div class="choice-body">
-              <div class="choice-top">
-                <strong>KCP over UDP</strong>
-                <span class="pill-tag">UDP + FEC</span>
-              </div>
-              <span class="choice-desc">Repairs lost packets on unstable routes and bypasses TCP reset (RST) interference.</span>
-            </div>
-          </label>
-
-          <label class="choice-card">
-            <input type="radio" name="tn-link" value="kcp-hop">
-            <div class="choice-body">
-              <div class="choice-top">
-                <strong>KCP Port-Hopping UDP</strong>
-                <span class="pill-tag tag-good">Port-Hop + FEC</span>
-              </div>
-              <span class="choice-desc">Rotates local and remote UDP sockets every 15s across an 8-port pool with PSK-authenticated headers and zero-drop drain handoff.</span>
-            </div>
-          </label>
-
-          <label class="choice-card">
-            <input type="radio" name="tn-link" value="sni-spoof">
-            <div class="choice-body">
-              <div class="choice-top">
-                <strong>Decoy Whitelisted SNI Spoof</strong>
-                <span class="pill-tag tag-good">Works on All VPS</span>
-              </div>
-              <span class="choice-desc">Injects a low-TTL out-of-window decoy TLS 1.3 ClientHello with a whitelisted SNI (Cloudflare Turnstile / reCAPTCHA) so DPI whitelists the flow while the peer drops the decoy.</span>
-            </div>
-          </label>
-
-          <label class="choice-card">
-            <input type="radio" name="tn-link" value="split">
-            <div class="choice-body">
-              <div class="choice-top">
-                <strong>Split-Stream TLS (Anti-Freeze Rotation)</strong>
-                <span class="pill-tag tag-good">Byte-Cap Bypass</span>
-              </div>
-              <span class="choice-desc">Continuously rotates underlying TLS sockets every 14 KB with pre-warmed legs so DPI byte-counter filters never freeze long-lived streams.</span>
-            </div>
-          </label>
-
-          <label class="choice-card">
-            <input type="radio" name="tn-link" value="faketcp">
-            <div class="choice-body">
-              <div class="choice-top">
-                <strong>Raw FakeTCP · Paqet-Style (KCP+FEC)</strong>
-                <span class="pill-tag tag-accent">Paqet · Raw TCP</span>
-              </div>
-              <span class="choice-desc">Carries KCP+FEC inside raw TCP PSH|ACK segments with outer source-port rotation and low-TTL SYN decoy, bypassing UDP throttles while ignoring ISP TCP RST injection.</span>
-            </div>
-          </label>
-
-          <label class="choice-card">
-            <input type="radio" name="tn-link" value="icmp">
-            <div class="choice-body">
-              <div class="choice-top">
-                <strong>ICMP Ping Tunnel (KCP+FEC)</strong>
-                <span class="pill-tag">Ping Tunnel</span>
-              </div>
-              <span class="choice-desc">Encapsulates KCP+FEC inside realistic ICMP Echo Request &amp; Reply (ping) packets when both TCP and UDP ports are heavily filtered.</span>
-            </div>
-          </label>
-
-          <label class="choice-card">
-            <input type="radio" name="tn-link" value="sit">
-            <div class="choice-body">
-              <div class="choice-top">
-                <strong>Private 6in4 Link (SIT Protocol 41)</strong>
-                <span class="pill-tag">Protocol 41</span>
-              </div>
-              <span class="choice-desc">Builds a deterministic private IPv6 link (fd99::/64 over IP protocol 41) between IPv4 servers so traffic rides inside IPv6-in-IPv4 packets.</span>
-            </div>
-          </label>
-
-          <label class="choice-card">
-            <input type="radio" name="tn-link" value="ip-spoof">
-            <div class="choice-body">
-              <div class="choice-top">
-                <strong>Source IP + Whitelisted SNI Spoof</strong>
-                <span class="pill-tag tag-accent">Raw IP + SNI</span>
-              </div>
-              <span class="choice-desc">Forges a whitelisted source IP (104.18.4.130) + decoy TLS ClientHello over KCP/UDP. Requires at least one VPS that allows raw outbound IP spoofing.</span>
-            </div>
-          </label>
-
-          <label class="choice-card">
-            <input type="radio" name="tn-link" value="plain">
-            <div class="choice-body">
-              <div class="choice-top">
-                <strong>Raw TCP (No Disguise)</strong>
-                <span class="pill-tag">Fastest</span>
-              </div>
-              <span class="choice-desc">Lowest overhead and maximum speed, but easiest for firewalls to detect.</span>
-            </div>
-          </label>
-        </div>
 
         <!-- Contextual options for the chosen link -->
         <div id="tn-opt-webheader" class="sub-panel" hidden>
@@ -1027,10 +1165,10 @@
         </label>
       </fieldset>
 
-      <!-- STEP 4: Connection Sharing & User Capacity -->
+      <!-- STEP 5: Connection Sharing & User Capacity -->
       <fieldset class="step-section">
         <legend class="step-header">
-          <span class="step-num">4</span>
+          <span class="step-num">5</span>
           <span>
             <span class="step-title">Connection Pooling, Multiplexing &amp; User Capacity</span>
             <span class="step-sub">Pick your expected concurrent user count to auto-tune connection mode &amp; limits, or customize below (1 active user ≈ 15–30 TCP streams).</span>
@@ -1131,39 +1269,6 @@
         </div>
       </fieldset>
 
-      <!-- STEP 5: Ports -->
-      <fieldset class="step-section">
-        <legend class="step-header">
-          <span class="step-num">5</span>
-          <span>
-            <span class="step-title">Port Configuration</span>
-            <span class="step-sub">Set your Foreign inbound port(s), Relay user port(s), and the internal tunnel port.</span>
-          </span>
-        </legend>
-        <div class="ports-grid">
-          <div class="port-box">
-            <label for="tn-service">Inbound Port(s) <span class="muted">(Foreign)</span></label>
-            <span class="field-hint">Your X-UI / V2Ray inbound port(s), e.g. 443, 2096</span>
-            <input id="tn-service" inputmode="numeric" required placeholder="443, 2096">
-          </div>
-          <div class="port-box">
-            <label for="tn-users">User Listen Port(s) <span class="muted">(Relay)</span></label>
-            <span class="field-hint">Port(s) users connect to (empty = same as Inbound)</span>
-            <input id="tn-users" inputmode="numeric" placeholder="Same as Inbound Port(s)">
-          </div>
-          <div class="port-box">
-            <label for="tn-linkport">Tunnel Bridge Port</label>
-            <span class="field-hint">Internal port between the two servers</span>
-            <input id="tn-linkport" type="number" min="1" max="65535" value="2053" inputmode="numeric">
-          </div>
-        </div>
-        <div class="actions left port-check-bar">
-          <button type="button" id="tn-check">Test &amp; Verify Ports on Both Servers</button>
-          <button type="button" id="tn-scan-cdn">Scan Free CDN Ports</button>
-        </div>
-        <ul id="tn-ports-result" class="ports-result" aria-live="polite"></ul>
-      </fieldset>
-
       <!-- STEP 6: Visitor Addresses & Advanced -->
       <fieldset class="step-section">
         <legend class="step-header">
@@ -1202,7 +1307,7 @@
         <input type="checkbox" id="tn-autoheal" checked>
         <span>
           <strong>Auto-Heal &amp; Smart Failover (Recommended)</strong>
-          <span class="muted"> — Automatically detects if this tunnel gets blocked or loses links, benchmarks all available modes (Direct, Reverse, IPv4, IPv6, Stealth, gRPC, KCP, CDN), and switches to the best working path automatically.</span>
+          <span class="muted"> — Automatically detects if this tunnel gets blocked or loses links, benchmarks all available modes (Direct, Reverse, IPv4/IPv6, HTTPS/TLS, SplitHTTP/XHTTP, QUIC/HTTP/3, Asymmetric Dual-Path, WebRTC, Twin-Path, KCP, FakeTCP, ICMP, CDN), and switches to the best working path automatically.</span>
         </span>
       </label>
 
@@ -2103,15 +2208,17 @@
             <div>
               <label for="wb-link">Inter-Server Disguise</label>
               <select id="wb-link">
-                <option value="website">Fake TLS Website + Stealth (Recommended)</option>
-                <option value="xhttp">SplitHTTP / XHTTP Stream (Direct)</option>
-                <option value="asymmetric">Asymmetric Hybrid (Stealth XHTTP ↑ + KCP-Hop ↓)</option>
+                <option value="website">Fake TLS Website (HTTPS SNI Disguise · Recommended)</option>
+                <option value="xhttp">SplitHTTP / XHTTP (Direct Server-to-Server)</option>
+                <option value="asymmetric">Asymmetric Dual-Path (Direct XHTTP ↑ + Reverse UDP ↓)</option>
                 <option value="h3">QUIC / HTTP/3 Masquerade (Direct UDP)</option>
                 <option value="sni-spoof">Decoy Whitelisted SNI Spoof (challenges.cloudflare.com)</option>
-                <option value="split">Split-Stream TLS (Anti-Freeze Rotation)</option>
-                <option value="kcp-hop">KCP Port-Hopping UDP (8-Port Pool + FEC)</option>
-                <option value="kcp">KCP over UDP (Packet-loss repair)</option>
-                <option value="plain">Raw TCP (Fastest on clean routes)</option>
+                <option value="split">Split-Stream TLS (14 KB Anti-Freeze Rotation)</option>
+                <option value="webrtc">WebRTC Video-Call Disguise (STUN + SRTP)</option>
+                <option value="twin">Twin-Path 1+1 Gaming UDP (Zero-Lag Duplication)</option>
+                <option value="kcp-hop">KCP Port-Hopping UDP (8-Port Rotation + FEC)</option>
+                <option value="kcp">KCP Accelerated UDP (Single-Port + FEC)</option>
+                <option value="plain">Raw TCP (No Disguise · Clean Routes)</option>
               </select>
               <label for="wb-sni" class="small muted">Camouflage SNI / Host</label>
               <input id="wb-sni" value="www.bing.com" autocapitalize="none" spellcheck="false">

@@ -1832,11 +1832,19 @@ select.cf-server-pick {
 /* ------------------------------------------- Smart Route & Transport Probe */
 
 .probe-box {
-  margin-top: .85rem;
-  padding: .85rem 1rem;
+  margin-top: .95rem;
+  padding: 1rem 1.1rem;
   background: var(--panel);
   border: 1px solid var(--accent-border);
+  border-left: 3.5px solid var(--accent);
   border-radius: var(--radius-sm);
+  box-shadow: 0 2px 8px rgba(0, 0, 0, .03);
+}
+.probe-box.explore-box {
+  border: 1px dashed var(--line-strong);
+  border-left: 3.5px solid var(--line-strong);
+  background: var(--panel-2);
+  box-shadow: none;
 }
 .probe-head {
   display: flex;
@@ -1845,72 +1853,151 @@ select.cf-server-pick {
   gap: .85rem;
   flex-wrap: wrap;
 }
-.probe-head strong {
-  font-size: .95rem;
+.probe-head strong,
+.probe-title-row strong {
+  font-size: .97rem;
+  color: var(--text);
 }
-.probe-head p {
-  margin: .15rem 0 0;
+.probe-head p,
+.probe-banner-head p {
+  margin: .28rem 0 0;
+  line-height: 1.44;
 }
-.probe-goal-row {
+.probe-title-row {
   display: flex;
   align-items: center;
   gap: .5rem;
   flex-wrap: wrap;
-  margin-top: .65rem;
-  padding-top: .6rem;
+}
+.probe-subblock {
+  margin-top: .85rem;
+  padding-top: .8rem;
   border-top: 1px solid var(--line);
 }
-.probe-goal-label {
-  font-size: .8rem;
-  font-weight: 650;
-  color: var(--muted);
-  margin-right: .15rem;
-}
-label.probe-goal-pill {
-  display: inline-flex;
+.probe-subhead-row {
+  display: flex;
   align-items: center;
-  gap: .42rem;
-  margin: 0;
-  padding: .34rem .68rem;
-  border-radius: 7px;
-  border: 1px solid var(--line);
-  background: var(--well);
-  font-size: .79rem;
-  font-weight: 450;
-  color: var(--text);
-  cursor: pointer;
-  transition: border-color .15s ease, background .15s ease;
+  justify-content: space-between;
+  gap: .5rem;
+  flex-wrap: wrap;
+  margin-bottom: .5rem;
 }
-label.probe-goal-pill:hover {
+.probe-subhead {
+  font-size: .83rem;
+  font-weight: 700;
+  color: var(--text);
+  letter-spacing: .01em;
+}
+.probe-goal-stack {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: .55rem;
+}
+label.choice-card.probe-goal-card {
+  padding: .68rem .88rem;
+  background: var(--well);
+}
+label.choice-card.probe-goal-card:hover {
+  background: var(--panel-2);
   border-color: var(--accent-border);
 }
-label.probe-goal-pill:has(input:checked) {
-  border-color: var(--accent);
+label.choice-card.probe-goal-card:has(input:checked),
+label.choice-card.probe-goal-card.is-selected {
   background: var(--accent-soft);
+  border-color: var(--accent);
 }
-label.probe-goal-pill input[type="radio"] {
-  width: auto;
-  margin: 0;
-}
-.probe-ports-row {
-  display: grid;
-  grid-template-columns: 1.4fr 1fr;
-  gap: .65rem;
-  margin-top: .65rem;
-  align-items: end;
-}
-.probe-ports-row label {
-  margin-top: 0;
-}
+.probe-ports-row,
 .probe-cdn-row {
   display: grid;
-  grid-template-columns: 1.4fr 1fr;
-  gap: .65rem;
-  margin-top: .65rem;
-  align-items: end;
+  grid-template-columns: 1fr 1fr;
+  gap: .7rem;
+  align-items: stretch;
 }
-.probe-cdn-row label {
+.probe-cdn-row:has(> [hidden]) {
+  grid-template-columns: 1fr;
+}
+.port-box.probe-port-card {
+  background: var(--well);
+  padding: .68rem .8rem;
+}
+.port-box.probe-port-card label {
   margin-top: 0;
+}
+.probe-cta-bar {
+  margin-top: .9rem;
+  padding-top: .85rem;
+  border-top: 1px solid var(--line);
+  display: flex;
+  align-items: center;
+  gap: .85rem;
+  flex-wrap: wrap;
+}
+button.probe-cta-btn {
+  min-height: 2.6rem;
+  padding: .58rem 1.35rem;
+  font-size: .94rem;
+  font-weight: 650;
+  flex-shrink: 0;
+}
+.probe-cta-note {
+  flex: 1 1 14rem;
+  margin: 0;
+  line-height: 1.38;
+}
+
+.step-header-flex {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: .75rem;
+  flex-wrap: wrap;
+  flex: 1;
+  min-width: 0;
+}
+.transport-groups {
+  display: grid;
+  gap: .85rem;
+  margin-top: .35rem;
+}
+.transport-group {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  padding: .85rem .95rem;
+}
+.transport-group-head {
+  display: flex;
+  flex-direction: column;
+  gap: .15rem;
+  padding-bottom: .58rem;
+  margin-bottom: .65rem;
+  border-bottom: 1px solid var(--line);
+}
+.transport-group-head strong {
+  font-size: .93rem;
+  font-weight: 700;
+  color: var(--text);
+}
+.transport-group-sub {
+  font-size: .81rem;
+  color: var(--muted);
+  font-weight: 400;
+  line-height: 1.38;
+}
+.transport-group label.choice-card {
+  background: var(--well);
+}
+.transport-group label.choice-card:hover {
+  background: var(--panel-2);
+  border-color: var(--line-strong);
+}
+.transport-group label.choice-card:has(input:checked),
+.transport-group label.choice-card.is-selected {
+  background: var(--accent-soft);
+  border-color: var(--accent);
+}
+label.check-card.gre-override-card {
+  margin-top: .85rem;
 }
 .probe-results {
   margin-top: .85rem;
@@ -2147,6 +2234,7 @@ button.btn-autoheal.is-on {
   .choice-grid.cols-2, .choice-grid.cols-3, .choice-grid.cols-4 { grid-template-columns: 1fr; }
   .cf-filter-bar { grid-template-columns: 1fr; }
   .probe-ports-row, .probe-cdn-row { grid-template-columns: 1fr; }
+  button.probe-cta-btn { width: 100%; justify-content: center; }
   .top-inner { padding: .55rem .85rem; gap: .5rem; }
   .brand { gap: .45rem; font-size: 1.05rem; min-width: 0; }
   .top-right { gap: .38rem; margin-left: auto; flex-shrink: 0; }

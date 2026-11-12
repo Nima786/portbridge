@@ -116,7 +116,9 @@ type createRequest struct {
 	Mode    string `json:"mode"`    // direct or reverse
 
 	// Link is how the link between the servers looks: plain, website, cdn,
-	// website-cdn-backup, grpc, grpc-cdn or kcp.
+	// website-cdn-backup, xhttp, xhttp-cdn, h3, h3-cdn, asymmetric,
+	// asymmetric-cdn, grpc, grpc-cdn, kcp, kcp-hop, twin, webrtc, faketcp,
+	// icmp, sit, sni-spoof or ip-spoof.
 	Link         string `json:"link"`
 	ServerName   string `json:"server_name"` // the name it claims
 	Domain       string `json:"domain"`      // the domain pointed at the CDN
@@ -130,6 +132,7 @@ type createRequest struct {
 	AntiFreeze   bool   `json:"anti_freeze"`
 	PortHop      bool   `json:"port_hop"`
 	PortHopPorts int    `json:"port_hop_ports,omitempty"`
+	TwinPath     bool   `json:"twin_path"`
 	Asymmetric   bool   `json:"asymmetric"`
 	AsymUplink   string `json:"asym_uplink,omitempty"`
 	AsymDownlink string `json:"asym_downlink,omitempty"`
@@ -408,10 +411,36 @@ func (p *Panel) toSpec(r createRequest) (agent.EdgeSpec, error) {
 			s.PortHop = "on"
 			s.PortHopPorts = r.PortHopPorts
 		}
+		if r.TwinPath {
+			s.TwinPath = "on"
+			r.Shared = true
+		}
 	case "kcp-hop":
 		s.Transport = "kcp"
 		s.PortHop = "on"
 		s.PortHopPorts = r.PortHopPorts
+		if r.TwinPath {
+			s.TwinPath = "on"
+			r.Shared = true
+		}
+	case "twin":
+		s.Transport = "kcp"
+		s.TwinPath = "on"
+		r.Shared = true
+		if r.PortHop {
+			s.PortHop = "on"
+			s.PortHopPorts = r.PortHopPorts
+		}
+	case "webrtc":
+		s.Transport = "webrtc"
+		r.Shared = true
+		if r.PortHop {
+			s.PortHop = "on"
+			s.PortHopPorts = r.PortHopPorts
+		}
+		if r.TwinPath {
+			s.TwinPath = "on"
+		}
 	case "faketcp":
 		s.Transport = "faketcp"
 	case "icmp":
@@ -449,7 +478,7 @@ func (p *Panel) toSpec(r createRequest) (agent.EdgeSpec, error) {
 		if r.AntiFreeze {
 			s.AntiFreeze = "on"
 		}
-		if r.SNISpoof && s.Transport != "h3" {
+		if r.SNISpoof && s.Transport != "h3" && s.Transport != "webrtc" {
 			s.SNISpoof = "on"
 			s.SpoofSNI = strings.TrimSpace(r.SpoofSNI)
 			if s.SpoofSNI == "" {
@@ -552,6 +581,7 @@ func intsOf(list string) []int {
 func (p *Panel) checkForeignPorts(ctx context.Context, j *job, foreignID string, s agent.EdgeSpec) error {
 	ask := intsOf(s.ServicePorts)
 	var hopPorts []int
+	var twinPorts []int
 	if s.Mode == "direct" {
 		if s.PortHop == "on" {
 			cnt := s.PortHopPorts
@@ -562,6 +592,12 @@ func (p *Panel) checkForeignPorts(ctx context.Context, j *job, foreignID string,
 				hopPorts = append(hopPorts, s.LinkPort+i)
 			}
 			ask = append(ask, hopPorts...)
+		} else if s.TwinPath == "on" {
+			twinPorts = append(twinPorts, s.LinkPort)
+			if s.LinkPort+1 <= 65535 {
+				twinPorts = append(twinPorts, s.LinkPort+1)
+			}
+			ask = append(ask, twinPorts...)
 		} else {
 			ask = append(ask, s.LinkPort)
 		}
@@ -581,6 +617,14 @@ func (p *Panel) checkForeignPorts(ctx context.Context, j *job, foreignID string,
 				if ps := st[hp]; ps.State == "busy" || ps.State == "reserved" {
 					problems = append(problems, fmt.Sprintf("port-hop bridge port %d is already used on the foreign server%s",
 						hp, byWhom(ps.By)))
+					break
+				}
+			}
+		} else if len(twinPorts) > 0 {
+			for _, tp := range twinPorts {
+				if ps := st[tp]; ps.State == "busy" || ps.State == "reserved" {
+					problems = append(problems, fmt.Sprintf("twin-path bridge port %d is already used on the foreign server%s",
+						tp, byWhom(ps.By)))
 					break
 				}
 			}

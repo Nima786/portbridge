@@ -34,8 +34,8 @@ var icmpMagic = [3]byte{'P', 'B', 'I'}
 
 type icmpClientMeta struct {
 	lastSeen atomic.Int64 // unix nano of the last packet from this client
-	id       uint16
-	seq      uint32
+	id       atomic.Uint32
+	seq      atomic.Uint32
 }
 
 type icmpRxPkt struct {
@@ -405,12 +405,15 @@ func (c *icmpPacketConn) ReadFrom(p []byte) (int, net.Addr, error) {
 		uaddr := &net.UDPAddr{IP: srcIP, Port: int(srcPort)}
 		if c.isServer {
 			key := uaddr.String()
-			val, loaded := c.clients.LoadOrStore(key, &icmpClientMeta{id: icmpID, seq: uint32(icmpSeq)})
+			fresh := &icmpClientMeta{}
+			fresh.id.Store(uint32(icmpID))
+			fresh.seq.Store(uint32(icmpSeq))
+			val, loaded := c.clients.LoadOrStore(key, fresh)
 			meta := val.(*icmpClientMeta)
 			meta.lastSeen.Store(time.Now().UnixNano())
 			if loaded {
-				meta.id = icmpID
-				atomic.StoreUint32(&meta.seq, uint32(icmpSeq))
+				meta.id.Store(uint32(icmpID))
+				meta.seq.Store(uint32(icmpSeq))
 			} else if c.newClients.Add(1)%64 == 0 {
 				// Every reconnect arrives from a new port; clear out the long-gone
 				// ones so the table cannot only grow.
@@ -481,8 +484,8 @@ func (c *icmpPacketConn) WriteTo(p []byte, addr net.Addr) (int, error) {
 		key := (&net.UDPAddr{IP: dstIP, Port: int(dstPort)}).String()
 		if val, ok := c.clients.Load(key); ok {
 			meta := val.(*icmpClientMeta)
-			id = meta.id
-			seq = uint16(atomic.AddUint32(&meta.seq, 1))
+			id = uint16(meta.id.Load())
+			seq = uint16(meta.seq.Add(1))
 		}
 	}
 

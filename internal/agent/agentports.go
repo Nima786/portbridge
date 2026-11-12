@@ -170,6 +170,9 @@ func buildOriginConf(p *PairingData, secretFile, certFile, keyFile string) strin
 			fmt.Fprintf(&b, "port_hop_ports = %s\n", php)
 		}
 	}
+	if p.TwinPath == "on" {
+		fmt.Fprintf(&b, "twin_path = on\n")
+	}
 	if p.Asymmetric == "on" {
 		fmt.Fprintf(&b, "asymmetric = on\n")
 		if up := strings.TrimSpace(p.AsymUplink); up != "" {
@@ -343,6 +346,11 @@ func checkPairingPorts(p *PairingData, confDir string, host agentHost, _ string)
 			if err != nil {
 				problems = append(problems, fmt.Sprintf(
 					"the port between the servers, %d, is busy on this server: something else is using it", tport))
+			} else if p.TwinPath == "on" && p.PortHop != "on" && tport < 65535 {
+				if err2 := host.PortFree(engine.Transport(p.Transport), tport+1); err2 != nil {
+					problems = append(problems, fmt.Sprintf(
+						"the Twin-Path companion UDP port, %d, is busy on this server: something else is using it", tport+1))
+				}
 			}
 		}
 		for _, in := range inbound {

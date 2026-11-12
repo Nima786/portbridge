@@ -497,3 +497,92 @@ func TestCreateJoinAndEditH3AndAsymmetric(t *testing.T) {
 		t.Fatalf("updatePairingData(asymmetric-cdn): %v", err)
 	}
 }
+
+func TestPhase3WebRTCAndTwinPathCreateJoinAndEdit(t *testing.T) {
+	// 1. WebRTC Video-Call Disguise (Direct) -> Edit to Twin-Path 1+1 Gaming Mode -> Edit to WebRTC + PortHop
+	edgeDir := t.TempDir()
+	originDir := t.TempDir()
+
+	resWRTC, err := CreateEdge(EdgeSpec{
+		Name:         "twrtc",
+		Mode:         "direct",
+		Transport:    "webrtc",
+		Mux:          "on",
+		MuxLinks:     4,
+		PeerIP:       "5.6.7.8",
+		LocalIP:      "1.2.3.4",
+		LinkPort:     3478,
+		UserPorts:    "31709",
+		ServicePorts: "31709",
+	}, edgeDir)
+	if err != nil {
+		t.Fatalf("CreateEdge(webrtc): %v", err)
+	}
+	pWRTC, err := decodePairingCode(resWRTC.Code)
+	if err != nil {
+		t.Fatalf("decodePairingCode(webrtc): %v", err)
+	}
+	if pWRTC.Transport != "webrtc" {
+		t.Fatalf("expected transport=webrtc, got %+v", pWRTC)
+	}
+	if err := applyPairingData(pWRTC, originDir); err != nil {
+		t.Fatalf("applyPairingData(webrtc): %v", err)
+	}
+	repE := TunnelsReport(edgeDir)
+	repO := TunnelsReport(originDir)
+	if len(repE) != 1 || repE[0].Transport != "webrtc" || len(repO) != 1 || repO[0].Transport != "webrtc" {
+		t.Fatalf("unexpected webrtc TunnelsReport: edge=%+v origin=%+v", repE, repO)
+	}
+
+	// Edit to Twin-Path 1+1 Gaming Mode (KCP + twin_path=on)
+	editTwin, err := EditEdge(EditSpec{
+		Name:      "twrtc",
+		Mode:      "direct",
+		Transport: "kcp",
+		TwinPath:  "on",
+		Mux:       "on",
+		MuxLinks:  4,
+	}, edgeDir)
+	if err != nil {
+		t.Fatalf("EditEdge(twin_path): %v", err)
+	}
+	pTwin, err := decodePairingCode(editTwin.Code)
+	if err != nil {
+		t.Fatalf("decodePairingCode(twin_path): %v", err)
+	}
+	if pTwin.Transport != "kcp" || pTwin.TwinPath != "on" {
+		t.Fatalf("expected kcp + twin_path=on, got %+v", pTwin)
+	}
+	if err := updatePairingData(pTwin, originDir, nil); err != nil {
+		t.Fatalf("updatePairingData(twin_path): %v", err)
+	}
+	repE = TunnelsReport(edgeDir)
+	repO = TunnelsReport(originDir)
+	if !repE[0].TwinPath || !repO[0].TwinPath {
+		t.Fatalf("expected TwinPath=true on both halves: edge=%+v origin=%+v", repE[0], repO[0])
+	}
+
+	// Edit to WebRTC + PortHop
+	editWRTCHop, err := EditEdge(EditSpec{
+		Name:         "twrtc",
+		Mode:         "reverse",
+		Transport:    "webrtc",
+		PortHop:      "on",
+		PortHopPorts: 8,
+		Mux:          "on",
+		MuxLinks:     4,
+	}, edgeDir)
+	if err != nil {
+		t.Fatalf("EditEdge(webrtc-porthop): %v", err)
+	}
+	pWRTCHop, err := decodePairingCode(editWRTCHop.Code)
+	if err != nil {
+		t.Fatalf("decodePairingCode(webrtc-porthop): %v", err)
+	}
+	if pWRTCHop.Transport != "webrtc" || pWRTCHop.PortHop != "on" {
+		t.Fatalf("expected webrtc + port_hop=on, got %+v", pWRTCHop)
+	}
+	if err := updatePairingData(pWRTCHop, originDir, nil); err != nil {
+		t.Fatalf("updatePairingData(webrtc-porthop): %v", err)
+	}
+}

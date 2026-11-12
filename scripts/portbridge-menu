@@ -596,6 +596,10 @@ explain_disguise() {
         say "  ${B}8) QUIC / HTTP/3 stream${R} ${DIM}(TLS 1.3 over UDP, zero head-of-line blocking, direct or CDN)${R}"
         say "     ${DIM}Runs genuine HTTP/3 over QUIC v1 (UDP + TLS 1.3 ALPN h3). Eliminates TCP${R}"
         say "     ${DIM}head-of-line blocking and works directly or through Cloudflare HTTP/3.${R}"
+        say ""
+        say "  ${B}9) WebRTC video-call disguise${R} ${DIM}(STUN + SRTP Opus/VP8 over UDP with FEC)${R}"
+        say "     ${DIM}Opens with genuine RFC 5389 ICE STUN Binding checks and frames KCP+FEC as${R}"
+        say "     ${DIM}encrypted SRTP audio/video packets so DPI classifies the flow as VoIP.${R}"
     else
         say ""
         say "  ${B}4) HTTP/2 / gRPC stream${R}"
@@ -615,6 +619,10 @@ explain_disguise() {
         say "  ${B}7) QUIC / HTTP/3 stream${R} ${DIM}(TLS 1.3 over UDP, zero head-of-line blocking, direct or CDN)${R}"
         say "     ${DIM}Runs genuine HTTP/3 over QUIC v1 (UDP + TLS 1.3 ALPN h3). Eliminates TCP${R}"
         say "     ${DIM}head-of-line blocking and works directly or through Cloudflare HTTP/3.${R}"
+        say ""
+        say "  ${B}8) WebRTC video-call disguise${R} ${DIM}(STUN + SRTP Opus/VP8 over UDP with FEC)${R}"
+        say "     ${DIM}Opens with genuine RFC 5389 ICE STUN Binding checks and frames KCP+FEC as${R}"
+        say "     ${DIM}encrypted SRTP audio/video packets so DPI classifies the flow as VoIP.${R}"
     fi
     hr
 }
@@ -824,14 +832,15 @@ ask_disguise() {
 
     explain_disguise "$mode"
     if [ "$mode" = direct ]; then
-        choice=$(choose "Choose 1, 2, 3, 4, 5, 6, 7 or 8" "2" 1 2 3 4 5 6 7 8)
+        choice=$(choose "Choose 1, 2, 3, 4, 5, 6, 7, 8 or 9" "2" 1 2 3 4 5 6 7 8 9)
     else
-        choice=$(choose "Choose 1, 2, 3, 4, 5, 6 or 7" "2" 1 2 3 4 5 6 7)
+        choice=$(choose "Choose 1, 2, 3, 4, 5, 6, 7 or 8" "2" 1 2 3 4 5 6 7 8)
         case "$choice" in
             4) choice=5 ;; # gRPC
             5) choice=6 ;; # KCP
             6) choice=7 ;; # XHTTP
             7) choice=8 ;; # H3
+            8) choice=9 ;; # WebRTC
         esac
     fi
 
@@ -878,6 +887,15 @@ ask_disguise() {
             ;;
         7) DG_TRANSPORT=xhttp ;;
         8) DG_TRANSPORT=h3 ;;
+        9)
+            DG_TRANSPORT=webrtc
+            DG_CDN=off
+            DG_SERVERNAME=""
+            DG_WSPATH=""
+            say ""
+            ok "Chosen: WebRTC video-call disguise (RFC 5389 STUN + SRTP Opus/VP8 over UDP)."
+            return 0
+            ;;
     esac
 
     if [ "$choice" = 3 ] || [ "$choice" = 4 ]; then
@@ -1095,7 +1113,7 @@ ask_real_site() {
     # this server, which cannot carry the proof, so it would be shown the real site.
     if [ "${DG_CDN:-off}" = on ] || [ -n "${DG_ALTHOST:-}" ] ||
         [ "${DG_TRANSPORT:-plain}" = plain ] || [ "${DG_TRANSPORT:-plain}" = kcp ] ||
-        [ "${DG_TRANSPORT:-plain}" = h3 ]; then
+        [ "${DG_TRANSPORT:-plain}" = webrtc ] || [ "${DG_TRANSPORT:-plain}" = h3 ]; then
         return 0
     fi
 
@@ -1174,6 +1192,7 @@ describe_disguise() {
         grpc:on) printf 'gRPC stream through Cloudflare' ;;
         grpc:*) printf 'looks like gRPC over HTTP/2' ;;
         kcp:*) printf 'loss-resistant KCP/UDP with FEC' ;;
+        webrtc:*) printf 'WebRTC video call (STUN + SRTP over UDP)' ;;
         wss:on) printf 'through a CDN' ;;
         wss:*)
             if [ -n "${3-}" ]; then
@@ -1511,7 +1530,7 @@ explain_sharing() {
     local transport=${DG_TRANSPORT:-plain} rec_one="" rec_two=""
     # The two choices are always numbered the same way, so "2" never means
     # something different from one screen to the next. Only the suggestion moves.
-    if [ "$transport" = kcp ] || [ "$transport" = wss ] || [ "$transport" = xhttp ] || [ "$transport" = h3 ] || [ "$transport" = grpc ]; then
+    if [ "$transport" = kcp ] || [ "$transport" = webrtc ] || [ "$transport" = wss ] || [ "$transport" = xhttp ] || [ "$transport" = h3 ] || [ "$transport" = grpc ]; then
         rec_two=" ${DIM}(recommended for $transport)${R}"
     else
         rec_one=" ${DIM}(recommended)${R}"
@@ -1553,7 +1572,7 @@ ask_mux_links() {
 ask_sharing() {
     explain_sharing
     local transport=${DG_TRANSPORT:-plain} def=1
-    if [ "$transport" = kcp ] || [ "$transport" = wss ] || [ "$transport" = xhttp ] || [ "$transport" = h3 ] || [ "$transport" = grpc ]; then
+    if [ "$transport" = kcp ] || [ "$transport" = webrtc ] || [ "$transport" = wss ] || [ "$transport" = xhttp ] || [ "$transport" = h3 ] || [ "$transport" = grpc ]; then
         def=2
     fi
     case "$(choose "Choose 1 or 2" "$def" 1 2)" in
@@ -1811,7 +1830,7 @@ write_tunnel() {
             printf 'http_header = on\n'
             printf 'http_host = %s\n' "${DG_HTTPHOST:-www.bing.com}"
         fi
-        if [ "${DG_TRANSPORT:-plain}" != plain ] && [ "${DG_TRANSPORT:-plain}" != kcp ]; then
+        if [ "${DG_TRANSPORT:-plain}" != plain ] && [ "${DG_TRANSPORT:-plain}" != kcp ] && [ "${DG_TRANSPORT:-plain}" != webrtc ]; then
             [ -n "${DG_SERVERNAME-}" ] && printf 'server_name = %s\n' "$DG_SERVERNAME"
             [ -n "${DG_WSPATH-}" ] && printf 'ws_path = %s\n' "$DG_WSPATH"
             printf 'cdn = %s\n' "${DG_CDN:-off}"
@@ -2187,7 +2206,7 @@ create_tunnel() {
         say "${DIM}IPv6 is not offered through a CDN, which reaches your server by name.${R}"
     else
         case "$DG_TRANSPORT" in
-            plain | tls | xhttp | h3 | h2 | grpc | kcp)
+            plain | tls | xhttp | h3 | h2 | grpc | kcp | webrtc)
                 # A foreign server that was given by its IPv6 address is that
                 # address already, so it is not asked for again.
                 case "$peer" in
@@ -2286,7 +2305,7 @@ create_tunnel() {
         if [ "$mode" = reverse ]; then
             # Reverse: it is opened here on the Iran server, so check it here.
             local link_proto=tcp
-            if [ "$DG_TRANSPORT" = kcp ] || { [ "$DG_TRANSPORT" = h3 ] && [ "${DG_CDN:-off}" != on ]; }; then
+            if [ "$DG_TRANSPORT" = kcp ] || [ "$DG_TRANSPORT" = webrtc ] || { [ "$DG_TRANSPORT" = h3 ] && [ "${DG_CDN:-off}" != on ]; }; then
                 link_proto=udp
             fi
             tport=$(ask_port "Port between the two servers" "${PORT_BEST:-$DEFAULT_TUNNEL_PORT}" "" link "$link_proto")
@@ -2533,7 +2552,7 @@ join_tunnel() {
         return 1
     fi
     case "$mode" in direct | reverse) ;; *) err "That code has an unknown mode."; return 1 ;; esac
-    case "$DG_TRANSPORT" in plain | tls | wss | xhttp | h3 | h2 | grpc | kcp | icmp | faketcp) ;; *) err "That code has an unknown link type."; return 1 ;; esac
+    case "$DG_TRANSPORT" in plain | tls | wss | xhttp | h3 | h2 | grpc | kcp | webrtc | icmp | faketcp) ;; *) err "That code has an unknown link type."; return 1 ;; esac
     case "$DG_CDN" in on | off) ;; *) err "That code has a bad CDN setting."; return 1 ;; esac
     case "$MX_MUX" in on | off) ;; *) err "That code has a bad sharing setting."; return 1 ;; esac
     case "$DG_HTTPHEADER" in on | off) ;; *) err "That code has a bad web header setting."; return 1 ;; esac
@@ -2700,7 +2719,7 @@ join_tunnel() {
     fi
     if [ "$mode" = direct ]; then
         local link_proto=tcp
-        if [ "$DG_TRANSPORT" = kcp ] || { [ "$DG_TRANSPORT" = h3 ] && [ "${DG_CDN:-off}" != on ]; }; then
+        if [ "$DG_TRANSPORT" = kcp ] || [ "$DG_TRANSPORT" = webrtc ] || { [ "$DG_TRANSPORT" = h3 ] && [ "${DG_CDN:-off}" != on ]; }; then
             link_proto=udp
         fi
         if port_in_use_by_system "$tport" "$link_proto" || port_owner "$tport" >/dev/null; then
@@ -2809,7 +2828,14 @@ status_line() {
         h3:*) look=h3-quic ;;
         h2:*) look=http2 ;;
         grpc:*) look=grpc ;;
-        kcp:*) look=kcp-udp ;;
+        kcp:*)
+            if [ "$(read_conf "$name" twin_path)" = on ]; then
+                look=twin-udp
+            else
+                look=kcp-udp
+            fi
+            ;;
+        webrtc:*) look=webrtc ;;
         wss:on) look=cdn ;;
         wss:*)
             if [ -n "$(read_conf "$name" alt_target)" ]; then
@@ -3105,7 +3131,7 @@ edit_tunnel_ports() {
     transport=$(read_conf "$name" transport); [ -n "$transport" ] || transport=plain
     alt=$(read_conf "$name" alt_target)
     proto=tcp
-    if [ "$transport" = kcp ] || { [ "$transport" = h3 ] && [ "$(read_conf "$name" cdn)" != on ]; }; then
+    if [ "$transport" = kcp ] || [ "$transport" = webrtc ] || { [ "$transport" = h3 ] && [ "$(read_conf "$name" cdn)" != on ]; }; then
         proto=udp
     fi
     use_foreign_agent "$(agent_for_tunnel "$name" 2>/dev/null || true)" "$name"
@@ -3631,7 +3657,7 @@ test_tunnel() {
 
     taddr=$(read_conf "$name" tunnel_addr)
     local link_proto=tcp
-    if [ "$(read_conf "$name" transport)" = kcp ] || { [ "$(read_conf "$name" transport)" = h3 ] && [ "$(read_conf "$name" cdn)" != on ]; }; then
+    if [ "$(read_conf "$name" transport)" = kcp ] || [ "$(read_conf "$name" transport)" = webrtc ] || { [ "$(read_conf "$name" transport)" = h3 ] && [ "$(read_conf "$name" cdn)" != on ]; }; then
         link_proto=udp
     fi
     if [ "$mode:$role" = "direct:edge" ] || [ "$mode:$role" = "reverse:origin" ]; then

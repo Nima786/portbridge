@@ -231,6 +231,12 @@ type Config struct {
 	PortHopPorts    int
 	PortHopInterval time.Duration
 
+	// TwinPath transmits latency-critical packets (<= TwinPathMaxBytes) across two
+	// independent UDP sockets/ports simultaneously and deduplicates them via a
+	// 2048-packet sequence bitmap so single-packet drops cause 0 ms jitter spikes.
+	TwinPath         bool
+	TwinPathMaxBytes int
+
 	// Asymmetric pairs an independent Uplink leg (Relay -> Foreign, e.g. XHTTP /
 	// XHTTP-CDN) with a Reverse Downlink leg (Foreign -> Relay, e.g. KCP-Hop UDP
 	// with automatic Reverse TLS TCP fallback) inside a single unified net.Conn.
@@ -816,6 +822,17 @@ func (c *Config) Set(key, val string) error {
 		return num(&c.PortHopPorts)
 	case "port_hop_interval":
 		return dur(&c.PortHopInterval)
+	case "twin_path":
+		switch strings.ToLower(strings.TrimSpace(val)) {
+		case "on", "yes", "true":
+			c.TwinPath = true
+		case "off", "no", "false":
+			c.TwinPath = false
+		default:
+			return fmt.Errorf("twin_path must be on or off, got %q", val)
+		}
+	case "twin_path_max_bytes":
+		return num(&c.TwinPathMaxBytes)
 	case "asymmetric":
 		switch strings.ToLower(strings.TrimSpace(val)) {
 		case "on", "yes", "true":
@@ -834,7 +851,7 @@ func (c *Config) Set(key, val string) error {
 	case "asym_downlink":
 		d := strings.ToLower(strings.TrimSpace(val))
 		if !ValidAsymDownlink(d) {
-			return fmt.Errorf("asym_downlink must be kcp-hop, kcp, tls or h3, got %q", val)
+			return fmt.Errorf("asym_downlink must be kcp-hop, kcp, webrtc, twin, tls or h3, got %q", val)
 		}
 		c.AsymDownlink = d
 	case "asym_down_port":
@@ -893,7 +910,7 @@ func (c *Config) Validate() error {
 			return fmt.Errorf("asym_uplink must be xhttp, split, wss, tls or h3, got %q", c.AsymUplink)
 		}
 		if !ValidAsymDownlink(c.AsymDownlink) {
-			return fmt.Errorf("asym_downlink must be kcp-hop, kcp, tls or h3, got %q", c.AsymDownlink)
+			return fmt.Errorf("asym_downlink must be kcp-hop, kcp, webrtc, twin, tls or h3, got %q", c.AsymDownlink)
 		}
 		if c.AsymDownPort < 0 || c.AsymDownPort > 65535 {
 			return fmt.Errorf("asym_down_port must be between 0 and 65535, got %d", c.AsymDownPort)
@@ -1148,13 +1165,19 @@ func (c *Config) Validate() error {
 	if c.PortHopPorts < 0 || c.PortHopPorts > 64 {
 		return fmt.Errorf("port_hop_ports must be between 1 and 64, got %d", c.PortHopPorts)
 	}
-	if c.PortHop && c.Transport != TransportKCP {
-		return fmt.Errorf("port_hop requires transport %q, got %q", TransportKCP, c.Transport)
+	if c.PortHop && c.Transport != TransportKCP && c.Transport != TransportWebRTC {
+		return fmt.Errorf("port_hop requires transport %q or %q, got %q", TransportKCP, TransportWebRTC, c.Transport)
+	}
+	if c.TwinPath && c.Transport != TransportKCP && c.Transport != TransportWebRTC {
+		return fmt.Errorf("twin_path requires transport %q or %q, got %q", TransportKCP, TransportWebRTC, c.Transport)
+	}
+	if c.TwinPathMaxBytes != 0 && (c.TwinPathMaxBytes < 128 || c.TwinPathMaxBytes > 1400) {
+		return fmt.Errorf("twin_path_max_bytes must be between 128 and 1400, got %d", c.TwinPathMaxBytes)
 	}
 
 	if !ValidTransport(c.Transport) {
-		return fmt.Errorf("transport must be %q, %q, %q, %q, %q, %q, %q, %q, %q or %q, got %q",
-			TransportPlain, TransportTLS, TransportWSS, TransportXHTTP, TransportH2, TransportGRPC, TransportH3, TransportKCP, TransportICMP, TransportFakeTCP, c.Transport)
+		return fmt.Errorf("transport must be %q, %q, %q, %q, %q, %q, %q, %q, %q, %q or %q, got %q",
+			TransportPlain, TransportTLS, TransportWSS, TransportXHTTP, TransportH2, TransportGRPC, TransportH3, TransportKCP, TransportWebRTC, TransportICMP, TransportFakeTCP, c.Transport)
 	}
 	if c.Transport != TransportPlain && !c.Transport.IsPacketBased() {
 		// Only the accepting side presents a certificate, and it is created on

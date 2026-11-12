@@ -1159,6 +1159,12 @@
     if (/split-stream/i.test(raw)) return 'Split-Stream TLS';
     if (/FakeTCP/i.test(raw) || any.transport === 'faketcp') return 'FakeTCP · Paqet (KCP)';
     if (/ICMP/i.test(raw) || any.transport === 'icmp') return 'ICMP Ping (KCP)';
+    if (any.transport === 'webrtc' || /WebRTC/i.test(raw)) {
+      if (any.twin_path && any.port_hop) return 'WebRTC (Twin+Hop)';
+      if (any.twin_path) return 'WebRTC (Twin 1+1)';
+      if (any.port_hop) return 'WebRTC Port-Hop';
+      return 'WebRTC (STUN+SRTP)';
+    }
     const m = raw.match(/\(([^(),]+)\)/);
     const host = m ? m[1] : '';
     const sniSuffix = any.sni_spoof ? ' + Decoy SNI' : '';
@@ -1182,6 +1188,9 @@
     if (/gRPC/i.test(raw)) return (host ? `gRPC (${host})` : 'gRPC') + sniSuffix;
     if (/HTTPS site/i.test(raw) || any.transport === 'tls' || any.transport === 'tlsmux') {
       return (host ? `HTTPS (${host})` : 'HTTPS') + sniSuffix;
+    }
+    if (any.twin_path || /twin-path/i.test(raw)) {
+      return (any.port_hop ? 'Twin-Path + Port-Hop (UDP)' : 'Twin-Path 1+1 (UDP)') + sniSuffix;
     }
     if (any.port_hop || /port hopping/i.test(raw)) return 'KCP Port-Hop (UDP)' + sniSuffix;
     if (/KCP/i.test(raw) || any.transport === 'kcp') return 'KCP (UDP)' + sniSuffix;
@@ -1240,8 +1249,9 @@
     else if (/browser TLS/i.test(combinedLinkDesc)) extraTags.push('uTLS');
     if (any.sit) extraTags.push('6in4 (Protocol 41)');
     if (any.asymmetric) extraTags.push(`Dual-Path (${String(any.asym_uplink || 'xhttp').toUpperCase()}↑ + ${String(any.asym_downlink || 'kcp-hop').toUpperCase()}↓)`);
-    if (any.anti_freeze) extraTags.push('Anti-Freeze (24KB Rotation)');
+    if (any.anti_freeze) extraTags.push('Anti-Freeze (14 KB Rotation)');
     if (any.port_hop) extraTags.push(`Port-Hop (${any.port_hop_ports || 8} UDP ports)`);
+    if (any.twin_path) extraTags.push('Twin-Path 1+1 (Dual UDP)');
     if (any.sni_spoof) extraTags.push(`Decoy SNI (${any.spoof_sni || 'challenges.cloudflare.com'})`);
     if (any.ip_spoof) extraTags.push(`Spoof IP (${any.spoof_ip || '104.18.4.130'})`);
     if (any.real_site) extraTags.push('Real-Site Cover');
@@ -1399,6 +1409,8 @@
     if (any.sit) return 'sit';
     if (any.asymmetric) return any.cdn ? 'asymmetric-cdn' : 'asymmetric';
     if (any.ip_spoof) return 'ip-spoof';
+    if (any.transport === 'webrtc') return 'webrtc';
+    if (any.twin_path) return 'twin';
     if (any.port_hop) return 'kcp-hop';
     if (any.anti_freeze) return 'split';
     if (any.sni_spoof && !any.cdn) return 'sni-spoof';
@@ -1415,7 +1427,7 @@
     const preset = ['light', 'medium', 'heavy'].includes(loadPreset) ? loadPreset : 'light';
     const isRawKCP = ['icmp', 'faketcp', 'ip-spoof'].includes(linkKey);
     const isCDN = ['cdn', 'website-cdn-backup', 'xhttp-cdn', 'h3-cdn', 'asymmetric-cdn', 'grpc-cdn'].includes(linkKey);
-    const isMuxFirst = ['split', 'xhttp', 'h3', 'asymmetric', 'grpc', 'kcp', 'kcp-hop'].includes(linkKey);
+    const isMuxFirst = ['split', 'xhttp', 'h3', 'asymmetric', 'grpc', 'kcp', 'kcp-hop', 'webrtc', 'twin'].includes(linkKey);
 
     if (isRawKCP) {
       if (preset === 'heavy') return { shared: true, muxLinks: 4, pool: 100, maxConn: 8000 };
@@ -2830,7 +2842,7 @@
     $('tn-opt-clean').hidden = !['cdn', 'xhttp-cdn', 'h3-cdn', 'asymmetric-cdn', 'grpc-cdn'].includes(link);
     $('tn-opt-stealth').hidden = !['website', 'split', 'sit', 'sni-spoof', 'xhttp', 'grpc'].includes(link);
     if ($('tn-opt-snispoof')) {
-      $('tn-opt-snispoof').hidden = gre || ['kcp', 'kcp-hop', 'h3', 'h3-cdn', 'asymmetric', 'asymmetric-cdn', 'icmp', 'faketcp', 'sit'].includes(link);
+      $('tn-opt-snispoof').hidden = gre || ['kcp', 'kcp-hop', 'webrtc', 'twin', 'h3', 'h3-cdn', 'asymmetric', 'asymmetric-cdn', 'icmp', 'faketcp', 'sit'].includes(link);
       if (link === 'ip-spoof' || link === 'sni-spoof') {
         $('tn-snispoof').checked = true;
         $('tn-snispoof').disabled = true;
@@ -2845,7 +2857,7 @@
     }
     if (['grpc', 'h3'].includes(link) && $('tn-claim').value === 'www.bing.com') $('tn-claim').value = 'www.google.com';
     if (!['grpc', 'h3'].includes(link) && $('tn-claim').value === 'www.google.com') $('tn-claim').value = 'www.bing.com';
-    const v6ok = !gre && ['plain', 'website', 'split', 'sni-spoof', 'xhttp', 'h3', 'grpc', 'kcp', 'kcp-hop'].includes(link) &&
+    const v6ok = !gre && ['plain', 'website', 'split', 'sni-spoof', 'xhttp', 'h3', 'grpc', 'kcp', 'kcp-hop', 'webrtc', 'twin'].includes(link) &&
       hasIPv6(serverById($('tn-relay').value)) && hasIPv6(serverById($('tn-foreign').value));
     $('tn-ipv6-row').hidden = !v6ok;
     if (!v6ok) $('tn-ipv6').checked = false;
@@ -2854,7 +2866,7 @@
     if (!sharingTouched && loadPreset !== 'custom') {
       applyCreateLoadPreset(loadPreset);
     }
-    if (['asymmetric', 'asymmetric-cdn'].includes(link)) {
+    if (['asymmetric', 'asymmetric-cdn', 'webrtc', 'twin'].includes(link)) {
       setRadio('tn-shared', 'shared');
     }
     const isShared = radio('tn-shared') === 'shared';
@@ -2865,6 +2877,15 @@
       const muxLinks = Number(($('tn-links-n') && $('tn-links-n').value) || 4);
       const maxConn = Number(($('tn-max-conn') && $('tn-max-conn').value) || 2000);
       $('tn-capacity-hint').textContent = describeCapacityAdvice(currentCreateLinkKey(), isShared, poolSize, muxLinks, maxConn);
+    }
+    if ($('tn-selected-mode-pill')) {
+      if (gre) {
+        $('tn-selected-mode-pill').textContent = 'Selected: Private GRE Layer-3 Tunnel';
+      } else {
+        const checked = document.querySelector('#tunnel-form input[name="tn-link"]:checked');
+        const cardTitle = checked && checked.closest('.choice-card') && checked.closest('.choice-card').querySelector('.choice-top strong');
+        $('tn-selected-mode-pill').textContent = 'Selected: ' + (cardTitle ? cardTitle.textContent.trim() : link);
+      }
     }
     syncChoiceCards($('tunnel-dialog'));
   }
@@ -3341,7 +3362,11 @@
     setRadio('tn-mode', cand.mode === 'reverse' ? 'reverse' : 'direct');
     const resolvedLink = cand.asymmetric
       ? (cand.cdn ? 'asymmetric-cdn' : 'asymmetric')
-      : (cand.ip_spoof ? 'ip-spoof' : (cand.port_hop ? 'kcp-hop' : (cand.anti_freeze ? 'split' : (cand.sni_spoof ? 'sni-spoof' : (cand.link || 'website')))));
+      : (cand.transport === 'webrtc'
+          ? 'webrtc'
+          : (cand.twin_path || cand.link === 'twin'
+              ? 'twin'
+              : (cand.ip_spoof ? 'ip-spoof' : (cand.port_hop ? 'kcp-hop' : (cand.anti_freeze ? 'split' : (cand.sni_spoof ? 'sni-spoof' : (cand.link || 'website')))))));
     setRadio('tn-link', resolvedLink);
     $('tn-stealth').checked = !!cand.stealth;
     $('tn-webheader').checked = !!cand.web_header;
@@ -3414,11 +3439,14 @@
     const base = `Applied "${cand.label}" (Score ${cand.score}/100).`;
     if (listenSrv) {
       try {
-        const res = await api('POST', '/api/ports', { server: listenSrv, ports: String(cand.port) });
-        const st = (res.ports || []).find((p) => p.port === cand.port);
+        const checkList = (cand.twin_path && !cand.port_hop && cand.port < 65535)
+          ? `${cand.port},${cand.port + 1}`
+          : String(cand.port);
+        const res = await api('POST', '/api/ports', { server: listenSrv, ports: checkList });
+        const st = (res.ports || []).find((p) => p.state !== 'free');
         if (st && st.state !== 'free') {
           const who = st.by ? ` by ${st.by}` : '';
-          const msg = `${base} The benchmark tested on port ${cand.port}, but that port is now used on ${listenName}${who}, so the Tunnel Bridge Port was left at ${cur}. The result may differ on another port; "Deep Scan" can check which ports get through.`;
+          const msg = `${base} The benchmark tested on port ${cand.port}, but port ${st.port} is now used on ${listenName}${who}, so the Tunnel Bridge Port was left at ${cur}. The result may differ on another port; "Deep Scan" can check which ports get through.`;
           appliedProbeWarn = true;
           appliedProbeText = msg;
           setStatus(msg, true);
@@ -3438,7 +3466,7 @@
       setStatus(`${base} Inbound Port(s) set to ${svc} and Tunnel Bridge Port set to ${cand.port} (tested port). Click Create Tunnel when ready.`);
     } else {
       appliedProbeText = `✓ Applied "${cand.label}" (${cand.score}/100) — Tunnel Bridge Port: ${cand.port} (tested port). Enter your Inbound Port(s) above, then click "Create Tunnel".`;
-      setStatus(`${base} Tunnel Bridge Port set to ${cand.port}, the port the benchmark tested on. Enter your Inbound Port(s) in Step 5 and click Create Tunnel.`);
+      setStatus(`${base} Tunnel Bridge Port set to ${cand.port}, the port the benchmark tested on. Enter your Inbound Port(s) in Step 2 and click Create Tunnel.`);
     }
     if (lastProbeReport) renderProbeResults(lastProbeReport, false, -1);
   }
@@ -3632,7 +3660,7 @@
           setProbeProgress(`Step ${i + 1} of ${cands.length}: ${spec.label}…`, pct);
           renderProbeResults({ results: liveState, notes: sess.notes }, true, i);
 
-          const isTCPDirect = !spec.cdn && !['kcp', 'icmp', 'faketcp'].includes(spec.transport) && spec.target_addr;
+          const isTCPDirect = !spec.cdn && !spec.asymmetric && !['kcp', 'webrtc', 'h3', 'icmp', 'faketcp'].includes(spec.transport) && spec.target_addr;
           if (isTCPDirect && (deadTCP[spec.target_addr] || 0) >= 2) {
             const skipped = Object.assign({}, spec, {
               status: 'blocked',
@@ -3776,13 +3804,15 @@
     const gre = $('tn-gre').checked;
     const link = gre ? 'plain' : radio('tn-link');
     const asymmetric = !gre && (link === 'asymmetric' || link === 'asymmetric-cdn');
-    const shared = asymmetric || radio('tn-shared') === 'shared';
+    const twinPath = !gre && link === 'twin';
+    const isWebRTC = !gre && link === 'webrtc';
+    const shared = asymmetric || twinPath || isWebRTC || radio('tn-shared') === 'shared';
     const ipSpoof = !gre && link === 'ip-spoof';
     const sit = !gre && link === 'sit';
     const antiFreeze = !gre && link === 'split';
     const portHop = !gre && link === 'kcp-hop';
     const isH3 = !gre && (link === 'h3' || link === 'h3-cdn');
-    const sniSpoof = !gre && !sit && !portHop && !asymmetric && !isH3 && (ipSpoof || link === 'sni-spoof' || ($('tn-snispoof') && !$('tn-opt-snispoof').hidden && $('tn-snispoof').checked));
+    const sniSpoof = !gre && !sit && !portHop && !twinPath && !isWebRTC && !asymmetric && !isH3 && (ipSpoof || link === 'sni-spoof' || ($('tn-snispoof') && !$('tn-opt-snispoof').hidden && $('tn-snispoof').checked));
     return {
       name: $('tn-name').value.trim(),
       relay: $('tn-relay').value,
@@ -3795,7 +3825,7 @@
       stealth: ['sni-spoof', 'split', 'asymmetric'].includes(link) || $('tn-stealth').checked,
       web_header: !gre && $('tn-webheader').checked,
       web_host: $('tn-webhost').value.trim(),
-      real_site: !asymmetric && !isH3 && $('tn-realsite').checked,
+      real_site: !asymmetric && !isH3 && !isWebRTC && !twinPath && $('tn-realsite').checked,
       sni_spoof: sniSpoof,
       spoof_sni: $('tn-spoofsni') ? $('tn-spoofsni').value.trim() : '',
       ip_spoof: ipSpoof,
@@ -3804,6 +3834,7 @@
       sit,
       anti_freeze: antiFreeze,
       port_hop: portHop,
+      twin_path: twinPath,
       asymmetric,
       ipv6: $('tn-ipv6').checked,
       shared,
@@ -3979,15 +4010,19 @@
       return;
     }
     out.replaceChildren(h('li', null, 'Checking ports on both servers...'));
-    const relayPorts = users + ((r.mode === 'reverse' || r.asymmetric) ? ',' + r.link_port : '');
-    const foreignPorts = r.service_ports + (r.mode === 'direct' ? ',' + r.link_port : '');
+    const bridgePorts = (r.twin_path && !r.port_hop && r.link_port < 65535)
+      ? `${r.link_port},${r.link_port + 1}`
+      : String(r.link_port);
+    const relayPorts = users + ((r.mode === 'reverse' || r.asymmetric) ? ',' + bridgePorts : '');
+    const foreignPorts = r.service_ports + (r.mode === 'direct' ? ',' + bridgePorts : '');
+    const isBridgePort = (port) => port === r.link_port || (r.twin_path && !r.port_hop && port === r.link_port + 1);
     const describe = async (server, list, role) => {
       const s = serverById(server);
       try {
         const res = await api('POST', '/api/ports', { server, ports: list });
         return res.ports.map((p) => {
           let what = 'User listen port';
-          if (p.port === r.link_port && ((role === 'relay' && (r.mode === 'reverse' || r.asymmetric)) || (role === 'foreign' && r.mode === 'direct'))) what = 'Tunnel bridge port';
+          if (isBridgePort(p.port) && ((role === 'relay' && (r.mode === 'reverse' || r.asymmetric)) || (role === 'foreign' && r.mode === 'direct'))) what = 'Tunnel bridge port';
           else if (role === 'foreign') what = 'Inbound port';
           const by = p.by ? ` (${p.by.replace(/^PortBridge /, '')})` : '';
           let cls = 'good', text;
@@ -4917,10 +4952,11 @@
             link,
             asymmetric: link === 'asymmetric',
             port_hop: link === 'kcp-hop',
+            twin_path: link === 'twin',
             server_name: sni,
             spoof_sni: link === 'sni-spoof' ? sni : '',
             stealth: true,
-            real_site: !['asymmetric', 'h3', 'kcp', 'kcp-hop', 'plain'].includes(link),
+            real_site: !['asymmetric', 'h3', 'webrtc', 'twin', 'kcp', 'kcp-hop', 'plain'].includes(link),
             shared: true,
             shared_links: muxLinks,
             max_conn: maxConn,

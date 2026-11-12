@@ -165,6 +165,7 @@ func TestPairingCodeFieldsMatch(t *testing.T) {
 		"anti_freeze":             "configured from the web panel and engine",
 		"port_hop":                "configured from the web panel and engine",
 		"port_hop_ports":          "configured from the web panel and engine",
+		"twin_path":               "configured from the web panel and engine",
 		"asymmetric":              "configured from the web panel and engine",
 		"asym_uplink":             "configured from the web panel and engine",
 		"asym_downlink":           "configured from the web panel and engine",

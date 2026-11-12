@@ -67,6 +67,10 @@ const (
 	// TransportKCP wraps the link in encrypted KCP over UDP with Reed-Solomon Forward Error Correction.
 	TransportKCP Transport = "kcp"
 
+	// TransportWebRTC wraps KCP + FEC inside RFC 5389 ICE STUN connectivity checks
+	// and RFC 3550/3711 RTP/SRTP v2 media packets (Opus + VP8 video-call disguise).
+	TransportWebRTC Transport = "webrtc"
+
 	// TransportICMP wraps KCP + FEC inside raw IPv4 ICMP Echo Request (Type 8) and Echo Reply (Type 0) ping packets.
 	TransportICMP Transport = "icmp"
 
@@ -86,16 +90,16 @@ const (
 
 func ValidTransport(t Transport) bool {
 	switch t {
-	case TransportPlain, TransportTLS, TransportWSS, TransportXHTTP, TransportH2, TransportGRPC, TransportH3, TransportKCP, TransportICMP, TransportFakeTCP:
+	case TransportPlain, TransportTLS, TransportWSS, TransportXHTTP, TransportH2, TransportGRPC, TransportH3, TransportKCP, TransportWebRTC, TransportICMP, TransportFakeTCP:
 		return true
 	}
 	return false
 }
 
 // IsPacketBased reports whether the transport uses KCP over a packet socket
-// (UDP, raw ICMP Echo, or raw FakeTCP) rather than a kernel TCP listener/dialer.
+// (UDP, WebRTC SRTP, raw ICMP Echo, or raw FakeTCP) rather than a kernel TCP listener/dialer.
 func (t Transport) IsPacketBased() bool {
-	return t == TransportKCP || t == TransportICMP || t == TransportFakeTCP
+	return t == TransportKCP || t == TransportWebRTC || t == TransportICMP || t == TransportFakeTCP
 }
 
 // IsKCPFamily reports whether t is a packet-based KCP transport (kcp, icmp, or faketcp).
@@ -531,13 +535,13 @@ func wrapDialPurposeInternal(raw net.Conn, cfg *Config, purpose byte, tlsOnly bo
 		return h3DialPurpose(raw, cfg, purpose)
 	}
 	injectedDecoy := false
-	if cfg.SNISpoof && cfg.Transport != TransportKCP && cfg.Transport != TransportICMP && cfg.Transport != TransportFakeTCP && !isDecoyRawBypassed(raw.RemoteAddr()) {
+	if cfg.SNISpoof && !cfg.Transport.IsPacketBased() && !isDecoyRawBypassed(raw.RemoteAddr()) {
 		if injectDecoyClientHello(raw, cfg.EffectiveSpoofSNI(), cfg.SNISpoofTTL) == nil {
 			injectedDecoy = true
 		}
 	}
 	switch cfg.Transport {
-	case TransportPlain, TransportKCP, TransportICMP, TransportFakeTCP:
+	case TransportPlain, TransportKCP, TransportWebRTC, TransportICMP, TransportFakeTCP:
 		if cfg.Transport == TransportPlain && cfg.HTTPHeader {
 			if err := httpHeaderDial(raw, cfg.HTTPHost); err != nil {
 				if injectedDecoy {
@@ -737,7 +741,7 @@ func wrapDialTLSOnce(raw net.Conn, cfg *Config, purpose byte, echConfigList []by
 // wrapAccept is the same from the point of view of the side that accepted.
 func wrapAccept(raw net.Conn, cfg *Config, cert *tls.Certificate, guard ...*replayGuard) (net.Conn, error) {
 	switch cfg.Transport {
-	case TransportPlain, TransportKCP, TransportICMP, TransportFakeTCP:
+	case TransportPlain, TransportKCP, TransportWebRTC, TransportICMP, TransportFakeTCP:
 		if cfg.Transport == TransportPlain && cfg.HTTPHeader {
 			if err := httpHeaderAccept(raw); err != nil {
 				_ = raw.Close()
@@ -894,6 +898,14 @@ func describeTransport(cfg *Config) string {
 				cfg.EffectiveServerName(), cfg.effectiveH3Path())
 		}
 	case TransportKCP:
+		if cfg.TwinPath && cfg.PortHop {
+			return fmt.Sprintf("Twin-Path 1+1 gaming KCP/UDP transport with FEC (%d/%d shards) and port hopping (%d UDP ports)",
+				cfg.KCPDataShards, cfg.KCPParityShards, cfg.EffectivePortHopPorts())
+		}
+		if cfg.TwinPath {
+			return fmt.Sprintf("Twin-Path 1+1 gaming KCP/UDP transport with FEC (%d/%d shards) and 2048-packet sequence deduplication",
+				cfg.KCPDataShards, cfg.KCPParityShards)
+		}
 		if cfg.PortHop {
 			return fmt.Sprintf("loss-resistant KCP/UDP transport with FEC (%d/%d shards) and dynamic port hopping (%d UDP ports)",
 				cfg.KCPDataShards, cfg.KCPParityShards, cfg.EffectivePortHopPorts())
@@ -907,6 +919,17 @@ func describeTransport(cfg *Config) string {
 				cfg.KCPDataShards, cfg.KCPParityShards, cfg.EffectiveSpoofSNI())
 		}
 		return fmt.Sprintf("loss-resistant KCP/UDP transport with FEC (%d/%d shards)", cfg.KCPDataShards, cfg.KCPParityShards)
+	case TransportWebRTC:
+		if cfg.TwinPath {
+			return fmt.Sprintf("disguised as a WebRTC video call (STUN + SRTP Opus/VP8) with Twin-Path 1+1 redundancy and KCP+FEC (%d/%d shards)",
+				cfg.KCPDataShards, cfg.KCPParityShards)
+		}
+		if cfg.PortHop {
+			return fmt.Sprintf("disguised as a WebRTC video call (STUN + SRTP Opus/VP8) with port hopping (%d UDP ports) and KCP+FEC (%d/%d shards)",
+				cfg.EffectivePortHopPorts(), cfg.KCPDataShards, cfg.KCPParityShards)
+		}
+		return fmt.Sprintf("disguised as a WebRTC video call (RFC 5389 STUN + SRTP Opus/VP8) with KCP+FEC (%d/%d shards)",
+			cfg.KCPDataShards, cfg.KCPParityShards)
 	case TransportICMP:
 		return fmt.Sprintf("ICMP Echo Request/Reply ping tunnel with KCP+FEC (%d/%d shards)", cfg.KCPDataShards, cfg.KCPParityShards)
 	case TransportFakeTCP:

@@ -602,3 +602,115 @@ func TestPhase2H3AndAsymmetricTunnelSpecsAndAutoHeal(t *testing.T) {
 		t.Fatalf("unexpected describeCandidate output: %q", desc)
 	}
 }
+
+func TestPhase3WebRTCAndTwinPathSpecsAndAutoHeal(t *testing.T) {
+	p, foreignID, foreignDir := twoServers(t)
+	_ = foreignID
+
+	// 1. toSpec mappings & validation for webrtc and twin.
+	rtcSpec, err := p.toSpec(createRequest{
+		Name: "rtc1", Relay: "this", Foreign: "far", Mode: "direct",
+		Link: "webrtc", SNISpoof: true, ServicePorts: "443", UserPorts: "443", LinkPort: 24050, RelayIP: "198.51.100.1",
+	})
+	if err != nil {
+		t.Fatalf("toSpec(webrtc) failed: %v", err)
+	}
+	if rtcSpec.Transport != "webrtc" || rtcSpec.Mux != "on" || rtcSpec.SNISpoof == "on" {
+		t.Fatalf("unexpected webrtc spec: %+v", rtcSpec)
+	}
+
+	rtcCombo, err := p.toSpec(createRequest{
+		Name: "rtc2", Relay: "this", Foreign: "far", Mode: "reverse",
+		Link: "webrtc", PortHop: true, TwinPath: true,
+		ServicePorts: "443", LinkPort: 24100, RelayIP: "198.51.100.1",
+	})
+	if err != nil {
+		t.Fatalf("toSpec(webrtc+hop+twin) failed: %v", err)
+	}
+	if rtcCombo.Transport != "webrtc" || rtcCombo.PortHop != "on" || rtcCombo.TwinPath != "on" || rtcCombo.Mux != "on" {
+		t.Fatalf("unexpected webrtc+hop+twin spec: %+v", rtcCombo)
+	}
+
+	twinSpec, err := p.toSpec(createRequest{
+		Name: "tw1", Relay: "this", Foreign: "far", Mode: "direct",
+		Link: "twin", ServicePorts: "443", LinkPort: 24200, RelayIP: "198.51.100.1",
+	})
+	if err != nil {
+		t.Fatalf("toSpec(twin) failed: %v", err)
+	}
+	if twinSpec.Transport != "kcp" || twinSpec.TwinPath != "on" || twinSpec.Mux != "on" {
+		t.Fatalf("unexpected twin spec: %+v", twinSpec)
+	}
+
+	// 2. Full create/join across Relay + Foreign for WebRTC and Twin-Path tunnels.
+	rtcReq := newTunnel("voipcall")
+	rtcReq.Mode = "direct"
+	rtcReq.Link = "webrtc"
+	rtcReq.LinkPort = 26100
+	if v := waitJob(t, p, mustCreate(t, p, rtcReq)); v.Error != "" {
+		t.Fatalf("creating webrtc tunnel failed: %s\n%s", v.Error, strings.Join(v.Lines, "\n"))
+	}
+
+	twinReq := newTunnel("twingame")
+	twinReq.Mode = "direct"
+	twinReq.Link = "twin"
+	twinReq.ServicePorts = "2096"
+	twinReq.UserPorts = "2096"
+	twinReq.LinkPort = 26200
+	if v := waitJob(t, p, mustCreate(t, p, twinReq)); v.Error != "" {
+		t.Fatalf("creating twin tunnel failed: %s\n%s", v.Error, strings.Join(v.Lines, "\n"))
+	}
+
+	edges, origins := agent.TunnelsReport(p.tunnelsDir), agent.TunnelsReport(foreignDir)
+	if len(edges) != 2 || len(origins) != 2 {
+		t.Fatalf("expected 2 tunnels on each side, got %+v / %+v", edges, origins)
+	}
+	byNameEdge := map[string]agent.TunnelInfo{}
+	byNameOrig := map[string]agent.TunnelInfo{}
+	for _, ti := range edges {
+		byNameEdge[ti.Name] = ti
+	}
+	for _, ti := range origins {
+		byNameOrig[ti.Name] = ti
+	}
+	if byNameEdge["voipcall"].Transport != "webrtc" || byNameOrig["voipcall"].Transport != "webrtc" {
+		t.Fatalf("webrtc tunnel mismatch: edge=%+v origin=%+v", byNameEdge["voipcall"], byNameOrig["voipcall"])
+	}
+	if !byNameEdge["twingame"].TwinPath || !byNameOrig["twingame"].TwinPath || byNameEdge["twingame"].Transport != "kcp" {
+		t.Fatalf("twin tunnel mismatch: edge=%+v origin=%+v", byNameEdge["twingame"], byNameOrig["twingame"])
+	}
+
+	// 3. Auto-Heal descriptions, matching, and failover candidate selection.
+	if desc := describeTunnelInfo(byNameEdge["twingame"]); !strings.Contains(desc, "Twin-Path 1+1") {
+		t.Fatalf("unexpected describeTunnelInfo for twin: %q", desc)
+	}
+	twinCand := engine.ProbeCandidateResult{
+		ProbeCandidateSpec: engine.ProbeCandidateSpec{
+			ID: "direct-twin-v4", Mode: "direct", Transport: "kcp", Link: "twin",
+			TwinPath: true, Shared: true, Port: 26200,
+		},
+		Status: "ok", Score: 95,
+	}
+	kcpPlainInfo := agent.TunnelInfo{Name: "main", Mode: "direct", Transport: "kcp", LinkPort: 26200}
+	if sameCandidateAsCurrent(twinCand, kcpPlainInfo) {
+		t.Fatal("sameCandidateAsCurrent must distinguish TwinPath=true from plain KCP")
+	}
+	if !sameCandidateAsCurrent(twinCand, byNameEdge["twingame"]) {
+		t.Fatal("sameCandidateAsCurrent should match Twin-Path tunnel against Twin-Path candidate")
+	}
+	if desc := describeCandidate(twinCand); !strings.Contains(desc, "Twin-Path 1+1") {
+		t.Fatalf("unexpected describeCandidate for twin: %q", desc)
+	}
+	rtcCand := engine.ProbeCandidateResult{
+		ProbeCandidateSpec: engine.ProbeCandidateSpec{
+			ID: "direct-webrtc-v4", Mode: "direct", Transport: "webrtc", Link: "webrtc",
+			Shared: true, Port: 26100,
+		},
+		Status: "ok", Score: 92,
+	}
+	rep := &engine.ProbeBenchmarkReport{Results: []engine.ProbeCandidateResult{twinCand, rtcCand}}
+	best, ok := p.healer.pickBestCandidate(rep, byNameEdge["twingame"], false)
+	if !ok || best.ID != "direct-webrtc-v4" {
+		t.Fatalf("expected unhealthy twin tunnel to fail over to webrtc candidate, got ok=%v best=%+v", ok, best)
+	}
+}

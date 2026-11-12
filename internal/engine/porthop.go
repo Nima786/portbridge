@@ -198,6 +198,8 @@ type PortHopListenConn struct {
 	primary          net.PacketConn
 	companions       []*net.UDPConn
 	allowPassthrough bool
+	webrtcMux        *webrtcServerMux
+	twinMux          *twinServerMux
 
 	sessions sync.Map // [8]byte -> *portHopPeerRoute
 	rxCh     chan portHopRxItem
@@ -293,6 +295,10 @@ func wrapPortHopListenConn(primary net.PacketConn, companionNet string, hopPorts
 		wdl:              newDeadline(),
 		closedCh:         make(chan struct{}),
 	}
+	if allowPassthrough {
+		c.webrtcMux = newWebRTCServerMux(psk, DefaultTwinPathMaxDupBytes)
+		c.twinMux = newTwinServerMux(psk, DefaultTwinPathMaxDupBytes)
+	}
 
 	if hopPorts > 1 {
 		if ua, ok := primary.LocalAddr().(*net.UDPAddr); ok && ua != nil && ua.Port > 0 {
@@ -362,6 +368,44 @@ func (c *PortHopListenConn) readSocketLoop(sock net.PacketConn, isPrimary bool) 
 		if n <= 0 {
 			portHopBufPool.Put(bp)
 			continue
+		}
+
+		if c.webrtcMux != nil {
+			pLen, vaddr, matched, deliver := c.webrtcMux.tryHandlePacket(sock, raddr, buf, n)
+			if matched {
+				if deliver {
+					select {
+					case c.rxCh <- portHopRxItem{bufPtr: bp, n: pLen, addr: vaddr}:
+					case <-c.closedCh:
+						portHopBufPool.Put(bp)
+						return
+					default:
+						portHopBufPool.Put(bp)
+					}
+				} else {
+					portHopBufPool.Put(bp)
+				}
+				continue
+			}
+		}
+
+		if c.twinMux != nil {
+			pLen, vaddr, matched, deliver := c.twinMux.tryHandlePacket(sock, raddr, buf, n)
+			if matched {
+				if deliver {
+					select {
+					case c.rxCh <- portHopRxItem{bufPtr: bp, n: pLen, addr: vaddr}:
+					case <-c.closedCh:
+						portHopBufPool.Put(bp)
+						return
+					default:
+						portHopBufPool.Put(bp)
+					}
+				} else {
+					portHopBufPool.Put(bp)
+				}
+				continue
+			}
 		}
 
 		sid, payload, ok := decodePortHopPacket(buf[:n], &c.keys)
@@ -443,6 +487,12 @@ func (c *PortHopListenConn) janitorLoop() {
 			return
 		case <-ticker.C:
 			cutoff := time.Now().Add(-portHopSessionIdle).UnixNano()
+			if c.webrtcMux != nil {
+				c.webrtcMux.sweepIdle(cutoff)
+			}
+			if c.twinMux != nil {
+				c.twinMux.sweepIdle(cutoff)
+			}
 			c.sessions.Range(func(k, v any) bool {
 				r := v.(*portHopPeerRoute)
 				r.mu.RLock()
@@ -481,6 +531,12 @@ func (c *PortHopListenConn) ReadFrom(p []byte) (int, net.Addr, error) {
 func (c *PortHopListenConn) WriteTo(p []byte, addr net.Addr) (int, error) {
 	if c.closed.Load() {
 		return 0, net.ErrClosed
+	}
+	if wa, ok := addr.(webrtcSessionAddr); ok && c.webrtcMux != nil {
+		return c.webrtcMux.writeSessionPacket(wa.id, p)
+	}
+	if ta, ok := addr.(twinPathSessionAddr); ok && c.twinMux != nil {
+		return c.twinMux.writeSessionPacket(ta.id, p)
 	}
 	if ha, ok := addr.(portHopSessionAddr); ok {
 		val, exists := c.sessions.Load(ha.id)
@@ -1045,6 +1101,15 @@ func (c *Config) EffectivePortHopPorts() int {
 		return 64
 	}
 	return c.PortHopPorts
+}
+
+// EffectivePortHopInterval returns the configured client socket/port rotation
+// period, defaulting to DefaultPortHopInterval when unset.
+func (c *Config) EffectivePortHopInterval() time.Duration {
+	if c == nil || c.PortHopInterval <= 0 {
+		return DefaultPortHopInterval
+	}
+	return c.PortHopInterval
 }
 
 // PortHopEndPort returns the highest UDP port number in the port-hop range

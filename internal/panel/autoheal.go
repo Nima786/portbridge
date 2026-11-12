@@ -594,6 +594,10 @@ func describeTunnelInfo(ti agent.TunnelInfo) string {
 		tr += " (6in4)"
 	} else if ti.CDN {
 		tr += " (CDN)"
+	} else if ti.TwinPath && ti.PortHop {
+		tr += " (Twin-Path+Hop)"
+	} else if ti.TwinPath {
+		tr += " (Twin-Path 1+1)"
 	} else if ti.PortHop {
 		tr += " (Port-Hop)"
 	} else if ti.AntiFreeze {
@@ -633,6 +637,7 @@ func sameCandidateAsCurrent(c engine.ProbeCandidateResult, ti agent.TunnelInfo) 
 		c.CDN == ti.CDN &&
 		c.AntiFreeze == ti.AntiFreeze &&
 		c.PortHop == ti.PortHop &&
+		c.TwinPath == ti.TwinPath &&
 		c.WebHeader == curHTTP
 }
 
@@ -709,15 +714,17 @@ func (ah *autoHealer) chooseFailoverLinkPort(ctx context.Context, relayID, forei
 	var ask []int
 	seen := map[int]bool{}
 	needHop := best.PortHop || (best.Asymmetric && (best.AsymDownlink == "" || best.AsymDownlink == "kcp-hop"))
+	needTwin := best.TwinPath && !needHop
+	spanPorts := 1
+	if needHop {
+		spanPorts = engine.DefaultPortHopPorts
+	} else if needTwin {
+		spanPorts = 2
+	}
 	rangeAvoided := func(base int) bool {
-		if avoid[base] {
-			return true
-		}
-		if needHop {
-			for i := 0; i < engine.DefaultPortHopPorts; i++ {
-				if base+i > 65535 || avoid[base+i] {
-					return true
-				}
+		for i := 0; i < spanPorts; i++ {
+			if base+i > 65535 || avoid[base+i] {
+				return true
 			}
 		}
 		return false
@@ -736,13 +743,13 @@ func (ah *autoHealer) chooseFailoverLinkPort(ctx context.Context, relayID, forei
 	}
 
 	queryPorts := append([]int(nil), ask...)
-	if needHop {
+	if spanPorts > 1 {
 		qSeen := map[int]bool{}
 		for _, p := range queryPorts {
 			qSeen[p] = true
 		}
 		for _, base := range ask {
-			for i := 1; i < engine.DefaultPortHopPorts && base+i <= 65535; i++ {
+			for i := 1; i < spanPorts && base+i <= 65535; i++ {
 				if !qSeen[base+i] {
 					qSeen[base+i] = true
 					queryPorts = append(queryPorts, base+i)
@@ -752,13 +759,9 @@ func (ah *autoHealer) chooseFailoverLinkPort(ctx context.Context, relayID, forei
 	}
 
 	ownLabel := "PortBridge tunnel " + cur.Name
-	portFreeIn := func(st map[int]portState, p int, hop bool) bool {
+	portFreeIn := func(st map[int]portState, p int, cnt int) bool {
 		if st == nil {
 			return true
-		}
-		cnt := 1
-		if hop {
-			cnt = engine.DefaultPortHopPorts
 		}
 		for i := 0; i < cnt; i++ {
 			ps, ok := st[p+i]
@@ -773,7 +776,7 @@ func (ah *autoHealer) chooseFailoverLinkPort(ctx context.Context, relayID, forei
 		stForeign, _ := ah.p.portsThere(ctx, foreignID, ask)
 		stRelay, _ := ah.p.portsThere(ctx, relayID, queryPorts)
 		for _, p := range ask {
-			if portFreeIn(stForeign, p, false) && portFreeIn(stRelay, p, needHop) {
+			if portFreeIn(stForeign, p, 1) && portFreeIn(stRelay, p, spanPorts) {
 				return p
 			}
 		}
@@ -789,7 +792,7 @@ func (ah *autoHealer) chooseFailoverLinkPort(ctx context.Context, relayID, forei
 		return ask[0]
 	}
 	for _, p := range ask {
-		if portFreeIn(st, p, needHop) {
+		if portFreeIn(st, p, spanPorts) {
 			return p
 		}
 	}
@@ -1029,6 +1032,7 @@ func (ah *autoHealer) healTunnel(ctx context.Context, j *job, key, name, relayID
 		SIT:          "off",
 		AntiFreeze:   onOff(best.AntiFreeze),
 		PortHop:      onOff(best.PortHop),
+		TwinPath:     onOff(best.TwinPath),
 		Asymmetric:   onOff(best.Asymmetric),
 		AsymUplink:   best.AsymUplink,
 		AsymDownlink: best.AsymDownlink,
@@ -1075,6 +1079,10 @@ func describeCandidate(c engine.ProbeCandidateResult) string {
 		tr += " (CDN)"
 	} else if c.IPSpoof {
 		tr += " (IP Spoof)"
+	} else if c.TwinPath && c.PortHop {
+		tr += " (Twin-Path+Hop)"
+	} else if c.TwinPath {
+		tr += " (Twin-Path 1+1)"
 	} else if c.PortHop {
 		tr += " (Port-Hop)"
 	} else if c.AntiFreeze {

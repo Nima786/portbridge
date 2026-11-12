@@ -84,6 +84,7 @@ type PairingData struct {
 	AntiFreeze   string
 	PortHop      string
 	PortHopPorts string
+	TwinPath     string
 	Asymmetric   string
 	AsymUplink   string
 	AsymDownlink string
@@ -164,6 +165,7 @@ func decodePairingCode(code string) (*PairingData, error) {
 		AntiFreeze:    kv["anti_freeze"],
 		PortHop:       kv["port_hop"],
 		PortHopPorts:  kv["port_hop_ports"],
+		TwinPath:      kv["twin_path"],
 		Asymmetric:    kv["asymmetric"],
 		AsymUplink:    kv["asym_uplink"],
 		AsymDownlink:  kv["asym_downlink"],

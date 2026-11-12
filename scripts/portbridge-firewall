@@ -146,7 +146,9 @@ load() {
     esac
 
     PROTO=tcp
-    [ "$TRANSPORT" = kcp ] && PROTO=udp
+    if [ "$TRANSPORT" = kcp ] || [ "$TRANSPORT" = webrtc ]; then
+        PROTO=udp
+    fi
     [ "$TRANSPORT" = icmp ] && PROTO=icmp
     if [ "$TRANSPORT" = h3 ]; then
         if [ "$CDN_ON" = on ]; then
@@ -159,6 +161,7 @@ load() {
 
     PORT_HOP=$(read_conf "$conf" port_hop)
     PORT_HOP_PORTS=$(read_conf "$conf" port_hop_ports)
+    TWIN_PATH=$(read_conf "$conf" twin_path)
     if [ "$ASYMMETRIC" = on ] && [ "$mode:$role" = "direct:edge" ]; then
         PROTO=udp
         PORT_HOP=on
@@ -173,6 +176,13 @@ load() {
         [ "$PORT_HOP_PORTS" -lt 1 ] && PORT_HOP_PORTS=8
         [ "$PORT_HOP_PORTS" -gt 64 ] && PORT_HOP_PORTS=64
         local end_port=$((TPORT + PORT_HOP_PORTS - 1))
+        [ "$end_port" -gt 65535 ] && end_port=65535
+        if [ "$end_port" -gt "$TPORT" ]; then
+            TPORT_SPEC="$TPORT:$end_port"
+            TPORT_NFT="$TPORT-$end_port"
+        fi
+    elif [ "$PROTO" = udp ] && [ "$TWIN_PATH" = on ]; then
+        local end_port=$((TPORT + 1))
         [ "$end_port" -gt 65535 ] && end_port=65535
         if [ "$end_port" -gt "$TPORT" ]; then
             TPORT_SPEC="$TPORT:$end_port"

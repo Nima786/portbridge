@@ -47,6 +47,7 @@ type ProbeCandidateSpec struct {
 	SpoofIP      string `json:"spoof_ip,omitempty"`
 	AntiFreeze   bool   `json:"anti_freeze,omitempty"`
 	PortHop      bool   `json:"port_hop,omitempty"`
+	TwinPath     bool   `json:"twin_path,omitempty"`
 	Asymmetric   bool   `json:"asymmetric,omitempty"`
 	AsymUplink   string `json:"asym_uplink,omitempty"`
 	AsymDownlink string `json:"asym_downlink,omitempty"`
@@ -636,7 +637,7 @@ func BuildProbeCandidates(mode, ipv4, ipv6 string, port int, cdnDomain string) [
 		specs = append(specs,
 			ProbeCandidateSpec{
 				ID:         mode + "-tls-stealth",
-				Label:      v4Label + " · Fake TLS + Stealth (uTLS + Frag)",
+				Label:      v4Label + " · Fake TLS Website + Stealth (uTLS + Frag)",
 				Mode:       mode,
 				Link:       "website",
 				Transport:  string(TransportTLS),
@@ -648,7 +649,7 @@ func BuildProbeCandidates(mode, ipv4, ipv6 string, port int, cdnDomain string) [
 			},
 			ProbeCandidateSpec{
 				ID:         mode + "-split",
-				Label:      v4Label + " · Split-Stream TLS (Anti-Freeze Rotation)",
+				Label:      v4Label + " · Split-Stream TLS (14 KB Anti-Freeze Rotation)",
 				Mode:       mode,
 				Link:       "split",
 				Transport:  string(TransportTLS),
@@ -663,7 +664,7 @@ func BuildProbeCandidates(mode, ipv4, ipv6 string, port int, cdnDomain string) [
 			},
 			ProbeCandidateSpec{
 				ID:         mode + "-sni-spoof",
-				Label:      v4Label + " · Decoy Whitelisted SNI (" + DefaultSpoofSNI + ")",
+				Label:      v4Label + " · Decoy Whitelisted SNI Spoof (" + DefaultSpoofSNI + ")",
 				Mode:       mode,
 				Link:       "sni-spoof",
 				Transport:  string(TransportTLS),
@@ -677,7 +678,7 @@ func BuildProbeCandidates(mode, ipv4, ipv6 string, port int, cdnDomain string) [
 			},
 			ProbeCandidateSpec{
 				ID:         mode + "-tls",
-				Label:      v4Label + " · Fake TLS Website (SNI)",
+				Label:      v4Label + " · Fake TLS Website (HTTPS SNI Disguise)",
 				Mode:       mode,
 				Link:       "website",
 				Transport:  string(TransportTLS),
@@ -689,7 +690,7 @@ func BuildProbeCandidates(mode, ipv4, ipv6 string, port int, cdnDomain string) [
 			},
 			ProbeCandidateSpec{
 				ID:         mode + "-grpc",
-				Label:      v4Label + " · gRPC Stream (HTTP/2)",
+				Label:      v4Label + " · gRPC Stream (Direct HTTP/2)",
 				Mode:       mode,
 				Link:       "grpc",
 				Transport:  string(TransportGRPC),
@@ -701,7 +702,7 @@ func BuildProbeCandidates(mode, ipv4, ipv6 string, port int, cdnDomain string) [
 			},
 			ProbeCandidateSpec{
 				ID:         mode + "-xhttp",
-				Label:      v4Label + " · SplitHTTP / XHTTP (GET + POST Stream)",
+				Label:      v4Label + " · SplitHTTP / XHTTP (Direct Server-to-Server)",
 				Mode:       mode,
 				Link:       "xhttp",
 				Transport:  string(TransportXHTTP),
@@ -713,7 +714,7 @@ func BuildProbeCandidates(mode, ipv4, ipv6 string, port int, cdnDomain string) [
 			},
 			ProbeCandidateSpec{
 				ID:         mode + "-h3",
-				Label:      v4Label + " · QUIC / HTTP/3 Masquerade (UDP)",
+				Label:      v4Label + " · QUIC / HTTP/3 Masquerade (Direct UDP)",
 				Mode:       mode,
 				Link:       "h3",
 				Transport:  string(TransportH3),
@@ -724,7 +725,7 @@ func BuildProbeCandidates(mode, ipv4, ipv6 string, port int, cdnDomain string) [
 			},
 			ProbeCandidateSpec{
 				ID:         mode + "-kcp",
-				Label:      v4Label + " · KCP over UDP (FEC)",
+				Label:      v4Label + " · KCP Accelerated UDP (Single-Port + FEC)",
 				Mode:       mode,
 				Link:       "kcp",
 				Transport:  string(TransportKCP),
@@ -735,7 +736,7 @@ func BuildProbeCandidates(mode, ipv4, ipv6 string, port int, cdnDomain string) [
 			},
 			ProbeCandidateSpec{
 				ID:         mode + "-kcp-hop",
-				Label:      v4Label + " · KCP Port-Hopping UDP (Anti-QoS)",
+				Label:      v4Label + " · KCP Port-Hopping UDP (8-Port Rotation + FEC)",
 				Mode:       mode,
 				Link:       "kcp-hop",
 				Transport:  string(TransportKCP),
@@ -745,8 +746,29 @@ func BuildProbeCandidates(mode, ipv4, ipv6 string, port int, cdnDomain string) [
 				Port:       port,
 			},
 			ProbeCandidateSpec{
+				ID:         mode + "-webrtc",
+				Label:      v4Label + " · WebRTC Video-Call Disguise (STUN + SRTP)",
+				Mode:       mode,
+				Link:       "webrtc",
+				Transport:  string(TransportWebRTC),
+				Shared:     true,
+				TargetAddr: addr4,
+				Port:       port,
+			},
+			ProbeCandidateSpec{
+				ID:         mode + "-twin",
+				Label:      v4Label + " · Twin-Path 1+1 Gaming UDP (Zero-Lag Duplication)",
+				Mode:       mode,
+				Link:       "twin",
+				Transport:  string(TransportKCP),
+				TwinPath:   true,
+				Shared:     true,
+				TargetAddr: addr4,
+				Port:       port,
+			},
+			ProbeCandidateSpec{
 				ID:         mode + "-ip-spoof",
-				Label:      v4Label + " · Source IP + SNI Spoof (" + DefaultSpoofIP + ")",
+				Label:      v4Label + " · Source IP + Whitelisted SNI Spoof (" + DefaultSpoofIP + ")",
 				Mode:       mode,
 				Link:       "ip-spoof",
 				Transport:  string(TransportKCP),
@@ -780,7 +802,7 @@ func BuildProbeCandidates(mode, ipv4, ipv6 string, port int, cdnDomain string) [
 			},
 			ProbeCandidateSpec{
 				ID:         mode + "-http-tcp",
-				Label:      v4Label + " · TCP + HTTP Header",
+				Label:      v4Label + " · Raw TCP + HTTP Header",
 				Mode:       mode,
 				Link:       "plain",
 				Transport:  string(TransportPlain),
@@ -792,7 +814,7 @@ func BuildProbeCandidates(mode, ipv4, ipv6 string, port int, cdnDomain string) [
 			},
 			ProbeCandidateSpec{
 				ID:         mode + "-plain",
-				Label:      v4Label + " · Plain TCP (Raw)",
+				Label:      v4Label + " · Raw TCP (No Disguise)",
 				Mode:       mode,
 				Link:       "plain",
 				Transport:  string(TransportPlain),
@@ -809,7 +831,7 @@ func BuildProbeCandidates(mode, ipv4, ipv6 string, port int, cdnDomain string) [
 		specs = append(specs,
 			ProbeCandidateSpec{
 				ID:         mode + "-ipv6-tls-stealth",
-				Label:      dirLabel + " (IPv6) · Fake TLS + Stealth (uTLS + Frag)",
+				Label:      dirLabel + " (IPv6) · Fake TLS Website + Stealth (uTLS + Frag)",
 				Mode:       mode,
 				Link:       "website",
 				Transport:  string(TransportTLS),
@@ -822,7 +844,7 @@ func BuildProbeCandidates(mode, ipv4, ipv6 string, port int, cdnDomain string) [
 			},
 			ProbeCandidateSpec{
 				ID:         mode + "-ipv6-sni-spoof",
-				Label:      dirLabel + " (IPv6) · Decoy Whitelisted SNI (" + DefaultSpoofSNI + ")",
+				Label:      dirLabel + " (IPv6) · Decoy Whitelisted SNI Spoof (" + DefaultSpoofSNI + ")",
 				Mode:       mode,
 				Link:       "sni-spoof",
 				Transport:  string(TransportTLS),
@@ -837,7 +859,7 @@ func BuildProbeCandidates(mode, ipv4, ipv6 string, port int, cdnDomain string) [
 			},
 			ProbeCandidateSpec{
 				ID:         mode + "-ipv6-tls",
-				Label:      dirLabel + " (IPv6) · Fake TLS Website (SNI)",
+				Label:      dirLabel + " (IPv6) · Fake TLS Website (HTTPS SNI Disguise)",
 				Mode:       mode,
 				Link:       "website",
 				Transport:  string(TransportTLS),
@@ -850,7 +872,7 @@ func BuildProbeCandidates(mode, ipv4, ipv6 string, port int, cdnDomain string) [
 			},
 			ProbeCandidateSpec{
 				ID:         mode + "-ipv6-plain",
-				Label:      dirLabel + " (IPv6) · Plain TCP (Raw)",
+				Label:      dirLabel + " (IPv6) · Raw TCP (No Disguise)",
 				Mode:       mode,
 				Link:       "plain",
 				Transport:  string(TransportPlain),
@@ -865,7 +887,7 @@ func BuildProbeCandidates(mode, ipv4, ipv6 string, port int, cdnDomain string) [
 			// lowest-ping gaming route may be exactly that pair.
 			ProbeCandidateSpec{
 				ID:         mode + "-ipv6-kcp",
-				Label:      dirLabel + " (IPv6) · KCP over UDP (FEC)",
+				Label:      dirLabel + " (IPv6) · KCP Accelerated UDP (Single-Port + FEC)",
 				Mode:       mode,
 				Link:       "kcp",
 				Transport:  string(TransportKCP),
@@ -877,11 +899,34 @@ func BuildProbeCandidates(mode, ipv4, ipv6 string, port int, cdnDomain string) [
 			},
 			ProbeCandidateSpec{
 				ID:         mode + "-ipv6-kcp-hop",
-				Label:      dirLabel + " (IPv6) · KCP Port-Hopping UDP (Anti-QoS)",
+				Label:      dirLabel + " (IPv6) · KCP Port-Hopping UDP (8-Port Rotation + FEC)",
 				Mode:       mode,
 				Link:       "kcp-hop",
 				Transport:  string(TransportKCP),
 				PortHop:    true,
+				IPv6:       true,
+				Shared:     true,
+				TargetAddr: addr6,
+				Port:       port,
+			},
+			ProbeCandidateSpec{
+				ID:         mode + "-ipv6-webrtc",
+				Label:      dirLabel + " (IPv6) · WebRTC Video-Call Disguise (STUN + SRTP)",
+				Mode:       mode,
+				Link:       "webrtc",
+				Transport:  string(TransportWebRTC),
+				IPv6:       true,
+				Shared:     true,
+				TargetAddr: addr6,
+				Port:       port,
+			},
+			ProbeCandidateSpec{
+				ID:         mode + "-ipv6-twin",
+				Label:      dirLabel + " (IPv6) · Twin-Path 1+1 Gaming UDP (Zero-Lag Duplication)",
+				Mode:       mode,
+				Link:       "twin",
+				Transport:  string(TransportKCP),
+				TwinPath:   true,
 				IPv6:       true,
 				Shared:     true,
 				TargetAddr: addr6,
@@ -893,7 +938,7 @@ func BuildProbeCandidates(mode, ipv4, ipv6 string, port int, cdnDomain string) [
 			// IPv4 only, in a real tunnel as much as in this test.
 			ProbeCandidateSpec{
 				ID:         mode + "-ipv6-grpc",
-				Label:      dirLabel + " (IPv6) · gRPC Stream (HTTP/2)",
+				Label:      dirLabel + " (IPv6) · gRPC Stream (Direct HTTP/2)",
 				Mode:       mode,
 				Link:       "grpc",
 				Transport:  string(TransportGRPC),
@@ -906,7 +951,7 @@ func BuildProbeCandidates(mode, ipv4, ipv6 string, port int, cdnDomain string) [
 			},
 			ProbeCandidateSpec{
 				ID:         mode + "-ipv6-xhttp",
-				Label:      dirLabel + " (IPv6) · SplitHTTP / XHTTP (GET + POST Stream)",
+				Label:      dirLabel + " (IPv6) · SplitHTTP / XHTTP (Direct Server-to-Server)",
 				Mode:       mode,
 				Link:       "xhttp",
 				Transport:  string(TransportXHTTP),
@@ -919,7 +964,7 @@ func BuildProbeCandidates(mode, ipv4, ipv6 string, port int, cdnDomain string) [
 			},
 			ProbeCandidateSpec{
 				ID:         mode + "-ipv6-h3",
-				Label:      dirLabel + " (IPv6) · QUIC / HTTP/3 Masquerade (UDP)",
+				Label:      dirLabel + " (IPv6) · QUIC / HTTP/3 Masquerade (Direct UDP)",
 				Mode:       mode,
 				Link:       "h3",
 				Transport:  string(TransportH3),
@@ -931,7 +976,7 @@ func BuildProbeCandidates(mode, ipv4, ipv6 string, port int, cdnDomain string) [
 			},
 			ProbeCandidateSpec{
 				ID:         mode + "-ipv6-split",
-				Label:      dirLabel + " (IPv6) · Split-Stream TLS (Anti-Freeze Rotation)",
+				Label:      dirLabel + " (IPv6) · Split-Stream TLS (14 KB Anti-Freeze Rotation)",
 				Mode:       mode,
 				Link:       "split",
 				Transport:  string(TransportTLS),
@@ -947,7 +992,7 @@ func BuildProbeCandidates(mode, ipv4, ipv6 string, port int, cdnDomain string) [
 			},
 			ProbeCandidateSpec{
 				ID:         mode + "-ipv6-http-tcp",
-				Label:      dirLabel + " (IPv6) · TCP + HTTP Header",
+				Label:      dirLabel + " (IPv6) · Raw TCP + HTTP Header",
 				Mode:       mode,
 				Link:       "plain",
 				Transport:  string(TransportPlain),
@@ -967,7 +1012,7 @@ func BuildProbeCandidates(mode, ipv4, ipv6 string, port int, cdnDomain string) [
 		specs = append(specs,
 			ProbeCandidateSpec{
 				ID:         "direct-cdn-ws",
-				Label:      "Direct · Cloudflare CDN (WebSocket)",
+				Label:      "Direct · WebSocket via Cloudflare CDN (WSS)",
 				Mode:       "direct",
 				Link:       "cdn",
 				Transport:  string(TransportWSS),
@@ -981,7 +1026,7 @@ func BuildProbeCandidates(mode, ipv4, ipv6 string, port int, cdnDomain string) [
 			},
 			ProbeCandidateSpec{
 				ID:         "direct-cdn-xhttp",
-				Label:      "Direct · Cloudflare CDN (SplitHTTP / XHTTP)",
+				Label:      "Direct · SplitHTTP / XHTTP via Cloudflare CDN",
 				Mode:       "direct",
 				Link:       "xhttp-cdn",
 				Transport:  string(TransportXHTTP),
@@ -995,7 +1040,7 @@ func BuildProbeCandidates(mode, ipv4, ipv6 string, port int, cdnDomain string) [
 			},
 			ProbeCandidateSpec{
 				ID:         "direct-cdn-h3",
-				Label:      "Direct · Cloudflare CDN (QUIC / HTTP/3)",
+				Label:      "Direct · QUIC / HTTP/3 via Cloudflare CDN",
 				Mode:       "direct",
 				Link:       "h3-cdn",
 				Transport:  string(TransportH3),
@@ -1008,7 +1053,7 @@ func BuildProbeCandidates(mode, ipv4, ipv6 string, port int, cdnDomain string) [
 			},
 			ProbeCandidateSpec{
 				ID:         "direct-cdn-grpc",
-				Label:      "Direct · Cloudflare CDN (gRPC)",
+				Label:      "Direct · gRPC via Cloudflare CDN",
 				Mode:       "direct",
 				Link:       "grpc-cdn",
 				Transport:  string(TransportGRPC),
@@ -1103,6 +1148,7 @@ func probeOneSpec(parentCtx context.Context, spec ProbeCandidateSpec, secret []b
 		PortHop:         spec.PortHop,
 		PortHopPorts:    4,
 		PortHopInterval: 500 * time.Millisecond,
+		TwinPath:        spec.TwinPath,
 		UTLS:            false,
 		TLSFragment:     false,
 		ECH:             false,
@@ -1794,7 +1840,7 @@ func FinalizeProbeReport(results []ProbeCandidateResult, cdnDomain string) *Prob
 				}
 			}
 			if r.Mode == "reverse" && !r.IPv6 &&
-				(r.Link == "kcp-hop" || r.Link == "kcp" || r.Link == "h3" || r.Link == "website") {
+				(r.Link == "kcp-hop" || r.Link == "webrtc" || r.Link == "twin" || r.Link == "kcp" || r.Link == "h3" || r.Link == "website") {
 				if bestRevAsymDown == nil || asymDownPreference(r) > asymDownPreference(bestRevAsymDown) {
 					bestRevAsymDown = r
 				}
@@ -1817,7 +1863,7 @@ func FinalizeProbeReport(results []ProbeCandidateResult, cdnDomain string) *Prob
 		hybrid := ProbeCandidateResult{
 			ProbeCandidateSpec: ProbeCandidateSpec{
 				ID:         "direct-website-cdn-backup",
-				Label:      "Direct · Fake TLS + CDN Auto-Fallback (Hybrid)",
+				Label:      "Direct · Fake TLS + Cloudflare CDN Auto-Fallback",
 				Mode:       "direct",
 				Link:       "website-cdn-backup",
 				Transport:  string(TransportTLS),
@@ -1856,7 +1902,7 @@ func FinalizeProbeReport(results []ProbeCandidateResult, cdnDomain string) *Prob
 		asym := ProbeCandidateResult{
 			ProbeCandidateSpec: ProbeCandidateSpec{
 				ID:           "direct-asymmetric",
-				Label:        fmt.Sprintf("Direct · Asymmetric Hybrid (%s ↑ + Reverse %s ↓)", strings.ToUpper(upProto), strings.ToUpper(dnProto)),
+				Label:        fmt.Sprintf("Direct · Asymmetric Dual-Path (%s ↑ + Reverse %s ↓)", strings.ToUpper(upProto), strings.ToUpper(dnProto)),
 				Mode:         "direct",
 				Link:         "asymmetric",
 				Transport:    bestDirectAsymUp.Transport,
@@ -1909,7 +1955,7 @@ func FinalizeProbeReport(results []ProbeCandidateResult, cdnDomain string) *Prob
 		asymCDN := ProbeCandidateResult{
 			ProbeCandidateSpec: ProbeCandidateSpec{
 				ID:           "direct-asymmetric-cdn",
-				Label:        fmt.Sprintf("Direct · Asymmetric CDN Hybrid (CDN %s ↑ + Reverse %s ↓)", strings.ToUpper(upProto), strings.ToUpper(dnProto)),
+				Label:        fmt.Sprintf("Direct · Asymmetric CDN Hybrid (Cloudflare %s ↑ + Reverse %s ↓)", strings.ToUpper(upProto), strings.ToUpper(dnProto)),
 				Mode:         "direct",
 				Link:         "asymmetric-cdn",
 				Transport:    bestCDNAsymUp.Transport,
@@ -2017,13 +2063,15 @@ func scoreCandidate(r *ProbeCandidateResult, maxMbps float64) int {
 		dpiBonus = 10.0
 	case r.Link == "xhttp" || r.Link == "h3":
 		dpiBonus = 9.5
+	case r.Link == "webrtc":
+		dpiBonus = 9.2
 	case r.Link == "website" || r.Link == "grpc" || r.Link == "h3-cdn":
 		dpiBonus = 9.0
 	case r.Link == "xhttp-cdn":
 		dpiBonus = 8.8
 	case r.Link == "cdn" || r.Link == "grpc-cdn":
 		dpiBonus = 8.5
-	case r.Link == "kcp-hop":
+	case r.Link == "kcp-hop" || r.Link == "twin":
 		dpiBonus = 7.5
 	case r.Link == "faketcp" || r.Link == "ip-spoof":
 		dpiBonus = 7.0
@@ -2071,7 +2119,9 @@ func scoreGamingCandidate(r *ProbeCandidateResult) int {
 	// or have zero framing/encryption overhead (Plain TCP with Dedicated Pool).
 	var gamingBonus float64
 	switch {
-	case r.Link == "kcp" || r.Link == "kcp-hop" || r.Link == "ip-spoof" || r.Link == "faketcp":
+	case r.Link == "twin":
+		gamingBonus = 8.0
+	case r.Link == "kcp" || r.Link == "kcp-hop" || r.Link == "webrtc" || r.Link == "ip-spoof" || r.Link == "faketcp":
 		gamingBonus = 8.0
 	case r.Link == "h3":
 		gamingBonus = 7.5
@@ -2157,8 +2207,10 @@ func asymUpPreference(r *ProbeCandidateResult) float64 {
 func asymDownPreference(r *ProbeCandidateResult) float64 {
 	bonus := 0.0
 	switch r.Link {
-	case "kcp-hop":
+	case "kcp-hop", "webrtc":
 		bonus = 6.0
+	case "twin":
+		bonus = 4.5
 	case "h3":
 		bonus = 4.0
 	case "kcp":
@@ -2186,6 +2238,10 @@ func mapLinkToAsymDownlink(link string) string {
 	switch link {
 	case "kcp-hop":
 		return "kcp-hop"
+	case "webrtc":
+		return "webrtc"
+	case "twin":
+		return "twin"
 	case "kcp":
 		return "kcp"
 	case "h3":

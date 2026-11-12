@@ -261,6 +261,34 @@ func kcpDial(addr string, cfg *Config) (net.Conn, error) {
 		sendUDPDecoyClientHello(addr, cfg.EffectiveSpoofSNI(), cfg.SNISpoofTTL)
 	}
 
+	if cfg.Transport == TransportWebRTC {
+		pConn, err := newWebRTCDialConn(addr, cfg)
+		if err != nil {
+			return nil, err
+		}
+		sess, err := kcp.NewConn2(pConn.RemoteAddr(), block, dataShards, parityShards, pConn)
+		if err != nil {
+			_ = pConn.Close()
+			return nil, fmt.Errorf("dialing webrtc kcp: %w", err)
+		}
+		tuneKCP(sess, cfg)
+		return newKCPConn(sess, pConn), nil
+	}
+
+	if cfg.TwinPath {
+		pConn, err := newTwinPathDialConn(addr, cfg)
+		if err != nil {
+			return nil, err
+		}
+		sess, err := kcp.NewConn2(pConn.RemoteAddr(), block, dataShards, parityShards, pConn)
+		if err != nil {
+			_ = pConn.Close()
+			return nil, fmt.Errorf("dialing twin-path kcp: %w", err)
+		}
+		tuneKCP(sess, cfg)
+		return newKCPConn(sess, pConn), nil
+	}
+
 	if cfg.PortHop {
 		pConn, err := newPortHopDialConn(addr, cfg)
 		if err != nil {
@@ -364,15 +392,27 @@ func tuneKCP(sess *kcp.UDPSession, cfg *Config) {
 	sess.SetNoDelay(1, orDefault(cfg.KCPInterval, kcpDefaultInterval), resend, nc)
 	defaultWin := kcpDefaultWindow
 	defaultMTU := kcpDefaultMTU
+	maxDisguiseMTU := 0
 	if cfg.Transport == TransportICMP || cfg.Transport == TransportFakeTCP {
 		defaultWin = 256
 		defaultMTU = 1200
+	} else if cfg.Transport == TransportWebRTC {
+		defaultMTU = 1340
+		maxDisguiseMTU = 1340
+	} else if cfg.TwinPath {
+		defaultMTU = 1350
+		maxDisguiseMTU = 1350
 	} else if cfg.PortHop {
 		defaultMTU = 1360
+		maxDisguiseMTU = 1360
 	}
 	w := orDefault(cfg.KCPWindow, defaultWin)
 	sess.SetWindowSize(w, w)
-	if m := orDefault(cfg.KCPMTU, defaultMTU); m != kcpDefaultMTU {
+	m := orDefault(cfg.KCPMTU, defaultMTU)
+	if maxDisguiseMTU > 0 && m > maxDisguiseMTU {
+		m = maxDisguiseMTU
+	}
+	if m != kcpDefaultMTU {
 		sess.SetMtu(m)
 	}
 	sess.SetACKNoDelay(true)
@@ -459,6 +499,32 @@ func kcpListen(addr string, cfg *Config) (net.Listener, error) {
 		return &kcpListenerWrap{Listener: ln, cfg: cfg, ownConn: packetConn}, nil
 	}
 
+	if cfg.Transport == TransportWebRTC {
+		pConn, err := newWebRTCListenConn(addr, cfg, nil)
+		if err != nil {
+			return nil, err
+		}
+		ln, err := kcp.ServeConn(block, dataShards, parityShards, pConn)
+		if err != nil {
+			_ = pConn.Close()
+			return nil, fmt.Errorf("serving webrtc kcp: %w", err)
+		}
+		return &kcpListenerWrap{Listener: ln, cfg: cfg, ownConn: pConn}, nil
+	}
+
+	if cfg.TwinPath {
+		pConn, err := newTwinPathListenConn(addr, cfg, nil)
+		if err != nil {
+			return nil, err
+		}
+		ln, err := kcp.ServeConn(block, dataShards, parityShards, pConn)
+		if err != nil {
+			_ = pConn.Close()
+			return nil, fmt.Errorf("serving twin-path kcp: %w", err)
+		}
+		return &kcpListenerWrap{Listener: ln, cfg: cfg, ownConn: pConn}, nil
+	}
+
 	if cfg.PortHop {
 		pConn, err := newPortHopListenConn(addr, cfg, nil)
 		if err != nil {
@@ -522,6 +588,14 @@ func (l *kcpListenerWrap) Accept() (net.Conn, error) {
 		return nil, err
 	}
 	tuneKCP(sess, l.cfg)
+	switch sess.RemoteAddr().(type) {
+	case webrtcSessionAddr:
+		sess.SetMtu(1340)
+	case twinPathSessionAddr:
+		sess.SetMtu(1350)
+	case portHopSessionAddr:
+		sess.SetMtu(1360)
+	}
 	return newKCPConn(sess), nil
 }
 

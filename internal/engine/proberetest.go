@@ -27,7 +27,7 @@ func probeFamily(r *ProbeCandidateResult) string {
 	switch Transport(r.Transport) {
 	case TransportICMP:
 		return "icmp"
-	case TransportKCP, TransportFakeTCP:
+	case TransportKCP, TransportWebRTC, TransportFakeTCP:
 		return "kcp"
 	default:
 		return "stream"

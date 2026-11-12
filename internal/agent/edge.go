@@ -54,8 +54,9 @@ type EdgeSpec struct {
 	IPSpoof      string `json:"ip_spoof,omitempty"` // source IP spoofing over raw sockets
 	SpoofIP      string `json:"spoof_ip,omitempty"`
 	AntiFreeze   string `json:"anti_freeze,omitempty"` // multi-connection split-stream leg rotation
-	PortHop      string `json:"port_hop,omitempty"`    // dynamic UDP port hopping over KCP
+	PortHop      string `json:"port_hop,omitempty"`    // dynamic UDP port hopping over KCP/WebRTC
 	PortHopPorts int    `json:"port_hop_ports,omitempty"`
+	TwinPath     string `json:"twin_path,omitempty"`  // 1+1 gaming packet duplication over KCP/WebRTC
 	Asymmetric   string `json:"asymmetric,omitempty"` // asymmetric dual-path hybrid mode
 	AsymUplink   string `json:"asym_uplink,omitempty"`
 	AsymDownlink string `json:"asym_downlink,omitempty"`
@@ -146,6 +147,7 @@ func (s *EdgeSpec) normalise() {
 			s.AntiFreeze = "off"
 		}
 		s.PortHop = "off"
+		s.TwinPath = "off"
 		s.IPSpoof = "off"
 		s.RealSite = "off"
 	}
@@ -190,7 +192,7 @@ func (s *EdgeSpec) normalise() {
 		s.SIT = "off"
 		s.ServerName, s.WSPath, s.CDN, s.AltHost, s.CleanIPs = "", "", "off", "", ""
 		s.UTLS, s.TLSFragment, s.HTTPHeader, s.HTTPHost, s.RealSite, s.CoverSite = "", "", "", "", "", ""
-		s.SNISpoof, s.SpoofSNI, s.IPSpoof, s.SpoofIP, s.AntiFreeze, s.PortHop = "", "", "", "", "", ""
+		s.SNISpoof, s.SpoofSNI, s.IPSpoof, s.SpoofIP, s.AntiFreeze, s.PortHop, s.TwinPath = "", "", "", "", "", "", ""
 		s.PortHopPorts = 0
 		s.Asymmetric, s.AsymUplink, s.AsymDownlink, s.AsymDownPort = "", "", "", 0
 	}
@@ -199,14 +201,21 @@ func (s *EdgeSpec) normalise() {
 		s.GRE = "off"
 		s.ServerName, s.WSPath, s.CDN, s.AltHost, s.CleanIPs = "", "", "off", "", ""
 		s.UTLS, s.TLSFragment, s.HTTPHeader, s.HTTPHost, s.RealSite, s.CoverSite = "", "", "", "", "", ""
-		s.SNISpoof, s.SpoofSNI, s.IPSpoof, s.SpoofIP, s.AntiFreeze, s.PortHop = "", "", "", "", "", ""
+		s.SNISpoof, s.SpoofSNI, s.IPSpoof, s.SpoofIP, s.AntiFreeze, s.PortHop, s.TwinPath = "", "", "", "", "", "", ""
 		s.PortHopPorts = 0
 		s.Asymmetric, s.AsymUplink, s.AsymDownlink, s.AsymDownPort = "", "", "", 0
 	}
 	if s.PortHop == "on" {
-		s.Transport = "kcp"
+		if s.Transport != "webrtc" {
+			s.Transport = "kcp"
+		}
 		if s.PortHopPorts <= 0 {
 			s.PortHopPorts = engine.DefaultPortHopPorts
+		}
+	}
+	if s.TwinPath == "on" {
+		if s.Transport != "webrtc" {
+			s.Transport = "kcp"
 		}
 	}
 	if s.AntiFreeze == "on" {
@@ -302,16 +311,16 @@ func (s *EdgeSpec) check() error {
 		return fmt.Errorf("mode %q is not direct or reverse", s.Mode)
 	}
 	switch s.Transport {
-	case "plain", "tls", "wss", "xhttp", "h3", "grpc", "kcp", "icmp", "faketcp":
+	case "plain", "tls", "wss", "xhttp", "h3", "grpc", "kcp", "webrtc", "icmp", "faketcp":
 	default:
-		return fmt.Errorf("link type %q is not one of plain, tls, wss, xhttp, h3, grpc, kcp, icmp or faketcp", s.Transport)
+		return fmt.Errorf("link type %q is not one of plain, tls, wss, xhttp, h3, grpc, kcp, webrtc, icmp or faketcp", s.Transport)
 	}
 	for _, f := range []struct{ name, val string }{
 		{"cdn", s.CDN}, {"mux", s.Mux}, {"utls", s.UTLS}, {"tls_fragment", s.TLSFragment},
 		{"http_header", s.HTTPHeader}, {"gre", s.GRE}, {"sit", s.SIT}, {"real_site", s.RealSite},
 		{"sni_spoof", s.SNISpoof}, {"ip_spoof", s.IPSpoof}, {"anti_freeze", s.AntiFreeze},
-		{"port_hop", s.PortHop}, {"asymmetric", s.Asymmetric}, {"website_bridge", s.WebsiteBridge},
-		{"outbound_proxy", s.OutboundProxy},
+		{"port_hop", s.PortHop}, {"twin_path", s.TwinPath}, {"asymmetric", s.Asymmetric},
+		{"website_bridge", s.WebsiteBridge}, {"outbound_proxy", s.OutboundProxy},
 	} {
 		if f.val != "" && f.val != "on" && f.val != "off" {
 			return fmt.Errorf("%s must be on or off, got %q", f.name, f.val)
@@ -391,8 +400,11 @@ func (s *EdgeSpec) check() error {
 	if s.Pool < 1 || s.Pool > 10000 {
 		return errors.New("connection pool size must be from 1 to 10000")
 	}
-	if s.PortHop == "on" && s.Transport != "kcp" {
-		return errors.New("dynamic port hopping requires the KCP (UDP) transport")
+	if s.PortHop == "on" && s.Transport != "kcp" && s.Transport != "webrtc" {
+		return errors.New("dynamic port hopping requires the KCP or WebRTC (UDP) transport")
+	}
+	if s.TwinPath == "on" && s.Transport != "kcp" && s.Transport != "webrtc" {
+		return errors.New("Twin-Path 1+1 packet duplication requires the KCP or WebRTC (UDP) transport")
 	}
 	if s.PortHopPorts != 0 && (s.PortHopPorts < 1 || s.PortHopPorts > 64) {
 		return errors.New("port_hop_ports must be from 1 to 64")
@@ -636,6 +648,9 @@ func buildEdgeConf(s *EdgeSpec, l edgeLayout, confDir string, now time.Time) str
 			w("port_hop_ports = %d\n", s.PortHopPorts)
 		}
 	}
+	if s.TwinPath == "on" {
+		w("twin_path = on\n")
+	}
 	if s.Asymmetric == "on" {
 		w("asymmetric = on\n")
 		if s.AsymUplink != "" {
@@ -779,6 +794,10 @@ func EncodePairingCode(p *PairingData) string {
 		}
 		v = max(v, 10)
 	}
+	if p.TwinPath == "on" {
+		extra.WriteString("twin_path=on\n")
+		v = max(v, 10)
+	}
 	if p.Asymmetric == "on" {
 		extra.WriteString("asymmetric=on\n")
 		if up := strings.TrimSpace(p.AsymUplink); up != "" {
@@ -889,6 +908,7 @@ func edgePairingCode(confDir, name string) (string, error) {
 		RealSite: kv["real_site"], CoverSite: kv["cover_site"], ProxyProtocol: kv["proxy_protocol"],
 		SNISpoof: kv["sni_spoof"], SpoofSNI: kv["spoof_sni"], IPSpoof: kv["ip_spoof"], SpoofIP: kv["spoof_ip"],
 		AntiFreeze: kv["anti_freeze"], PortHop: kv["port_hop"], PortHopPorts: kv["port_hop_ports"],
+		TwinPath:   kv["twin_path"],
 		Asymmetric: kv["asymmetric"], AsymUplink: kv["asym_uplink"], AsymDownlink: kv["asym_downlink"], AsymDownPort: kv["asym_down_port"],
 		MaxConn:       kv["max_conn"],
 		WebsiteBridge: kv["website_bridge"], WebsiteDomains: kv["website_domains"],
@@ -942,6 +962,12 @@ func checkEdgePorts(s *EdgeSpec, confDir string, host agentHost) error {
 			problems = append(problems, fmt.Sprintf("the port between the servers, %d, is already used on this server by %s", s.LinkPort, o))
 		} else if err := host.PortFree(t, s.LinkPort); err != nil {
 			problems = append(problems, fmt.Sprintf("the port between the servers, %d, is already in use on this server", s.LinkPort))
+		} else if s.TwinPath == "on" && s.PortHop != "on" && s.LinkPort < 65535 {
+			if o2 := owner(s.LinkPort + 1); o2 != "" {
+				problems = append(problems, fmt.Sprintf("the Twin-Path companion port, %d, is already used on this server by %s", s.LinkPort+1, o2))
+			} else if err2 := host.PortFree(t, s.LinkPort+1); err2 != nil {
+				problems = append(problems, fmt.Sprintf("the Twin-Path companion UDP port, %d, is already in use on this server", s.LinkPort+1))
+			}
 		}
 	} else if s.Asymmetric == "on" {
 		downPort := s.AsymDownPort
@@ -1231,6 +1257,7 @@ type EditSpec struct {
 	AntiFreeze   string `json:"anti_freeze,omitempty"`  // "on" or "off"
 	PortHop      string `json:"port_hop,omitempty"`     // "on" or "off"
 	PortHopPorts int    `json:"port_hop_ports,omitempty"`
+	TwinPath     string `json:"twin_path,omitempty"`  // "on" or "off"
 	Asymmetric   string `json:"asymmetric,omitempty"` // "on" or "off"
 	AsymUplink   string `json:"asym_uplink,omitempty"`
 	AsymDownlink string `json:"asym_downlink,omitempty"`
@@ -1426,7 +1453,7 @@ func EditEdge(spec EditSpec, confDir string) (EdgeResult, error) {
 
 	text := oldConf
 
-	if curCfg.Role == engine.RoleEdge && (spec.Mode != "" || spec.Transport != "" || spec.Asymmetric != "") {
+	if curCfg.Role == engine.RoleEdge && (spec.Mode != "" || spec.Transport != "" || spec.Asymmetric != "" || spec.TwinPath != "") {
 		// Full mode / transport replacement while preserving user ports, service ports,
 		// secret, proxy_protocol, pool, max_conn, spare_ttl, and drain.
 		curUsers := portsIn(curCfg.UserListen)
@@ -1552,6 +1579,7 @@ func EditEdge(spec EditSpec, confDir string) (EdgeResult, error) {
 			AntiFreeze:            spec.AntiFreeze,
 			PortHop:               spec.PortHop,
 			PortHopPorts:          spec.PortHopPorts,
+			TwinPath:              spec.TwinPath,
 			Asymmetric:            spec.Asymmetric,
 			AsymUplink:            spec.AsymUplink,
 			AsymDownlink:          spec.AsymDownlink,
@@ -1609,6 +1637,14 @@ func EditEdge(spec EditSpec, confDir string) (EdgeResult, error) {
 			} else if !(curCfg.Mode == engine.ModeReverse && es.LinkPort == curLink) && !intInSlice(es.LinkPort, curUsers) {
 				if err := host.PortFree(t, es.LinkPort); err != nil {
 					problems = append(problems, fmt.Sprintf("the port between the servers, %d, is already in use on this server", es.LinkPort))
+				} else if es.TwinPath == "on" && es.PortHop != "on" && es.LinkPort < 65535 {
+					if o2 := owner(es.LinkPort + 1); o2 != "" {
+						problems = append(problems, fmt.Sprintf("the Twin-Path companion port, %d, is already used on this server by %s", es.LinkPort+1, o2))
+					} else if !(curCfg.Mode == engine.ModeReverse && curCfg.TwinPath && es.LinkPort == curLink) && !intInSlice(es.LinkPort+1, curUsers) {
+						if err2 := host.PortFree(t, es.LinkPort+1); err2 != nil {
+							problems = append(problems, fmt.Sprintf("the Twin-Path companion UDP port, %d, is already in use on this server", es.LinkPort+1))
+						}
+					}
 				}
 			}
 		} else if es.Asymmetric == "on" {
