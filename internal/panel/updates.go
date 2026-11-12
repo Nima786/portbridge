@@ -754,13 +754,14 @@ func (p *Panel) sshUpdate(j *job, s Server, r addRequest) error {
 		},
 		Timeout: 20 * time.Second,
 	}
-	addr := net.JoinHostPort(s.Address, strconv.Itoa(r.SSHPort))
-	j.say("Connecting to %s over SSH...", addr)
-	client, err := ssh.Dial("tcp", addr, cfg)
+	client, viaName, err := p.dialSSHClient(context.Background(), j, s.Address, r.SSHPort, cfg, s.Group, r.ViaServer)
 	if err != nil {
-		return plainSSHError(err)
+		return err
 	}
 	defer client.Close()
+	if viaName != "" {
+		j.say("Connected over SSH via %s.", viaName)
+	}
 	rm := &remote{c: client}
 	facts, err := rm.run("echo pb_uid=$(id -u); echo pb_arch=$(uname -m)", nil, 30*time.Second)
 	if err != nil {

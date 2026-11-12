@@ -46,6 +46,8 @@ func (p *Panel) routes() http.Handler {
 
 	mux.HandleFunc("GET /hub/poll", p.hub.handlePoll)
 	mux.HandleFunc("POST /hub/reply", p.hub.handleReply)
+	mux.HandleFunc("POST /hub/register", p.handleHubRegister)
+	mux.HandleFunc("GET /hub/bootstrap/{ticket}", p.handleHubBootstrap)
 	mux.HandleFunc("GET /hub/release/{id}", p.handleRelease)
 
 	mux.HandleFunc("POST /api/login", p.handleLogin)
@@ -54,6 +56,8 @@ func (p *Panel) routes() http.Handler {
 	mux.HandleFunc("POST /api/account", p.withAuth(p.handleAccount))
 	mux.HandleFunc("GET /api/servers", p.withAuth(p.handleServers))
 	mux.HandleFunc("POST /api/servers", p.withAuth(p.handleAddServer))
+	mux.HandleFunc("POST /api/join-tickets", p.withAuth(p.handleCreateJoinTicket))
+	mux.HandleFunc("GET /api/join-tickets/{id}", p.withAuth(p.handleGetJoinTicket))
 	mux.HandleFunc("PATCH /api/servers/{id}", p.withAuth(p.handleEditServer))
 	mux.HandleFunc("DELETE /api/servers/{id}", p.withAuth(p.handleRemoveServer))
 	mux.HandleFunc("GET /api/jobs/{id}", p.withAuth(p.handleJob))
@@ -422,18 +426,20 @@ func (p *Panel) handleAddServer(w http.ResponseWriter, r *http.Request, _ authed
 // so it can be confirmed before any password or key is sent.
 func (p *Panel) handleHostKey(w http.ResponseWriter, r *http.Request, _ authed) {
 	var req struct {
-		Address string `json:"address"`
-		SSHPort int    `json:"ssh_port"`
+		Address   string `json:"address"`
+		SSHPort   int    `json:"ssh_port"`
+		Group     string `json:"group"`
+		ViaServer string `json:"via_server"`
 	}
 	if !decodeJSON(w, r, &req) {
 		return
 	}
-	fp, err := fetchHostKey(strings.TrimSpace(req.Address), req.SSHPort)
+	fp, viaName, err := p.fetchHostKeyMultiPath(r.Context(), strings.TrimSpace(req.Address), req.SSHPort, strings.TrimSpace(req.Group), strings.TrimSpace(req.ViaServer))
 	if err != nil {
 		writeErr(w, http.StatusBadGateway, capitalise(err.Error())+".")
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]string{"host_key": fp})
+	writeJSON(w, http.StatusOK, map[string]string{"host_key": fp, "via": viaName})
 }
 
 func (p *Panel) handleJob(w http.ResponseWriter, r *http.Request, _ authed) {

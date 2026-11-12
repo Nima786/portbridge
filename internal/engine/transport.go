@@ -2,6 +2,7 @@ package engine
 
 import (
 	"bytes"
+	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
@@ -298,6 +299,44 @@ func (fc *fragmentConn) Write(b []byte) (int, error) {
 			"large enough to split; it was sent whole")
 	}
 	return fc.Conn.Write(b)
+}
+
+// DialStealthHTTP1TLS dials an HTTPS/1.1 connection disguised with a Chrome uTLS
+// fingerprint, 512+ byte browser padding, and 2-segment ClientHello fragmentation.
+// It is used by the management agent and panel when standard Go TLS handshakes to
+// bare IPs are reset by middleboxes; certificate pinning is enforced via verify.
+func DialStealthHTTP1TLS(
+	ctx context.Context,
+	baseDial func(context.Context, string, string) (net.Conn, error),
+	network, addr, sni string,
+	verify func([][]byte, [][]*x509.Certificate) error,
+) (net.Conn, error) {
+	if baseDial == nil {
+		baseDial = (&net.Dialer{Timeout: 8 * time.Second, KeepAlive: 30 * time.Second}).DialContext
+	}
+	raw, err := baseDial(ctx, network, addr)
+	if err != nil {
+		return nil, err
+	}
+	frag := newFragmentConn(raw, 37, 3*time.Millisecond)
+	ucfg := &utls.Config{
+		ServerName:            sni,
+		InsecureSkipVerify:    verify != nil,
+		VerifyPeerCertificate: verify,
+		MinVersion:            tls.VersionTLS12,
+	}
+	uconn := utls.UClient(frag, ucfg, utls.HelloChrome_Auto)
+	if err := shapeUTLSHello(uconn, &Config{Transport: TransportWSS}); err != nil {
+		_ = raw.Close()
+		return nil, err
+	}
+	hctx, cancel := context.WithTimeout(ctx, tlsHandshakeTimeout)
+	defer cancel()
+	if err := uconn.HandshakeContext(hctx); err != nil {
+		_ = raw.Close()
+		return nil, err
+	}
+	return uconn, nil
 }
 
 // ---------------------------------------------------------------------------

@@ -69,16 +69,103 @@ const (
 // NewPinnedClient is an HTTPS client that trusts exactly one certificate, by its
 // fingerprint, or the usual certificate authorities when no fingerprint is given.
 func NewPinnedClient(fingerprint, targetURL string, timeout time.Duration) *http.Client {
+	return NewPinnedClientOpts(fingerprint, targetURL, timeout, nil, false)
+}
+
+// NewPinnedClientOpts builds a certificate-pinned HTTPS client with optional
+// custom TCP dialer (e.g. fleet jump proxy) and optional Stealth Chrome uTLS +
+// fragmented ClientHello disguise for routes where standard Go TLS is blocked.
+func NewPinnedClientOpts(
+	fingerprint, targetURL string,
+	timeout time.Duration,
+	baseDial func(context.Context, string, string) (net.Conn, error),
+	stealth bool,
+) *http.Client {
+	dialFn := baseDial
+	if dialFn == nil {
+		dialFn = (&net.Dialer{Timeout: 6 * time.Second, KeepAlive: 30 * time.Second}).DialContext
+	}
 	if fingerprint == "" {
 		return &http.Client{Timeout: timeout, Transport: &http.Transport{
-			DialContext:         (&net.Dialer{Timeout: 5 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
-			TLSHandshakeTimeout: 5 * time.Second,
+			DialContext:         dialFn,
+			TLSHandshakeTimeout: 6 * time.Second,
 			TLSClientConfig:     &tls.Config{MinVersion: tls.VersionTLS12},
 		}}
 	}
-	c := makeAgentHTTPClient(agentTrust{Fingerprint: fingerprint}, targetURL)
-	c.Timeout = timeout
-	return c
+	want := normalizeFingerprint(fingerprint)
+	verify := func(raw [][]byte, _ [][]*x509.Certificate) error {
+		if len(raw) == 0 {
+			return errors.New("the agent sent no certificate")
+		}
+		if got := normalizeFingerprint(fingerprintOf(raw[0])); got != want {
+			return fmt.Errorf("the agent's certificate does not match the saved fingerprint (it is %s); "+
+				"this could be the wrong server or someone in between", got)
+		}
+		return nil
+	}
+	sni := agentSNI(targetURL)
+	if stealth {
+		if u, err := url.Parse(targetURL); err == nil && net.ParseIP(u.Hostname()) != nil {
+			sni = "challenges.cloudflare.com"
+		}
+		return &http.Client{
+			Timeout: timeout,
+			Transport: &http.Transport{
+				DialTLSContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+					return engine.DialStealthHTTP1TLS(ctx, dialFn, network, addr, sni, verify)
+				},
+			},
+		}
+	}
+	tc := &tls.Config{
+		MinVersion:            tls.VersionTLS12,
+		InsecureSkipVerify:    true,
+		ServerName:            sni,
+		VerifyPeerCertificate: verify,
+	}
+	return &http.Client{
+		Timeout: timeout,
+		Transport: &http.Transport{
+			DialContext:         dialFn,
+			TLSHandshakeTimeout: 6 * time.Second,
+			TLSClientConfig:     tc,
+		},
+	}
+}
+
+type panelClientCand struct {
+	url    string
+	label  string
+	client *http.Client
+}
+
+func panelVerifyFunc(fingerprint, panelURL string) (func([][]byte, [][]*x509.Certificate) error, bool) {
+	host := ""
+	if u, err := url.Parse(panelURL); err == nil {
+		host = u.Hostname()
+	}
+	byName := host != "" && net.ParseIP(host) == nil
+	want := normalizeFingerprint(fingerprint)
+	return func(raw [][]byte, _ [][]*x509.Certificate) error {
+		if len(raw) == 0 {
+			return errors.New("the panel sent no certificate")
+		}
+		if want != "" && normalizeFingerprint(fingerprintOf(raw[0])) == want {
+			return nil
+		}
+		if byName {
+			if verifyChainFor(raw, host) == nil {
+				return nil
+			}
+			if want != "" {
+				return fmt.Errorf("the panel's certificate is neither the one it had when this server was added "+
+					"nor one issued for %s; this could be the wrong server or someone in between", host)
+			}
+			return fmt.Errorf("the panel's certificate is not valid for %s", host)
+		}
+		return errors.New("the panel's certificate is not the one it had when this server was added; " +
+			"this could be the wrong server or someone in between")
+	}, byName
 }
 
 // panelClient is the client an agent calls the panel with. It trusts the panel's
@@ -90,36 +177,53 @@ func panelClient(fingerprint, panelURL string, timeout time.Duration) *http.Clie
 	if fingerprint == "" {
 		return NewPinnedClient("", panelURL, timeout)
 	}
-	host := ""
-	if u, err := url.Parse(panelURL); err == nil {
-		host = u.Hostname()
-	}
-	byName := host != "" && net.ParseIP(host) == nil
-	want := normalizeFingerprint(fingerprint)
+	verify, _ := panelVerifyFunc(fingerprint, panelURL)
 	tc := &tls.Config{
-		MinVersion: tls.VersionTLS12,
-		// The usual check is replaced, not dropped: see VerifyPeerCertificate.
-		InsecureSkipVerify: true,
-		ServerName:         agentSNI(panelURL),
-		VerifyPeerCertificate: func(raw [][]byte, _ [][]*x509.Certificate) error {
-			if len(raw) == 0 {
-				return errors.New("the panel sent no certificate")
-			}
-			if normalizeFingerprint(fingerprintOf(raw[0])) == want {
-				return nil
-			}
-			if byName {
-				if verifyChainFor(raw, host) == nil {
-					return nil
-				}
-				return fmt.Errorf("the panel's certificate is neither the one it had when this server was added "+
-					"nor one issued for %s; this could be the wrong server or someone in between", host)
-			}
-			return errors.New("the panel's certificate is not the one it had when this server was added; " +
-				"this could be the wrong server or someone in between")
-		},
+		MinVersion:            tls.VersionTLS12,
+		InsecureSkipVerify:    true,
+		ServerName:            agentSNI(panelURL),
+		VerifyPeerCertificate: verify,
 	}
 	return &http.Client{Timeout: timeout, Transport: &http.Transport{TLSClientConfig: tc}}
+}
+
+func panelStealthClient(fingerprint, panelURL string, timeout time.Duration, sni string) *http.Client {
+	verify, _ := panelVerifyFunc(fingerprint, panelURL)
+	tr := &http.Transport{
+		DialTLSContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			return engine.DialStealthHTTP1TLS(ctx, nil, network, addr, sni, verify)
+		},
+	}
+	return &http.Client{Timeout: timeout, Transport: tr}
+}
+
+func buildPanelClients(fingerprint string, urls []string, timeout time.Duration) []panelClientCand {
+	var out []panelClientCand
+	for _, u := range urls {
+		c := panelClient(fingerprint, u, timeout)
+		if timeout == 0 {
+			if tr, ok := c.Transport.(*http.Transport); ok {
+				tr.ResponseHeaderTimeout = hubAnswerWait
+			}
+		}
+		out = append(out, panelClientCand{url: u, label: u, client: c})
+	}
+	if fingerprint != "" {
+		for _, u := range urls {
+			pu, err := url.Parse(u)
+			if err != nil || net.ParseIP(pu.Hostname()) == nil {
+				continue
+			}
+			sc := panelStealthClient(fingerprint, u, timeout, "challenges.cloudflare.com")
+			if timeout == 0 {
+				if tr, ok := sc.Transport.(*http.Transport); ok {
+					tr.ResponseHeaderTimeout = hubAnswerWait
+				}
+			}
+			out = append(out, panelClientCand{url: u, label: u + " (stealth uTLS+frag)", client: sc})
+		}
+	}
+	return out
 }
 
 // verifyChainFor checks a certificate chain the ordinary way, against the system's
@@ -290,13 +394,9 @@ func callHome(ctx context.Context, panelURL, fingerprint, token string, h http.H
 	if len(urls) == 0 {
 		return
 	}
-	clients := make([]*http.Client, len(urls))
-	for i, u := range urls {
-		c := panelClient(fingerprint, u, 0)
-		if tr, ok := c.Transport.(*http.Transport); ok {
-			tr.ResponseHeaderTimeout = hubAnswerWait
-		}
-		clients[i] = c
+	cands := buildPanelClients(fingerprint, urls, 0)
+	if len(cands) == 0 {
+		return
 	}
 	logs := newCallHomeLog()
 	backoff := time.Duration(0)
@@ -304,12 +404,12 @@ func callHome(ctx context.Context, panelURL, fingerprint, token string, h http.H
 	hubSlots := make(chan struct{}, hubMaxParallel)
 	log.Printf("[agent] calling the panel at %s", strings.Join(urls, ", "))
 	for ctx.Err() == nil {
-		curURL := urls[idx]
-		curClient := clients[idx]
+		curURL := cands[idx].url
+		curClient := cands[idx].client
 		req, err := hubPoll(ctx, curClient, curURL, token)
 		if err != nil {
-			// If another callback URL is available, try it next before backing off long.
-			idx = (idx + 1) % len(urls)
+			// If another callback URL or stealth TLS variant is available, try it next before backing off long.
+			idx = (idx + 1) % len(cands)
 			if idx != 0 {
 				continue
 			}

@@ -50,7 +50,8 @@ type addRequest struct {
 	// address (from /api/servers/hostkey). The login only goes through to a
 	// server that shows exactly this key, so a man in the middle cannot collect
 	// the password or key that is about to be sent.
-	HostKey string `json:"host_key"`
+	HostKey   string `json:"host_key"`
+	ViaServer string `json:"via_server,omitempty"`
 }
 
 // job is one server being added, with what has happened so far.
@@ -346,15 +347,17 @@ func (p *Panel) addServer(j *job, r addRequest) (string, error) {
 		},
 		Timeout: 20 * time.Second,
 	}
-	addr := net.JoinHostPort(r.Address, strconv.Itoa(r.SSHPort))
-	j.say("Connecting to %s over SSH...", addr)
-	client, err := ssh.Dial("tcp", addr, cfg)
+	client, viaName, err := p.dialSSHClient(context.Background(), j, r.Address, r.SSHPort, cfg, r.Group, r.ViaServer)
 	if err != nil {
-		return "", plainSSHError(err)
+		return "", err
 	}
 	defer client.Close()
 	rm := &remote{c: client}
-	j.say("Connected (host key %s).", hostKey)
+	if viaName != "" {
+		j.say("Connected via %s (host key %s).", viaName, hostKey)
+	} else {
+		j.say("Connected (host key %s).", hostKey)
+	}
 
 	// What the server is, asked in one go. Each answer is labelled and on its
 	// own line, so a login banner, or a stray warning that some servers print
@@ -453,11 +456,18 @@ func (p *Panel) addServer(j *job, r addRequest) (string, error) {
 		HostKey:     hostKey,
 		Added:       time.Now().UTC(),
 	}
+	if addrOut, aerr := rm.run("/usr/local/bin/portbridge addresses 2>/dev/null", nil, 10*time.Second); aerr == nil {
+		for _, line := range strings.Split(addrOut, "\n") {
+			if ip6, ok := strings.CutPrefix(strings.TrimSpace(line), "ipv6 "); ok && strings.TrimSpace(ip6) != "" {
+				srv.IPv6 = append(srv.IPv6, strings.TrimSpace(ip6))
+			}
+		}
+	}
 	if srv.TokenEnc, err = p.store.seal(res.Token); err != nil {
 		return "", err
 	}
 
-	j.say("Checking the panel can reach it without SSH...")
+	j.say("Checking the panel can reach it without SSH (trying Direct, IPv6 & Stealth TLS)...")
 	ov, derr := p.tryDirect(srv)
 	if derr == nil {
 		j.say("Reached it directly.")
@@ -473,25 +483,45 @@ func (p *Panel) addServer(j *job, r addRequest) (string, error) {
 		if panelURL == "" {
 			panelURL = p.publicURL()
 		}
-		if panelURL == "" {
-			return "", errors.New("the panel does not know its own public address for servers to call; " +
-				"set it in the menu (Web panel). Nothing was saved")
+		var hubErr error
+		if panelURL != "" && p.ownFingerprint() != "" {
+			p.addPending(srv.ID, res.Token)
+			defer p.dropPending(srv.ID)
+			if _, err := remoteAgentSetup(rm, "-panel-url "+shellQuote(panelURL)+
+				" -panel-fingerprint "+shellQuote(p.ownFingerprint())); err != nil {
+				return "", err
+			}
+			srv.CallsPanel = true
+			ov, hubErr = p.waitForCall(srv)
+			if hubErr == nil {
+				j.say("It is calling the panel.")
+			}
+		} else {
+			hubErr = errors.New("the panel does not have a public address set yet")
 		}
-		p.addPending(srv.ID, res.Token)
-		defer p.dropPending(srv.ID)
-		if _, err := remoteAgentSetup(rm, "-panel-url "+shellQuote(panelURL)+
-			" -panel-fingerprint "+shellQuote(p.ownFingerprint())); err != nil {
-			return "", err
+
+		if ov == nil {
+			j.say("Reverse callback did not connect (%v). Trying encrypted jump via an online server...", hubErr)
+			jov, jumpName, jerr := p.tryJumpOverview(srv, r.ViaServer)
+			if jerr != nil {
+				if srv.CallsPanel {
+					_, _ = remoteAgentSetup(rm, "-panel-url off")
+				}
+				if panelURL == "" {
+					return "", errors.New("the panel does not know its own public address for servers to call, and no jump route worked; " +
+						"set the panel's public address in the menu (Web panel). Nothing was saved")
+				}
+				return "", fmt.Errorf("could not reach it directly, it could not call the panel (%v), and peer jump also failed (%v). "+
+					"Check firewall/ports or try the 1-Line Join Command. Nothing was saved", hubErr, jerr)
+			}
+			ov = jov
+			srv.CallsPanel = false
+			srv.JumpAllowed = true
+			if panelURL != "" {
+				srv.StandbyHub = true
+			}
+			j.say("Reached its agent securely via %s.", jumpName)
 		}
-		srv.CallsPanel = true
-		if ov, err = p.waitForCall(srv); err != nil {
-			// Put the agent back as it was, so it does not keep calling a panel
-			// that has no record of it.
-			_, _ = remoteAgentSetup(rm, "-panel-url off")
-			return "", fmt.Errorf("could not reach it directly, and it could not call the panel either (%v). "+
-				"Check that one of the two can reach the other on the ports involved. Nothing was saved", err)
-		}
-		j.say("It is calling the panel.")
 	}
 	if ov != nil && len(ov.IPv6) > 0 {
 		srv.IPv6 = append([]string(nil), ov.IPv6...)

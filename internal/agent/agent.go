@@ -1286,6 +1286,8 @@ func newAgentHandler(token, confDir string, allowUpdates func() bool) *http.Serv
 		writeJSONReply(w, http.StatusOK, res)
 	})
 
+	registerNetProxyHandlers(mux, token)
+
 	return mux
 }
 
@@ -1621,8 +1623,13 @@ func listSavedAgents() error {
 
 // cmdAgent handles the "portbridge agent" command line.
 func CmdAgent(args []string) error {
-	if len(args) > 0 && args[0] == "setup" {
-		return cmdAgentSetup(args[1:])
+	if len(args) > 0 {
+		switch args[0] {
+		case "setup":
+			return cmdAgentSetup(args[1:])
+		case "pair-panel":
+			return cmdAgentPairPanel(args[1:])
+		}
 	}
 	fs := flag.NewFlagSet("agent", flag.ExitOnError)
 	confPath := fs.String("config", "/etc/portbridge/agent.conf", "path to agent config file")

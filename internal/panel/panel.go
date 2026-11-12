@@ -53,6 +53,9 @@ type Panel struct {
 	pendingMu sync.Mutex
 	pending   map[string]string
 
+	ticketsMu sync.Mutex
+	tickets   map[string]*joinTicket
+
 	selfCertMu sync.RWMutex
 	selfCert   tls.Certificate
 	selfFP     string
@@ -80,6 +83,7 @@ func newPanel(dir string, cfg Config, st *store) *Panel {
 		tunnelsDir: defaultTunnelsDir,
 		jobs:       map[string]*job{},
 		pending:    map[string]string{},
+		tickets:    map[string]*joinTicket{},
 		loginSem:   make(chan struct{}, 2),
 	}
 	p.hub = newHub(p.hubTokens)

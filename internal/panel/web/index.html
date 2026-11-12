@@ -150,18 +150,41 @@
         <div id="this-card" class="cards this-card"></div>
       </div>
 
-      <div class="columns">
-        <section class="column column-relay" aria-labelledby="h-relay">
+      <div class="servers-bar" aria-label="Filter and organize servers">
+        <div class="servers-search-wrap">
+          <input id="srv-search" type="search" placeholder="Search server name, IP, or tunnel…" autocapitalize="none" spellcheck="false" aria-label="Search servers">
+        </div>
+        <div class="servers-bar-controls">
+          <div class="seg-group" role="group" aria-label="Filter by status">
+            <button type="button" class="seg-btn is-active" data-srv-filter="all" aria-pressed="true">All</button>
+            <button type="button" class="seg-btn" data-srv-filter="online" aria-pressed="false">Online</button>
+            <button type="button" class="seg-btn" data-srv-filter="offline" aria-pressed="false">Offline</button>
+          </div>
+          <div class="seg-group" role="group" aria-label="Card view density">
+            <button type="button" class="seg-btn is-active" data-srv-density="detailed" aria-pressed="true" title="Full server metrics and tunnel details">Detailed</button>
+            <button type="button" class="seg-btn" data-srv-density="compact" aria-pressed="false" title="Compact cards for managing many servers">Compact</button>
+          </div>
+        </div>
+      </div>
+
+      <div class="columns" id="servers-columns">
+        <section class="column column-relay" id="sec-col-relay" aria-labelledby="h-relay">
           <div class="column-head">
             <h3 id="h-relay"><span class="role-dot relay-dot" aria-hidden="true"></span> Relay Servers <span class="muted">(Iran)</span></h3>
-            <span class="column-tag">Entry Nodes</span>
+            <div class="column-head-meta">
+              <span id="relay-col-count" class="column-count" hidden></span>
+              <span class="column-tag">Entry Nodes</span>
+            </div>
           </div>
           <div id="col-relay" class="cards"></div>
         </section>
-        <section class="column column-foreign" aria-labelledby="h-foreign">
+        <section class="column column-foreign" id="sec-col-foreign" aria-labelledby="h-foreign">
           <div class="column-head">
             <h3 id="h-foreign"><span class="role-dot foreign-dot" aria-hidden="true"></span> Foreign Servers</h3>
-            <span class="column-tag">Exit Nodes</span>
+            <div class="column-head-meta">
+              <span id="foreign-col-count" class="column-count" hidden></span>
+              <span class="column-tag">Exit Nodes</span>
+            </div>
           </div>
           <div id="col-foreign" class="cards"></div>
         </section>
@@ -387,19 +410,25 @@
           </div>
         </fieldset>
 
-        <label for="add-address">Server IP or Hostname</label>
-        <input id="add-address" autocapitalize="none" spellcheck="false" required placeholder="e.g. 203.0.113.5">
-      </div>
-
-      <div class="row">
-        <div>
-          <label for="add-user">SSH Username</label>
-          <input id="add-user" value="root" autocapitalize="none" spellcheck="false">
-        </div>
-        <div>
-          <label for="add-port">SSH Port</label>
-          <input id="add-port" type="number" min="1" max="65535" value="22" inputmode="numeric">
-        </div>
+        <fieldset class="step-box" id="add-method-box">
+          <legend>Connection &amp; Pairing Method</legend>
+          <div class="choice-grid cols-2">
+            <label class="choice-card">
+              <input type="radio" name="add-method" value="ssh" checked>
+              <div class="choice-body">
+                <div class="choice-top"><strong>SSH Auto-Setup</strong><span class="pill-tag tag-ok">Auto-Fallback</span></div>
+                <span class="choice-desc">Tries Direct IPv4/IPv6, hops via an online server if blocked, and pairs over Direct, Stealth TLS, Callback, or Jump.</span>
+              </div>
+            </label>
+            <label class="choice-card">
+              <input type="radio" name="add-method" value="join">
+              <div class="choice-body">
+                <div class="choice-top"><strong>1-Line Join Command</strong><span class="pill-tag">No SSH Needed</span></div>
+                <span class="choice-desc">Gives a single command to paste on the server when SSH from the panel is completely blocked or disabled.</span>
+              </div>
+            </label>
+          </div>
+        </fieldset>
       </div>
 
       <div id="add-only-name">
@@ -407,49 +436,104 @@
         <input id="add-name" maxlength="64" placeholder="e.g. Iran-Asiatech or Germany-Hetzner">
       </div>
 
-      <fieldset class="step-box">
-        <legend>SSH Authentication</legend>
-        <div class="choice-grid cols-3">
-          <label class="choice-card compact">
-            <input type="radio" name="auth" value="password" checked>
-            <div class="choice-body"><div class="choice-top"><strong>Password</strong></div></div>
-          </label>
-          <label class="choice-card compact">
-            <input type="radio" name="auth" value="key">
-            <div class="choice-body"><div class="choice-top"><strong>Paste SSH Key</strong></div></div>
-          </label>
-          <label class="choice-card compact">
-            <input type="radio" name="auth" value="file">
-            <div class="choice-body"><div class="choice-top"><strong>Key File (.ppk / OpenSSH)</strong></div></div>
-          </label>
+      <div id="add-ssh-pane">
+        <div id="add-address-wrap">
+          <label for="add-address">Server IP or Hostname</label>
+          <input id="add-address" autocapitalize="none" spellcheck="false" required placeholder="e.g. 203.0.113.5 or [2001:db8::1]">
         </div>
-      </fieldset>
 
-      <div id="auth-password">
-        <label for="add-password">SSH Password</label>
-        <input id="add-password" type="password" autocomplete="new-password">
-      </div>
-      <div id="auth-key" hidden>
-        <label for="add-key">Private Key <span class="muted">(OpenSSH, PEM, or PuTTY .ppk)</span></label>
-        <textarea id="add-key" rows="5" spellcheck="false" autocomplete="off" placeholder="-----BEGIN OPENSSH PRIVATE KEY----- or PuTTY-User-Key-File-3: ..."></textarea>
-      </div>
-      <div id="auth-file" hidden>
-        <label for="add-file">Private Key File <span class="muted">(OpenSSH id_ed25519 / id_rsa, .pem, or PuTTY .ppk)</span></label>
-        <input id="add-file" type="file">
-      </div>
-      <div id="auth-passphrase" hidden>
-        <label for="add-passphrase">Key Passphrase <span class="muted">(leave empty unless your key is encrypted)</span></label>
-        <input id="add-passphrase" type="password" autocomplete="new-password" placeholder="Leave empty for unencrypted keys">
-      </div>
-      <div id="auth-sudo" hidden>
-        <label for="add-sudo-password">Sudo / Root Password <span class="muted">(optional — leave empty if sudo is passwordless or uses your SSH password)</span></label>
-        <input id="add-sudo-password" type="password" autocomplete="new-password" placeholder="Leave empty for passwordless sudo or same as SSH password">
+        <div class="row">
+          <div>
+            <label for="add-user">SSH Username</label>
+            <input id="add-user" value="root" autocapitalize="none" spellcheck="false">
+          </div>
+          <div>
+            <label for="add-port">SSH Port</label>
+            <input id="add-port" type="number" min="1" max="65535" value="22" inputmode="numeric">
+          </div>
+        </div>
+
+        <div id="add-via-wrap">
+          <label for="add-via">Connection Route <span class="muted">(for hard-to-reach servers)</span></label>
+          <select id="add-via">
+            <option value="auto">Auto — Try Direct (IPv4/IPv6), then jump via online server</option>
+            <option value="direct">Direct from Panel only (no jump)</option>
+          </select>
+        </div>
+
+        <fieldset class="step-box">
+          <legend>SSH Authentication</legend>
+          <div class="choice-grid cols-3">
+            <label class="choice-card compact">
+              <input type="radio" name="auth" value="password" checked>
+              <div class="choice-body"><div class="choice-top"><strong>Password</strong></div></div>
+            </label>
+            <label class="choice-card compact">
+              <input type="radio" name="auth" value="key">
+              <div class="choice-body"><div class="choice-top"><strong>Paste SSH Key</strong></div></div>
+            </label>
+            <label class="choice-card compact">
+              <input type="radio" name="auth" value="file">
+              <div class="choice-body"><div class="choice-top"><strong>Key File (.ppk / OpenSSH)</strong></div></div>
+            </label>
+          </div>
+        </fieldset>
+
+        <div id="auth-password">
+          <label for="add-password">SSH Password</label>
+          <input id="add-password" type="password" autocomplete="new-password">
+        </div>
+        <div id="auth-key" hidden>
+          <label for="add-key">Private Key <span class="muted">(OpenSSH, PEM, or PuTTY .ppk)</span></label>
+          <textarea id="add-key" rows="5" spellcheck="false" autocomplete="off" placeholder="-----BEGIN OPENSSH PRIVATE KEY----- or PuTTY-User-Key-File-3: ..."></textarea>
+        </div>
+        <div id="auth-file" hidden>
+          <label for="add-file">Private Key File <span class="muted">(OpenSSH id_ed25519 / id_rsa, .pem, or PuTTY .ppk)</span></label>
+          <input id="add-file" type="file">
+        </div>
+        <div id="auth-passphrase" hidden>
+          <label for="add-passphrase">Key Passphrase <span class="muted">(leave empty unless your key is encrypted)</span></label>
+          <input id="add-passphrase" type="password" autocomplete="new-password" placeholder="Leave empty for unencrypted keys">
+        </div>
+        <div id="auth-sudo" hidden>
+          <label for="add-sudo-password">Sudo / Root Password <span class="muted">(optional — leave empty if sudo is passwordless or uses your SSH password)</span></label>
+          <input id="add-sudo-password" type="password" autocomplete="new-password" placeholder="Leave empty for passwordless sudo or same as SSH password">
+        </div>
+
+        <label class="check-card" id="add-update-row">
+          <input type="checkbox" id="add-update" checked>
+          <span><strong>Auto-upgrade old version</strong> — If this server has an older PortBridge version installed, upgrade it automatically (existing tunnels restart briefly).</span>
+        </label>
       </div>
 
-      <label class="check-card" id="add-update-row">
-        <input type="checkbox" id="add-update" checked>
-        <span><strong>Auto-upgrade old version</strong> — If this server has an older PortBridge version installed, upgrade it automatically (existing tunnels restart briefly).</span>
-      </label>
+      <div id="add-join-pane" class="join-pane" hidden>
+        <p class="muted small">Generate a single-use pairing command (valid for 15 minutes) and run it as <code>root</code> on the target server. It installs/updates PortBridge and connects out to this panel over standard or Stealth fragmented TLS.</p>
+        <div class="actions left">
+          <button type="button" id="join-gen-btn" class="primary">Generate 1-Line Join Command</button>
+        </div>
+        <div id="join-cmd-wrap" class="join-cmd-wrap" hidden>
+          <label for="join-cmd-text">Paste &amp; run on the new server (SSH / VNC / Provider Console):</label>
+          <div class="join-copy-box">
+            <textarea id="join-cmd-text" rows="3" readonly spellcheck="false"></textarea>
+            <button type="button" id="join-copy-btn">Copy Command</button>
+          </div>
+          <details id="join-panel-alt" class="join-alt-details" hidden>
+            <summary>Server cannot reach GitHub? Use direct Panel download command</summary>
+            <p class="muted small">Downloads the SHA-256 verified PortBridge archive directly from this panel instead of GitHub:</p>
+            <div class="join-copy-box">
+              <textarea id="join-panel-cmd-text" rows="3" readonly spellcheck="false"></textarea>
+              <button type="button" id="join-panel-copy-btn">Copy Offline Command</button>
+            </div>
+          </details>
+          <div id="join-wait-box" class="probe-live-box">
+            <div class="probe-live-head">
+              <span class="probe-spinner" aria-hidden="true"></span>
+              <span id="join-wait-text">Waiting for the server to run the command and register with the panel…</span>
+            </div>
+          </div>
+          <p id="join-done-msg" class="good" role="status" hidden></p>
+        </div>
+      </div>
 
       <p id="add-error" class="error" role="alert"></p>
     </div>
@@ -471,6 +555,7 @@
     </div>
     <div class="dialog-footer actions">
       <button type="button" id="add-back" hidden>Back</button>
+      <button type="button" id="add-switch-join" hidden>Use 1-Line Join Command Instead</button>
       <button type="button" id="add-close" class="primary">Close</button>
     </div>
   </div>

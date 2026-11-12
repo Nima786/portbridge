@@ -107,14 +107,15 @@ type Server struct {
 	ID          string    `json:"id"`
 	Name        string    `json:"name"`
 	Group       string    `json:"group"`
-	Address     string    `json:"address"`               // what the user typed to reach it
-	IPv6        []string  `json:"ipv6,omitempty"`        // known public IPv6 addresses for fallback
-	AgentURL    string    `json:"agent_url"`             // https://address:port of its agent
-	Fingerprint string    `json:"fingerprint"`           // the agent's certificate, pinned
-	TokenEnc    string    `json:"token"`                 // the agent's token, encrypted
-	CallsPanel  bool      `json:"calls_panel"`           // reached by the agent calling in
-	StandbyHub  bool      `json:"standby_hub,omitempty"` // allowed to call in on /hub/poll as a failover route
-	HostKey     string    `json:"ssh_host_key"`          // SSH host key seen when it was added
+	Address     string    `json:"address"`                // what the user typed to reach it
+	IPv6        []string  `json:"ipv6,omitempty"`         // known public IPv6 addresses for fallback
+	AgentURL    string    `json:"agent_url"`              // https://address:port of its agent
+	Fingerprint string    `json:"fingerprint"`            // the agent's certificate, pinned
+	TokenEnc    string    `json:"token"`                  // the agent's token, encrypted
+	CallsPanel  bool      `json:"calls_panel"`            // reached by the agent calling in
+	StandbyHub  bool      `json:"standby_hub,omitempty"`  // allowed to call in on /hub/poll as a failover route
+	JumpAllowed bool      `json:"jump_allowed,omitempty"` // reached via peer jump proxy when direct & hub fail
+	HostKey     string    `json:"ssh_host_key"`           // SSH host key seen when it was added
 	Added       time.Time `json:"added"`
 }
 

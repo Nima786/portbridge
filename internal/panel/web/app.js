@@ -420,6 +420,75 @@
 
   // ---------------------------------------------------------------- servers
 
+  let srvSearch = '';
+  let srvFilter = 'all';
+  let srvDensity = 'detailed';
+  try {
+    if (localStorage.getItem('pb-srv-density') === 'compact') srvDensity = 'compact';
+  } catch (_) {}
+
+  function syncServerBarControls() {
+    for (const btn of document.querySelectorAll('[data-srv-filter]')) {
+      const on = btn.dataset.srvFilter === srvFilter;
+      btn.classList.toggle('is-active', on);
+      btn.setAttribute('aria-pressed', String(on));
+    }
+    for (const btn of document.querySelectorAll('[data-srv-density]')) {
+      const on = btn.dataset.srvDensity === srvDensity;
+      btn.classList.toggle('is-active', on);
+      btn.setAttribute('aria-pressed', String(on));
+    }
+  }
+  syncServerBarControls();
+
+  if ($('srv-search')) {
+    $('srv-search').addEventListener('input', () => {
+      srvSearch = $('srv-search').value.trim().toLowerCase();
+      renderServers(serversCache);
+    });
+  }
+  for (const btn of document.querySelectorAll('[data-srv-filter]')) {
+    btn.addEventListener('click', () => {
+      srvFilter = btn.dataset.srvFilter || 'all';
+      syncServerBarControls();
+      renderServers(serversCache);
+    });
+  }
+  for (const btn of document.querySelectorAll('[data-srv-density]')) {
+    btn.addEventListener('click', () => {
+      srvDensity = btn.dataset.srvDensity === 'compact' ? 'compact' : 'detailed';
+      try { localStorage.setItem('pb-srv-density', srvDensity); } catch (_) {}
+      syncServerBarControls();
+      renderServers(serversCache);
+    });
+  }
+
+  function matchesServerFilter(s) {
+    if (srvFilter === 'online' && !s.online) return false;
+    if (srvFilter === 'offline' && s.online) return false;
+    if (!srvSearch) return true;
+    const ov = s.overview || {};
+    const tNames = ((ov.tunnels) || []).map((t) => t.name || '').join(' ');
+    const v6 = (ov.ipv6 || []).join(' ');
+    const hay = `${s.name || ''} ${s.address || ''} ${ov.hostname || ''} ${ov.version || ''} ${tNames} ${v6}`.toLowerCase();
+    return hay.includes(srvSearch);
+  }
+
+  function updateStickyServerColumns() {
+    const colR = $('sec-col-relay');
+    const colF = $('sec-col-foreign');
+    if (!colR || !colF) return;
+    colR.classList.remove('column-sticky');
+    colF.classList.remove('column-sticky');
+    if (window.innerWidth <= 760 || currentTab !== 'servers') return;
+    const hR = colR.offsetHeight;
+    const hF = colF.offsetHeight;
+    if (!hR || !hF || Math.abs(hR - hF) < 90) return;
+    if (hR < hF) colR.classList.add('column-sticky');
+    else colF.classList.add('column-sticky');
+  }
+  window.addEventListener('resize', updateStickyServerColumns);
+
   async function loadServers() {
     const [data] = await Promise.all([api('GET', '/api/servers'), loadUpdates()]);
     serversCache = data.servers || [];
@@ -433,18 +502,48 @@
 
   function renderServers(list) {
     const relay = [], foreign = [];
+    let relayTotal = 0, relayOnline = 0, foreignTotal = 0, foreignOnline = 0;
     let unassigned = null;
     for (const s of list) {
-      if (s.group === 'relay') relay.push(serverCard(s));
-      else if (s.group === 'foreign') foreign.push(serverCard(s));
-      else if (s.this) unassigned = s;
+      if (s.group === 'relay') {
+        relayTotal++;
+        if (s.online) relayOnline++;
+        if (matchesServerFilter(s)) relay.push(serverCard(s));
+      } else if (s.group === 'foreign') {
+        foreignTotal++;
+        if (s.online) foreignOnline++;
+        if (matchesServerFilter(s)) foreign.push(serverCard(s));
+      } else if (s.this) {
+        unassigned = s;
+      }
     }
+    const rc = $('relay-col-count');
+    if (rc) {
+      rc.hidden = relayTotal === 0;
+      rc.textContent = relay.length !== relayTotal
+        ? `${relay.length} shown · ${relayOnline}/${relayTotal} online`
+        : `${relayOnline}/${relayTotal} online`;
+    }
+    const fc = $('foreign-col-count');
+    if (fc) {
+      fc.hidden = foreignTotal === 0;
+      fc.textContent = foreign.length !== foreignTotal
+        ? `${foreign.length} shown · ${foreignOnline}/${foreignTotal} online`
+        : `${foreignOnline}/${foreignTotal} online`;
+    }
+    const isCompact = srvDensity === 'compact';
+    $('col-relay').classList.toggle('is-compact', isCompact);
+    $('col-foreign').classList.toggle('is-compact', isCompact);
     $('this-unassigned').hidden = !unassigned;
     $('this-card').replaceChildren(...(unassigned ? [serverCard(unassigned)] : []));
+    const filteredMsg = (srvSearch || srvFilter !== 'all')
+      ? 'No matching servers for the current search/filter.'
+      : null;
     $('col-relay').replaceChildren(...(relay.length ? relay
-      : [h('p', { class: 'empty' }, 'No relay servers yet. Click "+ Add Server" to add one.')]));
+      : [h('p', { class: 'empty' }, filteredMsg && relayTotal > 0 ? filteredMsg : 'No relay servers yet. Click "+ Add Server" to add one.')]));
     $('col-foreign').replaceChildren(...(foreign.length ? foreign
-      : [h('p', { class: 'empty' }, 'No foreign servers yet. Click "+ Add Server" to add one.')]));
+      : [h('p', { class: 'empty' }, filteredMsg && foreignTotal > 0 ? filteredMsg : 'No foreign servers yet. Click "+ Add Server" to add one.')]));
+    requestAnimationFrame(updateStickyServerColumns);
   }
 
   function serverState(s) {
@@ -549,12 +648,30 @@
     if (s.address) chips.push(h('span', { class: 'meta-chip chip-ip', title: 'Server IP / Hostname' }, s.address));
     if (ov && ov.version) chips.push(h('span', { class: 'meta-chip' }, 'PortBridge ' + ov.version));
     chips.push(h('span', { class: 'meta-chip' }, tunnels.length ? `${plural(tunnels.length, 'tunnel')} (${running} running)` : 'No tunnels'));
+    if (ov && (Number(ov.cpu_cores) > 0 || Number(ov.mem_total_bytes) > 0)) {
+      const cpuStr = Number(ov.cpu_cores) > 0 ? `CPU ${Math.round(Number(ov.cpu_percent) || 0)}%` : '';
+      const memTotal = Number(ov.mem_total_bytes) || 0;
+      const memAvail = Math.min(memTotal, Math.max(0, Number(ov.mem_avail_bytes) || 0));
+      const memPct = memTotal > 0 ? Math.round(Number(ov.mem_used_percent) || (((memTotal - memAvail) * 100) / memTotal)) : 0;
+      const ramStr = memTotal > 0 ? `RAM ${memPct}%` : '';
+      const compactLoad = [cpuStr, ramStr].filter(Boolean).join(' · ');
+      if (compactLoad) chips.push(h('span', { class: 'meta-chip chip-compact-load', title: 'Live CPU & Memory load' }, compactLoad));
+    }
 
     const badges = [];
     if (s.this) badges.push(h('span', { class: 'badge badge-accent' }, 'Panel Host (This Server)'));
-    if (s.calls_panel) {
-      badges.push(h('span', { class: 'badge', title: 'This server connects in to the panel automatically.' },
+    if (s.calls_panel || s.route === 'hub') {
+      badges.push(h('span', { class: 'badge', title: 'This server connects in to the panel over /hub/poll.' },
         'Callback Mode'));
+    } else if (s.route === 'stealth') {
+      badges.push(h('span', { class: 'badge badge-accent', title: 'Reached using Chrome uTLS + fragmented ClientHello.' },
+        'Stealth TLS'));
+    } else if (s.route === 'ipv6') {
+      badges.push(h('span', { class: 'badge', title: 'Reached directly over IPv6.' },
+        'IPv6 Route'));
+    } else if (s.route === 'jump') {
+      badges.push(h('span', { class: 'badge badge-accent', title: 'Reached end-to-end with pinned TLS via an online peer server.' },
+        'Via Peer Jump'));
     }
     if (ov && ov.bbr_active) {
       badges.push(h('span', { class: 'badge badge-ok', title: 'BBR TCP congestion control is active on this server.' }, 'BBR Active'));
@@ -588,7 +705,8 @@
       h('button', { type: 'button', class: 'link', 'data-focus': `srv-${s.id}-ssh`, onclick: () => openSSHUpdate(s) },
         'Upgrade via SSH')) : null;
 
-    const card = h('article', { class: 'card server' + roleClass, 'aria-labelledby': headingId },
+    const compactClass = srvDensity === 'compact' ? ' is-compact' : '';
+    const card = h('article', { class: 'card server' + roleClass + compactClass, 'aria-labelledby': headingId },
       h('div', { class: 'head' },
         h('div', { class: 'server-title-wrap' },
           isDraggable ? h('span', { class: 'drag-grip', 'aria-hidden': 'true', title: 'Drag onto a server in the other column to link them' }, '⠿') : null,
@@ -727,12 +845,13 @@
   }
 
   // Resolves true only if the person accepts the fingerprint shown.
-  function confirmHostKey(address, fingerprint) {
+  function confirmHostKey(address, fingerprint, viaName) {
     return new Promise((resolve) => {
       let ok = false;
       $('confirm-dialog').addEventListener('close', () => resolve(ok), { once: true });
+      const routeNote = viaName ? ` (reached via jump server "${viaName}")` : '';
       openConfirm(`Is this the right server?`,
-        `${address} shows this SSH fingerprint: ${fingerprint}. ` +
+        `${address}${routeNote} shows this SSH fingerprint: ${fingerprint}. ` +
         'If you can, compare it with the one on the server (ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub, or the other ssh_host_*_key.pub files). ' +
         'Your password or key is only sent to a server that shows exactly this.',
         'Yes, continue', async () => { ok = true; });
@@ -839,21 +958,181 @@
   });
 
   let addMode = { kind: 'add' };
+  let joinPollTimer = null;
+
+  function stopJoinPoll() {
+    if (joinPollTimer) {
+      clearTimeout(joinPollTimer);
+      joinPollTimer = null;
+    }
+  }
+
+  function resetJoinPane() {
+    stopJoinPoll();
+    if ($('join-cmd-wrap')) $('join-cmd-wrap').hidden = true;
+    if ($('join-cmd-text')) $('join-cmd-text').value = '';
+    if ($('join-panel-alt')) $('join-panel-alt').hidden = true;
+    if ($('join-panel-cmd-text')) $('join-panel-cmd-text').value = '';
+    if ($('join-wait-box')) $('join-wait-box').hidden = false;
+    if ($('join-done-msg')) {
+      $('join-done-msg').hidden = true;
+      $('join-done-msg').textContent = '';
+    }
+  }
+
+  function addMethodKind() {
+    const c = document.querySelector('input[name="add-method"]:checked');
+    return c ? c.value : 'ssh';
+  }
+
+  function populateAddViaOptions(excludeAddr) {
+    const sel = $('add-via');
+    if (!sel) return;
+    const prev = sel.value || 'auto';
+    const opts = [
+      h('option', { value: 'auto' }, 'Auto — Try Direct (IPv4/IPv6), then jump via online server'),
+      h('option', { value: 'direct' }, 'Direct from Panel only (no jump)'),
+    ];
+    const onlinePeers = serversCache.filter((s) => !s.this && s.online && (!excludeAddr || s.address !== excludeAddr));
+    for (const s of onlinePeers) {
+      const role = s.group === 'foreign' ? 'Foreign' : 'Relay';
+      opts.push(h('option', { value: s.id }, `Jump via ${s.name || s.address} (${role} · ${s.address})`));
+    }
+    sel.replaceChildren(...opts);
+    if (Array.from(sel.options).some((o) => o.value === prev)) {
+      sel.value = prev;
+    } else {
+      sel.value = 'auto';
+    }
+  }
+
+  function syncAddMethodUI() {
+    const add = addMode.kind === 'add';
+    const isJoin = add && addMethodKind() === 'join';
+    if (!isJoin) stopJoinPoll();
+    if ($('add-ssh-pane')) $('add-ssh-pane').hidden = isJoin;
+    if ($('add-address-wrap')) $('add-address-wrap').hidden = !add;
+    if ($('add-join-pane')) $('add-join-pane').hidden = !isJoin;
+    $('add-submit').hidden = isJoin;
+    $('add-cancel').textContent = isJoin ? 'Close' : 'Cancel';
+    syncChoiceCards($('add-dialog'));
+  }
+
+  for (const r of document.querySelectorAll('input[name="add-method"]')) {
+    r.addEventListener('change', () => {
+      $('add-error').textContent = '';
+      syncAddMethodUI();
+    });
+  }
+
+  async function copyTextWithButton(text, btn, defaultLabel) {
+    if (!text) return;
+    try {
+      await navigator.clipboard.writeText(text);
+    } catch (_) {
+      const ta = document.createElement('textarea');
+      ta.value = text;
+      document.body.append(ta);
+      ta.select();
+      try { document.execCommand('copy'); } catch (_) {}
+      ta.remove();
+    }
+    if (btn) {
+      btn.textContent = 'Copied!';
+      setTimeout(() => { btn.textContent = defaultLabel; }, 1800);
+    }
+  }
+
+  if ($('join-copy-btn')) {
+    $('join-copy-btn').addEventListener('click', () => {
+      copyTextWithButton($('join-cmd-text').value, $('join-copy-btn'), 'Copy Command');
+    });
+  }
+  if ($('join-panel-copy-btn')) {
+    $('join-panel-copy-btn').addEventListener('click', () => {
+      copyTextWithButton($('join-panel-cmd-text').value, $('join-panel-copy-btn'), 'Copy Offline Command');
+    });
+  }
+
+  if ($('join-gen-btn')) {
+    $('join-gen-btn').addEventListener('click', async () => {
+      const err = $('add-error');
+      err.textContent = '';
+      const group = document.querySelector('input[name="group"]:checked');
+      if (!group) {
+        err.textContent = 'Select whether this is a Relay (Iran) or Foreign server first.';
+        return;
+      }
+      const btn = $('join-gen-btn');
+      btn.disabled = true;
+      btn.classList.add('is-loading');
+      resetJoinPane();
+      try {
+        const res = await api('POST', '/api/join-tickets', {
+          group: group.value,
+          name: ($('add-name') && $('add-name').value.trim()) || '',
+        });
+        $('join-cmd-text').value = res.command || '';
+        if (res.panel_command && $('join-panel-alt') && $('join-panel-cmd-text')) {
+          $('join-panel-cmd-text').value = res.panel_command;
+          $('join-panel-alt').hidden = false;
+        }
+        $('join-cmd-wrap').hidden = false;
+        $('join-wait-box').hidden = false;
+        const pollTicket = async () => {
+          if (!$('add-dialog').open || addMethodKind() !== 'join') return;
+          try {
+            const st = await api('GET', '/api/join-tickets/' + encodeURIComponent(res.ticket_id));
+            if (st && st.done) {
+              stopJoinPoll();
+              $('join-wait-box').hidden = true;
+              $('join-done-msg').textContent = `Success: paired "${st.server_name || 'server'}" — it is now in your server list.`;
+              $('join-done-msg').hidden = false;
+              lastServers = '';
+              refresh();
+              return;
+            }
+          } catch (pe) {
+            if (pe.status === 404) {
+              stopJoinPoll();
+              $('join-wait-box').hidden = true;
+              err.textContent = pe.message;
+              return;
+            }
+          }
+          joinPollTimer = setTimeout(pollTicket, 2000);
+        };
+        joinPollTimer = setTimeout(pollTicket, 2000);
+      } catch (e) {
+        err.textContent = e.message;
+      } finally {
+        btn.classList.remove('is-loading');
+        btn.disabled = false;
+      }
+    });
+  }
 
   function setAddMode(mode) {
     addMode = mode;
     const add = mode.kind === 'add';
+    resetJoinPane();
+    if (add) {
+      const sshRadio = document.querySelector('input[name="add-method"][value="ssh"]');
+      if (sshRadio) sshRadio.checked = true;
+    }
+    populateAddViaOptions(add ? '' : (mode.server && mode.server.address));
     $('add-only').hidden = !add;
     $('add-only-name').hidden = !add;
     $('add-update-row').hidden = !add;
     $('add-title').textContent = add ? 'Add a Server' : `Upgrade ${mode.server.name} via SSH`;
     $('add-intro').textContent = add
-      ? 'The panel connects via SSH once to install or pair PortBridge, and communicates directly through the agent afterwards. Your SSH password or key is never stored.'
+      ? 'The panel connects via SSH once (trying Direct IPv4/IPv6 + online server jump automatically) or pairs via a 1-Line Join Command. Your SSH password or key is never stored.'
       : 'This server runs an older PortBridge version from before one-click updates. Enter its SSH login once to upgrade it; future updates will work with one click.';
     $('add-submit').textContent = add ? 'Add Server' : 'Upgrade Server';
     $('add-form').hidden = false;
     $('add-progress').hidden = true;
     $('add-error').textContent = '';
+    syncAddMethodUI();
     showAuth();
   }
 
@@ -881,13 +1160,27 @@
   // However the window is closed, Escape included, the password or key typed in
   // it is gone. Otherwise it would still be sitting in the form for the next
   // server the window is opened for.
-  $('add-dialog').addEventListener('close', clearSecrets);
+  $('add-dialog').addEventListener('close', () => {
+    stopJoinPoll();
+    clearSecrets();
+  });
   $('add-back').addEventListener('click', () => {
     $('add-progress').hidden = true;
     $('add-form').hidden = false;
     $('add-error').textContent = '';
     (addMode.kind === 'add' ? $('add-address') : $('add-user')).focus();
   });
+  if ($('add-switch-join')) {
+    $('add-switch-join').addEventListener('click', () => {
+      $('add-progress').hidden = true;
+      $('add-form').hidden = false;
+      $('add-error').textContent = '';
+      const joinRadio = document.querySelector('input[name="add-method"][value="join"]');
+      if (joinRadio) joinRadio.checked = true;
+      syncAddMethodUI();
+      if ($('join-gen-btn')) $('join-gen-btn').focus();
+    });
+  }
 
   $('add-form').addEventListener('submit', async (ev) => {
     ev.preventDefault();
@@ -912,6 +1205,7 @@
         }
       }
     }
+    const viaServer = ($('add-via') && $('add-via').value) || 'auto';
     const body = {
       name: $('add-name').value.trim(),
       group: group ? group.value : '',
@@ -919,6 +1213,7 @@
       ssh_port: port,
       user: $('add-user').value.trim() || 'root',
       allow_update: $('add-update').checked,
+      via_server: viaServer,
     };
     if (kind === 'password') body.password = $('add-password').value;
     else body.private_key = kind === 'key' ? $('add-key').value : keyFromFile;
@@ -945,8 +1240,13 @@
       // The server's SSH fingerprint is shown first, and the password or key is
       // only sent to a server that shows exactly that one.
       const hostAddr = updating ? addMode.server.address : address;
-      const fp = await api('POST', '/api/servers/hostkey', { address: hostAddr, ssh_port: port });
-      if (!(await confirmHostKey(hostAddr, fp.host_key))) return;
+      const fp = await api('POST', '/api/servers/hostkey', {
+        address: hostAddr,
+        ssh_port: port,
+        group: updating ? (addMode.server.group || '') : body.group,
+        via_server: viaServer,
+      });
+      if (!(await confirmHostKey(hostAddr, fp.host_key, fp.via))) return;
       body.host_key = fp.host_key;
       const path = updating ? `/api/servers/${encodeURIComponent(addMode.server.id)}/ssh-update` : '/api/servers';
       const res = await api('POST', path, body);
@@ -966,6 +1266,7 @@
     $('add-result').className = '';
     $('add-note').hidden = false;
     $('add-back').hidden = true;
+    if ($('add-switch-join')) $('add-switch-join').hidden = true;
     $('add-progress-title').focus();
     jobLines = 0;
     if (jobTimer) clearTimeout(jobTimer);
@@ -995,6 +1296,7 @@
         $('add-result').textContent = (updating ? 'Upgrade failed. ' : 'Could not add server. ') + sentence(job.error);
         $('add-result').className = 'bad';
         $('add-back').hidden = false;
+        if ($('add-switch-join')) $('add-switch-join').hidden = updating;
       } else {
         clearSecrets();
         $('add-result').textContent = updating ? 'Success: server is updated and supports one-click updates from now on.'

@@ -39,6 +39,7 @@ type serverView struct {
 	Address    string          `json:"address"`
 	This       bool            `json:"this"`
 	CallsPanel bool            `json:"calls_panel"`
+	Route      string          `json:"route,omitempty"`
 	Online     bool            `json:"online"`
 	Problem    string          `json:"problem,omitempty"`
 	LastSeen   string          `json:"last_seen,omitempty"`
@@ -53,6 +54,9 @@ type heard struct {
 	seededHome bool
 	lastURL    string
 	preferHub  bool
+	stealth    bool
+	jumpID     string
+	route      string
 }
 
 // fleet is every server, and what was last heard from each.
@@ -64,7 +68,7 @@ type fleet struct {
 
 func newFleet(p *Panel) *fleet { return &fleet{p: p, by: map[string]*heard{}} }
 
-func (f *fleet) recordPath(id, url string, hub bool) {
+func (f *fleet) recordPath(id, url string, hub, stealth bool, route string) {
 	f.mu.Lock()
 	h := f.by[id]
 	if h == nil {
@@ -73,16 +77,34 @@ func (f *fleet) recordPath(id, url string, hub bool) {
 	}
 	h.lastURL = url
 	h.preferHub = hub
+	h.stealth = stealth
+	h.jumpID = ""
+	h.route = route
 	f.mu.Unlock()
 }
 
-func (f *fleet) preferredPath(id string) (url string, hub bool) {
+func (f *fleet) recordJump(id, jumpID string) {
+	f.mu.Lock()
+	h := f.by[id]
+	if h == nil {
+		h = &heard{}
+		f.by[id] = h
+	}
+	h.lastURL = ""
+	h.preferHub = false
+	h.stealth = false
+	h.jumpID = jumpID
+	h.route = "jump"
+	f.mu.Unlock()
+}
+
+func (f *fleet) preferredPath(id string) (url string, hub, stealth bool, jumpID string) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if h := f.by[id]; h != nil {
-		return h.lastURL, h.preferHub
+		return h.lastURL, h.preferHub, h.stealth, h.jumpID
 	}
-	return "", false
+	return "", false, false, ""
 }
 
 // call sends one request to a server's agent and returns its answer.
@@ -104,17 +126,19 @@ func agentURLPort(rawURL string) string {
 
 // callLimit is call for an answer that may be larger, such as a release.
 // It tries every available control path so the panel can still manage a
-// foreign server even when Iran -> Foreign IPv4 is blocked:
+// foreign server even when Iran -> Foreign IPv4 is blocked or DPI-filtered:
 //  1. Direct IPv4/Primary URL (or Reverse Hub first if CallsPanel is set)
 //  2. Direct IPv6 agent URLs (https://[<ipv6>]:<port>)
-//  3. Reverse Hub (/hub/poll) if the server is calling in to the panel
+//  3. Stealth Chrome uTLS + fragmented ClientHello over IPv4 / IPv6
+//  4. Reverse Hub (/hub/poll) if the server is calling in to the panel
+//  5. End-to-end pinned TLS jumped via an online peer server (/api/net/*)
 func (f *fleet) callLimit(ctx context.Context, srv Server, method, path string, body []byte, limit int64) (int, []byte, error) {
 	token, err := f.p.store.open(srv.TokenEnc)
 	if err != nil {
 		return 0, nil, err
 	}
 
-	tryDirectURL := func(baseURL string, maxWait time.Duration) (int, []byte, error) {
+	tryURL := func(baseURL string, maxWait time.Duration, stealth bool) (int, []byte, error) {
 		rctx := ctx
 		var cancel context.CancelFunc
 		if maxWait > 0 {
@@ -129,13 +153,46 @@ func (f *fleet) callLimit(ctx context.Context, srv Server, method, path string, 
 		if len(body) > 0 {
 			req.Header.Set("Content-Type", "application/json")
 		}
-		resp, err := agent.NewPinnedClient(srv.Fingerprint, baseURL, 10*time.Minute).Do(req)
+		resp, err := agent.NewPinnedClientOpts(srv.Fingerprint, baseURL, 10*time.Minute, nil, stealth).Do(req)
 		if err != nil {
 			return 0, nil, err
 		}
 		defer resp.Body.Close()
 		b, err := io.ReadAll(io.LimitReader(resp.Body, limit))
 		return resp.StatusCode, b, err
+	}
+
+	tryPeerJump := func(prefJumpID string) (int, []byte, bool) {
+		if isNoJump(ctx) {
+			return 0, nil, false
+		}
+		var cands []Server
+		if prefJumpID != "" {
+			cands = append(cands, f.p.jumpCandidates(srv.Address, srv.Group, prefJumpID)...)
+		}
+		for _, c := range f.p.jumpCandidates(srv.Address, srv.Group, "") {
+			dup := false
+			for _, ex := range cands {
+				if ex.ID == c.ID {
+					dup = true
+					break
+				}
+			}
+			if !dup {
+				cands = append(cands, c)
+			}
+		}
+		if len(cands) > 2 {
+			cands = cands[:2]
+		}
+		for _, cand := range cands {
+			st, rb, jerr := f.p.callAgentViaJump(ctx, srv, cand, token, method, path, body, limit, 4*time.Second)
+			if jerr == nil {
+				f.recordJump(srv.ID, cand.ID)
+				return st, rb, true
+			}
+		}
+		return 0, nil, false
 	}
 
 	var v6URLs []string
@@ -148,39 +205,65 @@ func (f *fleet) callLimit(ctx context.Context, srv Server, method, path string, 
 		}
 	}
 
+	prefURL, prefHub, prefStealth, prefJump := f.preferredPath(srv.ID)
+
 	if srv.CallsPanel {
 		status, b, herr := f.p.hub.do(ctx, srv.ID, method, path, body)
-		if herr == nil || srv.AgentURL == "" {
+		if herr == nil {
+			f.recordPath(srv.ID, "", true, false, "hub")
+			return status, b, nil
+		}
+		if srv.AgentURL == "" {
 			return status, b, herr
 		}
 		for _, u := range append([]string{srv.AgentURL}, v6URLs...) {
-			if st, rb, derr := tryDirectURL(u, 6*time.Second); derr == nil {
+			if st, rb, derr := tryURL(u, 5*time.Second, false); derr == nil {
+				route := "direct"
+				if slices.Contains(v6URLs, u) {
+					route = "ipv6"
+				}
+				f.recordPath(srv.ID, u, false, false, route)
 				return st, rb, nil
 			}
+			if st, rb, serr := tryURL(u, 5*time.Second, true); serr == nil {
+				f.recordPath(srv.ID, u, false, true, "stealth")
+				return st, rb, nil
+			}
+		}
+		if st, rb, ok := tryPeerJump(prefJump); ok {
+			return st, rb, nil
 		}
 		return status, b, herr
 	}
 
-	hasFallback := len(v6URLs) > 0 || f.p.hub.connected(srv.ID)
+	canJump := !isNoJump(ctx) && (srv.JumpAllowed || prefJump != "" || len(f.p.jumpCandidates(srv.Address, srv.Group, "")) > 0)
+	hasFallback := len(v6URLs) > 0 || f.p.hub.connected(srv.ID) || canJump || prefStealth
 	var perTry time.Duration
 	if hasFallback && method == http.MethodGet && limit <= overviewLimit {
-		perTry = 6 * time.Second
+		perTry = 5 * time.Second
 	}
 
-	prefURL, prefHub := f.preferredPath(srv.ID)
 	if prefHub && f.p.hub.connected(srv.ID) {
 		if st, rb, herr := f.p.hub.do(ctx, srv.ID, method, path, body); herr == nil {
 			return st, rb, nil
 		}
+	} else if prefJump != "" && !isNoJump(ctx) {
+		if st, rb, ok := tryPeerJump(prefJump); ok {
+			return st, rb, nil
+		}
+	} else if prefStealth && prefURL != "" {
+		if st, rb, errPref := tryURL(prefURL, perTry, true); errPref == nil {
+			return st, rb, nil
+		}
 	} else if prefURL != "" && slices.Contains(v6URLs, prefURL) {
-		if st, rb, errPref := tryDirectURL(prefURL, perTry); errPref == nil {
+		if st, rb, errPref := tryURL(prefURL, perTry, false); errPref == nil {
 			return st, rb, nil
 		}
 	}
 
-	status, b, derr := tryDirectURL(srv.AgentURL, perTry)
+	status, b, derr := tryURL(srv.AgentURL, perTry, false)
 	if derr == nil {
-		f.recordPath(srv.ID, srv.AgentURL, false)
+		f.recordPath(srv.ID, srv.AgentURL, false, false, "direct")
 		return status, b, nil
 	}
 	if strings.Contains(derr.Error(), "does not match the saved fingerprint") {
@@ -188,9 +271,9 @@ func (f *fleet) callLimit(ctx context.Context, srv Server, method, path string, 
 	}
 
 	for _, u := range v6URLs {
-		st, rb, err6 := tryDirectURL(u, perTry)
+		st, rb, err6 := tryURL(u, perTry, false)
 		if err6 == nil {
-			f.recordPath(srv.ID, u, false)
+			f.recordPath(srv.ID, u, false, false, "ipv6")
 			return st, rb, nil
 		}
 		if strings.Contains(err6.Error(), "does not match the saved fingerprint") {
@@ -198,11 +281,30 @@ func (f *fleet) callLimit(ctx context.Context, srv Server, method, path string, 
 		}
 	}
 
+	// If standard TLS was reset or DPI-dropped (rather than an immediate TCP
+	// connection refused), retry with Chrome uTLS + fragmented ClientHello.
+	if !strings.Contains(derr.Error(), "connection refused") && !strings.Contains(derr.Error(), "actively refused") {
+		for _, u := range append([]string{srv.AgentURL}, v6URLs...) {
+			st, rb, serr := tryURL(u, 5*time.Second, true)
+			if serr == nil {
+				f.recordPath(srv.ID, u, false, true, "stealth")
+				return st, rb, nil
+			}
+			if strings.Contains(serr.Error(), "does not match the saved fingerprint") {
+				return 0, nil, serr
+			}
+		}
+	}
+
 	if f.p.hub.connected(srv.ID) {
 		if st, rb, herr := f.p.hub.do(ctx, srv.ID, method, path, body); herr == nil {
-			f.recordPath(srv.ID, "", true)
+			f.recordPath(srv.ID, "", true, false, "hub")
 			return st, rb, nil
 		}
+	}
+
+	if st, rb, ok := tryPeerJump(prefJump); ok {
+		return st, rb, nil
 	}
 
 	return 0, nil, derr
@@ -373,6 +475,7 @@ func (f *fleet) views() []serverView {
 		v := serverView{ID: srv.ID, Name: srv.Name, Group: srv.Group, Address: srv.Address, CallsPanel: srv.CallsPanel}
 		if h := f.by[srv.ID]; h != nil {
 			v.Overview = h.overview
+			v.Route = h.route
 			if !h.at.IsZero() {
 				v.LastSeen = h.at.UTC().Format(time.RFC3339)
 			}
