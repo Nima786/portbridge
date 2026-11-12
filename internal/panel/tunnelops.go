@@ -1070,6 +1070,9 @@ func (p *Panel) deleteTunnel(t tunnelTarget) []halfOutcome {
 		out = append(out, o)
 	}
 	p.healer.forget(t.Edge, t.Name)
+	if p.traffic != nil {
+		p.traffic.forget(t.Edge, t.Name)
+	}
 	logf("deleted tunnel %q", t.Name)
 	return out
 }

@@ -158,6 +158,37 @@ type AutoHealConfig struct {
 	History   []AutoHealEvent `json:"history,omitempty"`
 }
 
+// TunnelTraffic holds persistent byte counters and monthly quota settings for one tunnel.
+type TunnelTraffic struct {
+	TotalUp       int64   `json:"total_up"`
+	TotalDown     int64   `json:"total_down"`
+	MonthKey      string  `json:"month_key,omitempty"` // "YYYY-MM" in UTC
+	MonthUp       int64   `json:"month_up"`
+	MonthDown     int64   `json:"month_down"`
+	QuotaGB       float64 `json:"quota_gb,omitempty"`
+	AutoPause     bool    `json:"auto_pause,omitempty"`
+	PausedByQuota bool    `json:"paused_by_quota,omitempty"`
+	Warned80Month string  `json:"warned_80_month,omitempty"`
+	ExceededMonth string  `json:"exceeded_month,omitempty"`
+	LastInstance  string  `json:"last_instance,omitempty"`
+	LastRawUp     int64   `json:"last_raw_up,omitempty"`
+	LastRawDown   int64   `json:"last_raw_down,omitempty"`
+	UpdatedAt     string  `json:"updated_at,omitempty"`
+}
+
+// NotifyConfig holds encrypted Telegram Bot and Webhook alert settings.
+type NotifyConfig struct {
+	Enabled          bool   `json:"enabled"`
+	TelegramTokenEnc string `json:"telegram_token,omitempty"`
+	TelegramHint     string `json:"telegram_hint,omitempty"`
+	TelegramChatID   string `json:"telegram_chat_id,omitempty"`
+	WebhookURLEnc    string `json:"webhook_url,omitempty"`
+	WebhookHint      string `json:"webhook_hint,omitempty"`
+	OnServerOffline  bool   `json:"on_server_offline"`
+	OnTunnelFailover bool   `json:"on_tunnel_failover"`
+	OnTrafficQuota   bool   `json:"on_traffic_quota"`
+}
+
 // State is state.json.
 type State struct {
 	Admin      Admin                     `json:"admin"`
@@ -166,6 +197,8 @@ type State struct {
 	Servers    []Server                  `json:"servers"`
 	CFAccounts []CFAccount               `json:"cf_accounts,omitempty"`
 	AutoHeal   map[string]AutoHealConfig `json:"auto_heal,omitempty"`
+	Traffic    map[string]TunnelTraffic  `json:"traffic,omitempty"`
+	Notify     NotifyConfig              `json:"notify,omitempty"`
 }
 
 // store guards the state and saves every change at once.
@@ -213,6 +246,12 @@ func (s *store) get() State {
 			st.AutoHeal[k] = v
 		}
 	}
+	if len(s.st.Traffic) > 0 {
+		st.Traffic = make(map[string]TunnelTraffic, len(s.st.Traffic))
+		for k, v := range s.st.Traffic {
+			st.Traffic[k] = v
+		}
+	}
 	return st
 }
 
@@ -223,6 +262,19 @@ func (s *store) update(change func(*State) error) error {
 	next := s.st
 	next.Servers = append([]Server(nil), s.st.Servers...)
 	next.CFAccounts = append([]CFAccount(nil), s.st.CFAccounts...)
+	if len(s.st.AutoHeal) > 0 {
+		next.AutoHeal = make(map[string]AutoHealConfig, len(s.st.AutoHeal))
+		for k, v := range s.st.AutoHeal {
+			v.History = append([]AutoHealEvent(nil), v.History...)
+			next.AutoHeal[k] = v
+		}
+	}
+	if len(s.st.Traffic) > 0 {
+		next.Traffic = make(map[string]TunnelTraffic, len(s.st.Traffic))
+		for k, v := range s.st.Traffic {
+			next.Traffic[k] = v
+		}
+	}
 	if err := change(&next); err != nil {
 		return err
 	}

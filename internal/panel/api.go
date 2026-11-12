@@ -80,6 +80,10 @@ func (p *Panel) routes() http.Handler {
 	mux.HandleFunc("POST /api/probe/spoof-test", p.withAuth(p.handleProbeSpoofTest))
 	mux.HandleFunc("POST /api/tunnels/autoheal", p.withAuth(p.handleSetTunnelAutoHeal))
 	mux.HandleFunc("POST /api/tunnels/autoheal/trigger", p.withAuth(p.handleTriggerTunnelAutoHeal))
+	mux.HandleFunc("POST /api/tunnels/traffic", p.withAuth(p.handleTunnelTraffic))
+	mux.HandleFunc("GET /api/notifications", p.withAuth(p.handleGetNotifications))
+	mux.HandleFunc("POST /api/notifications", p.withAuth(p.handleSaveNotifications))
+	mux.HandleFunc("POST /api/notifications/test", p.withAuth(p.handleTestNotifications))
 	mux.HandleFunc("POST /api/ports", p.withAuth(p.handlePorts))
 	mux.HandleFunc("GET /api/servers/{id}/tune", p.withAuth(p.handleGetServerTune))
 	mux.HandleFunc("POST /api/servers/{id}/tune", p.withAuth(p.handleSetServerTune))
@@ -552,6 +556,9 @@ func (p *Panel) handleRemoveServer(w http.ResponseWriter, r *http.Request, _ aut
 func (p *Panel) handleTunnels(w http.ResponseWriter, _ *http.Request, _ authed) {
 	tunnels := pairTunnels(p.fleet.views())
 	p.healer.attachViews(tunnels)
+	if p.traffic != nil {
+		p.traffic.observeAndAttach(tunnels)
+	}
 	writeJSON(w, http.StatusOK, map[string]any{"tunnels": tunnels})
 }
 
@@ -631,6 +638,9 @@ func (p *Panel) handleServiceTunnel(w http.ResponseWriter, r *http.Request, _ au
 	default:
 		writeErr(w, http.StatusBadRequest, "The action must be start, stop or restart.")
 		return
+	}
+	if req.Action == "start" && p.traffic != nil {
+		p.traffic.clearPausedByQuota(req.Edge, req.Origin, req.Name)
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"results": p.serviceTunnel(req.tunnelTarget, req.Action)})
 }
@@ -1111,6 +1121,55 @@ func (p *Panel) handleSetServerFirewall(w http.ResponseWriter, r *http.Request, 
 	}
 	p.refreshOne(id)
 	writeJSON(w, http.StatusOK, info)
+}
+
+func (p *Panel) handleTunnelTraffic(w http.ResponseWriter, r *http.Request, _ authed) {
+	var req tunnelTrafficRequest
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	view, err := p.traffic.applyRequest(req)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, capitalise(err.Error())+".")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "traffic": view})
+}
+
+func (p *Panel) handleGetNotifications(w http.ResponseWriter, _ *http.Request, _ authed) {
+	writeJSON(w, http.StatusOK, p.notifier.view())
+}
+
+func (p *Panel) handleSaveNotifications(w http.ResponseWriter, r *http.Request, _ authed) {
+	var req saveNotifyRequest
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	view, err := p.notifier.save(req)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, capitalise(err.Error())+".")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "notify": view})
+}
+
+func (p *Panel) handleTestNotifications(w http.ResponseWriter, r *http.Request, _ authed) {
+	var req testNotifyRequest
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 35*time.Second)
+	defer cancel()
+	route, err := p.notifier.sendTest(ctx, req)
+	if err != nil {
+		writeErr(w, http.StatusBadGateway, capitalise(err.Error())+".")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":     true,
+		"route":  route,
+		"notify": p.notifier.view(),
+	})
 }
 
 // capitalise starts a message with a capital letter, for showing on its own.

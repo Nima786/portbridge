@@ -27,6 +27,15 @@ type status struct {
 	parkedSpares     int64
 	retries          int64
 	emptyConnections int64
+	bytesUp          int64
+	bytesDown        int64
+
+	rateMu        sync.Mutex
+	prevBytesUp   int64
+	prevBytesDown int64
+	prevRateAt    time.Time
+	lastUpBps     int64
+	lastDownBps   int64
 
 	clientMu  sync.Mutex
 	clientIPs map[string]int
@@ -59,6 +68,10 @@ type statusFile struct {
 	// EmptyConnections counts connections that arrived and left without sending
 	// anything, which is mostly internet background scanning.
 	EmptyConnections int64 `json:"empty_connections"`
+	BytesUp          int64 `json:"bytes_up"`
+	BytesDown        int64 `json:"bytes_down"`
+	UpBps            int64 `json:"up_bps"`
+	DownBps          int64 `json:"down_bps"`
 	// RouteInUse is the address being dialled at the moment, on the side that
 	// dials and only when there is more than one to choose from. Reported by the
 	// engine because it is the only thing that actually knows.
@@ -142,6 +155,32 @@ func (s *status) writeOnce() {
 		parked = 0
 	}
 
+	now := time.Now()
+	bUp := atomic.LoadInt64(&s.bytesUp)
+	bDown := atomic.LoadInt64(&s.bytesDown)
+	s.rateMu.Lock()
+	if s.prevRateAt.IsZero() {
+		s.prevRateAt = now
+		s.prevBytesUp = bUp
+		s.prevBytesDown = bDown
+	} else if dt := now.Sub(s.prevRateAt).Seconds(); dt >= 0.5 {
+		dUp := bUp - s.prevBytesUp
+		dDown := bDown - s.prevBytesDown
+		if dUp < 0 {
+			dUp = 0
+		}
+		if dDown < 0 {
+			dDown = 0
+		}
+		s.lastUpBps = int64(float64(dUp*8) / dt)
+		s.lastDownBps = int64(float64(dDown*8) / dt)
+		s.prevBytesUp = bUp
+		s.prevBytesDown = bDown
+		s.prevRateAt = now
+	}
+	upBps, downBps := s.lastUpBps, s.lastDownBps
+	s.rateMu.Unlock()
+
 	sf := statusFile{
 		Name:             s.cfg.Name,
 		Mode:             string(s.cfg.Mode),
@@ -152,7 +191,7 @@ func (s *status) writeOnce() {
 		InboundAddr:      s.cfg.InboundAddr,
 		PID:              os.Getpid(),
 		StartedAt:        s.started.UTC().Format(time.RFC3339),
-		UptimeSeconds:    int64(time.Since(s.started).Seconds()),
+		UptimeSeconds:    int64(now.Sub(s.started).Seconds()),
 		ActiveSessions:   atomic.LoadInt64(&s.activeSessions),
 		ActiveUsers:      s.uniqueClients(),
 		ParkedSpares:     parked,
@@ -165,6 +204,10 @@ func (s *status) writeOnce() {
 		DroppedSessions:  atomic.LoadInt64(&s.droppedSessions),
 		Retries:          atomic.LoadInt64(&s.retries),
 		EmptyConnections: atomic.LoadInt64(&s.emptyConnections),
+		BytesUp:          bUp,
+		BytesDown:        bDown,
+		UpBps:            upBps,
+		DownBps:          downBps,
 		RouteInUse:       routeInUse,
 		OnMainRoute:      onMain,
 		OnBackupRoute:    onBackup,
@@ -173,7 +216,7 @@ func (s *status) writeOnce() {
 		PathNote:          pathNote,
 		PathLastOKSeconds: pathLastOK,
 
-		UpdatedAt: time.Now().UTC().Format(time.RFC3339),
+		UpdatedAt: now.UTC().Format(time.RFC3339),
 	}
 
 	b, err := json.MarshalIndent(sf, "", "  ")

@@ -5,6 +5,7 @@ import (
 	"io"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -49,6 +50,12 @@ var bufPool = sync.Pool{
 // as cut-off downloads whenever a client finishes uploading before the reply
 // has fully arrived.
 func relay(local, tunnel net.Conn) error {
+	return relayCounted(local, tunnel, nil, nil)
+}
+
+// relayCounted moves bytes both ways like relay while atomically adding bytes
+// written from local->tunnel to localToTunnel and tunnel->local to tunnelToLocal.
+func relayCounted(local, tunnel net.Conn, localToTunnel, tunnelToLocal *int64) error {
 	defer local.Close()
 	defer tunnel.Close()
 
@@ -62,10 +69,10 @@ func relay(local, tunnel net.Conn) error {
 
 	var incomingErr error
 
-	pipe := func(dst, src net.Conn, watch bool) {
+	pipe := func(dst, src net.Conn, counter *int64, watch bool) {
 		defer wg.Done()
 
-		_, err := copyStream(dst, src)
+		_, err := copyStreamCounted(dst, src, counter)
 		if watch && worthReporting(err) {
 			// Written by this goroutine only, and read after both have
 			// finished, so no lock is needed.
@@ -84,8 +91,8 @@ func relay(local, tunnel net.Conn) error {
 		}
 	}
 
-	go pipe(tunnel, local, false)
-	go pipe(local, tunnel, true)
+	go pipe(tunnel, local, localToTunnel, false)
+	go pipe(local, tunnel, tunnelToLocal, true)
 	wg.Wait()
 
 	return incomingErr
@@ -105,12 +112,34 @@ func relay(local, tunnel net.Conn) error {
 // direction of every session and ignores the one just handed to it. Copying by
 // hand is what makes the shared pool actually do its job.
 func copyStream(dst, src net.Conn) (int64, error) {
+	return copyStreamCounted(dst, src, nil)
+}
+
+const kernelSpliceStep = 256 * 1024
+
+func copyStreamCounted(dst, src net.Conn, counter *int64) (int64, error) {
 	if kernelCanCopy(dst, src) {
-		return io.Copy(dst, src)
+		if counter == nil {
+			return io.Copy(dst, src)
+		}
+		var total int64
+		for {
+			n, err := io.CopyN(dst, src, kernelSpliceStep)
+			if n > 0 {
+				total += n
+				atomic.AddInt64(counter, n)
+			}
+			if err != nil {
+				if errors.Is(err, io.EOF) {
+					return total, nil
+				}
+				return total, err
+			}
+		}
 	}
 	buf := bufPool.Get().(*[]byte)
 	defer bufPool.Put(buf)
-	return copyThrough(dst, src, *buf)
+	return copyThroughCounted(dst, src, *buf, counter)
 }
 
 // kernelCanCopy reports whether io.Copy will hand this pair straight to the
@@ -130,12 +159,21 @@ func kernelCanCopy(dst, src net.Conn) bool {
 // io.Copy: one side finishing is how every session is meant to end, and
 // reporting it would turn every normal session into a logged failure.
 func copyThrough(dst io.Writer, src io.Reader, buf []byte) (int64, error) {
+	return copyThroughCounted(dst, src, buf, nil)
+}
+
+func copyThroughCounted(dst io.Writer, src io.Reader, buf []byte, counter *int64) (int64, error) {
 	var written int64
 	for {
 		nr, rerr := src.Read(buf)
 		if nr > 0 {
 			nw, werr := dst.Write(buf[:nr])
-			written += int64(nw)
+			if nw > 0 {
+				written += int64(nw)
+				if counter != nil {
+					atomic.AddInt64(counter, int64(nw))
+				}
+			}
 			if werr != nil {
 				return written, werr
 			}

@@ -137,6 +137,58 @@ func TestRelayCarriesBulkOverAWrappedLink(t *testing.T) {
 	_ = localPeer.Close()
 }
 
+func TestRelayCountedAccumulatesBidirectionalBytes(t *testing.T) {
+	t.Parallel()
+
+	upPayload := make([]byte, copyChunk*2+513)
+	downPayload := make([]byte, copyChunk*3+919)
+	if _, err := rand.Read(upPayload); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := rand.Read(downPayload); err != nil {
+		t.Fatal(err)
+	}
+
+	local, localPeer := net.Pipe()
+	tunnel, tunnelPeer := net.Pipe()
+
+	var upCount, downCount int64
+	done := make(chan error, 1)
+	go func() {
+		done <- relayCounted(local, tunnel, &upCount, &downCount)
+	}()
+
+	go func() {
+		defer tunnelPeer.Close()
+		got := make([]byte, len(upPayload))
+		if _, err := io.ReadFull(tunnelPeer, got); err != nil {
+			return
+		}
+		_, _ = tunnelPeer.Write(downPayload)
+	}()
+
+	go func() {
+		_, _ = localPeer.Write(upPayload)
+	}()
+
+	gotDown := make([]byte, len(downPayload))
+	if _, err := io.ReadFull(localPeer, gotDown); err != nil {
+		t.Fatalf("reading down payload: %v", err)
+	}
+	if !bytes.Equal(gotDown, downPayload) {
+		t.Fatal("down payload came back changed")
+	}
+	_ = localPeer.Close()
+	<-done
+
+	if upCount != int64(len(upPayload)) {
+		t.Fatalf("upCount = %d, want %d", upCount, len(upPayload))
+	}
+	if downCount != int64(len(downPayload)) {
+		t.Fatalf("downCount = %d, want %d", downCount, len(downPayload))
+	}
+}
+
 // ---------------------------------------------------------------------------
 
 type errorReader struct{ err error }

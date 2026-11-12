@@ -89,6 +89,19 @@ type BackupPairedTunnel struct {
 	OriginInfo       *agent.TunnelInfo `json:"origin_info,omitempty"`
 }
 
+// BackupNotifyConfig holds notification settings and decrypted credentials for backup/restore.
+type BackupNotifyConfig struct {
+	Enabled            bool   `json:"enabled"`
+	PlainTelegramToken string `json:"plain_telegram_token,omitempty"`
+	TelegramHint       string `json:"telegram_hint,omitempty"`
+	TelegramChatID     string `json:"telegram_chat_id,omitempty"`
+	PlainWebhookURL    string `json:"plain_webhook_url,omitempty"`
+	WebhookHint        string `json:"webhook_hint,omitempty"`
+	OnServerOffline    bool   `json:"on_server_offline"`
+	OnTunnelFailover   bool   `json:"on_tunnel_failover"`
+	OnTrafficQuota     bool   `json:"on_traffic_quota"`
+}
+
 // BackupPayload is the full state inside a panel backup.
 type BackupPayload struct {
 	Source        BackupSourcePanel         `json:"source"`
@@ -96,6 +109,8 @@ type BackupPayload struct {
 	Servers       []BackupServer            `json:"servers"`
 	CFAccounts    []BackupCFAccount         `json:"cf_accounts,omitempty"`
 	AutoHeal      map[string]AutoHealConfig `json:"auto_heal,omitempty"`
+	Traffic       map[string]TunnelTraffic  `json:"traffic,omitempty"`
+	Notify        *BackupNotifyConfig       `json:"notify,omitempty"`
 	LocalTunnels  []agent.TunnelSnapshot    `json:"local_tunnels,omitempty"`
 	PairedTunnels []BackupPairedTunnel      `json:"paired_tunnels,omitempty"`
 }
@@ -354,12 +369,38 @@ func (p *Panel) CreateBackup(ctx context.Context, passphrase string) (*BackupEnv
 		pairedOut = append(pairedOut, pt)
 	}
 
+	var backupNotify *BackupNotifyConfig
+	if st.Notify.Enabled || st.Notify.TelegramTokenEnc != "" || st.Notify.WebhookURLEnc != "" || st.Notify.TelegramChatID != "" {
+		bn := &BackupNotifyConfig{
+			Enabled:          st.Notify.Enabled,
+			TelegramHint:     st.Notify.TelegramHint,
+			TelegramChatID:   st.Notify.TelegramChatID,
+			WebhookHint:      st.Notify.WebhookHint,
+			OnServerOffline:  st.Notify.OnServerOffline,
+			OnTunnelFailover: st.Notify.OnTunnelFailover,
+			OnTrafficQuota:   st.Notify.OnTrafficQuota,
+		}
+		if st.Notify.TelegramTokenEnc != "" {
+			if tok, err := p.store.open(st.Notify.TelegramTokenEnc); err == nil {
+				bn.PlainTelegramToken = tok
+			}
+		}
+		if st.Notify.WebhookURLEnc != "" {
+			if wh, err := p.store.open(st.Notify.WebhookURLEnc); err == nil {
+				bn.PlainWebhookURL = wh
+			}
+		}
+		backupNotify = bn
+	}
+
 	payload := &BackupPayload{
 		Source:        src,
 		Admin:         st.Admin,
 		Servers:       servers,
 		CFAccounts:    cfAccounts,
 		AutoHeal:      st.AutoHeal,
+		Traffic:       st.Traffic,
+		Notify:        backupNotify,
 		LocalTunnels:  localSnaps,
 		PairedTunnels: pairedOut,
 	}
@@ -575,6 +616,34 @@ func (p *Panel) RestoreBackup(ctx context.Context, raw []byte, opts RestoreOptio
 		sealedCF = append(sealedCF, acc)
 	}
 
+	var sealedNotify *NotifyConfig
+	if payload.Notify != nil {
+		nc := NotifyConfig{
+			Enabled:          payload.Notify.Enabled,
+			TelegramHint:     payload.Notify.TelegramHint,
+			TelegramChatID:   payload.Notify.TelegramChatID,
+			WebhookHint:      payload.Notify.WebhookHint,
+			OnServerOffline:  payload.Notify.OnServerOffline,
+			OnTunnelFailover: payload.Notify.OnTunnelFailover,
+			OnTrafficQuota:   payload.Notify.OnTrafficQuota,
+		}
+		if payload.Notify.PlainTelegramToken != "" {
+			enc, err := p.store.seal(payload.Notify.PlainTelegramToken)
+			if err != nil {
+				return nil, fmt.Errorf("encrypting Telegram token: %w", err)
+			}
+			nc.TelegramTokenEnc = enc
+		}
+		if payload.Notify.PlainWebhookURL != "" {
+			enc, err := p.store.seal(payload.Notify.PlainWebhookURL)
+			if err != nil {
+				return nil, fmt.Errorf("encrypting webhook URL: %w", err)
+			}
+			nc.WebhookURLEnc = enc
+		}
+		sealedNotify = &nc
+	}
+
 	autoHealCount := 0
 	if err := p.store.update(func(st *State) error {
 		if opts.RestoreCredentials && payload.Admin.User != "" && payload.Admin.Hash != "" {
@@ -603,6 +672,12 @@ func (p *Panel) RestoreBackup(ctx context.Context, raw []byte, opts RestoreOptio
 			st.Servers = sealedServers
 			st.CFAccounts = sealedCF
 			st.AutoHeal = map[string]AutoHealConfig{}
+			st.Traffic = map[string]TunnelTraffic{}
+			if sealedNotify != nil {
+				st.Notify = *sealedNotify
+			} else {
+				st.Notify = NotifyConfig{}
+			}
 		} else {
 			for _, ns := range sealedServers {
 				replaced := false
@@ -653,9 +728,32 @@ func (p *Panel) RestoreBackup(ctx context.Context, raw []byte, opts RestoreOptio
 			st.AutoHeal[k] = v
 			autoHealCount++
 		}
+
+		if mode != "replace" && sealedNotify != nil {
+			if !st.Notify.Enabled && st.Notify.TelegramTokenEnc == "" && st.Notify.WebhookURLEnc == "" {
+				st.Notify = *sealedNotify
+			}
+		}
+		if st.Traffic == nil && len(payload.Traffic) > 0 {
+			st.Traffic = make(map[string]TunnelTraffic, len(payload.Traffic))
+		}
+		for k, v := range payload.Traffic {
+			if !sameHost && localAction == "skip" && strings.HasPrefix(k, "this/") {
+				continue
+			}
+			if matchedOwnServer != nil && matchedOwnServer.ID != "" {
+				if strings.HasPrefix(k, matchedOwnServer.ID+"/") {
+					k = "this/" + strings.TrimPrefix(k, matchedOwnServer.ID+"/")
+				}
+			}
+			st.Traffic[k] = v
+		}
 		return nil
 	}); err != nil {
 		return nil, fmt.Errorf("saving restored state: %w", err)
+	}
+	if p.traffic != nil {
+		p.traffic.reloadFromStore()
 	}
 
 	// Restore the panel's self-signed TLS identity so Reverse Hub agents

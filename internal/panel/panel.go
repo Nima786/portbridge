@@ -70,8 +70,10 @@ type Panel struct {
 	local      http.Handler
 	localToken string
 
-	updates *updater
-	healer  *autoHealer
+	updates  *updater
+	healer   *autoHealer
+	notifier *notifier
+	traffic  *trafficTracker
 }
 
 func newPanel(dir string, cfg Config, st *store) *Panel {
@@ -91,6 +93,8 @@ func newPanel(dir string, cfg Config, st *store) *Panel {
 	p.setLocal(defaultTunnelsDir)
 	p.updates = newUpdater(p)
 	p.healer = newAutoHealer(p)
+	p.notifier = newNotifier(p)
+	p.traffic = newTrafficTracker(p)
 	return p
 }
 
@@ -292,6 +296,7 @@ func Run(dir string) error {
 	go p.fleet.run(ctx)
 	go p.updates.run(ctx)
 	go p.healer.run(ctx)
+	go p.traffic.run(ctx)
 	// An update that restarted the panel carries on from where it was.
 	p.updates.resume()
 	if cfg.Domain != "" {

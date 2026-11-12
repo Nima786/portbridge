@@ -26,6 +26,8 @@ import (
 
 // TunnelLive is the live part of a running tunnel's status file.
 type TunnelLive struct {
+	PID            int    `json:"pid,omitempty"`
+	StartedAt      string `json:"started_at,omitempty"`
 	UptimeSeconds  int64  `json:"uptime_seconds"`
 	ActiveSessions int64  `json:"active_sessions"`
 	ActiveUsers    int    `json:"active_users"`
@@ -33,6 +35,10 @@ type TunnelLive struct {
 	PoolTarget     int    `json:"pool_target"`
 	Links          int    `json:"links"`
 	LinkTarget     int    `json:"link_target"`
+	BytesUp        int64  `json:"bytes_up"`
+	BytesDown      int64  `json:"bytes_down"`
+	UpBps          int64  `json:"up_bps"`
+	DownBps        int64  `json:"down_bps"`
 	PathState      string `json:"path_state"`
 	PathNote       string `json:"path_note"`
 	RouteInUse     string `json:"route_in_use"`

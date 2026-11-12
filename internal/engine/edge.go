@@ -519,7 +519,10 @@ func (e *edge) serve(ctx context.Context, user net.Conn, targetPort uint16) erro
 			continue
 		}
 		e.health.activationOK()
-		if err := relay(user, tunnel); err != nil {
+		if len(head) > 0 {
+			atomic.AddInt64(&e.st.bytesUp, int64(len(head)))
+		}
+		if err := relayCounted(user, tunnel, &e.st.bytesUp, &e.st.bytesDown); err != nil {
 			// The user has already been served as far as it got, so this is a
 			// report rather than a failure: their download was cut short by the
 			// tunnel rather than by them.

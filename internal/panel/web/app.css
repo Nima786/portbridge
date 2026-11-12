@@ -2855,3 +2855,226 @@ button.is-loading::before {
     grid-template-columns: 1fr;
   }
 }
+
+/* ------------------------------------------- traffic, quotas & alerts */
+
+.badge-rate {
+  background: var(--accent-soft, rgba(14, 165, 233, .12));
+  color: var(--accent);
+  border: 1px solid rgba(14, 165, 233, .28);
+  font-weight: 600;
+}
+
+.badge-traffic {
+  background: var(--surface-2, rgba(148, 163, 184, .12));
+  color: var(--text);
+  border: 1px solid var(--border);
+}
+
+.badge-traffic.is-warn {
+  background: rgba(245, 158, 11, .14);
+  color: var(--warn, #d97706);
+  border-color: rgba(245, 158, 11, .36);
+  font-weight: 600;
+}
+
+.badge-traffic.is-over {
+  background: rgba(239, 68, 68, .14);
+  color: var(--bad);
+  border-color: rgba(239, 68, 68, .36);
+  font-weight: 700;
+}
+
+.tunnel-traffic-strip {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: .65rem 1rem;
+  padding: .65rem .85rem;
+  margin-top: .55rem;
+  border-radius: .6rem;
+  background: var(--surface-2, rgba(148, 163, 184, .08));
+  border: 1px solid var(--border);
+  font-size: .82rem;
+}
+
+.tunnel-traffic-metrics {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: .5rem 1.1rem;
+}
+
+.tunnel-traffic-quota {
+  display: flex;
+  align-items: center;
+  gap: .55rem;
+  min-width: 11rem;
+}
+
+.tf-stats-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: .65rem;
+  margin-bottom: .9rem;
+}
+
+.tf-stat-box {
+  display: flex;
+  flex-direction: column;
+  gap: .2rem;
+  padding: .7rem .8rem;
+  border-radius: .6rem;
+  background: var(--surface-2, rgba(148, 163, 184, .08));
+  border: 1px solid var(--border);
+}
+
+.tf-stat-box strong {
+  font-size: 1.02rem;
+  color: var(--text);
+}
+
+.tf-meter-wrap {
+  padding: .7rem .85rem;
+  margin-bottom: .9rem;
+  border-radius: .6rem;
+  background: var(--surface-2, rgba(148, 163, 184, .08));
+  border: 1px solid var(--border);
+}
+
+.tf-meter-top {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: .5rem;
+  margin-bottom: .35rem;
+}
+
+.tf-progress {
+  width: 100%;
+  height: .55rem;
+  appearance: none;
+  -webkit-appearance: none;
+  border: none;
+  border-radius: 999px;
+  overflow: hidden;
+  background: rgba(148, 163, 184, .22);
+}
+
+.tf-progress::-webkit-progress-bar {
+  background: rgba(148, 163, 184, .22);
+  border-radius: 999px;
+}
+
+.tf-progress::-webkit-progress-value {
+  background: var(--ok);
+  border-radius: 999px;
+}
+
+.tf-progress::-moz-progress-bar {
+  background: var(--ok);
+  border-radius: 999px;
+}
+
+.tf-progress.is-warn::-webkit-progress-value {
+  background: var(--warn, #d97706);
+}
+
+.tf-progress.is-warn::-moz-progress-bar {
+  background: var(--warn, #d97706);
+}
+
+.tf-progress.is-over::-webkit-progress-value {
+  background: var(--bad);
+}
+
+.tf-progress.is-over::-moz-progress-bar {
+  background: var(--bad);
+}
+
+.tf-progress-inline {
+  width: 6.5rem;
+  height: .45rem;
+}
+
+.tf-presets {
+  display: flex;
+  flex-wrap: wrap;
+  gap: .4rem;
+  margin: .5rem 0 .85rem;
+}
+
+.tf-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: .6rem;
+  flex-wrap: wrap;
+}
+
+.tf-footer-right {
+  display: flex;
+  align-items: center;
+  gap: .5rem;
+  margin-left: auto;
+}
+
+.notify-channel-box {
+  padding: .75rem .85rem;
+  margin-top: .65rem;
+  border-radius: .6rem;
+  background: var(--surface-2, rgba(148, 163, 184, .07));
+  border: 1px solid var(--border);
+}
+
+.notify-label-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: .5rem;
+}
+
+.notify-label-row label {
+  margin-top: 0;
+}
+
+.notify-events-box {
+  margin-top: .75rem;
+  padding: .65rem .85rem .75rem;
+  border-radius: .6rem;
+  border: 1px solid var(--border);
+  display: flex;
+  flex-direction: column;
+  gap: .45rem;
+}
+
+.notify-events-box legend {
+  padding: 0 .35rem;
+  font-size: .8rem;
+  font-weight: 700;
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: .03em;
+}
+
+.notify-check-row {
+  display: flex;
+  align-items: center;
+  gap: .55rem;
+  margin: 0;
+  font-weight: 450;
+  font-size: .88rem;
+  cursor: pointer;
+}
+
+.notify-check-row input[type="checkbox"] {
+  width: auto;
+  margin: 0;
+}
+
+@media (max-width: 640px) {
+  .tf-stats-grid {
+    grid-template-columns: 1fr;
+  }
+}

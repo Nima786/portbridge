@@ -859,6 +859,13 @@ func (ah *autoHealer) healTunnel(ctx context.Context, j *job, key, name, relayID
 				st.AutoHeal[key] = c
 				return nil
 			})
+			if ah.p.notifier != nil {
+				if ev.Success && ev.ToDesc != "" {
+					ah.p.notifier.notifyFailover(name, ev.FromDesc, ev.ToDesc, ev.Reason, true, "")
+				} else if !ev.Success && ev.Error != "" {
+					ah.p.notifier.notifyFailover(name, ev.FromDesc, "", ev.Reason, false, ev.Error)
+				}
+			}
 		}
 	}()
 

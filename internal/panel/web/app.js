@@ -346,6 +346,8 @@
     let runningTunnels = 0;
     let activeUsers = 0;
     let activeConns = 0;
+    let totalUpBps = 0;
+    let totalDownBps = 0;
     for (const t of tunnelsCache) {
       const e = t.edge, o = t.origin;
       const halves = [e, o].filter(Boolean);
@@ -358,6 +360,13 @@
         activeUsers += Number(live.active_users) || 0;
       }
       if (live && live.active_sessions) activeConns += Number(live.active_sessions) || 0;
+      if (t.traffic) {
+        totalUpBps += Number(t.traffic.up_bps) || 0;
+        totalDownBps += Number(t.traffic.down_bps) || 0;
+      } else if (live) {
+        totalUpBps += Number(live.up_bps) || 0;
+        totalDownBps += Number(live.down_bps) || 0;
+      }
     }
 
     if ($('sum-tunnels')) {
@@ -366,7 +375,8 @@
     }
     if ($('sum-users')) {
       $('sum-users').textContent = String(activeUsers);
-      $('sum-users-sub').textContent = `${activeUsers === 1 ? '1 unique IP' : activeUsers + ' unique IPs'} · ${activeConns} TCP ${activeConns === 1 ? 'conn' : 'conns'}`;
+      const rateSuffix = fmtDualRate(totalUpBps, totalDownBps);
+      $('sum-users-sub').textContent = `${activeUsers === 1 ? '1 unique IP' : activeUsers + ' unique IPs'} · ${activeConns} TCP ${activeConns === 1 ? 'conn' : 'conns'}${rateSuffix ? ' · ' + rateSuffix : ''}`;
     }
 
     const ct = $('count-tunnels');
@@ -641,6 +651,41 @@
     return `${Math.round(b / mb)} MB`;
   }
 
+  function fmtTrafficBytes(bytes) {
+    const b = Math.max(0, Number(bytes) || 0);
+    const kb = 1024;
+    const mb = kb * 1024;
+    const gb = mb * 1024;
+    const tb = gb * 1024;
+    if (b < kb) return '0 MB';
+    if (b < mb) return `${Math.max(1, Math.round(b / kb))} KB`;
+    if (b < gb) return `${(b / mb).toFixed(b >= 100 * mb ? 0 : 1)} MB`;
+    if (b < tb) return `${(b / gb).toFixed(b >= 100 * gb ? 1 : 2)} GB`;
+    return `${(b / tb).toFixed(2)} TB`;
+  }
+
+  function fmtQuotaCap(gbVal) {
+    const g = Number(gbVal) || 0;
+    if (g <= 0) return 'Unlimited';
+    if (g >= 1024 && g % 1024 === 0) return `${g / 1024} TB`;
+    return `${Number.isInteger(g) ? g : g.toFixed(1)} GB`;
+  }
+
+  function fmtSingleRate(bytesPerSec) {
+    const bits = Math.max(0, Number(bytesPerSec) || 0) * 8;
+    if (bits >= 1000000000) return `${(bits / 1000000000).toFixed(2)} Gbps`;
+    if (bits >= 1000000) return `${(bits / 1000000).toFixed(bits >= 100000000 ? 0 : 1)} Mbps`;
+    if (bits >= 10000) return `${Math.round(bits / 1000)} Kbps`;
+    return '0 Kbps';
+  }
+
+  function fmtDualRate(upBytesPerSec, downBytesPerSec) {
+    const up = Math.max(0, Number(upBytesPerSec) || 0);
+    const dn = Math.max(0, Number(downBytesPerSec) || 0);
+    if ((up + dn) * 8 < 16000) return '';
+    return `↑ ${fmtSingleRate(up)} · ↓ ${fmtSingleRate(dn)}`;
+  }
+
   function metricRing(pct) {
     const clamped = Math.max(0, Math.min(100, Number(pct) || 0));
     const r = 17;
@@ -712,6 +757,32 @@
     if (s.address) chips.push(h('span', { class: 'meta-chip chip-ip', title: 'Server IP / Hostname' }, s.address));
     if (ov && ov.version) chips.push(h('span', { class: 'meta-chip' }, 'PortBridge ' + ov.version));
     chips.push(h('span', { class: 'meta-chip' }, tunnels.length ? `${plural(tunnels.length, 'tunnel')} (${running} running)` : 'No tunnels'));
+    let srvUpBps = 0, srvDownBps = 0, srvTotalBytes = 0;
+    for (const ti of tunnels) {
+      if (ti.running && ti.live) {
+        srvUpBps += Number(ti.live.up_bps) || 0;
+        srvDownBps += Number(ti.live.down_bps) || 0;
+      }
+    }
+    if (tunnelsCache && tunnelsCache.length) {
+      for (const tv of tunnelsCache) {
+        const onThis = (tv.edge && tv.edge.server_id === s.id) || (tv.origin && tv.origin.server_id === s.id);
+        if (onThis && tv.traffic) {
+          srvTotalBytes += (Number(tv.traffic.total_up) || 0) + (Number(tv.traffic.total_down) || 0);
+        }
+      }
+    } else {
+      for (const ti of tunnels) {
+        if (ti.live) srvTotalBytes += (Number(ti.live.bytes_up) || 0) + (Number(ti.live.bytes_down) || 0);
+      }
+    }
+    const srvRateStr = s.online ? fmtDualRate(srvUpBps, srvDownBps) : '';
+    if (srvRateStr) {
+      chips.push(h('span', { class: 'meta-chip mono', title: 'Aggregate live throughput across tunnels on this server' }, srvRateStr));
+    }
+    if (srvTotalBytes >= 1024 * 1024) {
+      chips.push(h('span', { class: 'meta-chip mono', title: 'Cumulative bandwidth transferred across tunnels on this server' }, `Traffic ${fmtTrafficBytes(srvTotalBytes)}`));
+    }
     if (ov && (Number(ov.cpu_cores) > 0 || Number(ov.mem_total_bytes) > 0)) {
       const cpuStr = Number(ov.cpu_cores) > 0 ? `CPU ${Math.round(Number(ov.cpu_percent) || 0)}%` : '';
       const memTotal = Number(ov.mem_total_bytes) || 0;
@@ -1872,6 +1943,66 @@
     return (raw.length > 28 ? raw.slice(0, 28) + '…' : (raw || 'TCP')) + sniSuffix;
   }
 
+  function buildTunnelTrafficWidgets(t, live) {
+    const tr = t.traffic || null;
+    const upBps = tr ? (Number(tr.up_bps) || 0) : (live ? (Number(live.up_bps) || 0) : 0);
+    const downBps = tr ? (Number(tr.down_bps) || 0) : (live ? (Number(live.down_bps) || 0) : 0);
+    const totalUp = tr ? (Number(tr.total_up) || 0) : (live ? (Number(live.bytes_up) || 0) : 0);
+    const totalDown = tr ? (Number(tr.total_down) || 0) : (live ? (Number(live.bytes_down) || 0) : 0);
+    const monthUp = tr ? (Number(tr.month_up) || 0) : totalUp;
+    const monthDown = tr ? (Number(tr.month_down) || 0) : totalDown;
+    const totalUsed = totalUp + totalDown;
+    const monthUsed = monthUp + monthDown;
+    const quotaGB = tr ? (Number(tr.quota_gb) || 0) : 0;
+    const pausedByQuota = !!(tr && tr.paused_by_quota);
+
+    const rateStr = fmtDualRate(upBps, downBps);
+    const rateBadge = rateStr
+      ? h('span', { class: 'badge badge-rate mono', title: 'Live throughput (Upload · Download)' }, rateStr)
+      : null;
+
+    let trafficBadge = null;
+    let quotaPct = 0;
+    if (quotaGB > 0) {
+      const quotaBytes = quotaGB * 1024 * 1024 * 1024;
+      quotaPct = quotaBytes > 0 ? Math.min(999, Math.round((monthUsed / quotaBytes) * 100)) : 0;
+      const tone = (pausedByQuota || quotaPct >= 100) ? ' is-over' : (quotaPct >= 80 ? ' is-warn' : '');
+      trafficBadge = h('span', {
+        class: 'badge badge-traffic mono' + tone,
+        title: `Monthly usage (${(tr && tr.month_key) || 'UTC'}): ↑ ${fmtTrafficBytes(monthUp)} · ↓ ${fmtTrafficBytes(monthDown)} · Lifetime: ${fmtTrafficBytes(totalUsed)}`
+      }, `${fmtTrafficBytes(monthUsed)} / ${fmtQuotaCap(quotaGB)} (${quotaPct}%)`);
+    } else if (totalUsed >= 100 * 1024) {
+      trafficBadge = h('span', {
+        class: 'badge badge-traffic mono',
+        title: `↑ ${fmtTrafficBytes(totalUp)} · ↓ ${fmtTrafficBytes(totalDown)} · This month: ${fmtTrafficBytes(monthUsed)}`
+      }, fmtTrafficBytes(totalUsed));
+    }
+
+    let quotaInline = null;
+    if (quotaGB > 0) {
+      const progCls = 'tf-progress tf-progress-inline' + ((pausedByQuota || quotaPct >= 100) ? ' is-over' : (quotaPct >= 80 ? ' is-warn' : ''));
+      const prog = h('progress', { class: progCls, max: '100', value: String(Math.min(100, Math.max(0, quotaPct))) });
+      quotaInline = h('div', { class: 'tunnel-traffic-quota' },
+        prog,
+        h('span', { class: 'mono small' }, `${quotaPct}% of ${fmtQuotaCap(quotaGB)}${tr && tr.auto_pause ? ' (Auto-Pause)' : ''}`));
+    }
+
+    const stripEl = h('div', { class: 'tunnel-traffic-strip' },
+      h('div', { class: 'tunnel-traffic-metrics' },
+        h('span', null,
+          h('strong', null, 'Live: '),
+          h('span', { class: 'mono' }, rateStr || 'Idle (0 Kbps)')),
+        h('span', null,
+          h('strong', null, `Month${tr && tr.month_key ? ' (' + tr.month_key + ')' : ''}: `),
+          h('span', { class: 'mono' }, `${fmtTrafficBytes(monthUsed)} (↑ ${fmtTrafficBytes(monthUp)} · ↓ ${fmtTrafficBytes(monthDown)})`)),
+        h('span', null,
+          h('strong', null, 'Total: '),
+          h('span', { class: 'mono' }, fmtTrafficBytes(totalUsed)))),
+      quotaInline);
+
+    return { rateBadge, trafficBadge, stripEl, pausedByQuota };
+  }
+
   function tunnelCard(t) {
     const e = t.edge, o = t.origin;
     const ei = e ? e.info : null, oi = o ? o.info : null;
@@ -1888,9 +2019,10 @@
     const isIPv6 = relayBridgeIP.includes(':') || foreignBridgeIP.includes(':');
     const protoTag = isIPv6 ? 'IPv6' : 'IPv4';
 
+    const tfWidgets = buildTunnelTrafficWidgets(t, live);
     let overall = ['ok', 'Running'];
     const halves = [e, o].filter(Boolean);
-    if (halves.some((x) => !x.info.running)) overall = ['bad', 'Stopped'];
+    if (halves.some((x) => !x.info.running)) overall = tfWidgets.pausedByQuota ? ['warn', 'Paused (Quota)'] : ['bad', 'Stopped'];
     else if (live && live.path_state === 'blocked') overall = ['bad', 'Blocked'];
     else if (halves.some((x) => x.info.problem)) overall = ['warn', 'Warning'];
     else if (live && live.path_state === 'degraded') overall = ['warn', 'Degraded'];
@@ -1979,6 +2111,7 @@
 
     const bodyEl = h('div', { class: 'tunnel-body', hidden: !isOpen },
       detailsGrid,
+      tfWidgets.stripEl,
       problems.map((p) => h('p', { class: 'problem' }, p)),
       t.stale ? h('p', { class: 'muted small' }, 'One of the servers cannot be reached right now, so these stats may be cached.') : null,
       tunnelActions(t, halves));
@@ -2005,6 +2138,8 @@
           mainPort ? h('span', { class: 'tunnel-summary-port mono' }, `:${mainPort}`) : null)),
       h('div', { class: 'tunnel-summary-right' },
         ahBadge,
+        tfWidgets.rateBadge,
+        tfWidgets.trafficBadge,
         h('span', { class: 'badge badge-transport' }, `${reverse ? 'Reverse' : 'Direct'}${isIPv6 ? ' (IPv6)' : ''} · ${shortLink}`),
         live ? h('span', { class: 'badge badge-users', title: 'Unique connected client IPs · Active TCP connections' }, userBadgeText) : null,
         h('span', { class: 'tunnel-chevron', 'aria-hidden': 'true' }, '▾')));
@@ -2070,6 +2205,7 @@
           }, 'Switch Mode')
         : null,
       target.edge ? h('button', { type: 'button', 'data-focus': key + '-edit', onclick: () => openEditTunnel(t) }, 'Edit') : null,
+      h('button', { type: 'button', 'data-focus': key + '-traffic', onclick: () => openTunnelTraffic(t) }, 'Traffic & Quota'),
       h('button', { type: 'button', 'data-focus': key + '-diag', onclick: () => openTunnelDiag(t, target) }, 'Diagnose & Speed Test'),
       h('button', { type: 'button', 'data-focus': key + '-logs', onclick: () => openTunnelLogs(t, target) }, 'Logs'),
       h('button', { type: 'button', 'data-focus': key + '-restart', onclick: service('restart', 'Restarting') }, 'Restart'),
@@ -2871,8 +3007,310 @@
 
   // --------------------------------------------------------------- settings
 
+  let clearSavedTG = false;
+  let clearSavedWH = false;
+
+  function renderNotifyView(nv) {
+    if (!nv || !$('notify-form')) return;
+    clearSavedTG = false;
+    clearSavedWH = false;
+    $('notify-enabled').checked = !!nv.enabled;
+    $('notify-tg-chat').value = nv.telegram_chat_id || '';
+    $('notify-ev-server').checked = nv.enabled || nv.has_telegram_token || nv.has_webhook_url ? !!nv.on_server_offline : true;
+    $('notify-ev-failover').checked = nv.enabled || nv.has_telegram_token || nv.has_webhook_url ? !!nv.on_tunnel_failover : true;
+    $('notify-ev-quota').checked = nv.enabled || nv.has_telegram_token || nv.has_webhook_url ? !!nv.on_traffic_quota : true;
+
+    const tgSaved = $('notify-tg-saved');
+    const tgClear = $('notify-tg-clear');
+    const tgInput = $('notify-tg-token');
+    if (nv.has_telegram_token) {
+      tgSaved.hidden = false;
+      tgSaved.textContent = `Saved (${nv.telegram_hint || '••••'})`;
+      tgClear.hidden = false;
+      tgInput.placeholder = `Saved (${nv.telegram_hint || '••••'}) — leave empty to keep, or paste a new token`;
+    } else {
+      tgSaved.hidden = true;
+      tgClear.hidden = true;
+      tgInput.placeholder = 'e.g. 123456789:ABCdefGHIjklMNOpqrSTUvwxYZ (from @BotFather)';
+    }
+
+    const whSaved = $('notify-wh-saved');
+    const whClear = $('notify-wh-clear');
+    const whInput = $('notify-wh-url');
+    if (nv.has_webhook_url) {
+      whSaved.hidden = false;
+      whSaved.textContent = `Saved (${nv.webhook_hint || '••••'})`;
+      whClear.hidden = false;
+      whInput.placeholder = `Saved (${nv.webhook_hint || '••••'}) — leave empty to keep, or paste a new URL`;
+    } else {
+      whSaved.hidden = true;
+      whClear.hidden = true;
+      whInput.placeholder = 'https://discord.com/api/webhooks/... or https://hooks.slack.com/...';
+    }
+
+    const lastInfo = $('notify-last-info');
+    if (lastInfo) {
+      const parts = [];
+      if (nv.last_sent_at) parts.push(`Last delivered ${ago(nv.last_sent_at)}${nv.last_route ? ' via ' + nv.last_route : ''}`);
+      if (nv.last_error) parts.push(`Last delivery error: ${nv.last_error}`);
+      lastInfo.hidden = parts.length === 0;
+      lastInfo.textContent = parts.join(' · ');
+    }
+    syncChoiceCards($('notify-form'));
+  }
+
+  async function loadNotifications() {
+    if (!$('notify-form')) return;
+    try {
+      const nv = await api('GET', '/api/notifications');
+      renderNotifyView(nv);
+    } catch (e) {
+      if (e.status === 401) throw e;
+    }
+  }
+
+  if ($('notify-tg-clear')) {
+    $('notify-tg-clear').addEventListener('click', () => {
+      clearSavedTG = true;
+      $('notify-tg-token').value = '';
+      $('notify-tg-saved').hidden = true;
+      $('notify-tg-clear').hidden = true;
+      $('notify-tg-token').placeholder = 'Will clear saved token when you click Save Alert Settings';
+    });
+  }
+
+  if ($('notify-wh-clear')) {
+    $('notify-wh-clear').addEventListener('click', () => {
+      clearSavedWH = true;
+      $('notify-wh-url').value = '';
+      $('notify-wh-saved').hidden = true;
+      $('notify-wh-clear').hidden = true;
+      $('notify-wh-url').placeholder = 'Will clear saved webhook when you click Save Alert Settings';
+    });
+  }
+
+  if ($('notify-form')) {
+    $('notify-form').addEventListener('submit', async (ev) => {
+      ev.preventDefault();
+      const msg = $('notify-msg');
+      const err = $('notify-err');
+      msg.textContent = '';
+      msg.className = '';
+      err.textContent = '';
+      const btn = $('notify-save-btn');
+      btn.disabled = true;
+      try {
+        const res = await api('POST', '/api/notifications', {
+          enabled: $('notify-enabled').checked,
+          telegram_token: $('notify-tg-token').value.trim(),
+          clear_telegram_token: clearSavedTG,
+          telegram_chat_id: $('notify-tg-chat').value.trim(),
+          webhook_url: $('notify-wh-url').value.trim(),
+          clear_webhook_url: clearSavedWH,
+          on_server_offline: $('notify-ev-server').checked,
+          on_tunnel_failover: $('notify-ev-failover').checked,
+          on_traffic_quota: $('notify-ev-quota').checked,
+        });
+        $('notify-tg-token').value = '';
+        $('notify-wh-url').value = '';
+        if (res && res.notify) renderNotifyView(res.notify);
+        msg.className = 'good';
+        msg.textContent = res.notify && res.notify.enabled
+          ? 'Alert settings encrypted and saved. Automatic notifications are active.'
+          : 'Alert settings saved (automatic notifications are currently turned off).';
+      } catch (e) {
+        err.textContent = e.message;
+      } finally {
+        btn.disabled = false;
+      }
+    });
+  }
+
+  if ($('notify-test-btn')) {
+    $('notify-test-btn').addEventListener('click', async () => {
+      const msg = $('notify-msg');
+      const err = $('notify-err');
+      msg.textContent = '';
+      msg.className = '';
+      err.textContent = '';
+      const btn = $('notify-test-btn');
+      const orig = btn.textContent;
+      btn.disabled = true;
+      btn.classList.add('is-loading');
+      btn.textContent = 'Sending Test…';
+      try {
+        const res = await api('POST', '/api/notifications/test', {
+          telegram_token: $('notify-tg-token').value.trim(),
+          telegram_chat_id: $('notify-tg-chat').value.trim(),
+          webhook_url: $('notify-wh-url').value.trim(),
+        });
+        if (res && res.notify) {
+          const lastInfo = $('notify-last-info');
+          if (lastInfo && res.notify.last_sent_at) {
+            lastInfo.hidden = false;
+            lastInfo.textContent = `Last delivered just now via ${res.route || res.notify.last_route || 'Direct'}`;
+          }
+        }
+        msg.className = 'good';
+        msg.textContent = `Test alert delivered (${res.route || 'Direct'}). Remember to click "Save Alert Settings" if you made changes.`;
+      } catch (e) {
+        err.textContent = e.message;
+      } finally {
+        btn.classList.remove('is-loading');
+        btn.disabled = false;
+        btn.textContent = orig;
+      }
+    });
+  }
+
+  // ----------------------------------------- tunnel traffic & monthly quota
+
+  let activeTrafficTunnel = null;
+
+  function syncTrafficPresets() {
+    const val = Number(($('tf-quota-gb') && $('tf-quota-gb').value) || 0);
+    for (const btn of document.querySelectorAll('[data-tf-preset]')) {
+      const p = Number(btn.dataset.tfPreset || 0);
+      btn.classList.toggle('is-active', p === val);
+    }
+  }
+
+  for (const btn of document.querySelectorAll('[data-tf-preset]')) {
+    btn.addEventListener('click', () => {
+      const p = Number(btn.dataset.tfPreset || 0);
+      $('tf-quota-gb').value = p > 0 ? String(p) : '';
+      if (p > 0 && !$('tf-autopause').checked) {
+        $('tf-autopause').checked = true;
+      }
+      syncTrafficPresets();
+      syncChoiceCards($('traffic-dialog'));
+    });
+  }
+  if ($('tf-quota-gb')) {
+    $('tf-quota-gb').addEventListener('input', syncTrafficPresets);
+  }
+
+  function openTunnelTraffic(t) {
+    activeTrafficTunnel = t;
+    const e = t.edge, o = t.origin;
+    const ei = e ? e.info : null, oi = o ? o.info : null;
+    const live = (ei && ei.live) || (oi && oi.live) || null;
+    const tr = t.traffic || {};
+
+    const upBps = Number(tr.up_bps) || (live ? (Number(live.up_bps) || 0) : 0);
+    const downBps = Number(tr.down_bps) || (live ? (Number(live.down_bps) || 0) : 0);
+    const totalUp = Number(tr.total_up) || (live ? (Number(live.bytes_up) || 0) : 0);
+    const totalDown = Number(tr.total_down) || (live ? (Number(live.bytes_down) || 0) : 0);
+    const monthUp = tr.month_up !== undefined ? (Number(tr.month_up) || 0) : totalUp;
+    const monthDown = tr.month_down !== undefined ? (Number(tr.month_down) || 0) : totalDown;
+    const monthUsed = monthUp + monthDown;
+    const totalUsed = totalUp + totalDown;
+    const quotaGB = Number(tr.quota_gb) || 0;
+
+    $('tf-title').textContent = `Traffic & Monthly Quota: ${t.name}`;
+    const rateStr = fmtDualRate(upBps, downBps);
+    $('tf-live-rate').textContent = rateStr || 'Idle (0 Kbps)';
+    $('tf-live-sub').textContent = `↑ ${fmtSingleRate(upBps)} upload · ↓ ${fmtSingleRate(downBps)} download`;
+
+    $('tf-month-label').textContent = tr.month_key ? `This Month (${tr.month_key} UTC)` : 'This Month (UTC)';
+    $('tf-month-total').textContent = fmtTrafficBytes(monthUsed);
+    $('tf-month-sub').textContent = `↑ ${fmtTrafficBytes(monthUp)} · ↓ ${fmtTrafficBytes(monthDown)}`;
+
+    $('tf-all-total').textContent = fmtTrafficBytes(totalUsed);
+    $('tf-all-sub').textContent = `↑ ${fmtTrafficBytes(totalUp)} · ↓ ${fmtTrafficBytes(totalDown)}`;
+
+    const meterWrap = $('tf-meter-wrap');
+    if (quotaGB > 0) {
+      meterWrap.hidden = false;
+      const quotaBytes = quotaGB * 1024 * 1024 * 1024;
+      const pct = quotaBytes > 0 ? Math.min(999, Math.round((monthUsed / quotaBytes) * 100)) : 0;
+      $('tf-meter-text').textContent = `${fmtTrafficBytes(monthUsed)} of ${fmtQuotaCap(quotaGB)} monthly cap${tr.paused_by_quota ? ' — Paused by quota' : ''}`;
+      $('tf-meter-pct').textContent = `${pct}%`;
+      const bar = $('tf-meter-bar');
+      bar.value = Math.min(100, Math.max(0, pct));
+      bar.className = 'tf-progress' + ((tr.paused_by_quota || pct >= 100) ? ' is-over' : (pct >= 80 ? ' is-warn' : ''));
+    } else {
+      meterWrap.hidden = true;
+    }
+
+    $('tf-quota-gb').value = quotaGB > 0 ? String(quotaGB) : '';
+    $('tf-autopause').checked = !!tr.auto_pause;
+    $('tf-error').textContent = '';
+    syncTrafficPresets();
+    openDialog($('traffic-dialog'));
+    $('tf-quota-gb').focus();
+  }
+
+  if ($('tf-cancel')) {
+    $('tf-cancel').addEventListener('click', () => $('traffic-dialog').close());
+  }
+
+  if ($('traffic-form')) {
+    $('traffic-form').addEventListener('submit', async (ev) => {
+      ev.preventDefault();
+      if (!activeTrafficTunnel) return;
+      const t = activeTrafficTunnel;
+      const err = $('tf-error');
+      err.textContent = '';
+      const rawCap = $('tf-quota-gb').value.trim();
+      const quotaGB = rawCap === '' ? 0 : Number(rawCap);
+      if (Number.isNaN(quotaGB) || quotaGB < 0 || quotaGB > 1000000) {
+        err.textContent = 'Enter a monthly cap between 0 (unlimited) and 1,000,000 GB.';
+        $('tf-quota-gb').focus();
+        return;
+      }
+      const btn = $('tf-save');
+      btn.disabled = true;
+      try {
+        await api('POST', '/api/tunnels/traffic', {
+          name: t.name,
+          edge: t.edge ? t.edge.server_id : '',
+          origin: t.origin ? t.origin.server_id : '',
+          action: 'set_quota',
+          quota_gb: quotaGB,
+          auto_pause: $('tf-autopause').checked,
+        });
+        $('traffic-dialog').close();
+        lastTunnels = '';
+        await refresh();
+        setStatus(quotaGB > 0
+          ? `${t.name}: monthly traffic cap set to ${fmtQuotaCap(quotaGB)}${$('tf-autopause').checked ? ' (Auto-Pause ON)' : ''}.`
+          : `${t.name}: monthly traffic cap removed (Unlimited).`);
+      } catch (e) {
+        err.textContent = e.message;
+      } finally {
+        btn.disabled = false;
+      }
+    });
+  }
+
+  if ($('tf-reset-btn')) {
+    $('tf-reset-btn').addEventListener('click', () => {
+      if (!activeTrafficTunnel) return;
+      const t = activeTrafficTunnel;
+      $('traffic-dialog').close();
+      openConfirm(
+        `Reset traffic counters for "${t.name}"?`,
+        `This resets both the monthly and lifetime bandwidth counters for "${t.name}" back to 0 MB (and resumes the tunnel if it was paused by quota).`,
+        'Reset Counters',
+        async () => {
+          await api('POST', '/api/tunnels/traffic', {
+            name: t.name,
+            edge: t.edge ? t.edge.server_id : '',
+            origin: t.origin ? t.origin.server_id : '',
+            action: 'reset',
+            scope: 'all',
+          });
+          lastTunnels = lastServers = '';
+          await refresh();
+          setStatus(`Traffic counters reset for "${t.name}".`);
+        }
+      );
+    });
+  }
+
   async function loadSettings() {
-    const [info] = await Promise.all([api('GET', '/api/panel'), loadUpdates()]);
+    const [info] = await Promise.all([api('GET', '/api/panel'), loadUpdates(), loadNotifications()]);
     const rows = [];
     const row = (k, v) => rows.push(h('dt', null, k), h('dd', null, v));
     row('Panel Version', info.version || '');
@@ -5362,9 +5800,10 @@
     const servicePorts = (oi && oi.service_ports && oi.service_ports.length) ? oi.service_ports : userPorts;
     const live = (ei && ei.live) || (oi && oi.live) || null;
 
+    const tfWidgets = buildTunnelTrafficWidgets(t, live);
     let overall = ['ok', 'Running'];
     const halves = [e, o].filter(Boolean);
-    if (halves.some((x) => !x.info.running)) overall = ['bad', 'Stopped'];
+    if (halves.some((x) => !x.info.running)) overall = tfWidgets.pausedByQuota ? ['warn', 'Paused (Quota)'] : ['bad', 'Stopped'];
     else if (live && live.path_state === 'blocked') overall = ['bad', 'Blocked'];
     else if (halves.some((x) => x.info.problem)) overall = ['warn', 'Warning'];
     else if (live && live.path_state === 'degraded') overall = ['warn', 'Degraded'];
@@ -5423,6 +5862,7 @@
 
     const bodyEl = h('div', { class: 'tunnel-body', hidden: !isOpen },
       detailsGrid,
+      tfWidgets.stripEl,
       problems.map((p) => h('p', { class: 'problem' }, p)),
       t.stale ? h('p', { class: 'muted small' }, 'One of the servers cannot be reached right now, so these stats may be cached.') : null,
       websiteActions(t, halves));
@@ -5450,6 +5890,8 @@
           h('span', { class: 'tunnel-summary-port mono' }, `:${mainPort}`))),
       h('div', { class: 'tunnel-summary-right' },
         ahBadge,
+        tfWidgets.rateBadge,
+        tfWidgets.trafficBadge,
         outboundOn ? h('span', { class: 'badge badge-transport mono' }, `Proxy 127.0.0.1:${outboundPort}`) : null,
         live ? h('span', { class: 'badge badge-users' }, visitorBadgeText) : null,
         h('span', { class: 'tunnel-chevron', 'aria-hidden': 'true' }, '▾')));
@@ -5520,6 +5962,7 @@
           }, ahOn ? 'Auto-Heal (ON)' : 'Auto-Heal & Failover')
         : null,
       target.edge ? h('button', { type: 'button', 'data-focus': key + '-edit', onclick: () => openEditWebsiteBridge(t) }, 'Edit') : null,
+      h('button', { type: 'button', 'data-focus': key + '-traffic', onclick: () => openTunnelTraffic(t) }, 'Traffic & Quota'),
       h('button', { type: 'button', 'data-focus': key + '-diag', onclick: () => openTunnelDiag(t, target) }, 'Diagnose & Speed Test'),
       h('button', { type: 'button', 'data-focus': key + '-logs', onclick: () => openTunnelLogs(t, target) }, 'Logs'),
       h('button', { type: 'button', 'data-focus': key + '-restart', onclick: service('restart', 'Restarting') }, 'Restart'),

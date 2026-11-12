@@ -847,7 +847,10 @@ func (o *origin) handleActivated(tunnel net.Conn, a arrival) {
 			_ = tunnel.Close()
 			return
 		}
-		if err := relay(svc, tunnel); err != nil {
+		if len(head) > 0 {
+			atomic.AddInt64(&o.st.bytesUp, int64(len(head)))
+		}
+		if err := relayCounted(svc, tunnel, &o.st.bytesDown, &o.st.bytesUp); err != nil {
 			o.logRelay.printf("a session was cut short taking data from the tunnel: %v", err)
 		}
 		return
@@ -875,7 +878,7 @@ func (o *origin) handleActivated(tunnel net.Conn, a arrival) {
 	}
 	_ = tunnel.SetWriteDeadline(time.Time{})
 
-	if err := relay(svc, tunnel); err != nil {
+	if err := relayCounted(svc, tunnel, &o.st.bytesDown, &o.st.bytesUp); err != nil {
 		o.logRelay.printf("a session was cut short taking data from the tunnel: %v", err)
 	}
 }

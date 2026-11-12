@@ -376,6 +376,64 @@
         </div>
 
         <div class="settings-stack">
+          <form id="notify-form" class="card settings-card" novalidate aria-labelledby="h-notify">
+            <div class="card-head">
+              <h3 id="h-notify">Telegram &amp; Webhook Alerts</h3>
+              <p class="muted small">Get instant alerts on Telegram, Discord, Slack, or a custom HTTPS webhook. If Telegram or Discord is blocked on an Iran Relay panel, PortBridge automatically delivers alerts over end-to-end TLS via an online Foreign server.</p>
+            </div>
+
+            <label class="check-card" for="notify-enabled">
+              <input type="checkbox" id="notify-enabled">
+              <span>
+                <strong>Enable Automatic Alerts</strong>
+                <span class="muted"> — Send notifications for the events selected below.</span>
+              </span>
+            </label>
+
+            <div class="notify-channel-box">
+              <div class="notify-label-row">
+                <label for="notify-tg-token">Telegram Bot Token <span id="notify-tg-saved" class="pill-tag tag-recommend" hidden>Saved</span></label>
+                <button type="button" id="notify-tg-clear" class="link small" hidden>Clear saved token</button>
+              </div>
+              <input id="notify-tg-token" type="password" autocomplete="new-password" spellcheck="false" placeholder="e.g. 123456789:ABCdefGHIjklMNOpqrSTUvwxYZ (from @BotFather)">
+
+              <label for="notify-tg-chat">Telegram Chat ID or Channel ID</label>
+              <input id="notify-tg-chat" autocapitalize="none" spellcheck="false" placeholder="e.g. 123456789 or -1001234567890">
+            </div>
+
+            <div class="notify-channel-box">
+              <div class="notify-label-row">
+                <label for="notify-wh-url">Discord / Slack / Custom Webhook URL <span id="notify-wh-saved" class="pill-tag tag-recommend" hidden>Saved</span></label>
+                <button type="button" id="notify-wh-clear" class="link small" hidden>Clear saved webhook</button>
+              </div>
+              <input id="notify-wh-url" type="password" autocomplete="new-password" spellcheck="false" placeholder="https://discord.com/api/webhooks/... or https://hooks.slack.com/...">
+            </div>
+
+            <fieldset class="notify-events-box">
+              <legend>Notify Me When</legend>
+              <label class="notify-check-row" for="notify-ev-server">
+                <input type="checkbox" id="notify-ev-server" checked>
+                <span>A server goes <strong>Offline</strong> or <strong>Recovers</strong></span>
+              </label>
+              <label class="notify-check-row" for="notify-ev-failover">
+                <input type="checkbox" id="notify-ev-failover" checked>
+                <span>A tunnel <strong>Auto-Heals</strong> to a new mode or <strong>All Modes Fail</strong></span>
+              </label>
+              <label class="notify-check-row" for="notify-ev-quota">
+                <input type="checkbox" id="notify-ev-quota" checked>
+                <span>A tunnel hits <strong>80%</strong> or <strong>100%</strong> of its monthly traffic quota</span>
+              </label>
+            </fieldset>
+
+            <p id="notify-last-info" class="muted small" hidden></p>
+            <p id="notify-msg" role="status"></p>
+            <p id="notify-err" class="error" role="alert"></p>
+            <div class="actions left">
+              <button type="submit" id="notify-save-btn" class="primary">Save Alert Settings</button>
+              <button type="button" id="notify-test-btn">Send Test Alert</button>
+            </div>
+          </form>
+
           <section class="card settings-card" aria-labelledby="h-about">
             <div class="card-head">
               <h3 id="h-about">Panel Information</h3>
@@ -2490,6 +2548,86 @@
       <button type="button" id="obt-close" class="primary">Close</button>
     </div>
   </div>
+</dialog>
+
+<!-- Tunnel Traffic & Monthly Quota Dialog -->
+<dialog id="traffic-dialog" aria-labelledby="tf-title">
+  <form id="traffic-form" novalidate>
+    <div class="dialog-header">
+      <div>
+        <h2 id="tf-title">Traffic &amp; Monthly Quota</h2>
+        <p id="tf-sub" class="muted small">Persistent upload/download counters survive tunnel restarts and transport switches. Optional monthly quotas warn at 80% and can pause the tunnel at 100% until the next UTC month.</p>
+      </div>
+    </div>
+
+    <div class="dialog-body">
+      <div class="tf-stats-grid">
+        <div class="tf-stat-box">
+          <span class="detail-label">Live Throughput</span>
+          <strong id="tf-live-rate" class="mono">—</strong>
+          <span id="tf-live-sub" class="muted small">Current upload &amp; download rate</span>
+        </div>
+        <div class="tf-stat-box">
+          <span id="tf-month-label" class="detail-label">This Month (UTC)</span>
+          <strong id="tf-month-total" class="mono">—</strong>
+          <span id="tf-month-sub" class="muted small mono">↑ 0 MB · ↓ 0 MB</span>
+        </div>
+        <div class="tf-stat-box">
+          <span class="detail-label">Lifetime Total</span>
+          <strong id="tf-all-total" class="mono">—</strong>
+          <span id="tf-all-sub" class="muted small mono">↑ 0 MB · ↓ 0 MB</span>
+        </div>
+      </div>
+
+      <div id="tf-meter-wrap" class="tf-meter-wrap" hidden>
+        <div class="tf-meter-top">
+          <span id="tf-meter-text" class="small">Monthly Quota Usage</span>
+          <strong id="tf-meter-pct" class="mono small">0%</strong>
+        </div>
+        <progress id="tf-meter-bar" class="tf-progress" max="100" value="0"></progress>
+      </div>
+
+      <fieldset class="step-section">
+        <legend class="step-header">
+          <span class="step-num">1</span>
+          <span>
+            <span class="step-title">Monthly Bandwidth Cap</span>
+            <span class="step-sub">Set to 0 (or leave empty) for unlimited monthly traffic.</span>
+          </span>
+        </legend>
+
+        <label for="tf-quota-gb">Monthly Traffic Cap (GB)</label>
+        <input id="tf-quota-gb" type="number" min="0" max="1000000" step="any" inputmode="decimal" placeholder="0 = Unlimited (e.g. 500)">
+
+        <div class="tf-presets" role="group" aria-label="Quick monthly quota presets">
+          <button type="button" class="seg-btn" data-tf-preset="0">Unlimited</button>
+          <button type="button" class="seg-btn" data-tf-preset="100">100 GB</button>
+          <button type="button" class="seg-btn" data-tf-preset="500">500 GB</button>
+          <button type="button" class="seg-btn" data-tf-preset="1024">1 TB</button>
+          <button type="button" class="seg-btn" data-tf-preset="2048">2 TB</button>
+          <button type="button" class="seg-btn" data-tf-preset="5120">5 TB</button>
+        </div>
+
+        <label class="check-card" for="tf-autopause">
+          <input type="checkbox" id="tf-autopause">
+          <span>
+            <strong>Auto-Pause Tunnel at 100% Cap</strong>
+            <span class="muted"> — Stops this tunnel automatically when monthly usage reaches 100%, and resumes it automatically on the 1st of the next UTC month (or when you raise the cap or reset traffic).</span>
+          </span>
+        </label>
+      </fieldset>
+
+      <p id="tf-error" class="error" role="alert"></p>
+    </div>
+
+    <div class="dialog-footer actions tf-footer">
+      <button type="button" id="tf-reset-btn" class="danger-text">Reset Traffic Counters…</button>
+      <div class="tf-footer-right">
+        <button type="button" id="tf-cancel">Cancel</button>
+        <button type="submit" id="tf-save" class="primary">Save Quota Settings</button>
+      </div>
+    </div>
+  </form>
 </dialog>
 </body>
 </html>
