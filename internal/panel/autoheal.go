@@ -25,9 +25,10 @@ import (
 )
 
 const (
-	autoHealInterval  = 20 * time.Second
-	autoHealCooldown  = 2 * time.Minute
-	autoHealThreshold = 2 // consecutive unhealthy checks (~40s) before probing & switching
+	autoHealInterval       = 20 * time.Second
+	autoHealCooldown       = 2 * time.Minute
+	autoHealThreshold      = 2 // consecutive unhealthy checks (~40s) before probing & switching
+	autoHealFailbackStreak = 3 // consecutive online checks (~60s) before failing back to Primary Foreign
 
 	// After a failed attempt the next one waits twice as long as the last, so a
 	// path that is down does not have the whole benchmark and two servers' worth
@@ -42,12 +43,14 @@ const (
 )
 
 type tunnelHealRuntime struct {
-	state     string
-	failCount int
-	lastCheck time.Time
-	lastHeal  time.Time
-	lastNote  string
-	running   bool
+	state            string
+	failCount        int
+	foreignDownCount int
+	primaryUpStreak  int
+	lastCheck        time.Time
+	lastHeal         time.Time
+	lastNote         string
+	running          bool
 
 	// failures counts failed heals in a row; nextTry is the earliest the next
 	// automatic attempt may start.
@@ -64,6 +67,16 @@ type autoHealer struct {
 	// working on the same server at the same time.
 	slots    chan struct{}
 	serverMu map[string]*sync.Mutex
+
+	// probeFn overrides p.probeBetweenServers in tests.
+	probeFn func(ctx context.Context, relayID, foreignID, cdnDomain string) (*engine.ProbeBenchmarkReport, error)
+}
+
+func (ah *autoHealer) probe(ctx context.Context, relayID, foreignID, cdnDomain string) (*engine.ProbeBenchmarkReport, error) {
+	if ah.probeFn != nil {
+		return ah.probeFn(ctx, relayID, foreignID, cdnDomain)
+	}
+	return ah.p.probeBetweenServers(ctx, relayID, foreignID, cdnDomain)
 }
 
 func newAutoHealer(p *Panel) *autoHealer {
@@ -262,6 +275,38 @@ func extractTunnelCDNDomain(ti agent.TunnelInfo) string {
 	return ""
 }
 
+// filterAndAttachViews hides stale orphan halves queued for HA cleanup on an
+// offline Foreign server and attaches Auto-Heal state to each tunnelView.
+func (ah *autoHealer) filterAndAttachViews(tunnels []tunnelView) []tunnelView {
+	st := ah.p.store.get()
+	if len(st.AutoHeal) > 0 {
+		type serverTunnel struct{ serverID, name string }
+		pending := map[serverTunnel]bool{}
+		for k, cfg := range st.AutoHeal {
+			if cfg.PendingCleanupForeignID == "" {
+				continue
+			}
+			tName := k
+			if idx := strings.LastIndexByte(k, '/'); idx >= 0 {
+				tName = k[idx+1:]
+			}
+			pending[serverTunnel{cfg.PendingCleanupForeignID, tName}] = true
+		}
+		if len(pending) > 0 {
+			filtered := make([]tunnelView, 0, len(tunnels))
+			for _, tv := range tunnels {
+				if tv.Edge == nil && tv.Origin != nil && tv.Stale && pending[serverTunnel{tv.Origin.ServerID, tv.Name}] {
+					continue
+				}
+				filtered = append(filtered, tv)
+			}
+			tunnels = filtered
+		}
+	}
+	ah.attachViews(tunnels)
+	return tunnels
+}
+
 // attachViews populates AutoHeal on each tunnelView for the UI.
 func (ah *autoHealer) attachViews(tunnels []tunnelView) {
 	st := ah.p.store.get()
@@ -276,6 +321,12 @@ func (ah *autoHealer) attachViews(tunnels []tunnelView) {
 			if dom := extractTunnelCDNDomain(tunnels[i].Edge.Info); dom != "" {
 				cfg.CDNDomain = dom
 			}
+		}
+		if cfg.StandbyForeignID != "" {
+			cfg.StandbyForeignName = ah.p.serverName(cfg.StandbyForeignID)
+		}
+		if cfg.PrimaryForeignID != "" {
+			cfg.PrimaryForeignName = ah.p.serverName(cfg.PrimaryForeignID)
 		}
 		if r := ah.rt[healKeyFor(edgeID, name)]; r != nil {
 			cfg.State = r.state
@@ -300,10 +351,11 @@ func (ah *autoHealer) attachViews(tunnels []tunnelView) {
 	}
 }
 
-// setConfig enables/disables Auto-Heal or updates its optional CDN failover domain.
+// setConfig enables/disables Auto-Heal or updates its optional CDN failover domain
+// and optional Backup (Standby) Foreign server for Server-Level HA.
 // edgeID says which relay server's tunnel is meant; when empty, the name alone
 // must pick out exactly one tunnel.
-func (ah *autoHealer) setConfig(edgeID, name string, enabled bool, cdnDomain string) error {
+func (ah *autoHealer) setConfig(edgeID, name string, enabled bool, cdnDomain string, standbyForeignID *string) error {
 	cdnDomain = strings.TrimSpace(cdnDomain)
 	if cdnDomain != "" && !engine.HostnameRe.MatchString(cdnDomain) {
 		return fmt.Errorf("%q is not a valid domain name", cdnDomain)
@@ -313,7 +365,7 @@ func (ah *autoHealer) setConfig(edgeID, name string, enabled bool, cdnDomain str
 	if edgeID == "" {
 		var found []string
 		for _, tv := range tunnels {
-			if tv.Name == name && tv.Edge != nil && tv.Origin != nil {
+			if tv.Name == name && tv.Edge != nil {
 				found = append(found, tv.Edge.ServerID)
 			}
 		}
@@ -326,16 +378,46 @@ func (ah *autoHealer) setConfig(edgeID, name string, enabled bool, cdnDomain str
 		}
 	}
 	key := healKeyFor(edgeID, name)
-	if cdnDomain == "" {
-		for _, tv := range tunnels {
-			if tv.Name == name && edgeIDOf(tv) == edgeID && tv.Edge != nil {
-				if dom := extractTunnelCDNDomain(tv.Edge.Info); dom != "" {
-					cdnDomain = dom
-				}
-				break
+	var matchedTV *tunnelView
+	for _, tv := range tunnels {
+		if tv.Name == name && edgeIDOf(tv) == edgeID {
+			copyTV := tv
+			matchedTV = &copyTV
+			break
+		}
+	}
+	if cdnDomain == "" && matchedTV != nil && matchedTV.Edge != nil {
+		if dom := extractTunnelCDNDomain(matchedTV.Edge.Info); dom != "" {
+			cdnDomain = dom
+		}
+	}
+
+	curState := ah.p.store.get()
+	curCfg, _ := resolveHealConfig(curState, edgeID, name, counts)
+	primaryID := curCfg.PrimaryForeignID
+	if !curCfg.OnStandby && matchedTV != nil && matchedTV.Origin != nil {
+		primaryID = matchedTV.Origin.ServerID
+	}
+
+	if standbyForeignID != nil {
+		sf := strings.TrimSpace(*standbyForeignID)
+		if sf != "" {
+			sv, ok := ah.p.viewOf(sf)
+			if !ok {
+				return errors.New("that backup foreign server is not in the panel")
+			}
+			if sv.Group != GroupForeign {
+				return fmt.Errorf("%s is not in the Foreign servers group", sv.Name)
+			}
+			if sf == edgeID {
+				return errors.New("backup foreign server cannot be the same as the Relay server")
+			}
+			if primaryID != "" && sf == primaryID {
+				return errors.New("backup foreign server must be different from the tunnel's primary foreign server")
 			}
 		}
 	}
+
 	err := ah.p.store.update(func(st *State) error {
 		if st.AutoHeal == nil {
 			st.AutoHeal = map[string]AutoHealConfig{}
@@ -345,6 +427,19 @@ func (ah *autoHealer) setConfig(edgeID, name string, enabled bool, cdnDomain str
 		c.Enabled = enabled
 		if cdnDomain != "" || !enabled {
 			c.CDNDomain = cdnDomain
+		}
+		if standbyForeignID != nil {
+			sf := strings.TrimSpace(*standbyForeignID)
+			c.StandbyForeignID = sf
+			if sf == "" {
+				if !c.OnStandby {
+					c.PrimaryForeignID = ""
+				}
+			} else if !c.OnStandby && primaryID != "" {
+				c.PrimaryForeignID = primaryID
+			}
+		} else if c.StandbyForeignID != "" && !c.OnStandby && c.PrimaryForeignID == "" && primaryID != "" {
+			c.PrimaryForeignID = primaryID
 		}
 		if enabled && c.State == "" {
 			c.State = "monitoring"
@@ -357,12 +452,18 @@ func (ah *autoHealer) setConfig(edgeID, name string, enabled bool, cdnDomain str
 	}
 	ah.mu.Lock()
 	r := ah.runtimeOf(key)
+	if standbyForeignID != nil {
+		r.foreignDownCount = 0
+		r.primaryUpStreak = 0
+	}
 	if enabled {
 		if !r.running {
 			r.state = "monitoring"
 		}
 	} else {
 		r.failCount = 0
+		r.foreignDownCount = 0
+		r.primaryUpStreak = 0
 		r.failures = 0
 		r.nextTry = time.Time{}
 		r.state = ""
@@ -386,15 +487,72 @@ func (ah *autoHealer) run(ctx context.Context) {
 	}
 }
 
+// cleanupPendingForeignHalves deletes leftover Origin tunnel halves on Foreign
+// servers that were offline when HA failover moved the tunnel elsewhere, once
+// those servers come back online.
+func (ah *autoHealer) cleanupPendingForeignHalves(ctx context.Context) {
+	st := ah.p.store.get()
+	for k, cfg := range st.AutoHeal {
+		pendingID := cfg.PendingCleanupForeignID
+		if pendingID == "" {
+			continue
+		}
+		tName := k
+		if idx := strings.LastIndexByte(k, '/'); idx >= 0 {
+			tName = k[idx+1:]
+		}
+		sv, ok := ah.p.viewOf(pendingID)
+		if !ok {
+			_ = ah.p.store.update(func(s *State) error {
+				if c, has := s.AutoHeal[k]; has && c.PendingCleanupForeignID == pendingID {
+					c.PendingCleanupForeignID = ""
+					s.AutoHeal[k] = c
+				}
+				return nil
+			})
+			continue
+		}
+		if !sv.Online {
+			continue
+		}
+		activeForeign := cfg.PrimaryForeignID
+		if cfg.OnStandby {
+			activeForeign = cfg.StandbyForeignID
+		}
+		if pendingID != activeForeign {
+			func() {
+				defer ah.lockServers(pendingID)()
+				cctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+				defer cancel()
+				if err := ah.p.deleteHalf(cctx, pendingID, tName); err != nil {
+					logf("[auto-heal %s] note cleaning stale half on %s: %v", tName, ah.p.serverName(pendingID), err)
+				}
+				ah.p.refreshOne(pendingID)
+			}()
+		}
+		_ = ah.p.store.update(func(s *State) error {
+			if c, has := s.AutoHeal[k]; has && c.PendingCleanupForeignID == pendingID {
+				c.PendingCleanupForeignID = ""
+				s.AutoHeal[k] = c
+			}
+			return nil
+		})
+	}
+}
+
 func (ah *autoHealer) checkAll(ctx context.Context) {
 	if len(ah.p.store.get().AutoHeal) == 0 {
 		return
 	}
+	ah.cleanupPendingForeignHalves(ctx)
 	tunnels := pairTunnels(ah.p.fleet.views())
 	ah.migrateLegacyKeys(tunnels)
 	st := ah.p.store.get()
 	counts := healableNameCounts(tunnels)
 	for _, tv := range tunnels {
+		if tv.Edge == nil {
+			continue
+		}
 		cfg, ok := resolveHealConfig(st, edgeIDOf(tv), tv.Name, counts)
 		if !ok || !cfg.Enabled {
 			continue
@@ -463,8 +621,16 @@ func tunnelUnhealthyReason(tv tunnelView) (bool, string) {
 }
 
 func (ah *autoHealer) evaluateTunnel(ctx context.Context, tv tunnelView, key string, cfg AutoHealConfig) {
-	unhealthy, reason := tunnelUnhealthyReason(tv)
 	now := time.Now()
+	if tv.Edge == nil {
+		return
+	}
+	relayID := tv.Edge.ServerID
+	relayOnline := !tv.Stale
+	if ah.p != nil {
+		rv, rok := ah.p.viewOf(relayID)
+		relayOnline = rok && rv.Online
+	}
 
 	ah.mu.Lock()
 	r := ah.runtimeOf(key)
@@ -473,6 +639,148 @@ func (ah *autoHealer) evaluateTunnel(ctx context.Context, tv tunnelView, key str
 		ah.mu.Unlock()
 		return
 	}
+	// Do not touch tunnels whose Relay server is offline or intentionally stopped.
+	if !relayOnline || !tv.Edge.Info.Running {
+		r.failCount = 0
+		r.foreignDownCount = 0
+		r.primaryUpStreak = 0
+		ah.mu.Unlock()
+		return
+	}
+
+	// 1. Automatic Failback: when running on Standby Foreign, watch Primary Foreign
+	// until it stays online for autoHealFailbackStreak consecutive checks (~60s).
+	if ah.p != nil && cfg.OnStandby && cfg.PrimaryForeignID != "" {
+		pv, pok := ah.p.viewOf(cfg.PrimaryForeignID)
+		if pok && pv.Online && cfg.PendingCleanupForeignID == "" {
+			r.primaryUpStreak++
+			primaryName := ah.p.serverName(cfg.PrimaryForeignID)
+			standbyName := ah.p.serverName(cfg.StandbyForeignID)
+			if r.primaryUpStreak < autoHealFailbackStreak {
+				r.state = "monitoring"
+				r.lastNote = fmt.Sprintf("Active on Standby (%s); Primary %s online (%d/%d checks before failback)",
+					standbyName, primaryName, r.primaryUpStreak, autoHealFailbackStreak)
+				ah.mu.Unlock()
+				return
+			}
+			failbackReason := fmt.Sprintf("Primary Foreign server %s recovered", primaryName)
+			if !r.lastHeal.IsZero() && now.Sub(r.lastHeal) < autoHealCooldown {
+				r.state = "cooldown"
+				r.lastNote = fmt.Sprintf("Waiting cooldown before failing back to %s", primaryName)
+				ah.mu.Unlock()
+				return
+			}
+			if now.Before(r.nextTry) {
+				r.state = "backoff"
+				r.lastNote = fmt.Sprintf("Waiting %s before retrying failback to %s",
+					r.nextTry.Sub(now).Round(time.Second), primaryName)
+				ah.mu.Unlock()
+				return
+			}
+			select {
+			case ah.slots <- struct{}{}:
+			default:
+				r.state = "queued"
+				r.lastNote = fmt.Sprintf("Queued for failback to %s", primaryName)
+				ah.mu.Unlock()
+				return
+			}
+			fromForeign := cfg.StandbyForeignID
+			if tv.Origin != nil && tv.Origin.ServerID != "" {
+				fromForeign = tv.Origin.ServerID
+			}
+			r.running = true
+			r.state = "switching"
+			r.lastNote = fmt.Sprintf("Primary %s recovered; failing back...", primaryName)
+			ah.mu.Unlock()
+
+			go func() {
+				defer func() { <-ah.slots }()
+				hctx, cancel := context.WithTimeout(ctx, 4*time.Minute)
+				defer cancel()
+				_ = ah.migrateTunnelForeignServer(hctx, nil, key, tv.Name, relayID, fromForeign, cfg.PrimaryForeignID, cfg.CDNDomain, false, failbackReason)
+			}()
+			return
+		}
+		r.primaryUpStreak = 0
+	}
+
+	// 2. Server-Level HA Failover: when running on Primary Foreign and Primary Foreign
+	// goes offline while Standby Foreign is online, migrate the tunnel to Standby.
+	if ah.p != nil && !cfg.OnStandby && cfg.StandbyForeignID != "" {
+		primaryID := cfg.PrimaryForeignID
+		if primaryID == "" && tv.Origin != nil {
+			primaryID = tv.Origin.ServerID
+			ah.mu.Unlock()
+			_ = ah.p.store.update(func(s *State) error {
+				if c, has := s.AutoHeal[key]; has && c.PrimaryForeignID == "" && !c.OnStandby {
+					c.PrimaryForeignID = primaryID
+					s.AutoHeal[key] = c
+				}
+				return nil
+			})
+			ah.mu.Lock()
+			r = ah.runtimeOf(key)
+			if r.running {
+				ah.mu.Unlock()
+				return
+			}
+		}
+		if primaryID != "" && cfg.StandbyForeignID != primaryID {
+			pv, pok := ah.p.viewOf(primaryID)
+			sv, sok := ah.p.viewOf(cfg.StandbyForeignID)
+			if (!pok || !pv.Online) && sok && sv.Online {
+				r.foreignDownCount++
+				primaryName := ah.p.serverName(primaryID)
+				standbyName := ah.p.serverName(cfg.StandbyForeignID)
+				offlineReason := fmt.Sprintf("Primary Foreign server %s is offline", primaryName)
+				r.lastNote = fmt.Sprintf("Primary Foreign offline (%d/%d): %s", r.foreignDownCount, autoHealThreshold, offlineReason)
+				if r.foreignDownCount < autoHealThreshold {
+					r.state = "monitoring"
+					ah.mu.Unlock()
+					return
+				}
+				if !r.lastHeal.IsZero() && now.Sub(r.lastHeal) < autoHealCooldown {
+					r.state = "cooldown"
+					r.lastNote = fmt.Sprintf("Waiting cooldown before failing over to %s (%s)", standbyName, offlineReason)
+					ah.mu.Unlock()
+					return
+				}
+				if now.Before(r.nextTry) {
+					r.state = "backoff"
+					r.lastNote = fmt.Sprintf("Last failover failed; retrying in %s (%s)",
+						r.nextTry.Sub(now).Round(time.Second), offlineReason)
+					ah.mu.Unlock()
+					return
+				}
+				select {
+				case ah.slots <- struct{}{}:
+				default:
+					r.state = "queued"
+					r.lastNote = fmt.Sprintf("Waiting for slot to fail over to %s (%s)", standbyName, offlineReason)
+					ah.mu.Unlock()
+					return
+				}
+				r.running = true
+				r.state = "probing"
+				r.lastNote = fmt.Sprintf("Benchmarking Backup Foreign server %s...", standbyName)
+				ah.mu.Unlock()
+
+				go func() {
+					defer func() { <-ah.slots }()
+					hctx, cancel := context.WithTimeout(ctx, 4*time.Minute)
+					defer cancel()
+					_ = ah.migrateTunnelForeignServer(hctx, nil, key, tv.Name, relayID, primaryID, cfg.StandbyForeignID, cfg.CDNDomain, true, offlineReason)
+				}()
+				return
+			}
+			if pok && pv.Online {
+				r.foreignDownCount = 0
+			}
+		}
+	}
+
+	unhealthy, reason := tunnelUnhealthyReason(tv)
 	if !unhealthy {
 		r.failCount = 0
 		// The path works again, whether by a heal or by itself: start the
@@ -483,7 +791,12 @@ func (ah *autoHealer) evaluateTunnel(ctx context.Context, tv tunnelView, key str
 			r.state = "cooldown"
 		} else {
 			r.state = "monitoring"
-			r.lastNote = "Tunnel link is healthy"
+			if ah.p != nil && cfg.OnStandby && cfg.StandbyForeignID != "" {
+				r.lastNote = fmt.Sprintf("Healthy on Standby Foreign (%s); watching Primary (%s)",
+					ah.p.serverName(cfg.StandbyForeignID), ah.p.serverName(cfg.PrimaryForeignID))
+			} else {
+				r.lastNote = "Tunnel link is healthy"
+			}
 		}
 		ah.mu.Unlock()
 		return
@@ -521,6 +834,10 @@ func (ah *autoHealer) evaluateTunnel(ctx context.Context, tv tunnelView, key str
 		return
 	}
 
+	effCDN := cfg.CDNDomain
+	if cfg.OnStandby {
+		effCDN = ""
+	}
 	r.running = true
 	r.state = "probing"
 	r.lastNote = "Benchmarking alternative tunnel modes..."
@@ -530,12 +847,22 @@ func (ah *autoHealer) evaluateTunnel(ctx context.Context, tv tunnelView, key str
 		defer func() { <-ah.slots }()
 		hctx, cancel := context.WithTimeout(ctx, 4*time.Minute)
 		defer cancel()
-		_ = ah.healTunnel(hctx, nil, key, tv.Name, tv.Edge.ServerID, tv.Origin.ServerID, cfg.CDNDomain, reason, false)
+		_ = ah.healTunnel(hctx, nil, key, tv.Name, tv.Edge.ServerID, tv.Origin.ServerID, effCDN, reason, false)
 	}()
 }
 
 // startManualHeal launches an immediate Smart Failover benchmark + mode switch job.
 func (ah *autoHealer) startManualHeal(name, edgeID, originID, cdnDomain string) (string, error) {
+	tunnels := pairTunnels(ah.p.fleet.views())
+	ah.migrateLegacyKeys(tunnels)
+	cfg, _ := resolveHealConfig(ah.p.store.get(), edgeID, name, healableNameCounts(tunnels))
+	if originID == "" {
+		if cfg.OnStandby && cfg.StandbyForeignID != "" {
+			originID = cfg.StandbyForeignID
+		} else if cfg.PrimaryForeignID != "" {
+			originID = cfg.PrimaryForeignID
+		}
+	}
 	if err := ah.p.knownTarget(tunnelTarget{Name: name, Edge: edgeID, Origin: originID}); err != nil {
 		return "", err
 	}
@@ -543,11 +870,8 @@ func (ah *autoHealer) startManualHeal(name, edgeID, originID, cdnDomain string) 
 		return "", errors.New("both the Relay (Iran) and Foreign servers must be in the panel to switch tunnel modes")
 	}
 	cdnDomain = strings.TrimSpace(cdnDomain)
-	tunnels := pairTunnels(ah.p.fleet.views())
-	ah.migrateLegacyKeys(tunnels)
 	key := healKeyFor(edgeID, name)
-	if cdnDomain == "" {
-		cfg, _ := resolveHealConfig(ah.p.store.get(), edgeID, name, healableNameCounts(tunnels))
+	if cdnDomain == "" && !cfg.OnStandby {
 		cdnDomain = cfg.CDNDomain
 	}
 	ah.mu.Lock()
@@ -799,146 +1123,11 @@ func (ah *autoHealer) chooseFailoverLinkPort(ctx context.Context, relayID, forei
 	return ask[0]
 }
 
-func (ah *autoHealer) healTunnel(ctx context.Context, j *job, key, name, relayID, foreignID, cdnDomain, reason string, force bool) (retErr error) {
-	say := func(format string, args ...any) {
-		msg := fmt.Sprintf(format, args...)
-		if j != nil {
-			j.say("%s", msg)
-		}
-		logf("[auto-heal %s] %s", name, msg)
-	}
-
-	var ev AutoHealEvent
-	ev.At = time.Now().UTC().Format(time.RFC3339)
-	ev.Reason = reason
-
-	defer func() {
-		var note string
-		ah.mu.Lock()
-		r := ah.runtimeOf(key)
-		r.running = false
-		r.lastCheck = time.Now()
-		if retErr != nil {
-			r.state = "error"
-			r.lastNote = retErr.Error()
-			ev.Success = false
-			ev.Error = retErr.Error()
-			// Each failure in a row doubles the wait before the next
-			// automatic attempt.
-			r.failures++
-			r.nextTry = time.Now().Add(healBackoff(r.failures))
-		} else {
-			r.failCount = 0
-			r.failures = 0
-			r.nextTry = time.Time{}
-			r.state = "monitoring"
-			if ev.ToDesc == "" {
-				// It came back by itself before anything was changed.
-				r.lastNote = "Tunnel link is healthy"
-			} else {
-				r.lastHeal = time.Now()
-				r.lastNote = fmt.Sprintf("Switched to %s (Score %d/100)", ev.ToDesc, ev.Score)
-			}
-			ev.Success = true
-		}
-		note = r.lastNote
-		ah.mu.Unlock()
-
-		if ev.FromDesc != "" || ev.Error != "" {
-			_ = ah.p.store.update(func(st *State) error {
-				if st.AutoHeal == nil {
-					st.AutoHeal = map[string]AutoHealConfig{}
-				}
-				c := st.AutoHeal[key]
-				c.LastHeal = ev.At
-				c.LastNote = note
-				c.History = append([]AutoHealEvent{ev}, c.History...)
-				if len(c.History) > 20 {
-					c.History = c.History[:20]
-				}
-				st.AutoHeal[key] = c
-				return nil
-			})
-			if ah.p.notifier != nil {
-				if ev.Success && ev.ToDesc != "" {
-					ah.p.notifier.notifyFailover(name, ev.FromDesc, ev.ToDesc, ev.Reason, true, "")
-				} else if !ev.Success && ev.Error != "" {
-					ah.p.notifier.notifyFailover(name, ev.FromDesc, "", ev.Reason, false, ev.Error)
-				}
-			}
-		}
-	}()
-
-	// Only one heal at a time may be working on a given server.
-	defer ah.lockServers(relayID, foreignID)()
-
-	// Refresh both servers first so we have fresh tunnel info and addresses.
-	ah.p.refreshOne(relayID)
-	ah.p.refreshOne(foreignID)
-
-	var tv *tunnelView
-	for _, item := range pairTunnels(ah.p.fleet.views()) {
-		// The relay is part of the match: another pair of servers may have a
-		// tunnel with the same name.
-		if item.Name == name && edgeIDOf(item) == relayID {
-			copyItem := item
-			tv = &copyItem
-			break
-		}
-	}
-	if tv == nil || tv.Edge == nil || tv.Origin == nil {
-		return fmt.Errorf("tunnel %q could not be found on both Relay and Foreign servers", name)
-	}
-	curInfo := tv.Edge.Info
-	ev.FromDesc = describeTunnelInfo(curInfo)
-	if cdnDomain == "" {
-		if dom := extractTunnelCDNDomain(curInfo); dom != "" {
-			cdnDomain = dom
-			_ = ah.p.store.update(func(st *State) error {
-				if st.AutoHeal == nil {
-					st.AutoHeal = map[string]AutoHealConfig{}
-				}
-				c := st.AutoHeal[key]
-				if c.CDNDomain == "" {
-					c.CDNDomain = dom
-					st.AutoHeal[key] = c
-				}
-				return nil
-			})
-		}
-	}
-
-	if !force {
-		if unhealthy, _ := tunnelUnhealthyReason(*tv); !unhealthy {
-			say("Tunnel %q recovered on its own before failover started.", name)
-			ev.FromDesc = "" // do not record a spurious event
-			return nil
-		}
-	}
-
-	say("Tunnel %q (%s) triggered Smart Failover (%s). Benchmarking all available paths...", name, ev.FromDesc, reason)
-	rep, err := ah.p.probeBetweenServers(ctx, relayID, foreignID, cdnDomain)
-	if err != nil {
-		return fmt.Errorf("could not benchmark paths between servers: %s", plainAgentError(err))
-	}
-
-	best, ok := ah.pickBestCandidate(rep, curInfo, force)
-	if !ok {
-		return errors.New("all tested tunnel modes (Direct, Reverse, IPv4, IPv6, CDN) failed or were blocked between these servers")
-	}
-	say("Best working path found: %s (%s, score %d/100).", best.Label, best.Summary, best.Score)
-
-	ah.mu.Lock()
-	if r := ah.rt[key]; r != nil {
-		r.state = "switching"
-		r.lastNote = fmt.Sprintf("Switching to %s...", best.Label)
-	}
-	ah.mu.Unlock()
-
+func (ah *autoHealer) buildFailoverEditSpec(ctx context.Context, name, relayID, foreignID, cdnDomain string, curInfo agent.TunnelInfo, best engine.ProbeCandidateResult, changingForeign, toStandby bool) (agent.EditSpec, int, error) {
 	rv, rok := ah.p.viewOf(relayID)
 	fv, fok := ah.p.viewOf(foreignID)
 	if !rok || !fok {
-		return errors.New("one of the tunnel's servers is no longer in the panel")
+		return agent.EditSpec{}, 0, errors.New("one of the tunnel's servers is no longer in the panel")
 	}
 	rv4, rv6 := addressesOf(rv)
 	fv4, fv6 := addressesOf(fv)
@@ -946,17 +1135,21 @@ func (ah *autoHealer) healTunnel(ctx context.Context, j *job, key, name, relayID
 	localIP, peerIP := rv4, fv4
 	if best.IPv6 {
 		if rv6 == "" || fv6 == "" {
-			return errors.New("selected IPv6 candidate, but one of the servers has no public IPv6 address")
+			return agent.EditSpec{}, 0, errors.New("selected IPv6 candidate, but one of the servers has no public IPv6 address")
 		}
 		localIP, peerIP = rv6, fv6
 	} else {
-		// Preserve custom IPv4 local/peer address if already IPv4.
 		if ip := net.ParseIP(curInfo.LocalIP); ip != nil && ip.To4() != nil {
 			localIP = curInfo.LocalIP
 		}
-		if ip := net.ParseIP(curInfo.PeerIP); ip != nil && ip.To4() != nil {
-			peerIP = curInfo.PeerIP
+		if !changingForeign {
+			if ip := net.ParseIP(curInfo.PeerIP); ip != nil && ip.To4() != nil {
+				peerIP = curInfo.PeerIP
+			}
 		}
+	}
+	if peerIP == "" {
+		return agent.EditSpec{}, 0, fmt.Errorf("could not determine a public IP address for %s", ah.p.serverName(foreignID))
 	}
 
 	linkPort := ah.chooseFailoverLinkPort(ctx, relayID, foreignID, curInfo, best)
@@ -999,33 +1192,32 @@ func (ah *autoHealer) healTunnel(ctx context.Context, j *job, key, name, relayID
 	realSite := !best.CDN && !best.Asymmetric && (best.Transport == "tls" || best.Transport == "xhttp" || best.Transport == "grpc")
 
 	// A CDN backup route the owner set up is kept where it can still work: on a
-	// direct website-style link. It cannot be combined with showing the real
-	// website to strangers (the CDN's own connection carries no proof), so that
-	// is left off for the tunnel that keeps the backup.
+	// direct website-style link to the Primary Foreign server.
 	altHost := ""
-	switch best.Transport {
-	case "tls", "wss", "xhttp", "h2", "grpc":
-		// (IPv6 between the servers cannot be combined with a CDN route.)
-		if curInfo.AltHost != "" && !best.CDN && !best.Asymmetric && !best.IPv6 && best.Mode == "direct" {
-			altHost = curInfo.AltHost
-			realSite = false
+	if !toStandby {
+		switch best.Transport {
+		case "tls", "wss", "xhttp", "h2", "grpc":
+			if curInfo.AltHost != "" && !best.CDN && !best.Asymmetric && !best.IPv6 && best.Mode == "direct" {
+				altHost = curInfo.AltHost
+				realSite = false
+			}
 		}
 	}
 
 	spec := agent.EditSpec{
-		Name:       name,
-		Mode:       best.Mode,
-		Transport:  best.Transport,
-		LinkPort:   linkPort,
-		PeerIP:     peerIP,
-		LocalIP:    localIP,
-		IPv6:       &ipv6Flag,
-		ServerName: serverName,
-		CDN:        onOff(best.CDN),
-		AltHost:    altHost,
-		CleanIPs:   "",
-		// The tunnel's own clean addresses are kept when it stays on a CDN link.
-		KeepCleanIPs: best.CDN,
+		Name:         name,
+		Mode:         best.Mode,
+		Transport:    best.Transport,
+		LinkPort:     linkPort,
+		ForwardProto: curInfo.ForwardProto,
+		PeerIP:       peerIP,
+		LocalIP:      localIP,
+		IPv6:         &ipv6Flag,
+		ServerName:   serverName,
+		CDN:          onOff(best.CDN),
+		AltHost:      altHost,
+		CleanIPs:     "",
+		KeepCleanIPs: best.CDN && !toStandby,
 		UTLS:         onOff(best.Stealth),
 		TLSFragment:  onOff(best.Stealth),
 		HTTPHeader:   onOff(best.WebHeader),
@@ -1046,6 +1238,490 @@ func (ah *autoHealer) healTunnel(ctx context.Context, j *job, key, name, relayID
 		Mux:          muxMode,
 		MuxLinks:     muxLinks,
 		Pool:         curInfo.PoolSize,
+	}
+	return spec, linkPort, nil
+}
+
+type foreignMigrationOutcome struct {
+	migrated                bool
+	onStandby               bool
+	primaryForeignID        string
+	pendingCleanupForeignID string
+}
+
+// doMigrateToForeign benchmarks (relayID, toForeignID), stages the updated Edge
+// config on relayID, deploys the Origin half on toForeignID (rolling back on any
+// failure), commits relayID, and cleans up fromForeignID (or queues deferred
+// cleanup if fromForeignID is currently offline). Caller must already hold
+// ah.lockServers(relayID, fromForeignID, toForeignID).
+func (ah *autoHealer) doMigrateToForeign(ctx context.Context, say func(string, ...any), key, name, relayID, fromForeignID, toForeignID, cdnDomain string, toStandby bool, curInfo agent.TunnelInfo, ev *AutoHealEvent) (foreignMigrationOutcome, error) {
+	var out foreignMigrationOutcome
+	relayName := ah.p.serverName(relayID)
+	fromName := ah.p.serverName(fromForeignID)
+	destName := ah.p.serverName(toForeignID)
+
+	ah.p.refreshOne(toForeignID)
+	destView, ok := ah.p.viewOf(toForeignID)
+	if !ok || !destView.Online {
+		return out, fmt.Errorf("destination Foreign server %s is not online", destName)
+	}
+
+	destHasSamePair := false
+	if destView.Overview != nil {
+		for _, ti := range destView.Overview.Tunnels {
+			if ti.Name == name {
+				if ti.Role == "origin" && ti.PairID != "" && ti.PairID == curInfo.PairID {
+					destHasSamePair = true
+				} else {
+					return out, fmt.Errorf("%s already has a different tunnel named %q", destName, name)
+				}
+			}
+		}
+	}
+
+	effCDN := cdnDomain
+	if toStandby {
+		effCDN = ""
+	}
+	if toStandby {
+		say("Failing over tunnel %q from %s to Backup Foreign server %s. Benchmarking available routes...", name, fromName, destName)
+	} else {
+		say("Failing back tunnel %q from %s to Primary Foreign server %s. Benchmarking available routes...", name, fromName, destName)
+	}
+
+	rep, err := ah.probe(ctx, relayID, toForeignID, effCDN)
+	if err != nil {
+		return out, fmt.Errorf("could not benchmark paths between %s and %s: %s", relayName, destName, plainAgentError(err))
+	}
+	best, found := ah.pickBestCandidate(rep, curInfo, true)
+	if !found {
+		return out, fmt.Errorf("all tested tunnel modes between %s and %s failed or were blocked", relayName, destName)
+	}
+	say("Best route to %s: %s (%s, score %d/100).", destName, best.Label, best.Summary, best.Score)
+
+	ah.mu.Lock()
+	if r := ah.rt[key]; r != nil {
+		r.state = "switching"
+		r.lastNote = fmt.Sprintf("Moving tunnel to %s (%s)...", destName, best.Label)
+	}
+	ah.mu.Unlock()
+
+	spec, linkPort, err := ah.buildFailoverEditSpec(ctx, name, relayID, toForeignID, effCDN, curInfo, best, true, toStandby)
+	if err != nil {
+		return out, err
+	}
+
+	toDesc := fmt.Sprintf("%s · %s", destName, describeCandidate(best))
+	say("Preparing new configuration (%s on port %d) on %s...", toDesc, linkPort, relayName)
+	spec.Stage = "prepare"
+	var prep agent.EdgeResult
+	status, err := ah.p.callJSON(ctx, relayID, "/api/tunnel/edit-edge", spec, &prep)
+	if err != nil {
+		return out, fmt.Errorf("%s could not prepare migration: %s", relayName, plainAgentError(err))
+	}
+	if !prep.OK {
+		if prep.Error == "" {
+			prep.Error = fmt.Sprintf("HTTP %d", status)
+		}
+		return out, fmt.Errorf("%s rejected migration config: %s", relayName, prep.Error)
+	}
+
+	rollbackRelay := func() {
+		rctx, rcancel := context.WithTimeout(context.Background(), 90*time.Second)
+		defer rcancel()
+		var rb agent.EdgeResult
+		_, _ = ah.p.callJSON(rctx, relayID, "/api/tunnel/edit-edge", agent.EditSpec{
+			Name:    name,
+			Stage:   "rollback",
+			OldConf: prep.OldConf,
+		}, &rb)
+	}
+
+	say("Deploying tunnel %q on %s...", name, destName)
+	var joinRes struct {
+		OK       bool     `json:"ok"`
+		Error    string   `json:"error"`
+		Warnings []string `json:"warnings"`
+	}
+	endpoint := "/api/tunnel/join"
+	if destHasSamePair {
+		endpoint = "/api/tunnel/update"
+	}
+	_, jerr := ah.p.callJSON(ctx, toForeignID, endpoint, map[string]string{"code": prep.Code}, &joinRes)
+	if jerr == nil && !joinRes.OK {
+		jerr = errors.New(joinRes.Error)
+	}
+	if jerr != nil {
+		reason := plainAgentError(jerr)
+		say("%s could not deploy tunnel (%s); rolling back %s...", destName, reason, relayName)
+		rollbackRelay()
+		return out, fmt.Errorf("%s could not deploy tunnel: %s", destName, reason)
+	}
+
+	say("Committing firewall rules and restarting %s...", relayName)
+	var commit agent.EdgeResult
+	cstatus, cerr := ah.p.callJSON(ctx, relayID, "/api/tunnel/edit-edge", agent.EditSpec{
+		Name:    name,
+		Stage:   "commit",
+		OldConf: prep.OldConf,
+	}, &commit)
+	if cerr == nil && !commit.OK {
+		if commit.Error == "" {
+			commit.Error = fmt.Sprintf("HTTP %d", cstatus)
+		}
+		cerr = errors.New(commit.Error)
+	}
+	if cerr != nil {
+		reason := plainAgentError(cerr)
+		say("%s could not commit migration (%s); cleaning up %s and rolling back...", relayName, reason, destName)
+		if !destHasSamePair {
+			rctx, rcancel := context.WithTimeout(context.Background(), 45*time.Second)
+			_ = ah.p.deleteHalf(rctx, toForeignID, name)
+			rcancel()
+		}
+		rollbackRelay()
+		return out, fmt.Errorf("%s could not restart on migrated config: %s", relayName, reason)
+	}
+
+	var reSync struct {
+		OK    bool   `json:"ok"`
+		Error string `json:"error"`
+	}
+	_, _ = ah.p.callJSON(ctx, toForeignID, "/api/tunnel/service", map[string]string{
+		"name":   name,
+		"action": "restart",
+	}, &reSync)
+
+	pendingCleanup := ""
+	if fromForeignID != "" && fromForeignID != toForeignID {
+		dctx, dcancel := context.WithTimeout(context.Background(), 20*time.Second)
+		if derr := ah.p.deleteHalf(dctx, fromForeignID, name); derr != nil {
+			pendingCleanup = fromForeignID
+			say("Note: %s is currently unreachable; its stale tunnel half will be cleaned up automatically when it comes back online.", fromName)
+		} else {
+			ah.p.refreshOne(fromForeignID)
+		}
+		dcancel()
+	}
+
+	ah.p.refreshOne(relayID)
+	ah.p.refreshOne(toForeignID)
+
+	ev.FromDesc = fmt.Sprintf("%s · %s", fromName, describeTunnelInfo(curInfo))
+	ev.ToDesc = toDesc
+	ev.Candidate = best.ID
+	ev.Score = best.Score
+
+	primaryID := toForeignID
+	if toStandby {
+		primaryID = fromForeignID
+	}
+	out = foreignMigrationOutcome{
+		migrated:                true,
+		onStandby:               toStandby,
+		primaryForeignID:        primaryID,
+		pendingCleanupForeignID: pendingCleanup,
+	}
+	say("Tunnel %q is now live on %s [%s] (Score %d/100)!", name, destName, describeCandidate(best), best.Score)
+	return out, nil
+}
+
+func (ah *autoHealer) migrateTunnelForeignServer(ctx context.Context, j *job, key, name, relayID, fromForeignID, toForeignID, cdnDomain string, toStandby bool, reason string) (retErr error) {
+	say := func(format string, args ...any) {
+		msg := fmt.Sprintf(format, args...)
+		if j != nil {
+			j.say("%s", msg)
+		}
+		logf("[auto-heal %s] %s", name, msg)
+	}
+
+	var ev AutoHealEvent
+	ev.At = time.Now().UTC().Format(time.RFC3339)
+	ev.Reason = reason
+	var migOut foreignMigrationOutcome
+
+	defer func() {
+		var note string
+		ah.mu.Lock()
+		r := ah.runtimeOf(key)
+		r.running = false
+		r.lastCheck = time.Now()
+		if retErr != nil {
+			r.state = "error"
+			r.lastNote = retErr.Error()
+			ev.Success = false
+			ev.Error = retErr.Error()
+			r.failures++
+			r.nextTry = time.Now().Add(healBackoff(r.failures))
+		} else {
+			r.failCount = 0
+			r.foreignDownCount = 0
+			r.primaryUpStreak = 0
+			r.failures = 0
+			r.nextTry = time.Time{}
+			r.state = "monitoring"
+			if ev.ToDesc != "" {
+				r.lastHeal = time.Now()
+				if migOut.onStandby {
+					r.lastNote = fmt.Sprintf("Failed over to Standby %s (Score %d/100)", ev.ToDesc, ev.Score)
+				} else {
+					r.lastNote = fmt.Sprintf("Failed back to Primary %s (Score %d/100)", ev.ToDesc, ev.Score)
+				}
+			} else {
+				r.lastNote = "Tunnel link is healthy"
+			}
+			ev.Success = true
+		}
+		note = r.lastNote
+		ah.mu.Unlock()
+
+		if ev.FromDesc != "" || ev.Error != "" {
+			_ = ah.p.store.update(func(st *State) error {
+				if st.AutoHeal == nil {
+					st.AutoHeal = map[string]AutoHealConfig{}
+				}
+				c := st.AutoHeal[key]
+				if migOut.migrated {
+					c.OnStandby = migOut.onStandby
+					if migOut.primaryForeignID != "" {
+						c.PrimaryForeignID = migOut.primaryForeignID
+					}
+					c.PendingCleanupForeignID = migOut.pendingCleanupForeignID
+				}
+				c.LastHeal = ev.At
+				c.LastNote = note
+				c.History = append([]AutoHealEvent{ev}, c.History...)
+				if len(c.History) > 20 {
+					c.History = c.History[:20]
+				}
+				st.AutoHeal[key] = c
+				return nil
+			})
+			if ah.p.notifier != nil {
+				if ev.Success && ev.ToDesc != "" {
+					ah.p.notifier.notifyFailover(name, ev.FromDesc, ev.ToDesc, ev.Reason, true, "")
+				} else if !ev.Success && ev.Error != "" {
+					ah.p.notifier.notifyFailover(name, ev.FromDesc, "", ev.Reason, false, ev.Error)
+				}
+			}
+		}
+	}()
+
+	defer ah.lockServers(relayID, fromForeignID, toForeignID)()
+
+	ah.p.refreshOne(relayID)
+	if fv, ok := ah.p.viewOf(fromForeignID); ok && fv.Online {
+		ah.p.refreshOne(fromForeignID)
+	}
+
+	rv, rok := ah.p.viewOf(relayID)
+	if !rok || !rv.Online || rv.Overview == nil {
+		return fmt.Errorf("Relay server %s is not reachable", ah.p.serverName(relayID))
+	}
+	var curInfo *agent.TunnelInfo
+	for _, ti := range rv.Overview.Tunnels {
+		if ti.Name == name && ti.Role == "edge" {
+			copyTI := ti
+			curInfo = &copyTI
+			break
+		}
+	}
+	if curInfo == nil {
+		return fmt.Errorf("tunnel %q was not found on Relay server %s", name, ah.p.serverName(relayID))
+	}
+	if !curInfo.Running {
+		say("Tunnel %q is stopped on %s; skipping migration.", name, ah.p.serverName(relayID))
+		return nil
+	}
+
+	ev.FromDesc = fmt.Sprintf("%s · %s", ah.p.serverName(fromForeignID), describeTunnelInfo(*curInfo))
+	var err error
+	migOut, err = ah.doMigrateToForeign(ctx, say, key, name, relayID, fromForeignID, toForeignID, cdnDomain, toStandby, *curInfo, &ev)
+	return err
+}
+
+func (ah *autoHealer) healTunnel(ctx context.Context, j *job, key, name, relayID, foreignID, cdnDomain, reason string, force bool) (retErr error) {
+	say := func(format string, args ...any) {
+		msg := fmt.Sprintf(format, args...)
+		if j != nil {
+			j.say("%s", msg)
+		}
+		logf("[auto-heal %s] %s", name, msg)
+	}
+
+	var ev AutoHealEvent
+	ev.At = time.Now().UTC().Format(time.RFC3339)
+	ev.Reason = reason
+	var migOut foreignMigrationOutcome
+
+	curStoreCfg := ah.p.store.get().AutoHeal[key]
+	standbyCandidateID := ""
+	if !curStoreCfg.OnStandby && curStoreCfg.StandbyForeignID != "" && curStoreCfg.StandbyForeignID != foreignID {
+		standbyCandidateID = curStoreCfg.StandbyForeignID
+	}
+
+	defer func() {
+		var note string
+		ah.mu.Lock()
+		r := ah.runtimeOf(key)
+		r.running = false
+		r.lastCheck = time.Now()
+		if retErr != nil {
+			r.state = "error"
+			r.lastNote = retErr.Error()
+			ev.Success = false
+			ev.Error = retErr.Error()
+			// Each failure in a row doubles the wait before the next
+			// automatic attempt.
+			r.failures++
+			r.nextTry = time.Now().Add(healBackoff(r.failures))
+		} else {
+			r.failCount = 0
+			r.foreignDownCount = 0
+			r.primaryUpStreak = 0
+			r.failures = 0
+			r.nextTry = time.Time{}
+			r.state = "monitoring"
+			if ev.ToDesc == "" {
+				// It came back by itself before anything was changed.
+				r.lastNote = "Tunnel link is healthy"
+			} else {
+				r.lastHeal = time.Now()
+				if migOut.migrated && migOut.onStandby {
+					r.lastNote = fmt.Sprintf("Failed over to Standby %s (Score %d/100)", ev.ToDesc, ev.Score)
+				} else {
+					r.lastNote = fmt.Sprintf("Switched to %s (Score %d/100)", ev.ToDesc, ev.Score)
+				}
+			}
+			ev.Success = true
+		}
+		note = r.lastNote
+		ah.mu.Unlock()
+
+		if ev.FromDesc != "" || ev.Error != "" {
+			_ = ah.p.store.update(func(st *State) error {
+				if st.AutoHeal == nil {
+					st.AutoHeal = map[string]AutoHealConfig{}
+				}
+				c := st.AutoHeal[key]
+				if migOut.migrated {
+					c.OnStandby = migOut.onStandby
+					if migOut.primaryForeignID != "" {
+						c.PrimaryForeignID = migOut.primaryForeignID
+					}
+					c.PendingCleanupForeignID = migOut.pendingCleanupForeignID
+				}
+				c.LastHeal = ev.At
+				c.LastNote = note
+				c.History = append([]AutoHealEvent{ev}, c.History...)
+				if len(c.History) > 20 {
+					c.History = c.History[:20]
+				}
+				st.AutoHeal[key] = c
+				return nil
+			})
+			if ah.p.notifier != nil {
+				if ev.Success && ev.ToDesc != "" {
+					ah.p.notifier.notifyFailover(name, ev.FromDesc, ev.ToDesc, ev.Reason, true, "")
+				} else if !ev.Success && ev.Error != "" {
+					ah.p.notifier.notifyFailover(name, ev.FromDesc, "", ev.Reason, false, ev.Error)
+				}
+			}
+		}
+	}()
+
+	// Only one heal at a time may be working on a given server.
+	defer ah.lockServers(relayID, foreignID, standbyCandidateID)()
+
+	// Refresh both servers first so we have fresh tunnel info and addresses.
+	ah.p.refreshOne(relayID)
+	ah.p.refreshOne(foreignID)
+
+	var tv *tunnelView
+	for _, item := range pairTunnels(ah.p.fleet.views()) {
+		// The relay is part of the match: another pair of servers may have a
+		// tunnel with the same name.
+		if item.Name == name && edgeIDOf(item) == relayID {
+			copyItem := item
+			tv = &copyItem
+			break
+		}
+	}
+	if tv == nil || tv.Edge == nil {
+		return fmt.Errorf("tunnel %q could not be found on Relay server", name)
+	}
+	curInfo := tv.Edge.Info
+	if tv.Origin == nil {
+		if standbyCandidateID != "" {
+			if sv, sok := ah.p.viewOf(standbyCandidateID); sok && sv.Online {
+				ev.FromDesc = fmt.Sprintf("%s · %s", ah.p.serverName(foreignID), describeTunnelInfo(curInfo))
+				var merr error
+				migOut, merr = ah.doMigrateToForeign(ctx, say, key, name, relayID, foreignID, standbyCandidateID, "", true, curInfo, &ev)
+				return merr
+			}
+		}
+		return fmt.Errorf("tunnel %q could not be found on both Relay and Foreign servers", name)
+	}
+	ev.FromDesc = describeTunnelInfo(curInfo)
+	if cdnDomain == "" && !curStoreCfg.OnStandby {
+		if dom := extractTunnelCDNDomain(curInfo); dom != "" {
+			cdnDomain = dom
+			_ = ah.p.store.update(func(st *State) error {
+				if st.AutoHeal == nil {
+					st.AutoHeal = map[string]AutoHealConfig{}
+				}
+				c := st.AutoHeal[key]
+				if c.CDNDomain == "" {
+					c.CDNDomain = dom
+					st.AutoHeal[key] = c
+				}
+				return nil
+			})
+		}
+	}
+
+	if !force {
+		if unhealthy, _ := tunnelUnhealthyReason(*tv); !unhealthy {
+			say("Tunnel %q recovered on its own before failover started.", name)
+			ev.FromDesc = "" // do not record a spurious event
+			return nil
+		}
+	}
+
+	say("Tunnel %q (%s) triggered Smart Failover (%s). Benchmarking all available paths...", name, ev.FromDesc, reason)
+	rep, err := ah.probe(ctx, relayID, foreignID, cdnDomain)
+	var best engine.ProbeCandidateResult
+	var ok bool
+	if err == nil {
+		best, ok = ah.pickBestCandidate(rep, curInfo, force)
+	}
+	if err != nil || !ok {
+		if standbyCandidateID != "" {
+			if sv, sok := ah.p.viewOf(standbyCandidateID); sok && sv.Online {
+				say("All routes to %s failed; attempting Server-Level HA failover to Backup Foreign server %s...",
+					ah.p.serverName(foreignID), ah.p.serverName(standbyCandidateID))
+				var merr error
+				migOut, merr = ah.doMigrateToForeign(ctx, say, key, name, relayID, foreignID, standbyCandidateID, "", true, curInfo, &ev)
+				return merr
+			}
+		}
+		if err != nil {
+			return fmt.Errorf("could not benchmark paths between servers: %s", plainAgentError(err))
+		}
+		return errors.New("all tested tunnel modes (Direct, Reverse, IPv4, IPv6, CDN) failed or were blocked between these servers")
+	}
+	say("Best working path found: %s (%s, score %d/100).", best.Label, best.Summary, best.Score)
+
+	ah.mu.Lock()
+	if r := ah.rt[key]; r != nil {
+		r.state = "switching"
+		r.lastNote = fmt.Sprintf("Switching to %s...", best.Label)
+	}
+	ah.mu.Unlock()
+
+	spec, linkPort, berr := ah.buildFailoverEditSpec(ctx, name, relayID, foreignID, cdnDomain, curInfo, best, false, curStoreCfg.OnStandby)
+	if berr != nil {
+		return berr
 	}
 
 	ev.Candidate = best.ID

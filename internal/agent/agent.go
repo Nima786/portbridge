@@ -90,6 +90,7 @@ type PairingData struct {
 	AsymDownlink string
 	AsymDownPort string
 	MaxConn      string
+	ForwardProto string
 
 	// Website Bridge & Smart Outbound Proxy settings.
 	WebsiteBridge         string
@@ -171,6 +172,7 @@ func decodePairingCode(code string) (*PairingData, error) {
 		AsymDownlink:  kv["asym_downlink"],
 		AsymDownPort:  kv["asym_down_port"],
 		MaxConn:       kv["max_conn"],
+		ForwardProto:  kv["forward_proto"],
 
 		WebsiteBridge:         kv["website_bridge"],
 		WebsiteDomains:        kv["website_domains"],

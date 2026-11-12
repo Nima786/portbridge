@@ -152,6 +152,7 @@ type createRequest struct {
 	UserPorts    string `json:"user_ports"`
 	LinkPort     int    `json:"link_port"`
 
+	ForwardProto  string `json:"forward_proto,omitempty"`
 	ProxyProtocol string `json:"proxy_protocol"`
 	RelayIP       string `json:"relay_ip"` // optional: the relay's address users connect to
 	AutoHeal      bool   `json:"auto_heal"`
@@ -232,7 +233,8 @@ func (p *Panel) toSpec(r createRequest) (agent.EdgeSpec, error) {
 		pool = 25
 	}
 	s := agent.EdgeSpec{Name: strings.TrimSpace(r.Name), Mode: r.Mode, Pool: pool, MaxConn: r.MaxConn,
-		ServicePorts: r.ServicePorts, UserPorts: r.UserPorts, LinkPort: r.LinkPort, ProxyProtocol: r.ProxyProtocol}
+		ServicePorts: r.ServicePorts, UserPorts: r.UserPorts, LinkPort: r.LinkPort,
+		ForwardProto: strings.TrimSpace(r.ForwardProto), ProxyProtocol: r.ProxyProtocol}
 	if r.WebsiteBridge {
 		s.WebsiteBridge = "on"
 		s.WebsiteDomains = strings.TrimSpace(r.WebsiteDomains)
@@ -663,7 +665,7 @@ func (p *Panel) checkForeignPortsForTunnel(ctx context.Context, j *job, foreignI
 		case ps.State == "free":
 			if s.WebsiteBridge == "on" {
 				j.say("Note: nothing is listening on port %d on the foreign server yet. Make sure your web server (LiteSpeed / CyberPanel / Nginx) is running there.", n)
-			} else {
+			} else if strings.ToLower(strings.TrimSpace(s.ForwardProto)) != "udp" {
 				j.say("Note: nothing is listening on port %d on the foreign server yet. Make sure your service (Xray) is running there.", n)
 			}
 		}
@@ -692,7 +694,7 @@ func (p *Panel) startCreate(r createRequest) (string, error) {
 			return "", err
 		}
 		if r.AutoHeal {
-			_ = p.healer.setConfig(r.Relay, spec.Name, true, strings.TrimSpace(r.Domain))
+			_ = p.healer.setConfig(r.Relay, spec.Name, true, strings.TrimSpace(r.Domain), nil)
 		}
 		return "", nil
 	}), nil
@@ -715,6 +717,7 @@ func edgeSpecToEditSpec(s agent.EdgeSpec) agent.EditSpec {
 		UserPorts:             s.UserPorts,
 		ServicePorts:          s.ServicePorts,
 		LinkPort:              s.LinkPort,
+		ForwardProto:          s.ForwardProto,
 		ProxyProtocol:         pp,
 		Pool:                  s.Pool,
 		MuxLinks:              s.MuxLinks,
@@ -870,7 +873,7 @@ func (p *Panel) switchTunnel(j *job, r createRequest, spec agent.EdgeSpec) error
 	}
 
 	if p.healer != nil {
-		_ = p.healer.setConfig(r.Relay, spec.Name, r.AutoHeal, strings.TrimSpace(r.Domain))
+		_ = p.healer.setConfig(r.Relay, spec.Name, r.AutoHeal, strings.TrimSpace(r.Domain), nil)
 		key := healKeyFor(r.Relay, spec.Name)
 		nowISO := time.Now().UTC().Format(time.RFC3339)
 		note := fmt.Sprintf("Manually switched to %s on port %d.", toDesc, spec.LinkPort)
@@ -1055,6 +1058,10 @@ func (p *Panel) deleteTunnel(t tunnelTarget) []halfOutcome {
 	ctx, cancel := context.WithTimeout(context.Background(), tunnelOpTimeout)
 	defer cancel()
 	var out []halfOutcome
+	pendingID := ""
+	if cfg, ok := p.store.get().AutoHeal[healKeyFor(t.Edge, t.Name)]; ok {
+		pendingID = cfg.PendingCleanupForeignID
+	}
 	for _, id := range []string{t.Origin, t.Edge} {
 		if id == "" {
 			continue
@@ -1068,6 +1075,11 @@ func (p *Panel) deleteTunnel(t tunnelTarget) []halfOutcome {
 			p.refreshOne(id)
 		}
 		out = append(out, o)
+	}
+	if pendingID != "" && pendingID != t.Origin && pendingID != t.Edge {
+		if err := p.deleteHalf(ctx, pendingID, t.Name); err == nil {
+			p.refreshOne(pendingID)
+		}
 	}
 	p.healer.forget(t.Edge, t.Name)
 	if p.traffic != nil {
@@ -1132,6 +1144,7 @@ type editTunnelRequest struct {
 	ServicePorts          string `json:"service_ports"`
 	UserPorts             string `json:"user_ports"`
 	LinkPort              int    `json:"link_port"`
+	ForwardProto          string `json:"forward_proto,omitempty"`
 	ProxyProtocol         string `json:"proxy_protocol"`
 	Mux                   string `json:"mux"`
 	Pool                  int    `json:"pool"`
@@ -1174,6 +1187,7 @@ func (p *Panel) editTunnel(j *job, r editTunnelRequest) error {
 		UserPorts:             strings.TrimSpace(r.UserPorts),
 		ServicePorts:          strings.TrimSpace(r.ServicePorts),
 		LinkPort:              r.LinkPort,
+		ForwardProto:          strings.TrimSpace(r.ForwardProto),
 		ProxyProtocol:         strings.TrimSpace(r.ProxyProtocol),
 		Mux:                   strings.TrimSpace(r.Mux),
 		Pool:                  r.Pool,

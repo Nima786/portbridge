@@ -84,6 +84,7 @@ type TunnelInfo struct {
 	AsymDownlink          string      `json:"asym_downlink,omitempty"`
 	AsymDownPort          int         `json:"asym_down_port,omitempty"`
 	ProxyProtocol         string      `json:"proxy_protocol"`
+	ForwardProto          string      `json:"forward_proto,omitempty"`
 	WebsiteBridge         bool        `json:"website_bridge,omitempty"`
 	WebsiteDomains        string      `json:"website_domains,omitempty"`
 	OutboundProxy         bool        `json:"outbound_proxy,omitempty"`
@@ -208,6 +209,7 @@ func tunnelInfo(path string, host agentHost) TunnelInfo {
 	if cfg.ProxyProtocol != 0 {
 		ti.ProxyProtocol = "v" + strconv.Itoa(cfg.ProxyProtocol)
 	}
+	ti.ForwardProto = cfg.EffectiveForwardProto()
 	ti.PoolSize = cfg.PoolSize
 	if cfg.Mux {
 		ti.MuxLinks = cfg.MuxLinks

@@ -33,9 +33,24 @@ type tunnelView struct {
 }
 
 func pairTunnels(servers []serverView) []tunnelView {
+	// Process online servers before offline ones so an active HA Standby Foreign
+	// server always pairs with the live Relay edge ahead of an offline Primary's
+	// cached overview.
+	ordered := make([]serverView, 0, len(servers))
+	for _, s := range servers {
+		if s.Online {
+			ordered = append(ordered, s)
+		}
+	}
+	for _, s := range servers {
+		if !s.Online {
+			ordered = append(ordered, s)
+		}
+	}
+
 	byPair := map[string]*tunnelView{}
 	var out []*tunnelView
-	for _, s := range servers {
+	for _, s := range ordered {
 		if s.Overview == nil {
 			continue
 		}

@@ -148,14 +148,20 @@ type AutoHealEvent struct {
 
 // AutoHealConfig holds per-tunnel Auto-Heal & Smart Failover settings and history.
 type AutoHealConfig struct {
-	Enabled   bool            `json:"enabled"`
-	CDNDomain string          `json:"cdn_domain,omitempty"`
-	State     string          `json:"state,omitempty"`      // "monitoring", "probing", "switching", "cooldown", "error"
-	FailCount int             `json:"fail_count,omitempty"` // consecutive unhealthy checks
-	LastCheck string          `json:"last_check,omitempty"`
-	LastHeal  string          `json:"last_heal,omitempty"`
-	LastNote  string          `json:"last_note,omitempty"`
-	History   []AutoHealEvent `json:"history,omitempty"`
+	Enabled                 bool            `json:"enabled"`
+	CDNDomain               string          `json:"cdn_domain,omitempty"`
+	StandbyForeignID        string          `json:"standby_foreign_id,omitempty"`
+	StandbyForeignName      string          `json:"standby_foreign_name,omitempty"`
+	PrimaryForeignID        string          `json:"primary_foreign_id,omitempty"`
+	PrimaryForeignName      string          `json:"primary_foreign_name,omitempty"`
+	OnStandby               bool            `json:"on_standby,omitempty"`
+	PendingCleanupForeignID string          `json:"pending_cleanup_foreign_id,omitempty"`
+	State                   string          `json:"state,omitempty"`      // "monitoring", "probing", "switching", "cooldown", "error"
+	FailCount               int             `json:"fail_count,omitempty"` // consecutive unhealthy checks
+	LastCheck               string          `json:"last_check,omitempty"`
+	LastHeal                string          `json:"last_heal,omitempty"`
+	LastNote                string          `json:"last_note,omitempty"`
+	History                 []AutoHealEvent `json:"history,omitempty"`
 }
 
 // TunnelTraffic holds persistent byte counters and monthly quota settings for one tunnel.

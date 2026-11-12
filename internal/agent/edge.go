@@ -63,6 +63,7 @@ type EdgeSpec struct {
 	AsymDownPort int    `json:"asym_down_port,omitempty"`
 
 	ProxyProtocol string `json:"proxy_protocol,omitempty"` // off, v1 or v2
+	ForwardProto  string `json:"forward_proto,omitempty"`  // tcp (default), udp, or both
 	Mux           string `json:"mux,omitempty"`
 	MuxLinks      int    `json:"mux_links,omitempty"`
 	Pool          int    `json:"pool,omitempty"`
@@ -261,6 +262,10 @@ func (s *EdgeSpec) normalise() {
 	if s.RealSite == "on" {
 		s.UTLS = "on"
 	}
+	s.ForwardProto = strings.ToLower(strings.TrimSpace(s.ForwardProto))
+	if s.ForwardProto == "tcp" {
+		s.ForwardProto = ""
+	}
 }
 
 // joinPorts tidies a list of ports the way the menu's prompts do.
@@ -328,6 +333,14 @@ func (s *EdgeSpec) check() error {
 	}
 	if !engine.ValidAsymUplink(s.AsymUplink) {
 		return fmt.Errorf("asym_uplink %q is not supported", s.AsymUplink)
+	}
+	switch s.ForwardProto {
+	case "", "tcp", "udp", "both":
+	default:
+		return fmt.Errorf("forward_proto must be tcp, udp or both, got %q", s.ForwardProto)
+	}
+	if s.WebsiteBridge == "on" && s.ForwardProto == "udp" {
+		return errors.New("website bridges require TCP forwarding (forward_proto cannot be udp)")
 	}
 	if !engine.ValidAsymDownlink(s.AsymDownlink) {
 		return fmt.Errorf("asym_downlink %q is not supported", s.AsymDownlink)
@@ -663,6 +676,9 @@ func buildEdgeConf(s *EdgeSpec, l edgeLayout, confDir string, now time.Time) str
 			w("asym_down_port = %d\n", s.AsymDownPort)
 		}
 	}
+	if s.ForwardProto == "udp" || s.ForwardProto == "both" {
+		w("forward_proto = %s\n", s.ForwardProto)
+	}
 	if s.ProxyProtocol == "v1" || s.ProxyProtocol == "v2" {
 		w("\n# Pass each user's real address on; the service must be set to expect it.\n")
 		w("proxy_protocol = %s\n", s.ProxyProtocol)
@@ -838,6 +854,10 @@ func EncodePairingCode(p *PairingData) string {
 		}
 		v = max(v, 10)
 	}
+	if fp := strings.ToLower(strings.TrimSpace(p.ForwardProto)); fp == "udp" || fp == "both" {
+		fmt.Fprintf(&extra, "forward_proto=%s\n", fp)
+		v = max(v, 10)
+	}
 	mux, links := p.Mux, p.MuxLinks
 	if mux == "" {
 		mux = "off"
@@ -915,6 +935,7 @@ func edgePairingCode(confDir, name string) (string, error) {
 		OutboundProxy: kv["outbound_proxy"], OutboundProxyPort: kv["outbound_proxy_port"],
 		OutboundProxyMode: kv["outbound_proxy_mode"], OutboundIranDomains: kv["outbound_iran_domains"],
 		OutboundBypassDomains: kv["outbound_bypass_domains"],
+		ForwardProto:          kv["forward_proto"],
 		Secret:                strings.TrimSpace(string(secret)),
 	}), nil
 }
@@ -946,11 +967,22 @@ func checkEdgePorts(s *EdgeSpec, confDir string, host agentHost) error {
 		}
 		return ""
 	}
+	checkTCPUser := s.ForwardProto != "udp"
+	checkUDPUser := s.ForwardProto == "udp" || s.ForwardProto == "both"
 	for _, u := range portsIn(s.UserPorts) {
 		if o := owner(u); o != "" {
 			problems = append(problems, fmt.Sprintf("users' port %d is already used on this server by %s", u, o))
-		} else if err := host.PortFree(engine.TransportPlain, u); err != nil {
-			problems = append(problems, fmt.Sprintf("users' port %d is already in use on this server by another program", u))
+		} else {
+			if checkTCPUser {
+				if err := host.PortFree(engine.TransportPlain, u); err != nil {
+					problems = append(problems, fmt.Sprintf("users' port %d is already in use on this server by another program", u))
+				}
+			}
+			if checkUDPUser {
+				if err := host.PortFree(engine.TransportKCP, u); err != nil {
+					problems = append(problems, fmt.Sprintf("users' UDP port %d is already in use on this server by another program", u))
+				}
+			}
 		}
 	}
 	if !s.dialsOut() {
@@ -1219,6 +1251,7 @@ type EditSpec struct {
 	UserPorts     string `json:"user_ports,omitempty"`
 	ServicePorts  string `json:"service_ports,omitempty"`
 	LinkPort      int    `json:"link_port,omitempty"`
+	ForwardProto  string `json:"forward_proto,omitempty"`  // "tcp", "udp" or "both"
 	ProxyProtocol string `json:"proxy_protocol,omitempty"` // "off", "v1" or "v2"
 	Pool          int    `json:"pool,omitempty"`
 	MuxLinks      int    `json:"mux_links,omitempty"`
@@ -1521,6 +1554,13 @@ func EditEdge(spec EditSpec, confDir string) (EdgeResult, error) {
 		if pp == "off" {
 			pp = ""
 		}
+		fp := strings.ToLower(strings.TrimSpace(spec.ForwardProto))
+		if fp == "" {
+			fp = kv["forward_proto"]
+		}
+		if fp == "tcp" {
+			fp = ""
+		}
 
 		wb := spec.WebsiteBridge
 		if wb == "" {
@@ -1584,6 +1624,7 @@ func EditEdge(spec EditSpec, confDir string) (EdgeResult, error) {
 			AsymUplink:            spec.AsymUplink,
 			AsymDownlink:          spec.AsymDownlink,
 			AsymDownPort:          spec.AsymDownPort,
+			ForwardProto:          fp,
 			ProxyProtocol:         pp,
 			Mux:                   mux,
 			MuxLinks:              muxLinks,
@@ -1618,12 +1659,22 @@ func EditEdge(spec EditSpec, confDir string) (EdgeResult, error) {
 			}
 			return ""
 		}
+		checkTCPUser := es.ForwardProto != "udp"
+		checkUDPUser := es.ForwardProto == "udp" || es.ForwardProto == "both"
 		for _, u := range portsIn(es.UserPorts) {
 			if o := owner(u); o != "" {
 				problems = append(problems, fmt.Sprintf("user listen port %d is already used on this server by %s", u, o))
-			} else if !intInSlice(u, curUsers) && !(curCfg.Mode == engine.ModeReverse && u == curLink) {
-				if err := host.PortFree(engine.TransportPlain, u); err != nil {
-					problems = append(problems, fmt.Sprintf("user listen port %d is already in use on this server by another program", u))
+			} else {
+				alreadyHeldPort := intInSlice(u, curUsers) || (curCfg.Mode == engine.ModeReverse && u == curLink)
+				if checkTCPUser && !(alreadyHeldPort && curCfg.ForwardsTCP()) {
+					if err := host.PortFree(engine.TransportPlain, u); err != nil {
+						problems = append(problems, fmt.Sprintf("user listen port %d is already in use on this server by another program", u))
+					}
+				}
+				if checkUDPUser && !(intInSlice(u, curUsers) && curCfg.ForwardsUDP()) {
+					if err := host.PortFree(engine.TransportKCP, u); err != nil {
+						problems = append(problems, fmt.Sprintf("user UDP listen port %d is already in use on this server by another program", u))
+					}
 				}
 			}
 		}
@@ -1759,6 +1810,19 @@ func EditEdge(spec EditSpec, confDir string) (EdgeResult, error) {
 			}
 		}
 
+		effForwardProto := curCfg.EffectiveForwardProto()
+		if fp := strings.ToLower(strings.TrimSpace(spec.ForwardProto)); fp != "" {
+			switch fp {
+			case "tcp", "udp", "both":
+				effForwardProto = fp
+			default:
+				return res, fmt.Errorf("forward_proto must be tcp, udp or both, got %q", spec.ForwardProto)
+			}
+		}
+		if effForwardProto == "udp" && (curCfg.WebsiteBridge || spec.WebsiteBridge == "on") {
+			return res, errors.New("website reverse bridge requires TCP (use forward_proto = tcp or both)")
+		}
+
 		// Check port clashes on this Relay server, ignoring ports already held by this tunnel itself.
 		var problems []string
 		claimed := portsClaimedByOthers(confDir, spec.Name)
@@ -1770,12 +1834,22 @@ func EditEdge(spec EditSpec, confDir string) (EdgeResult, error) {
 			}
 			return ""
 		}
+		checkTCPUser := effForwardProto != "udp"
+		checkUDPUser := effForwardProto == "udp" || effForwardProto == "both"
 		for _, u := range users {
 			if o := owner(u); o != "" {
 				problems = append(problems, fmt.Sprintf("user listen port %d is already used on this server by %s", u, o))
-			} else if !intInSlice(u, curUsers) && !(curCfg.Mode == engine.ModeReverse && u == curLink) {
-				if err := host.PortFree(engine.TransportPlain, u); err != nil {
-					problems = append(problems, fmt.Sprintf("user listen port %d is already in use on this server by another program", u))
+			} else {
+				alreadyHeldPort := intInSlice(u, curUsers) || (curCfg.Mode == engine.ModeReverse && u == curLink)
+				if checkTCPUser && !(alreadyHeldPort && curCfg.ForwardsTCP()) {
+					if err := host.PortFree(engine.TransportPlain, u); err != nil {
+						problems = append(problems, fmt.Sprintf("user listen port %d is already in use on this server by another program", u))
+					}
+				}
+				if checkUDPUser && !(intInSlice(u, curUsers) && curCfg.ForwardsUDP()) {
+					if err := host.PortFree(engine.TransportKCP, u); err != nil {
+						problems = append(problems, fmt.Sprintf("user UDP listen port %d is already in use on this server by another program", u))
+					}
 				}
 			}
 		}
@@ -1804,6 +1878,16 @@ func EditEdge(spec EditSpec, confDir string) (EdgeResult, error) {
 		}
 	}
 
+	if fp := strings.ToLower(strings.TrimSpace(spec.ForwardProto)); fp != "" {
+		switch fp {
+		case "tcp":
+			text = dropConfKey(text, "forward_proto")
+		case "udp", "both":
+			text = setConfKey(text, "forward_proto", fp)
+		default:
+			return res, fmt.Errorf("forward_proto must be tcp, udp or both, got %q", spec.ForwardProto)
+		}
+	}
 	if spec.ProxyProtocol != "" {
 		switch spec.ProxyProtocol {
 		case "off", "v1", "v2":

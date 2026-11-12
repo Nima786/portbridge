@@ -171,6 +171,7 @@ func TestPairingCodeFieldsMatch(t *testing.T) {
 		"asym_downlink":           "configured from the web panel and engine",
 		"asym_down_port":          "configured from the web panel and engine",
 		"max_conn":                "configured from the web panel and engine",
+		"forward_proto":           "configured from the web panel and engine",
 		"website_bridge":          "configured from the web panel Websites tab",
 		"website_domains":         "configured from the web panel Websites tab",
 		"outbound_proxy":          "configured from the web panel Websites tab",

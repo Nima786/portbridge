@@ -252,6 +252,10 @@ type Config struct {
 	// Works with every link, mode and kind of sharing. See proxyproto.go.
 	ProxyProtocol int
 
+	// ForwardProto selects which user traffic protocol(s) the edge accepts on
+	// UserListen: "tcp" (default when empty), "udp", or "both".
+	ForwardProto string
+
 	// WebsiteBridge marks this tunnel as a dedicated Website Bridge (shown in the
 	// Websites tab of the panel rather than the VPN Tunnels tab) and enables the
 	// smart local outbound proxy on the origin server when OutboundProxy is set.
@@ -893,6 +897,16 @@ func (c *Config) Set(key, val string) error {
 		c.OutboundIranDomains = strings.TrimSpace(val)
 	case "outbound_bypass_domains":
 		c.OutboundBypassDomains = strings.TrimSpace(val)
+	case "forward_proto":
+		v := strings.ToLower(strings.TrimSpace(val))
+		switch v {
+		case "", "tcp":
+			c.ForwardProto = "tcp"
+		case "udp", "both":
+			c.ForwardProto = v
+		default:
+			return fmt.Errorf("forward_proto must be tcp, udp, or both, got %q", val)
+		}
 	default:
 		return fmt.Errorf("unknown setting %q", key)
 	}
@@ -1228,6 +1242,12 @@ func (c *Config) Validate() error {
 			return fmt.Errorf("server_name must be a hostname when using a cdn, not the address %s", c.ServerName)
 		}
 	}
+	if c.WebsiteBridge && c.ForwardsUDP() && !c.ForwardsTCP() {
+		return fmt.Errorf("website_bridge requires TCP forwarding (forward_proto cannot be udp)")
+	}
+	if rawFP := strings.ToLower(strings.TrimSpace(c.ForwardProto)); rawFP != "" && rawFP != "tcp" && rawFP != "udp" && rawFP != "both" {
+		return fmt.Errorf("forward_proto must be tcp, udp, or both, got %q", c.ForwardProto)
+	}
 	if c.OutboundProxy {
 		if c.OutboundProxyPort <= 0 {
 			c.OutboundProxyPort = 18080
@@ -1294,6 +1314,12 @@ func (c *Config) Summary() string {
 		}
 	}
 	fmt.Fprintf(&b, "Link is %s. ", describeTransport(c))
+	switch c.EffectiveForwardProto() {
+	case "udp":
+		b.WriteString("User traffic protocol is UDP. ")
+	case "both":
+		b.WriteString("User traffic protocol is TCP + UDP. ")
+	}
 	if c.ProxyProtocol != proxyproto.Off {
 		if c.Role == RoleEdge {
 			b.WriteString("Each user's real address is sent to the other server. ")
@@ -1379,4 +1405,28 @@ func (c *Config) InboundFor(port uint16) string {
 		return c.InboundAddrs[0]
 	}
 	return c.InboundAddr
+}
+
+// EffectiveForwardProto returns "tcp" (default), "udp", or "both".
+func (c *Config) EffectiveForwardProto() string {
+	switch strings.ToLower(strings.TrimSpace(c.ForwardProto)) {
+	case "udp":
+		return "udp"
+	case "both":
+		return "both"
+	default:
+		return "tcp"
+	}
+}
+
+// ForwardsTCP reports whether the tunnel forwards TCP user connections.
+func (c *Config) ForwardsTCP() bool {
+	p := c.EffectiveForwardProto()
+	return p == "tcp" || p == "both"
+}
+
+// ForwardsUDP reports whether the tunnel forwards UDP user datagram sessions.
+func (c *Config) ForwardsUDP() bool {
+	p := c.EffectiveForwardProto()
+	return p == "udp" || p == "both"
 }

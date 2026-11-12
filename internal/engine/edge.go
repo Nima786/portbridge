@@ -263,21 +263,40 @@ func runEdge(ctx context.Context, cfg *Config, st *status) error {
 	}
 
 	var userLns []net.Listener
-	for _, addr := range cfg.UserListens {
-		ln, err := net.Listen("tcp", addr)
-		if err != nil {
-			for _, prev := range userLns {
-				_ = prev.Close()
-			}
-			return fmt.Errorf("listening for users on %s: %w", addr, err)
+	var udpUserConns []net.PacketConn
+	var udpUserAddrs []string
+	closeUserListeners := func() {
+		for _, prev := range userLns {
+			_ = prev.Close()
 		}
-		userLns = append(userLns, ln)
+		for _, prev := range udpUserConns {
+			_ = prev.Close()
+		}
+	}
+	if cfg.ForwardsTCP() {
+		for _, addr := range cfg.UserListens {
+			ln, err := net.Listen("tcp", addr)
+			if err != nil {
+				closeUserListeners()
+				return fmt.Errorf("listening for TCP users on %s: %w", addr, err)
+			}
+			userLns = append(userLns, ln)
+		}
+	}
+	if cfg.ForwardsUDP() {
+		for _, addr := range cfg.UserListens {
+			pc, err := net.ListenPacket("udp", addr)
+			if err != nil {
+				closeUserListeners()
+				return fmt.Errorf("listening for UDP users on %s: %w", addr, err)
+			}
+			udpUserConns = append(udpUserConns, pc)
+			udpUserAddrs = append(udpUserAddrs, addr)
+		}
 	}
 	go func() {
 		<-ctx.Done()
-		for _, ln := range userLns {
-			_ = ln.Close()
-		}
+		closeUserListeners()
 	}()
 
 	var listenerWg sync.WaitGroup
@@ -287,6 +306,14 @@ func runEdge(ctx context.Context, cfg *Config, st *status) error {
 			defer listenerWg.Done()
 			e.acceptUsers(ctx, ln, st)
 		}(ln)
+	}
+	for i, pc := range udpUserConns {
+		listenAddr := udpUserAddrs[i]
+		listenerWg.Add(1)
+		go func(pc net.PacketConn, addr string) {
+			defer listenerWg.Done()
+			e.acceptUDPUsers(ctx, pc, addr, st)
+		}(pc, listenAddr)
 	}
 
 	listenerWg.Wait()

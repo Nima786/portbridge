@@ -2061,14 +2061,24 @@
     if (any.ip_spoof) extraTags.push(`Spoof IP (${any.spoof_ip || '104.18.4.130'})`);
     if (any.real_site) extraTags.push('Real-Site Cover');
     if (any.cdn && !/CDN/i.test(shortLink)) extraTags.push('CDN Ready');
+    const fwdProto = (ei && ei.forward_proto) || (oi && oi.forward_proto) || 'tcp';
+    if (fwdProto === 'udp') extraTags.push('UDP-Only Forwarding');
+    else if (fwdProto === 'both') extraTags.push('TCP + UDP Forwarding');
     if (any.proxy_protocol && any.proxy_protocol !== 'off') extraTags.push(`PROXY ${any.proxy_protocol}`);
     if (live && live.on_backup_route) extraTags.push('On Backup Route');
+    const ahInfo = t.auto_heal || {};
+    if (ahInfo.on_standby && ahInfo.primary_foreign_name) {
+      extraTags.push(`HA Standby (Primary: ${ahInfo.primary_foreign_name})`);
+    } else if (ahInfo.standby_foreign_name) {
+      extraTags.push(`HA Backup: ${ahInfo.standby_foreign_name}`);
+    }
 
     let healthParts = [];
     if (live) {
       const pw = PATH_WORDS[live.path_state] || PATH_WORDS.unknown;
       healthParts.push(pw[1]);
-      healthParts.push(`${uniqueUsers} online ${uniqueUsers === 1 ? 'user' : 'users'} (${activeConns} TCP ${activeConns === 1 ? 'conn' : 'conns'})`);
+      const connKind = fwdProto === 'udp' ? 'UDP' : (fwdProto === 'both' ? 'TCP/UDP' : 'TCP');
+      healthParts.push(`${uniqueUsers} online ${uniqueUsers === 1 ? 'user' : 'users'} (${activeConns} ${connKind} ${activeConns === 1 ? 'session' : 'sessions'})`);
       if (any.mux) {
         healthParts.push(`${live.links || 0}/${live.link_target || any.mux_links || 1} mux links`);
       } else {
@@ -2120,9 +2130,17 @@
     let ahBadge = null;
     if (ah.state === 'probing' || ah.state === 'switching') {
       ahBadge = h('span', { class: 'badge badge-autoheal is-healing', title: ah.last_note || 'Auto-healing tunnel...' }, 'Auto-Healing…');
+    } else if (ah.on_standby) {
+      ahBadge = h('span', { class: 'badge badge-autoheal is-standby', title: ah.last_note || 'Running on Backup Foreign server; watching Primary for failback' }, 'HA: On Standby');
     } else if (ah.enabled) {
-      ahBadge = h('span', { class: 'badge badge-autoheal is-on', title: ah.last_note || 'Auto-Heal & Smart Failover enabled' }, 'Auto-Heal: ON');
+      ahBadge = h('span', { class: 'badge badge-autoheal is-on', title: ah.last_note || 'Auto-Heal & Smart Failover enabled' },
+        ah.standby_foreign_id ? 'Auto-Heal + HA' : 'Auto-Heal: ON');
     }
+    const protoBadge = fwdProto === 'udp'
+      ? h('span', { class: 'badge badge-proto-udp', title: 'UDP user-port forwarding active' }, 'UDP')
+      : (fwdProto === 'both'
+          ? h('span', { class: 'badge badge-proto-udp', title: 'Both TCP and UDP user-port forwarding active' }, 'TCP+UDP')
+          : null);
 
     const toggleBtn = h('button', {
       type: 'button',
@@ -2138,10 +2156,11 @@
           mainPort ? h('span', { class: 'tunnel-summary-port mono' }, `:${mainPort}`) : null)),
       h('div', { class: 'tunnel-summary-right' },
         ahBadge,
+        protoBadge,
         tfWidgets.rateBadge,
         tfWidgets.trafficBadge,
         h('span', { class: 'badge badge-transport' }, `${reverse ? 'Reverse' : 'Direct'}${isIPv6 ? ' (IPv6)' : ''} · ${shortLink}`),
-        live ? h('span', { class: 'badge badge-users', title: 'Unique connected client IPs · Active TCP connections' }, userBadgeText) : null,
+        live ? h('span', { class: 'badge badge-users', title: 'Unique connected client IPs · Active sessions' }, userBadgeText) : null,
         h('span', { class: 'tunnel-chevron', 'aria-hidden': 'true' }, '▾')));
 
     const card = h('article', { class: 'card tunnel' + (isOpen ? ' is-open' : ''), 'aria-labelledby': headingId },
@@ -2188,8 +2207,9 @@
       }
     };
     const ahOn = !!(t.auto_heal && t.auto_heal.enabled);
+    const canOpenAH = !!(target.edge && (target.origin || ahOn || (t.auto_heal && (t.auto_heal.primary_foreign_id || t.auto_heal.standby_foreign_id))));
     return h('div', { class: 'actions left tunnel-actions' },
-      target.edge && target.origin
+      canOpenAH
         ? h('button', {
             type: 'button',
             class: ahOn ? 'btn-autoheal is-on' : 'btn-autoheal',
@@ -2343,6 +2363,8 @@
     $('et-service').value = (servicePorts || []).join(',');
     $('et-users').value = (userPorts || []).join(',') === (servicePorts || []).join(',') ? '' : (userPorts || []).join(',');
     $('et-linkport').value = String(linkPort);
+    const curFwdProto = (ei && ei.forward_proto) || (oi && oi.forward_proto) || 'tcp';
+    setRadio('et-fwd-proto', ['tcp', 'udp', 'both'].includes(curFwdProto) ? curFwdProto : 'tcp');
 
     setRadio('et-shared', isMux ? 'shared' : 'one');
     $('et-pool').value = String(poolVal);
@@ -2419,7 +2441,7 @@
       });
     }
   }
-  for (const el of document.querySelectorAll('input[name="et-proxy"]')) {
+  for (const el of document.querySelectorAll('input[name="et-proxy"], input[name="et-fwd-proto"]')) {
     el.addEventListener('change', () => syncChoiceCards($('edit-tunnel-dialog')));
   }
 
@@ -2603,6 +2625,7 @@
       service_ports: servicePorts,
       user_ports: userPorts || servicePorts,
       link_port: linkPort,
+      forward_proto: radio('et-fwd-proto') || 'tcp',
       mux: isMux ? 'on' : 'off',
       pool: !isMux ? poolSize : 0,
       mux_links: isMux ? muxLinks : 0,
@@ -4028,7 +4051,7 @@
     syncChoiceCards($('tunnel-dialog'));
   }
 
-  for (const el of document.querySelectorAll('#tunnel-form input[name="tn-mode"], #tunnel-form input[name="tn-link"], #tn-gre, #tn-webheader, #tn-snispoof, #tn-relay, #tn-foreign')) {
+  for (const el of document.querySelectorAll('#tunnel-form input[name="tn-mode"], #tunnel-form input[name="tn-link"], #tunnel-form input[name="tn-fwd-proto"], #tn-gre, #tn-webheader, #tn-snispoof, #tn-relay, #tn-foreign')) {
     el.addEventListener('change', showTunnelOptions);
   }
   for (const el of document.querySelectorAll('input[name="tn-load"]')) {
@@ -4958,6 +4981,7 @@
     $('tunnel-form').hidden = false;
     $('tn-progress').hidden = true;
     sharingTouched = false;
+    setRadio('tn-fwd-proto', 'tcp');
     setRadio('tn-load', 'light');
     showTunnelOptions();
     openDialog($('tunnel-dialog'));
@@ -5015,6 +5039,8 @@
     $('tn-users').value = userPorts.join(',') === servicePorts.join(',') ? '' : userPorts.join(',');
     $('tn-linkport').value = String(linkPort);
     if ($('tn-probe-linkport')) $('tn-probe-linkport').value = String(linkPort);
+    const curFwdProto = ei.forward_proto || oi.forward_proto || 'tcp';
+    setRadio('tn-fwd-proto', ['tcp', 'udp', 'both'].includes(curFwdProto) ? curFwdProto : 'tcp');
 
     $('tn-gre').checked = !!any.gre;
     setRadio('tn-mode', any.mode === 'reverse' ? 'reverse' : 'direct');
@@ -5114,6 +5140,7 @@
       service_ports: $('tn-service').value.trim(),
       user_ports: $('tn-users').value.trim(),
       link_port: Number($('tn-linkport').value || 0),
+      forward_proto: radio('tn-fwd-proto') || 'tcp',
       proxy_protocol: radio('tn-proxy'),
       relay_ip: $('tn-relayip').value.trim(),
       auto_heal: $('tn-autoheal') ? $('tn-autoheal').checked : true,
@@ -5133,11 +5160,34 @@
     $('ah-msg').className = '';
     $('ah-error').textContent = '';
 
+    const standbySel = $('ah-standby-foreign');
+    if (standbySel) {
+      const primaryID = ah.primary_foreign_id || (!ah.on_standby && t && t.origin && t.origin.server_id) || '';
+      const edgeID = (t && t.edge && t.edge.server_id) || '';
+      const foreignList = (serversCache || []).filter((s) => s.group === 'foreign' && s.id !== primaryID && s.id !== edgeID);
+      const opts = [h('option', { value: '' }, '— None (Same Foreign Server Only) —')];
+      for (const s of foreignList) {
+        opts.push(h('option', { value: s.id }, `${s.name || s.address} (${s.address}${s.online ? ' · Online' : ' · Offline'})`));
+      }
+      if (ah.standby_foreign_id && !foreignList.some((s) => s.id === ah.standby_foreign_id)) {
+        opts.push(h('option', { value: ah.standby_foreign_id }, ah.standby_foreign_name || ah.standby_foreign_id));
+      }
+      standbySel.replaceChildren(...opts);
+      standbySel.value = ah.standby_foreign_id || '';
+    }
+
     const banner = $('ah-status-banner');
     if (banner) {
       let stateText = ah.enabled
         ? 'Active — Monitoring tunnel health every 20 seconds.'
         : 'Disabled — Enable below so PortBridge automatically benchmarks and switches modes if this tunnel gets blocked.';
+      if (ah.on_standby) {
+        const sbName = ah.standby_foreign_name || ah.standby_foreign_id || 'Backup Foreign';
+        const prName = ah.primary_foreign_name || ah.primary_foreign_id || 'Primary Foreign';
+        stateText = `HA Failover Active — Currently running on Backup Foreign "${sbName}" and watching Primary "${prName}" for automatic failback.`;
+      } else if (ah.standby_foreign_id) {
+        stateText += ` Server-Level HA Backup: ${ah.standby_foreign_name || ah.standby_foreign_id}.`;
+      }
       if (ah.last_note) {
         stateText += ` Latest status: ${ah.last_note}`;
       }
@@ -5191,16 +5241,21 @@
       try {
         const enabled = $('ah-enabled').checked;
         const cdnDomain = $('ah-cdn').value.trim();
+        const standbyForeign = $('ah-standby-foreign') ? $('ah-standby-foreign').value : '';
         await api('POST', '/api/tunnels/autoheal', {
           name: autoHealTunnel.name,
           edge: autoHealTunnel.edge ? autoHealTunnel.edge.server_id : '',
           enabled,
           cdn_domain: cdnDomain,
+          standby_foreign_id: standbyForeign,
         });
-        $('ah-msg').className = 'good';
-        $('ah-msg').textContent = enabled
-          ? 'Auto-Heal enabled. This tunnel will now automatically benchmark and switch modes if it gets blocked.'
+        const okMsg = enabled
+          ? (standbyForeign
+              ? 'Auto-Heal & Server-Level HA enabled. This tunnel will automatically switch modes or fail over to your Backup Foreign server if needed.'
+              : 'Auto-Heal enabled. This tunnel will now automatically benchmark and switch modes if it gets blocked.')
           : 'Auto-Heal disabled for this tunnel.';
+        $('ah-msg').className = 'good';
+        $('ah-msg').textContent = okMsg;
         lastTunnels = '';
         await refresh();
         const wantEdge = autoHealTunnel.edge ? autoHealTunnel.edge.server_id : '';
@@ -5210,9 +5265,7 @@
           autoHealTunnel = updated;
           renderAutoHealModal(updated);
           $('ah-msg').className = 'good';
-          $('ah-msg').textContent = enabled
-            ? 'Auto-Heal enabled. This tunnel will now automatically benchmark and switch modes if it gets blocked.'
-            : 'Auto-Heal disabled for this tunnel.';
+          $('ah-msg').textContent = okMsg;
         }
       } catch (e) {
         $('ah-error').textContent = e.message;
@@ -5233,12 +5286,14 @@
       btn.disabled = true;
       $('ah-error').textContent = '';
       try {
-        if ($('ah-enabled').checked || cdnDomain) {
+        const standbyForeign = $('ah-standby-foreign') ? $('ah-standby-foreign').value : '';
+        if ($('ah-enabled').checked || cdnDomain || standbyForeign) {
           await api('POST', '/api/tunnels/autoheal', {
             name: t.name,
             edge,
             enabled: $('ah-enabled').checked,
             cdn_domain: cdnDomain,
+            standby_foreign_id: standbyForeign,
           });
         }
         const res = await api('POST', '/api/tunnels/autoheal/trigger', {

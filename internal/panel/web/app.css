@@ -2529,6 +2529,21 @@ button.is-applied {
   color: var(--warn);
   font-weight: 650;
 }
+.badge-autoheal.is-standby {
+  background: var(--warn-soft);
+  border-color: var(--warn-border);
+  color: var(--warn);
+  font-weight: 650;
+}
+.badge-proto-udp {
+  background: var(--accent-soft);
+  border-color: var(--accent);
+  color: var(--accent);
+  font-weight: 600;
+}
+.fwd-proto-wrap {
+  margin-top: .75rem;
+}
 button.btn-autoheal.is-on {
   border-color: var(--ok-border);
   background: var(--ok-soft);

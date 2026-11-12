@@ -861,6 +861,43 @@
             <input id="tn-linkport" type="number" min="1" max="65535" value="2053" inputmode="numeric">
           </div>
         </div>
+        <div class="fwd-proto-wrap">
+          <div class="capacity-label-row">
+            <span class="capacity-subhead">Forwarded User Traffic Protocol</span>
+          </div>
+          <div class="choice-grid cols-3">
+            <label class="choice-card compact">
+              <input type="radio" name="tn-fwd-proto" value="tcp" checked>
+              <div class="choice-body">
+                <div class="choice-top">
+                  <strong>TCP Only</strong>
+                  <span class="pill-tag tag-good">Default</span>
+                </div>
+                <span class="choice-desc">Xray / VLESS / VMess / Trojan / SSH / Web.</span>
+              </div>
+            </label>
+            <label class="choice-card compact">
+              <input type="radio" name="tn-fwd-proto" value="both">
+              <div class="choice-body">
+                <div class="choice-top">
+                  <strong>TCP + UDP</strong>
+                  <span class="pill-tag tag-accent">Dual</span>
+                </div>
+                <span class="choice-desc">Forwards both TCP and UDP on the same user port(s).</span>
+              </div>
+            </label>
+            <label class="choice-card compact">
+              <input type="radio" name="tn-fwd-proto" value="udp">
+              <div class="choice-body">
+                <div class="choice-top">
+                  <strong>UDP Only</strong>
+                  <span class="pill-tag">UDP</span>
+                </div>
+                <span class="choice-desc">WireGuard, Hysteria2, TUIC, QUIC, voice &amp; game servers.</span>
+              </div>
+            </label>
+          </div>
+        </div>
         <div class="actions left port-check-bar">
           <button type="button" id="tn-check">Test &amp; Verify Ports on Both Servers</button>
           <button type="button" id="tn-scan-cdn">Scan Free CDN Ports</button>
@@ -1624,6 +1661,43 @@
             <input id="et-linkport" type="number" min="1" max="65535" required inputmode="numeric">
           </div>
         </div>
+        <div class="fwd-proto-wrap">
+          <div class="capacity-label-row">
+            <span class="capacity-subhead">Forwarded User Traffic Protocol</span>
+          </div>
+          <div class="choice-grid cols-3">
+            <label class="choice-card compact">
+              <input type="radio" name="et-fwd-proto" value="tcp" checked>
+              <div class="choice-body">
+                <div class="choice-top">
+                  <strong>TCP Only</strong>
+                  <span class="pill-tag tag-good">Default</span>
+                </div>
+                <span class="choice-desc">Xray / VLESS / VMess / Trojan / SSH / Web.</span>
+              </div>
+            </label>
+            <label class="choice-card compact">
+              <input type="radio" name="et-fwd-proto" value="both">
+              <div class="choice-body">
+                <div class="choice-top">
+                  <strong>TCP + UDP</strong>
+                  <span class="pill-tag tag-accent">Dual</span>
+                </div>
+                <span class="choice-desc">Forwards both TCP and UDP on the same user port(s).</span>
+              </div>
+            </label>
+            <label class="choice-card compact">
+              <input type="radio" name="et-fwd-proto" value="udp">
+              <div class="choice-body">
+                <div class="choice-top">
+                  <strong>UDP Only</strong>
+                  <span class="pill-tag">UDP</span>
+                </div>
+                <span class="choice-desc">WireGuard, Hysteria2, TUIC, QUIC, voice &amp; game servers.</span>
+              </div>
+            </label>
+          </div>
+        </div>
         <div class="actions left port-check-bar">
           <button type="button" id="et-check">Test &amp; Verify Ports on Both Servers</button>
           <button type="button" id="et-scan-cdn">Scan Free CDN Ports</button>
@@ -2048,6 +2122,14 @@
       <div class="field-block">
         <label for="ah-cdn">Optional Cloudflare CDN Failover Subdomain <span class="muted">(pointed at Foreign server with Cloudflare Proxy ON)</span></label>
         <input id="ah-cdn" placeholder="e.g. edge1.example.com (leave empty to failover across Direct / Reverse / IPv4 / IPv6)" autocapitalize="none" spellcheck="false">
+      </div>
+
+      <div class="field-block">
+        <label for="ah-standby-foreign">Backup (Standby) Foreign Server <span class="muted">(Optional Server-Level High Availability)</span></label>
+        <select id="ah-standby-foreign">
+          <option value="">— None (Same Foreign Server Only) —</option>
+        </select>
+        <span class="field-hint">If the Primary Foreign server goes completely offline or all tunnel modes to it are blocked, PortBridge automatically benchmarks and migrates this tunnel to the Backup Foreign server — and automatically fails back once Primary recovers.</span>
       </div>
 
       <p id="ah-msg" role="status"></p>

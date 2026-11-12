@@ -555,7 +555,7 @@ func (p *Panel) handleRemoveServer(w http.ResponseWriter, r *http.Request, _ aut
 
 func (p *Panel) handleTunnels(w http.ResponseWriter, _ *http.Request, _ authed) {
 	tunnels := pairTunnels(p.fleet.views())
-	p.healer.attachViews(tunnels)
+	tunnels = p.healer.filterAndAttachViews(tunnels)
 	if p.traffic != nil {
 		p.traffic.observeAndAttach(tunnels)
 	}
@@ -1010,9 +1010,10 @@ func (p *Panel) handleSetTunnelAutoHeal(w http.ResponseWriter, r *http.Request, 
 		Name string `json:"name"`
 		// Edge is the relay server the tunnel is on. Two pairs of servers can
 		// each have a tunnel with the same name, so it says which one is meant.
-		Edge      string `json:"edge"`
-		Enabled   bool   `json:"enabled"`
-		CDNDomain string `json:"cdn_domain"`
+		Edge             string  `json:"edge"`
+		Enabled          bool    `json:"enabled"`
+		CDNDomain        string  `json:"cdn_domain"`
+		StandbyForeignID *string `json:"standby_foreign_id,omitempty"`
 	}
 	if !decodeJSON(w, r, &req) {
 		return
@@ -1022,7 +1023,7 @@ func (p *Panel) handleSetTunnelAutoHeal(w http.ResponseWriter, r *http.Request, 
 		writeErr(w, http.StatusBadRequest, capitalise(err.Error())+".")
 		return
 	}
-	if err := p.healer.setConfig(strings.TrimSpace(req.Edge), name, req.Enabled, req.CDNDomain); err != nil {
+	if err := p.healer.setConfig(strings.TrimSpace(req.Edge), name, req.Enabled, req.CDNDomain, req.StandbyForeignID); err != nil {
 		writeErr(w, http.StatusBadRequest, capitalise(err.Error())+".")
 		return
 	}

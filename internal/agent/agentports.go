@@ -185,6 +185,9 @@ func buildOriginConf(p *PairingData, secretFile, certFile, keyFile string) strin
 			fmt.Fprintf(&b, "asym_down_port = %s\n", dp)
 		}
 	}
+	if fp := strings.ToLower(strings.TrimSpace(p.ForwardProto)); fp == "udp" || fp == "both" {
+		fmt.Fprintf(&b, "forward_proto = %s\n", fp)
+	}
 	if p.ProxyProtocol == "v1" || p.ProxyProtocol == "v2" {
 		fmt.Fprintf(&b, "\n# Tell the service each user's real address; it must be set to expect it.\n")
 		fmt.Fprintf(&b, "proxy_protocol = %s\n", p.ProxyProtocol)
@@ -395,7 +398,12 @@ func checkPairingPorts(p *PairingData, confDir string, host agentHost, _ string)
 					in, c.tunnel, c.what))
 			}
 		}
-		if !host.Listening(in) {
+		if strings.EqualFold(strings.TrimSpace(p.ForwardProto), "udp") {
+			if host.PortFree(engine.TransportKCP, in) == nil {
+				notes = append(notes, fmt.Sprintf(
+					"nothing is bound to UDP service port %d on this server yet; make sure your UDP service (WireGuard / Hysteria2 / TUIC / game server) is running there", in))
+			}
+		} else if !host.Listening(in) {
 			if p.WebsiteBridge == "on" {
 				notes = append(notes, fmt.Sprintf(
 					"nothing is answering on web port %d on this server yet; make sure your web server (LiteSpeed / Nginx / Apache) is listening there", in))

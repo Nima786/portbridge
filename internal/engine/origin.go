@@ -516,6 +516,7 @@ func (o *origin) parkUntilActivated(ctx context.Context, c net.Conn, timeout tim
 type arrival struct {
 	port uint16
 	from *proxyproto.Addrs
+	udp  bool
 }
 
 // awaitActivation blocks until the edge says a user has arrived. Anything other
@@ -555,6 +556,15 @@ func (o *origin) awaitActivation(c net.Conn, timeout time.Duration) (arrival, er
 				return arrival{}, err
 			}
 			return arrival{}, nil
+		case msgActivateUDP:
+			if err := c.SetReadDeadline(time.Time{}); err != nil {
+				return arrival{}, err
+			}
+			var portBuf [2]byte
+			if _, err := io.ReadFull(c, portBuf[:]); err != nil {
+				return arrival{}, err
+			}
+			return arrival{port: binary.BigEndian.Uint16(portBuf[:]), udp: true}, nil
 		case msgActivatePort, msgActivateFrom:
 			if err := c.SetReadDeadline(time.Time{}); err != nil {
 				return arrival{}, err
@@ -802,6 +812,10 @@ func (o *origin) handleActivated(tunnel net.Conn, a arrival) {
 		o.logDial.printf("a user asked for port %d, which none of the published services uses "+
 			"(%s); set server_inbound_port on the other server to match", targetPort, strings.Join(o.cfg.InboundAddrs, ", "))
 		_ = tunnel.Close()
+		return
+	}
+	if a.udp {
+		o.handleActivatedUDP(tunnel, inboundAddr)
 		return
 	}
 	if o.cfg.WebsiteBridge && strings.TrimSpace(o.cfg.WebsiteDomains) != "" {

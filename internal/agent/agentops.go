@@ -450,6 +450,11 @@ func validatePairing(p *PairingData) error {
 	default:
 		return fmt.Errorf("proxy_protocol must be off, v1 or v2, got %q", p.ProxyProtocol)
 	}
+	switch strings.ToLower(strings.TrimSpace(p.ForwardProto)) {
+	case "", "tcp", "udp", "both":
+	default:
+		return fmt.Errorf("forward_proto must be tcp, udp or both, got %q", p.ForwardProto)
+	}
 	if p.ServerName != "" && !engine.HostnameRe.MatchString(p.ServerName) {
 		return fmt.Errorf("server name %q is not a hostname", p.ServerName)
 	}

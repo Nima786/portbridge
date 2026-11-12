@@ -82,6 +82,11 @@ const (
 	// behalf of the origin's local Website Bridge outbound proxy.
 	msgOutboundDial = 0x0A
 
+	// msgActivateUDP activates a framed UDP user-port session:
+	// [1B msgActivateUDP][2B target port uint16 BE], confirmed with msgAck,
+	// then bidirectional [2B datagram length uint16 BE][datagram payload] frames.
+	msgActivateUDP = 0x0B
+
 	// Sent before closing, but only once the MAC has already verified, so these
 	// never leak information to a peer that does not hold the secret.
 	rejClockSkew = 0x11
