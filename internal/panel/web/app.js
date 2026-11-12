@@ -463,6 +463,70 @@
     });
   }
 
+  const retryDiagByServer = {};
+
+  if ($('srv-refresh-btn')) {
+    $('srv-refresh-btn').addEventListener('click', async () => {
+      const btn = $('srv-refresh-btn');
+      btn.disabled = true;
+      btn.classList.add('is-loading');
+      btn.textContent = 'Checking…';
+      try {
+        const data = await api('POST', '/api/servers/refresh');
+        if (data && Array.isArray(data.servers)) {
+          serversCache = data.servers;
+          updateSummaryStrip();
+          lastServers = JSON.stringify(serversCache) + JSON.stringify(updatesCache && updatesCache.servers);
+          keepFocus(() => renderServers(serversCache));
+        }
+        const onCount = serversCache.filter((s) => s.online).length;
+        setStatus(`Checked all servers (${onCount}/${serversCache.length} online).`);
+      } catch (e) {
+        setStatus(e.message, true);
+      } finally {
+        btn.classList.remove('is-loading');
+        btn.disabled = false;
+        btn.textContent = 'Refresh All';
+      }
+    });
+  }
+
+  async function retryServer(s, btn) {
+    if (btn) {
+      btn.disabled = true;
+      btn.classList.add('is-loading');
+      btn.textContent = 'Trying routes…';
+    }
+    try {
+      const res = await api('POST', `/api/servers/${encodeURIComponent(s.id)}/reconnect`);
+      if (res && res.server) {
+        const idx = serversCache.findIndex((x) => x.id === s.id);
+        if (idx >= 0) serversCache[idx] = res.server;
+      }
+      if (res && res.ok) {
+        delete retryDiagByServer[s.id];
+        setStatus(res.message || `Reconnected to ${s.name || s.address}.`);
+      } else if (res) {
+        retryDiagByServer[s.id] = {
+          diagnosis: res.diagnosis || '',
+          steps: Array.isArray(res.steps) ? res.steps : [],
+        };
+        setStatus(res.diagnosis || `${s.name || s.address} is still unreachable.`, true);
+      }
+      updateSummaryStrip();
+      lastServers = '';
+      keepFocus(() => renderServers(serversCache));
+      if (res && res.ok) refresh();
+    } catch (e) {
+      setStatus(e.message, true);
+      if (btn) {
+        btn.classList.remove('is-loading');
+        btn.disabled = false;
+        btn.textContent = 'Retry';
+      }
+    }
+  }
+
   function matchesServerFilter(s) {
     if (srvFilter === 'online' && !s.online) return false;
     if (srvFilter === 'offline' && s.online) return false;
@@ -679,11 +743,39 @@
       badges.push(h('span', { class: 'badge', title: `TCP congestion control: ${ov.congestion_control}` }, `TCP: ${ov.congestion_control}`));
     }
 
+    if (s.online) delete retryDiagByServer[s.id];
+
     let problem = null;
     if (!s.online && s.problem && s.problem !== 'not checked yet') {
-      let text = sentence(s.problem);
+      const diag = retryDiagByServer[s.id];
+      let text = sentence((diag && diag.diagnosis) || s.problem);
       if (s.last_seen) text += ` Last seen ${ago(s.last_seen)}.`;
-      problem = h('p', { class: 'problem' }, text);
+      const actionBtns = [
+        h('button', {
+          type: 'button',
+          'data-focus': `srv-${s.id}-retry`,
+          'aria-label': `Retry connecting to ${name} now`,
+          onclick: (ev) => retryServer(s, ev.currentTarget),
+        }, 'Retry'),
+      ];
+      if (!s.this) {
+        actionBtns.push(h('button', {
+          type: 'button',
+          'data-focus': `srv-${s.id}-repair-inline`,
+          'aria-label': `Repair or reconnect ${name}`,
+          onclick: () => openRepairServer(s),
+        }, 'Repair'));
+      }
+      const stepsList = diag && Array.isArray(diag.steps) && diag.steps.length
+        ? h('details', { class: 'retry-steps' },
+            h('summary', null, `Route check details (${plural(diag.steps.length, 'path')} tested)`),
+            h('ul', null, diag.steps.map((st) => h('li', null, `${st.route}: ${st.detail}`))))
+        : null;
+      problem = h('div', { class: 'problem', role: 'status' },
+        h('div', { class: 'problem-row' },
+          h('span', { class: 'problem-text' }, text),
+          h('div', { class: 'problem-actions' }, ...actionBtns)),
+        stepsList);
     }
 
     const mini = tunnels.length ? h('ul', { class: 'mini', 'aria-label': `Tunnels on ${name}` },
@@ -726,6 +818,10 @@
           'Network Tuning'),
         h('button', { type: 'button', 'data-focus': `srv-${s.id}-fw`, 'aria-label': `Firewall rules for ${name}`, onclick: () => openServerFirewall(s) },
           'Firewall'),
+        !s.online && !s.this
+          ? h('button', { type: 'button', 'data-focus': `srv-${s.id}-repair`, 'aria-label': `Repair or reconnect ${name}`, onclick: () => openRepairServer(s) },
+              'Repair')
+          : null,
         h('button', { type: 'button', 'data-focus': `srv-${s.id}-edit`, 'aria-label': `Edit ${name}`, onclick: () => openEdit(s) },
           'Edit'),
         s.this ? null : h('button', { type: 'button', class: 'danger-text', 'data-focus': `srv-${s.id}-remove`, 'aria-label': `Remove ${name} from the panel`, onclick: () => confirmRemove(s) },
@@ -1008,10 +1104,13 @@
 
   function syncAddMethodUI() {
     const add = addMode.kind === 'add';
-    const isJoin = add && addMethodKind() === 'join';
+    const repair = addMode.kind === 'repair';
+    const showMethods = add || repair;
+    const isJoin = showMethods && addMethodKind() === 'join';
     if (!isJoin) stopJoinPoll();
+    if ($('add-method-box')) $('add-method-box').hidden = !showMethods;
     if ($('add-ssh-pane')) $('add-ssh-pane').hidden = isJoin;
-    if ($('add-address-wrap')) $('add-address-wrap').hidden = !add;
+    if ($('add-address-wrap')) $('add-address-wrap').hidden = !(add || repair);
     if ($('add-join-pane')) $('add-join-pane').hidden = !isJoin;
     $('add-submit').hidden = isJoin;
     $('add-cancel').textContent = isJoin ? 'Close' : 'Cancel';
@@ -1058,20 +1157,31 @@
     $('join-gen-btn').addEventListener('click', async () => {
       const err = $('add-error');
       err.textContent = '';
-      const group = document.querySelector('input[name="group"]:checked');
-      if (!group) {
-        err.textContent = 'Select whether this is a Relay (Iran) or Foreign server first.';
-        return;
+      const repairing = addMode.kind === 'repair';
+      let ticketReq;
+      if (repairing) {
+        ticketReq = {
+          group: (addMode.server && addMode.server.group) || '',
+          name: (addMode.server && addMode.server.name) || '',
+          repair_id: addMode.server.id,
+        };
+      } else {
+        const group = document.querySelector('input[name="group"]:checked');
+        if (!group) {
+          err.textContent = 'Select whether this is a Relay (Iran) or Foreign server first.';
+          return;
+        }
+        ticketReq = {
+          group: group.value,
+          name: ($('add-name') && $('add-name').value.trim()) || '',
+        };
       }
       const btn = $('join-gen-btn');
       btn.disabled = true;
       btn.classList.add('is-loading');
       resetJoinPane();
       try {
-        const res = await api('POST', '/api/join-tickets', {
-          group: group.value,
-          name: ($('add-name') && $('add-name').value.trim()) || '',
-        });
+        const res = await api('POST', '/api/join-tickets', ticketReq);
         $('join-cmd-text').value = res.command || '';
         if (res.panel_command && $('join-panel-alt') && $('join-panel-cmd-text')) {
           $('join-panel-cmd-text').value = res.panel_command;
@@ -1086,7 +1196,10 @@
             if (st && st.done) {
               stopJoinPoll();
               $('join-wait-box').hidden = true;
-              $('join-done-msg').textContent = `Success: paired "${st.server_name || 'server'}" — it is now in your server list.`;
+              if (st.server_id) delete retryDiagByServer[st.server_id];
+              $('join-done-msg').textContent = repairing
+                ? `Success: reconnected "${st.server_name || 'server'}" — it is back online.`
+                : `Success: paired "${st.server_name || 'server'}" — it is now in your server list.`;
               $('join-done-msg').hidden = false;
               lastServers = '';
               refresh();
@@ -1113,22 +1226,38 @@
   }
 
   function setAddMode(mode) {
+    const wasRepair = addMode.kind === 'repair';
     addMode = mode;
     const add = mode.kind === 'add';
+    const repair = mode.kind === 'repair';
     resetJoinPane();
-    if (add) {
+    if (add || repair) {
       const sshRadio = document.querySelector('input[name="add-method"][value="ssh"]');
       if (sshRadio) sshRadio.checked = true;
     }
+    if (repair) {
+      $('add-address').value = (mode.server && mode.server.address) || '';
+    } else if (add && wasRepair) {
+      $('add-address').value = '';
+    }
+    if ($('add-method-ssh-title')) $('add-method-ssh-title').textContent = repair ? 'Repair via SSH' : 'SSH Auto-Setup';
+    if ($('add-method-join-title')) $('add-method-join-title').textContent = repair ? '1-Line Reconnect Command' : '1-Line Join Command';
+    if ($('join-gen-btn')) $('join-gen-btn').textContent = repair ? 'Generate 1-Line Reconnect Command' : 'Generate 1-Line Join Command';
+    if ($('add-switch-join')) $('add-switch-join').textContent = repair ? 'Use 1-Line Reconnect Command Instead' : 'Use 1-Line Join Command Instead';
     populateAddViaOptions(add ? '' : (mode.server && mode.server.address));
     $('add-only').hidden = !add;
     $('add-only-name').hidden = !add;
-    $('add-update-row').hidden = !add;
-    $('add-title').textContent = add ? 'Add a Server' : `Upgrade ${mode.server.name} via SSH`;
+    $('add-update-row').hidden = !(add || repair);
+    const srvLabel = (mode.server && (mode.server.name || mode.server.address)) || 'Server';
+    $('add-title').textContent = add
+      ? 'Add a Server'
+      : (repair ? `Repair / Reconnect ${srvLabel}` : `Upgrade ${srvLabel} via SSH`);
     $('add-intro').textContent = add
       ? 'The panel connects via SSH once (trying Direct IPv4/IPv6 + online server jump automatically) or pairs via a 1-Line Join Command. Your SSH password or key is never stored.'
-      : 'This server runs an older PortBridge version from before one-click updates. Enter its SSH login once to upgrade it; future updates will work with one click.';
-    $('add-submit').textContent = add ? 'Add Server' : 'Upgrade Server';
+      : (repair
+        ? 'Reconnects this existing server in place without losing its tunnels or settings — either via SSH (Direct or Peer Jump) or with a 1-Line Reconnect Command.'
+        : 'This server runs an older PortBridge version from before one-click updates. Enter its SSH login once to upgrade it; future updates will work with one click.');
+    $('add-submit').textContent = add ? 'Add Server' : (repair ? 'Repair Server' : 'Upgrade Server');
     $('add-form').hidden = false;
     $('add-progress').hidden = true;
     $('add-error').textContent = '';
@@ -1138,6 +1267,12 @@
 
   function openSSHUpdate(s) {
     setAddMode({ kind: 'ssh-update', server: s });
+    openDialog($('add-dialog'));
+    $('add-user').focus();
+  }
+
+  function openRepairServer(s) {
+    setAddMode({ kind: 'repair', server: s });
     openDialog($('add-dialog'));
     $('add-user').focus();
   }
@@ -1221,13 +1356,17 @@
     if ($('add-sudo-password') && $('add-sudo-password').value) body.sudo_password = $('add-sudo-password').value;
 
     const updating = addMode.kind === 'ssh-update';
+    const repairing = addMode.kind === 'repair';
     if (updating) {
       delete body.name;
       delete body.group;
       delete body.address;
       delete body.allow_update;
+    } else if (repairing) {
+      delete body.name;
+      delete body.group;
     }
-    if (!updating && !body.group) { err.textContent = 'Select whether this is a Relay (Iran) or Foreign server.'; return; }
+    if (!updating && !repairing && !body.group) { err.textContent = 'Select whether this is a Relay (Iran) or Foreign server.'; return; }
     if (!updating && !address) { err.textContent = 'Enter the server IP address or hostname.'; $('add-address').focus(); return; }
     if (!Number.isInteger(port) || port < 1 || port > 65535) { err.textContent = 'SSH port must be between 1 and 65535.'; return; }
     if (kind === 'password' && !body.password) { err.textContent = 'Enter the SSH password.'; $('add-password').focus(); return; }
@@ -1243,12 +1382,14 @@
       const fp = await api('POST', '/api/servers/hostkey', {
         address: hostAddr,
         ssh_port: port,
-        group: updating ? (addMode.server.group || '') : body.group,
+        group: (updating || repairing) ? (addMode.server.group || '') : body.group,
         via_server: viaServer,
       });
       if (!(await confirmHostKey(hostAddr, fp.host_key, fp.via))) return;
       body.host_key = fp.host_key;
-      const path = updating ? `/api/servers/${encodeURIComponent(addMode.server.id)}/ssh-update` : '/api/servers';
+      const path = updating
+        ? `/api/servers/${encodeURIComponent(addMode.server.id)}/ssh-update`
+        : (repairing ? `/api/servers/${encodeURIComponent(addMode.server.id)}/repair` : '/api/servers');
       const res = await api('POST', path, body);
       startJob(res.job);
     } catch (e) {
@@ -1262,6 +1403,9 @@
     $('add-form').hidden = true;
     $('add-progress').hidden = false;
     $('add-log').replaceChildren();
+    $('add-progress-title').textContent = addMode.kind === 'repair'
+      ? 'Repairing server'
+      : (addMode.kind === 'ssh-update' ? 'Upgrading server' : 'Setting up server');
     $('add-result').textContent = 'Connecting...';
     $('add-result').className = '';
     $('add-note').hidden = false;
@@ -1291,16 +1435,20 @@
       }
       $('add-note').hidden = true;
       const updating = addMode.kind === 'ssh-update';
+      const repairing = addMode.kind === 'repair';
       if (job.error) {
         if (/older than the panel/i.test(job.error)) $('add-update').checked = true;
-        $('add-result').textContent = (updating ? 'Upgrade failed. ' : 'Could not add server. ') + sentence(job.error);
+        const prefix = updating ? 'Upgrade failed. ' : (repairing ? 'Repair failed. ' : 'Could not add server. ');
+        $('add-result').textContent = prefix + sentence(job.error);
         $('add-result').className = 'bad';
         $('add-back').hidden = false;
         if ($('add-switch-join')) $('add-switch-join').hidden = updating;
       } else {
         clearSecrets();
-        $('add-result').textContent = updating ? 'Success: server is updated and supports one-click updates from now on.'
-          : 'Success: server has been added to the panel.';
+        if (repairing && addMode.server) delete retryDiagByServer[addMode.server.id];
+        $('add-result').textContent = updating
+          ? 'Success: server is updated and supports one-click updates from now on.'
+          : (repairing ? 'Success: server repaired and back online.' : 'Success: server has been added to the panel.');
         $('add-result').className = 'good';
         $('add-address').value = '';
         $('add-name').value = '';

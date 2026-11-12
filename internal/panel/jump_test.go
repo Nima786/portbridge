@@ -5,6 +5,8 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/json"
+	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -239,5 +241,155 @@ func TestOneLineJoinTicketAndStealthHubRegister(t *testing.T) {
 	servers := p.store.get().Servers
 	if len(servers) != 1 || servers[0].Name != "NL-JoinNode" || !servers[0].CallsPanel {
 		t.Fatalf("paired server not saved properly: %+v", servers)
+	}
+}
+
+func TestReconnectMultiRouteAndInPlaceRepairTicket(t *testing.T) {
+	agent.SetAllowLoopbackNetProxyForTest(true)
+	t.Cleanup(func() { agent.SetAllowLoopbackNetProxyForTest(false) })
+
+	p := newTestPanel(t)
+	ts := startPanel(t, p)
+	p.cfg.PublicURL = ts.URL
+
+	b := newBrowser(t, ts)
+	st, loginBody, _ := b.do(http.MethodPost, "/api/login", map[string]string{
+		"user":     "admin",
+		"password": testPassword,
+	}, map[string]string{"Origin": ts.URL})
+	if st != http.StatusOK {
+		t.Fatalf("login failed: %d %v", st, loginBody)
+	}
+	b.csrf, _ = loginBody["csrf"].(string)
+
+	// Target agent is running, but panel's direct AgentURL points to a closed local port
+	// (simulating direct route blocked between panel and target VPS).
+	const targetTok = "pba_cyberpanel_tok"
+	targetTS, targetFP := startPinnedMockAgent(t, targetTok)
+
+	closedLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	closedAddr := closedLn.Addr().String()
+	_ = closedLn.Close()
+
+	// Online jump server forwards /api/net/dial for closedAddr to targetTS's real address.
+	const jumpTok = "pba_turkey_jump"
+	baseJumpHandler := agent.NewHandler(jumpTok, t.TempDir(), nil)
+	jumpCertDir := t.TempDir()
+	jumpCert, err := engine.EnsureCert(filepath.Join(jumpCertDir, "agent.crt"), filepath.Join(jumpCertDir, "agent.key"), "portbridge-agent")
+	if err != nil {
+		t.Fatal(err)
+	}
+	jumpFP := fingerprintOf(jumpCert.Certificate[0])
+	jumpTS := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/net/dial" && r.Method == http.MethodPost {
+			raw, _ := io.ReadAll(r.Body)
+			var dreq agent.NetProxyDialReq
+			if json.Unmarshal(raw, &dreq) == nil && dreq.Addr == closedAddr {
+				dreq.Addr = targetTS.Listener.Addr().String()
+				raw, _ = json.Marshal(dreq)
+			}
+			r.Body = io.NopCloser(bytes.NewReader(raw))
+		}
+		baseJumpHandler.ServeHTTP(w, r)
+	}))
+	jumpTS.TLS = &tls.Config{
+		MinVersion:   tls.VersionTLS12,
+		Certificates: []tls.Certificate{jumpCert},
+		NextProtos:   []string{"http/1.1"},
+	}
+	jumpTS.StartTLS()
+	t.Cleanup(jumpTS.Close)
+
+	jumpSrv := addTestServer(t, p, Server{
+		ID:          "srv_turkey",
+		Name:        "Turkey",
+		Group:       GroupForeign,
+		Address:     "198.51.100.30",
+		AgentURL:    jumpTS.URL,
+		Fingerprint: jumpFP,
+	}, jumpTok)
+	p.fleet.refresh(jumpSrv)
+
+	cpSrv := addTestServer(t, p, Server{
+		ID:          "srv_cp",
+		Name:        "CyberPanel",
+		Group:       GroupForeign,
+		Address:     "185.139.7.48",
+		AgentURL:    "https://" + closedAddr,
+		Fingerprint: targetFP,
+	}, targetTok)
+
+	// 1. POST /api/servers/{id}/reconnect recovers CyberPanel via Peer Jump and enables JumpAllowed.
+	st, recBody, _ := b.do(http.MethodPost, "/api/servers/"+cpSrv.ID+"/reconnect", nil, map[string]string{"Origin": ts.URL})
+	if st != http.StatusOK || recBody["ok"] != true || recBody["route"] != "jump" || recBody["via"] != "Turkey" {
+		t.Fatalf("expected reconnect via Peer Jump, got HTTP %d %v", st, recBody)
+	}
+	updatedCP, ok := p.serverByID(cpSrv.ID)
+	if !ok || !updatedCP.JumpAllowed {
+		t.Fatalf("expected JumpAllowed=true after reconnect recovery, got %+v", updatedCP)
+	}
+
+	// 2. When target agent is genuinely down on all routes, reconnect returns ok=false + diagnosis + steps.
+	targetTS.Close()
+	st, failBody, _ := b.do(http.MethodPost, "/api/servers/"+cpSrv.ID+"/reconnect", nil, map[string]string{"Origin": ts.URL})
+	if st != http.StatusOK || failBody["ok"] != false {
+		t.Fatalf("expected reconnect ok=false when agent down, got HTTP %d %v", st, failBody)
+	}
+	diag, _ := failBody["diagnosis"].(string)
+	steps, _ := failBody["steps"].([]any)
+	if diag == "" || len(steps) < 3 {
+		t.Fatalf("expected actionable diagnosis and >=3 route steps, got diag=%q steps=%v", diag, steps)
+	}
+
+	// 3. POST /api/servers/refresh returns fleet server views cleanly.
+	st, refBody, _ := b.do(http.MethodPost, "/api/servers/refresh", nil, map[string]string{"Origin": ts.URL})
+	if st != http.StatusOK || refBody["servers"] == nil {
+		t.Fatalf("refresh all failed: HTTP %d %v", st, refBody)
+	}
+
+	// 4. In-place 1-Line Reconnect Ticket updates existing server without 409 Conflict and preserves hostname.
+	oraSrv := addTestServer(t, p, Server{
+		ID:          "srv_ora",
+		Name:        "Oracle-AU",
+		Group:       GroupForeign,
+		Address:     "cp.websy.au",
+		AgentURL:    "https://cp.websy.au:4356",
+		Fingerprint: jumpFP,
+	}, "old_token")
+
+	st, tBody, _ := b.do(http.MethodPost, "/api/join-tickets", map[string]string{
+		"repair_id": oraSrv.ID,
+	}, map[string]string{"Origin": ts.URL})
+	if st != http.StatusOK {
+		t.Fatalf("repair join ticket failed: %d %v", st, tBody)
+	}
+	cmdStr, _ := tBody["command"].(string)
+	m := regexp.MustCompile(`-ticket '([^']+)'`).FindStringSubmatch(cmdStr)
+	if len(m) != 2 {
+		t.Fatalf("missing ticket in repair command: %v", tBody)
+	}
+	const newOraTok = "pba_repaired_oracle_tok"
+	_, newOraFP := startPinnedMockAgent(t, newOraTok)
+	rep, _, err := agent.RegisterWithPanel(context.Background(), ts.URL, p.ownFingerprint(), agent.HubRegisterRequest{
+		Ticket:      m[1],
+		Token:       newOraTok,
+		Port:        4356,
+		Fingerprint: newOraFP,
+		Hostname:    "oracle-vps",
+		IPv4:        []string{"185.139.7.99"},
+		Version:     "v0.17.62",
+	})
+	if err != nil || !rep.OK || rep.ServerID != oraSrv.ID || rep.Name != "Oracle-AU" {
+		t.Fatalf("in-place repair RegisterWithPanel = %+v, err=%v", rep, err)
+	}
+	repairedOra, ok := p.serverByID(oraSrv.ID)
+	if !ok || repairedOra.Address != "cp.websy.au" || repairedOra.Fingerprint != newOraFP || !repairedOra.CallsPanel {
+		t.Fatalf("hostname or repaired credentials not preserved: %+v", repairedOra)
+	}
+	if gotCount := len(p.store.get().Servers); gotCount != 3 {
+		t.Fatalf("expected 3 servers in store (no duplicate created), got %d", gotCount)
 	}
 }

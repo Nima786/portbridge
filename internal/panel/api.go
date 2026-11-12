@@ -56,6 +56,7 @@ func (p *Panel) routes() http.Handler {
 	mux.HandleFunc("POST /api/account", p.withAuth(p.handleAccount))
 	mux.HandleFunc("GET /api/servers", p.withAuth(p.handleServers))
 	mux.HandleFunc("POST /api/servers", p.withAuth(p.handleAddServer))
+	mux.HandleFunc("POST /api/servers/refresh", p.withAuth(p.handleRefreshAllServers))
 	mux.HandleFunc("POST /api/join-tickets", p.withAuth(p.handleCreateJoinTicket))
 	mux.HandleFunc("GET /api/join-tickets/{id}", p.withAuth(p.handleGetJoinTicket))
 	mux.HandleFunc("PATCH /api/servers/{id}", p.withAuth(p.handleEditServer))
@@ -87,6 +88,8 @@ func (p *Panel) routes() http.Handler {
 	mux.HandleFunc("POST /api/updates", p.withAuth(p.handleStartUpdate))
 	mux.HandleFunc("POST /api/updates/check", p.withAuth(p.handleCheckUpdates))
 	mux.HandleFunc("POST /api/servers/{id}/ssh-update", p.withAuth(p.handleSSHUpdate))
+	mux.HandleFunc("POST /api/servers/{id}/reconnect", p.withAuth(p.handleReconnectServer))
+	mux.HandleFunc("POST /api/servers/{id}/repair", p.withAuth(p.handleRepairServer))
 	mux.HandleFunc("POST /api/servers/hostkey", p.withAuth(p.handleHostKey))
 	mux.HandleFunc("GET /api/panel", p.withAuth(p.handlePanelInfo))
 

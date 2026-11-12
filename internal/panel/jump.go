@@ -31,6 +31,7 @@ import (
 	"net/url"
 	"os"
 	"runtime"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -41,6 +42,7 @@ import (
 	"golang.org/x/crypto/ssh"
 
 	"github.com/Nima786/portbridge/internal/agent"
+	"github.com/Nima786/portbridge/internal/engine"
 )
 
 type noJumpCtxKey struct{}
@@ -623,6 +625,563 @@ func (p *Panel) tryJumpOverview(srv Server, preferViaID string) (*agent.Overview
 }
 
 // ---------------------------------------------------------------------------
+// Active Multi-Route Reconnect & In-Place Repair
+// ---------------------------------------------------------------------------
+
+// ReconnectStep records the outcome of one control-path probe during Retry.
+type ReconnectStep struct {
+	Route  string `json:"route"`
+	OK     bool   `json:"ok"`
+	Detail string `json:"detail"`
+}
+
+// ReconnectResult is returned by POST /api/servers/{id}/reconnect.
+type ReconnectResult struct {
+	OK        bool            `json:"ok"`
+	Route     string          `json:"route,omitempty"`
+	Via       string          `json:"via,omitempty"`
+	Message   string          `json:"message,omitempty"`
+	Diagnosis string          `json:"diagnosis,omitempty"`
+	Steps     []ReconnectStep `json:"steps,omitempty"`
+	Server    *serverView     `json:"server,omitempty"`
+}
+
+func (p *Panel) handleRefreshAllServers(w http.ResponseWriter, _ *http.Request, _ authed) {
+	agent.ExtendDeadlines(w, time.Minute)
+	for _, s := range p.store.get().Servers {
+		p.fleet.mu.Lock()
+		h := p.fleet.by[s.ID]
+		offline := h == nil || h.err != nil
+		p.fleet.mu.Unlock()
+		if offline {
+			p.fleet.clearPreferredPath(s.ID)
+		}
+	}
+	p.fleet.refreshAll()
+	writeJSON(w, http.StatusOK, map[string]any{"servers": p.fleet.views()})
+}
+
+func (p *Panel) handleReconnectServer(w http.ResponseWriter, r *http.Request, _ authed) {
+	agent.ExtendDeadlines(w, time.Minute)
+	srv, ok := p.serverByID(r.PathValue("id"))
+	if !ok {
+		writeErr(w, http.StatusNotFound, "That server is not in the panel.")
+		return
+	}
+	res := p.reconnectServer(r.Context(), srv)
+	writeJSON(w, http.StatusOK, res)
+}
+
+func decodeOverviewStatus(status int, raw []byte, srv Server) (*agent.Overview, error) {
+	switch status {
+	case http.StatusOK:
+	case http.StatusNotFound:
+		return nil, errors.New("PortBridge on this server is too old for the panel")
+	case http.StatusUnauthorized:
+		return nil, errors.New("the agent rejected the panel's token (401 unauthorized)")
+	default:
+		return nil, fmt.Errorf("agent answered HTTP %d", status)
+	}
+	var ov agent.Overview
+	if err := json.Unmarshal(raw, &ov); err != nil {
+		return nil, fmt.Errorf("invalid overview JSON: %w", err)
+	}
+	if len(ov.IPv4) == 0 || len(ov.IPv6) == 0 {
+		rv4, rv6 := resolveAddressIPs(srv.Address)
+		if len(ov.IPv4) == 0 && rv4 != "" {
+			ov.IPv4 = []string{rv4}
+		}
+		if len(ov.IPv6) == 0 && rv6 != "" {
+			ov.IPv6 = []string{rv6}
+		}
+	}
+	return &ov, nil
+}
+
+// reconnectServer clears cached routing state for srv and probes all 5 control
+// paths (Callback Hub, Direct HTTPS, IPv6 HTTPS, Stealth Fragmented TLS, and
+// Peer Jump across online servers), returning either the recovered overview or
+// an actionable diagnosis explaining why the server could not be reached.
+func (p *Panel) reconnectServer(ctx context.Context, srv Server) ReconnectResult {
+	p.fleet.clearPreferredPath(srv.ID)
+	token, err := p.store.open(srv.TokenEnc)
+	if err != nil {
+		return ReconnectResult{OK: false, Diagnosis: "Could not read saved agent token: " + err.Error()}
+	}
+
+	var steps []ReconnectStep
+	sawAuthOrCertMismatch := false
+	sawRefusedViaPeer := ""
+	sawRefusedDirect := false
+	triedPeerCount := 0
+
+	noteFailure := func(routeName string, ferr error) {
+		msg := ferr.Error()
+		steps = append(steps, ReconnectStep{Route: routeName, OK: false, Detail: plainAgentError(ferr)})
+		if strings.Contains(msg, "does not match the saved fingerprint") || strings.Contains(msg, "401") || strings.Contains(msg, "no longer accepts") {
+			sawAuthOrCertMismatch = true
+		}
+	}
+
+	finishSuccess := func(ov *agent.Overview, routeKey, routeLabel, viaPeerID, viaPeerName string) ReconnectResult {
+		steps = append(steps, ReconnectStep{Route: routeLabel, OK: true, Detail: "Connected"})
+		if viaPeerID != "" {
+			p.fleet.recordJump(srv.ID, viaPeerID)
+		}
+		p.fleet.mu.Lock()
+		h := p.fleet.by[srv.ID]
+		if h == nil {
+			h = &heard{}
+			p.fleet.by[srv.ID] = h
+		}
+		h.overview = ov
+		h.err = nil
+		h.at = time.Now()
+		h.tried = h.at
+		h.route = routeKey
+		p.fleet.mu.Unlock()
+
+		if len(ov.IPv6) > 0 && !slices.Equal(srv.IPv6, ov.IPv6) || (routeKey == "jump" && !srv.JumpAllowed) {
+			_ = p.store.update(func(st *State) error {
+				for i := range st.Servers {
+					if st.Servers[i].ID == srv.ID {
+						if len(ov.IPv6) > 0 {
+							st.Servers[i].IPv6 = append([]string(nil), ov.IPv6...)
+							srv.IPv6 = append([]string(nil), ov.IPv6...)
+						}
+						if routeKey == "jump" {
+							st.Servers[i].JumpAllowed = true
+							srv.JumpAllowed = true
+						}
+						break
+					}
+				}
+				return nil
+			})
+		}
+
+		go p.fleet.seedCallHome(srv)
+
+		var viewPtr *serverView
+		for _, v := range p.fleet.views() {
+			if v.ID == srv.ID {
+				vc := v
+				viewPtr = &vc
+				break
+			}
+		}
+		msg := fmt.Sprintf("Reconnected to %s via %s.", srv.Name, routeLabel)
+		return ReconnectResult{
+			OK:      true,
+			Route:   routeKey,
+			Via:     viaPeerName,
+			Message: msg,
+			Steps:   steps,
+			Server:  viewPtr,
+		}
+	}
+
+	// 1. Callback Hub (/hub/poll)
+	if p.hub.connected(srv.ID) {
+		hctx, cancel := context.WithTimeout(ctx, 8*time.Second)
+		st, raw, herr := p.hub.do(hctx, srv.ID, http.MethodGet, "/api/overview", nil)
+		cancel()
+		if herr == nil {
+			if ov, oerr := decodeOverviewStatus(st, raw, srv); oerr == nil {
+				p.fleet.recordPath(srv.ID, "", true, false, "hub")
+				return finishSuccess(ov, "hub", "Callback Hub", "", "")
+			} else {
+				noteFailure("Callback Hub", oerr)
+			}
+		} else {
+			noteFailure("Callback Hub", herr)
+		}
+	} else {
+		steps = append(steps, ReconnectStep{Route: "Callback Hub", OK: false, Detail: "agent is not currently calling in on /hub/poll"})
+	}
+
+	tryHTTP := func(baseURL string, stealth bool) (*agent.Overview, error) {
+		rctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		defer cancel()
+		req, err := http.NewRequestWithContext(rctx, http.MethodGet, strings.TrimRight(baseURL, "/")+"/api/overview", nil)
+		if err != nil {
+			return nil, err
+		}
+		req.Header.Set("Authorization", "Bearer "+token)
+		dialFn := (&net.Dialer{Timeout: 4 * time.Second, KeepAlive: 30 * time.Second}).DialContext
+		resp, err := agent.NewPinnedClientOpts(srv.Fingerprint, baseURL, 6*time.Second, dialFn, stealth).Do(req)
+		if err != nil {
+			return nil, err
+		}
+		raw, rerr := io.ReadAll(io.LimitReader(resp.Body, overviewLimit))
+		_ = resp.Body.Close()
+		if rerr != nil {
+			return nil, rerr
+		}
+		return decodeOverviewStatus(resp.StatusCode, raw, srv)
+	}
+
+	// 2. Direct IPv4 / Primary URL + 3. Direct IPv6
+	var v6URLs []string
+	if port := agentURLPort(srv.AgentURL); port != "" {
+		for _, ip := range srv.IPv6 {
+			cand := "https://" + net.JoinHostPort(ip, port)
+			if !strings.EqualFold(cand, strings.TrimRight(srv.AgentURL, "/")) {
+				v6URLs = append(v6URLs, cand)
+			}
+		}
+	}
+
+	var stealthTargets []string
+	if srv.AgentURL != "" {
+		ov, derr := tryHTTP(srv.AgentURL, false)
+		if derr == nil {
+			p.fleet.recordPath(srv.ID, srv.AgentURL, false, false, "direct")
+			return finishSuccess(ov, "direct", "Direct HTTPS", "", "")
+		}
+		noteFailure("Direct HTTPS", derr)
+		if strings.Contains(derr.Error(), "connection refused") || strings.Contains(derr.Error(), "actively refused") {
+			sawRefusedDirect = true
+		}
+		if !isTCPDialFailure(derr) && !sawAuthOrCertMismatch {
+			stealthTargets = append(stealthTargets, srv.AgentURL)
+		}
+	}
+
+	for _, u := range v6URLs {
+		ov, err6 := tryHTTP(u, false)
+		if err6 == nil {
+			p.fleet.recordPath(srv.ID, u, false, false, "ipv6")
+			return finishSuccess(ov, "ipv6", "Direct IPv6", "", "")
+		}
+		noteFailure("Direct IPv6 ("+u+")", err6)
+		if !isTCPDialFailure(err6) && !sawAuthOrCertMismatch {
+			stealthTargets = append(stealthTargets, u)
+		}
+	}
+
+	// 4. Stealth Chrome uTLS + Fragmented ClientHello
+	for _, u := range stealthTargets {
+		ov, serr := tryHTTP(u, true)
+		if serr == nil {
+			p.fleet.recordPath(srv.ID, u, false, true, "stealth")
+			return finishSuccess(ov, "stealth", "Stealth Fragmented TLS", "", "")
+		}
+		noteFailure("Stealth TLS ("+u+")", serr)
+	}
+
+	// 5. Peer Jump HTTPS across online fleet servers
+	if !sawAuthOrCertMismatch {
+		cands := p.jumpCandidates(srv.Address, srv.Group, "")
+		if len(cands) > 4 {
+			cands = cands[:4]
+		}
+		for _, cand := range cands {
+			triedPeerCount++
+			jctx, cancel := context.WithTimeout(withNoJump(ctx), 10*time.Second)
+			st, raw, jerr := p.callAgentViaJump(jctx, srv, cand, token, http.MethodGet, "/api/overview", nil, overviewLimit, 5*time.Second)
+			cancel()
+			label := "Peer Jump via " + cand.Name
+			if jerr == nil {
+				if ov, oerr := decodeOverviewStatus(st, raw, srv); oerr == nil {
+					return finishSuccess(ov, "jump", label, cand.ID, cand.Name)
+				} else {
+					noteFailure(label, oerr)
+				}
+			} else {
+				noteFailure(label, jerr)
+				if strings.Contains(jerr.Error(), "connection refused") || strings.Contains(jerr.Error(), "actively refused") {
+					sawRefusedViaPeer = cand.Name
+				}
+			}
+		}
+	}
+
+	agentPort := agentURLPort(srv.AgentURL)
+	if agentPort == "" {
+		agentPort = "4356"
+	}
+	var diagnosis string
+	switch {
+	case sawAuthOrCertMismatch:
+		diagnosis = "the server's agent answered with a different certificate or rejected the panel's token (it may have been reinstalled); click Repair to re-link it in place"
+	case sawRefusedViaPeer != "":
+		diagnosis = fmt.Sprintf("reached %s via %s, but nothing answered on agent port %s — portbridge-agent may be stopped or blocked by firewall; click Repair to restart it", srv.Address, sawRefusedViaPeer, agentPort)
+	case sawRefusedDirect:
+		diagnosis = fmt.Sprintf("reached %s, but nothing answered on agent port %s — portbridge-agent may be stopped; click Repair to restart it", srv.Address, agentPort)
+	case triedPeerCount > 0:
+		diagnosis = fmt.Sprintf("did not answer from the panel or via %d online peer server(s) — the VPS may be powered off, its IP changed, or port %s is dropped by firewall; click Repair to fix or re-pair it", triedPeerCount, agentPort)
+	default:
+		diagnosis = "direct connection timed out and the server is not calling in; click Repair to restart its agent via SSH or a 1-Line Reconnect Command"
+	}
+
+	p.fleet.mu.Lock()
+	h := p.fleet.by[srv.ID]
+	if h == nil {
+		h = &heard{}
+		p.fleet.by[srv.ID] = h
+	}
+	h.tried = time.Now()
+	h.err = errors.New(diagnosis)
+	p.fleet.mu.Unlock()
+
+	var viewPtr *serverView
+	for _, v := range p.fleet.views() {
+		if v.ID == srv.ID {
+			vc := v
+			viewPtr = &vc
+			break
+		}
+	}
+	return ReconnectResult{
+		OK:        false,
+		Diagnosis: capitalise(diagnosis) + ".",
+		Steps:     steps,
+		Server:    viewPtr,
+	}
+}
+
+func (p *Panel) handleRepairServer(w http.ResponseWriter, r *http.Request, _ authed) {
+	srv, ok := p.serverByID(r.PathValue("id"))
+	if !ok {
+		writeErr(w, http.StatusNotFound, "That server is not in the panel.")
+		return
+	}
+	var req addRequest
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	req.Address = strings.TrimSpace(req.Address)
+	if req.Address == "" {
+		req.Address = srv.Address
+	}
+	if strings.ContainsAny(req.Address, " /\\@") || len(req.Address) > 253 {
+		writeErr(w, http.StatusBadRequest, "Give the server's address: an IP address or a host name.")
+		return
+	}
+	if req.SSHPort == 0 {
+		req.SSHPort = 22
+	}
+	if req.SSHPort < 1 || req.SSHPort > 65535 {
+		writeErr(w, http.StatusBadRequest, "The SSH port must be from 1 to 65535.")
+		return
+	}
+	if req.Password == "" && strings.TrimSpace(req.PrivateKey) == "" {
+		writeErr(w, http.StatusBadRequest, "Give the server's password, or its private key.")
+		return
+	}
+	req.HostKey = strings.TrimSpace(req.HostKey)
+	if req.HostKey == "" {
+		writeErr(w, http.StatusBadRequest, "Confirm the server's SSH fingerprint first.")
+		return
+	}
+	for _, o := range p.store.get().Servers {
+		if o.ID != srv.ID && strings.EqualFold(o.Address, req.Address) {
+			writeErr(w, http.StatusBadRequest, fmt.Sprintf("%s is already used by %q.", req.Address, o.Name))
+			return
+		}
+	}
+	id := p.startJob(func(j *job) (string, error) {
+		return srv.ID, p.repairServer(j, srv, req)
+	})
+	writeJSON(w, http.StatusAccepted, map[string]string{"job": id})
+}
+
+// repairServer logs in to an existing server over Direct or Jump SSH, installs
+// or updates PortBridge if needed, restarts its agent, verifies multi-path
+// reachability, and updates the existing Server record in place.
+func (p *Panel) repairServer(j *job, existing Server, r addRequest) error {
+	methods, err := sshAuth(r)
+	if err != nil {
+		return err
+	}
+	if strings.TrimSpace(r.User) == "" {
+		r.User = "root"
+	}
+	if r.SSHPort == 0 {
+		r.SSHPort = 22
+	}
+	targetAddr := strings.TrimSpace(r.Address)
+	if targetAddr == "" {
+		targetAddr = existing.Address
+	}
+	var hostKey string
+	cfg := &ssh.ClientConfig{
+		User: strings.TrimSpace(r.User),
+		Auth: methods,
+		HostKeyCallback: func(_ string, _ net.Addr, key ssh.PublicKey) error {
+			hostKey = ssh.FingerprintSHA256(key)
+			if hostKey != r.HostKey {
+				return fmt.Errorf("its SSH fingerprint is %s, not the %s that was confirmed; nothing was sent", hostKey, r.HostKey)
+			}
+			return nil
+		},
+		Timeout: 20 * time.Second,
+	}
+
+	client, viaName, err := p.dialSSHClient(context.Background(), j, targetAddr, r.SSHPort, cfg, existing.Group, r.ViaServer)
+	if err != nil {
+		return err
+	}
+	defer client.Close()
+	rm := &remote{c: client}
+	if viaName != "" {
+		j.say("Connected via %s (host key %s).", viaName, hostKey)
+	} else {
+		j.say("Connected (host key %s).", hostKey)
+	}
+
+	const lookCmd = "echo pb_uid=$(id -u); echo pb_arch=$(uname -m); " +
+		"echo pb_systemd=$(test -d /run/systemd/system && echo yes); " +
+		"echo pb_version=$(/usr/local/bin/portbridge version 2>/dev/null)"
+	facts, err := rm.run(lookCmd, nil, 30*time.Second)
+	f := parseFacts(facts)
+	uid, answered := f["pb_uid"]
+	if !answered {
+		return fmt.Errorf("could not inspect server: %v %s", err, lastLines(facts, 5))
+	}
+	if uid != "0" {
+		j.say("Logged in as %q; switching to root with sudo -i...", r.User)
+		if err := rm.ensureRoot(r.User, r.Password, r.SudoPassword); err != nil {
+			return err
+		}
+		j.say("Switched to root (sudo -i).")
+	}
+	arch := archName(f["pb_arch"])
+	if arch == "" {
+		return fmt.Errorf("its processor type (%s) is not one PortBridge is built for", f["pb_arch"])
+	}
+	if f["pb_systemd"] != "yes" {
+		return errors.New("it does not use systemd, which PortBridge needs")
+	}
+	installed := ""
+	if strings.HasPrefix(f["pb_version"], "v") {
+		installed = f["pb_version"]
+	}
+
+	switch c := compareVersions(installed, engine.Version); {
+	case installed == "":
+		j.say("PortBridge is missing on it; installing %s...", engine.Version)
+		if err := p.install(j, rm, arch); err != nil {
+			return err
+		}
+	case c < 0 && r.AllowUpdate:
+		j.say("Updating PortBridge from %s to %s...", installed, engine.Version)
+		if err := p.install(j, rm, arch); err != nil {
+			return err
+		}
+	default:
+		j.say("PortBridge %s is installed.", installed)
+	}
+
+	setupArgs := "-panel-url off"
+	if now := installedAfter(installed, r.AllowUpdate); compareVersions(now, firstOneClickVersion) >= 0 {
+		setupArgs += " -allow-updates on"
+	}
+	j.say("Restarting & verifying its management agent...")
+	res, err := remoteAgentSetup(rm, setupArgs)
+	if err != nil {
+		return err
+	}
+	j.say("Agent is running on port %d.", res.Port)
+
+	updated := existing
+	updated.Address = targetAddr
+	updated.AgentURL = "https://" + net.JoinHostPort(targetAddr, strconv.Itoa(res.Port))
+	updated.Fingerprint = res.Fingerprint
+	updated.HostKey = hostKey
+	updated.CallsPanel = false
+	updated.StandbyHub = false
+	updated.JumpAllowed = false
+
+	if addrOut, aerr := rm.run("/usr/local/bin/portbridge addresses 2>/dev/null", nil, 10*time.Second); aerr == nil {
+		var v6s []string
+		for _, line := range strings.Split(addrOut, "\n") {
+			if ip6, ok := strings.CutPrefix(strings.TrimSpace(line), "ipv6 "); ok && strings.TrimSpace(ip6) != "" {
+				v6s = append(v6s, strings.TrimSpace(ip6))
+			}
+		}
+		if len(v6s) > 0 {
+			updated.IPv6 = v6s
+		}
+	}
+	if updated.TokenEnc, err = p.store.seal(res.Token); err != nil {
+		return err
+	}
+
+	p.fleet.clearPreferredPath(updated.ID)
+	j.say("Checking control paths (Direct, IPv6 & Stealth TLS)...")
+	ov, derr := p.tryDirect(updated)
+	if derr == nil {
+		j.say("Reached it directly.")
+		if cbURLs := p.allCallbackURLs(); cbURLs != "" && p.ownFingerprint() != "" {
+			if _, err := remoteAgentSetup(rm, "-panel-url "+shellQuote(cbURLs)+
+				" -panel-fingerprint "+shellQuote(p.ownFingerprint())); err == nil {
+				updated.StandbyHub = true
+			}
+		}
+	} else {
+		j.say("Direct path did not answer (%s). Configuring reverse callback...", plainAgentError(derr))
+		panelURL := p.allCallbackURLs()
+		if panelURL == "" {
+			panelURL = p.publicURL()
+		}
+		var hubErr error
+		if panelURL != "" && p.ownFingerprint() != "" {
+			p.addPending(updated.ID, res.Token)
+			defer p.dropPending(updated.ID)
+			if _, err := remoteAgentSetup(rm, "-panel-url "+shellQuote(panelURL)+
+				" -panel-fingerprint "+shellQuote(p.ownFingerprint())); err != nil {
+				return err
+			}
+			updated.CallsPanel = true
+			ov, hubErr = p.waitForCall(updated)
+			if hubErr == nil {
+				j.say("It is calling the panel.")
+			}
+		} else {
+			hubErr = errors.New("panel has no public callback URL configured")
+		}
+
+		if ov == nil {
+			j.say("Reverse callback did not connect (%v). Trying peer jump...", hubErr)
+			jov, jumpName, jerr := p.tryJumpOverview(updated, r.ViaServer)
+			if jerr != nil {
+				return fmt.Errorf("restarted agent, but could not reach it directly, via callback (%v), or via peer jump (%v)", hubErr, jerr)
+			}
+			ov = jov
+			updated.CallsPanel = false
+			updated.JumpAllowed = true
+			if panelURL != "" {
+				updated.StandbyHub = true
+			}
+			j.say("Reached its agent securely via %s.", jumpName)
+		}
+	}
+
+	if ov != nil && len(ov.IPv6) > 0 {
+		updated.IPv6 = append([]string(nil), ov.IPv6...)
+	}
+	if err := p.store.update(func(st *State) error {
+		for i := range st.Servers {
+			if st.Servers[i].ID == updated.ID {
+				st.Servers[i] = updated
+				return nil
+			}
+		}
+		return errors.New("server was removed while repair was running")
+	}); err != nil {
+		return err
+	}
+	p.updates.mu.Lock()
+	delete(p.updates.needSSH, updated.ID)
+	p.updates.mu.Unlock()
+	p.fleet.refresh(updated)
+	j.say("Repaired %q; it is back online. The SSH login was not kept.", updated.Name)
+	return nil
+}
+
+// ---------------------------------------------------------------------------
 // 1-Line Join Tickets (Zero-SSH Server Pairing)
 // ---------------------------------------------------------------------------
 
@@ -633,6 +1192,7 @@ type joinTicket struct {
 	secret     string
 	group      string
 	name       string
+	repairID   string
 	expires    time.Time
 	claiming   bool
 	done       bool
@@ -681,14 +1241,29 @@ func (p *Panel) sameArchArchiveSHA256() string {
 
 func (p *Panel) handleCreateJoinTicket(w http.ResponseWriter, r *http.Request, _ authed) {
 	var req struct {
-		Group string `json:"group"`
-		Name  string `json:"name"`
+		Group    string `json:"group"`
+		Name     string `json:"name"`
+		RepairID string `json:"repair_id"`
 	}
 	if !decodeJSON(w, r, &req) {
 		return
 	}
 	req.Group = strings.TrimSpace(req.Group)
 	req.Name = strings.TrimSpace(req.Name)
+	req.RepairID = strings.TrimSpace(req.RepairID)
+
+	if req.RepairID != "" {
+		existing, ok := p.serverByID(req.RepairID)
+		if !ok {
+			writeErr(w, http.StatusNotFound, "That server is not in the panel.")
+			return
+		}
+		req.Group = existing.Group
+		if req.Name == "" {
+			req.Name = existing.Name
+		}
+	}
+
 	if !validGroup(req.Group) {
 		writeErr(w, http.StatusBadRequest, "Choose whether this is a relay (Iran) or a foreign server.")
 		return
@@ -708,11 +1283,12 @@ func (p *Panel) handleCreateJoinTicket(w http.ResponseWriter, r *http.Request, _
 	}
 
 	t := &joinTicket{
-		id:      newID(8),
-		secret:  randomToken(),
-		group:   req.Group,
-		name:    req.Name,
-		expires: time.Now().Add(joinTicketTTL),
+		id:       newID(8),
+		secret:   randomToken(),
+		group:    req.Group,
+		name:     req.Name,
+		repairID: req.RepairID,
+		expires:  time.Now().Add(joinTicketTTL),
 	}
 	p.ticketsMu.Lock()
 	if p.tickets == nil {
@@ -829,6 +1405,7 @@ func (p *Panel) handleHubRegister(w http.ResponseWriter, r *http.Request) {
 	matched.claiming = true
 	group := matched.group
 	wantName := matched.name
+	repairID := matched.repairID
 	p.ticketsMu.Unlock()
 
 	releaseClaim := func() {
@@ -854,7 +1431,7 @@ func (p *Panel) handleHubRegister(w http.ResponseWriter, r *http.Request) {
 	}
 
 	for _, s := range p.store.get().Servers {
-		if strings.EqualFold(s.Address, addr) {
+		if s.ID != repairID && strings.EqualFold(s.Address, addr) {
 			releaseClaim()
 			writeJSON(w, http.StatusConflict, agent.HubRegisterReply{
 				OK:    false,
@@ -871,35 +1448,74 @@ func (p *Panel) handleHubRegister(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	name := wantName
-	if name == "" {
-		name = strings.TrimSpace(req.Hostname)
-	}
-	if name == "" {
-		name = addr
-	}
+	var srv Server
+	if repairID != "" {
+		existing, ok := p.serverByID(repairID)
+		if !ok {
+			releaseClaim()
+			writeJSON(w, http.StatusNotFound, agent.HubRegisterReply{OK: false, Error: "server to repair is no longer in the panel"})
+			return
+		}
+		srv = existing
+		// Preserve hostname if the server was added by domain name; otherwise update IP.
+		if existing.Address == "" || net.ParseIP(existing.Address) != nil {
+			srv.Address = addr
+		}
+		srv.IPv6 = append([]string(nil), req.IPv6...)
+		srv.AgentURL = "https://" + net.JoinHostPort(srv.Address, strconv.Itoa(req.Port))
+		srv.Fingerprint = strings.TrimSpace(req.Fingerprint)
+		srv.TokenEnc = tokEnc
+		srv.CallsPanel = true
+		srv.StandbyHub = true
+		p.fleet.clearPreferredPath(srv.ID)
 
-	srv := Server{
-		ID:          newID(9),
-		Name:        name,
-		Group:       group,
-		Address:     addr,
-		IPv6:        append([]string(nil), req.IPv6...),
-		AgentURL:    "https://" + net.JoinHostPort(addr, strconv.Itoa(req.Port)),
-		Fingerprint: strings.TrimSpace(req.Fingerprint),
-		TokenEnc:    tokEnc,
-		CallsPanel:  true,
-		StandbyHub:  true,
-		Added:       time.Now().UTC(),
-	}
+		if err := p.store.update(func(st *State) error {
+			for i := range st.Servers {
+				if st.Servers[i].ID == srv.ID {
+					st.Servers[i] = srv
+					return nil
+				}
+			}
+			return errors.New("server not found")
+		}); err != nil {
+			releaseClaim()
+			writeJSON(w, http.StatusInternalServerError, agent.HubRegisterReply{OK: false, Error: err.Error()})
+			return
+		}
+		p.updates.mu.Lock()
+		delete(p.updates.needSSH, srv.ID)
+		p.updates.mu.Unlock()
+	} else {
+		name := wantName
+		if name == "" {
+			name = strings.TrimSpace(req.Hostname)
+		}
+		if name == "" {
+			name = addr
+		}
 
-	if err := p.store.update(func(st *State) error {
-		st.Servers = append(st.Servers, srv)
-		return nil
-	}); err != nil {
-		releaseClaim()
-		writeJSON(w, http.StatusInternalServerError, agent.HubRegisterReply{OK: false, Error: err.Error()})
-		return
+		srv = Server{
+			ID:          newID(9),
+			Name:        name,
+			Group:       group,
+			Address:     addr,
+			IPv6:        append([]string(nil), req.IPv6...),
+			AgentURL:    "https://" + net.JoinHostPort(addr, strconv.Itoa(req.Port)),
+			Fingerprint: strings.TrimSpace(req.Fingerprint),
+			TokenEnc:    tokEnc,
+			CallsPanel:  true,
+			StandbyHub:  true,
+			Added:       time.Now().UTC(),
+		}
+
+		if err := p.store.update(func(st *State) error {
+			st.Servers = append(st.Servers, srv)
+			return nil
+		}); err != nil {
+			releaseClaim()
+			writeJSON(w, http.StatusInternalServerError, agent.HubRegisterReply{OK: false, Error: err.Error()})
+			return
+		}
 	}
 
 	p.ticketsMu.Lock()

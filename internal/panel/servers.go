@@ -11,6 +11,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -27,7 +28,7 @@ import (
 
 const (
 	refreshEvery  = 15 * time.Second
-	agentTimeout  = 20 * time.Second
+	agentTimeout  = 35 * time.Second
 	overviewLimit = 4 << 20
 )
 
@@ -107,6 +108,25 @@ func (f *fleet) preferredPath(id string) (url string, hub, stealth bool, jumpID 
 	return "", false, false, ""
 }
 
+func (f *fleet) clearPreferredPath(id string) {
+	f.mu.Lock()
+	if h := f.by[id]; h != nil {
+		h.lastURL = ""
+		h.preferHub = false
+		h.stealth = false
+		h.jumpID = ""
+	}
+	f.mu.Unlock()
+}
+
+func isTCPDialFailure(err error) bool {
+	if err == nil {
+		return false
+	}
+	var opErr *net.OpError
+	return errors.As(err, &opErr) && opErr.Op == "dial"
+}
+
 // call sends one request to a server's agent and returns its answer.
 func (f *fleet) call(ctx context.Context, srv Server, method, path string, body []byte) (int, []byte, error) {
 	return f.callLimit(ctx, srv, method, path, body, overviewLimit)
@@ -138,7 +158,7 @@ func (f *fleet) callLimit(ctx context.Context, srv Server, method, path string, 
 		return 0, nil, err
 	}
 
-	tryURL := func(baseURL string, maxWait time.Duration, stealth bool) (int, []byte, error) {
+	tryURL := func(baseURL string, dialWait, maxWait time.Duration, stealth bool) (int, []byte, error) {
 		rctx := ctx
 		var cancel context.CancelFunc
 		if maxWait > 0 {
@@ -153,7 +173,11 @@ func (f *fleet) callLimit(ctx context.Context, srv Server, method, path string, 
 		if len(body) > 0 {
 			req.Header.Set("Content-Type", "application/json")
 		}
-		resp, err := agent.NewPinnedClientOpts(srv.Fingerprint, baseURL, 10*time.Minute, nil, stealth).Do(req)
+		var baseDial func(context.Context, string, string) (net.Conn, error)
+		if dialWait > 0 {
+			baseDial = (&net.Dialer{Timeout: dialWait, KeepAlive: 30 * time.Second}).DialContext
+		}
+		resp, err := agent.NewPinnedClientOpts(srv.Fingerprint, baseURL, 10*time.Minute, baseDial, stealth).Do(req)
 		if err != nil {
 			return 0, nil, err
 		}
@@ -182,8 +206,8 @@ func (f *fleet) callLimit(ctx context.Context, srv Server, method, path string, 
 				cands = append(cands, c)
 			}
 		}
-		if len(cands) > 2 {
-			cands = cands[:2]
+		if len(cands) > 3 {
+			cands = cands[:3]
 		}
 		for _, cand := range cands {
 			st, rb, jerr := f.p.callAgentViaJump(ctx, srv, cand, token, method, path, body, limit, 4*time.Second)
@@ -217,7 +241,8 @@ func (f *fleet) callLimit(ctx context.Context, srv Server, method, path string, 
 			return status, b, herr
 		}
 		for _, u := range append([]string{srv.AgentURL}, v6URLs...) {
-			if st, rb, derr := tryURL(u, 5*time.Second, false); derr == nil {
+			st, rb, derr := tryURL(u, 3500*time.Millisecond, 4500*time.Millisecond, false)
+			if derr == nil {
 				route := "direct"
 				if slices.Contains(v6URLs, u) {
 					route = "ipv6"
@@ -225,9 +250,11 @@ func (f *fleet) callLimit(ctx context.Context, srv Server, method, path string, 
 				f.recordPath(srv.ID, u, false, false, route)
 				return st, rb, nil
 			}
-			if st, rb, serr := tryURL(u, 5*time.Second, true); serr == nil {
-				f.recordPath(srv.ID, u, false, true, "stealth")
-				return st, rb, nil
+			if !isTCPDialFailure(derr) {
+				if st, rb, serr := tryURL(u, 3500*time.Millisecond, 5*time.Second, true); serr == nil {
+					f.recordPath(srv.ID, u, false, true, "stealth")
+					return st, rb, nil
+				}
 			}
 		}
 		if st, rb, ok := tryPeerJump(prefJump); ok {
@@ -238,9 +265,12 @@ func (f *fleet) callLimit(ctx context.Context, srv Server, method, path string, 
 
 	canJump := !isNoJump(ctx) && (srv.JumpAllowed || prefJump != "" || len(f.p.jumpCandidates(srv.Address, srv.Group, "")) > 0)
 	hasFallback := len(v6URLs) > 0 || f.p.hub.connected(srv.ID) || canJump || prefStealth
-	var perTry time.Duration
-	if hasFallback && method == http.MethodGet && limit <= overviewLimit {
-		perTry = 5 * time.Second
+	var dialWait, perTry time.Duration
+	if hasFallback {
+		dialWait = 3500 * time.Millisecond
+		if method == http.MethodGet && limit <= overviewLimit {
+			perTry = 4500 * time.Millisecond
+		}
 	}
 
 	if prefHub && f.p.hub.connected(srv.ID) {
@@ -252,16 +282,17 @@ func (f *fleet) callLimit(ctx context.Context, srv Server, method, path string, 
 			return st, rb, nil
 		}
 	} else if prefStealth && prefURL != "" {
-		if st, rb, errPref := tryURL(prefURL, perTry, true); errPref == nil {
+		if st, rb, errPref := tryURL(prefURL, dialWait, perTry, true); errPref == nil {
 			return st, rb, nil
 		}
 	} else if prefURL != "" && slices.Contains(v6URLs, prefURL) {
-		if st, rb, errPref := tryURL(prefURL, perTry, false); errPref == nil {
+		if st, rb, errPref := tryURL(prefURL, dialWait, perTry, false); errPref == nil {
 			return st, rb, nil
 		}
 	}
 
-	status, b, derr := tryURL(srv.AgentURL, perTry, false)
+	var stealthTargets []string
+	status, b, derr := tryURL(srv.AgentURL, dialWait, perTry, false)
 	if derr == nil {
 		f.recordPath(srv.ID, srv.AgentURL, false, false, "direct")
 		return status, b, nil
@@ -269,9 +300,12 @@ func (f *fleet) callLimit(ctx context.Context, srv Server, method, path string, 
 	if strings.Contains(derr.Error(), "does not match the saved fingerprint") {
 		return 0, nil, derr
 	}
+	if !isTCPDialFailure(derr) {
+		stealthTargets = append(stealthTargets, srv.AgentURL)
+	}
 
 	for _, u := range v6URLs {
-		st, rb, err6 := tryURL(u, perTry, false)
+		st, rb, err6 := tryURL(u, dialWait, perTry, false)
 		if err6 == nil {
 			f.recordPath(srv.ID, u, false, false, "ipv6")
 			return st, rb, nil
@@ -279,27 +313,27 @@ func (f *fleet) callLimit(ctx context.Context, srv Server, method, path string, 
 		if strings.Contains(err6.Error(), "does not match the saved fingerprint") {
 			return 0, nil, err6
 		}
-	}
-
-	// If standard TLS was reset or DPI-dropped (rather than an immediate TCP
-	// connection refused), retry with Chrome uTLS + fragmented ClientHello.
-	if !strings.Contains(derr.Error(), "connection refused") && !strings.Contains(derr.Error(), "actively refused") {
-		for _, u := range append([]string{srv.AgentURL}, v6URLs...) {
-			st, rb, serr := tryURL(u, 5*time.Second, true)
-			if serr == nil {
-				f.recordPath(srv.ID, u, false, true, "stealth")
-				return st, rb, nil
-			}
-			if strings.Contains(serr.Error(), "does not match the saved fingerprint") {
-				return 0, nil, serr
-			}
+		if !isTCPDialFailure(err6) {
+			stealthTargets = append(stealthTargets, u)
 		}
 	}
 
+	// Check live standby Callback Hub immediately before probing Stealth TLS / Jump.
 	if f.p.hub.connected(srv.ID) {
 		if st, rb, herr := f.p.hub.do(ctx, srv.ID, method, path, body); herr == nil {
 			f.recordPath(srv.ID, "", true, false, "hub")
 			return st, rb, nil
+		}
+	}
+
+	for _, u := range stealthTargets {
+		st, rb, serr := tryURL(u, 3500*time.Millisecond, 5*time.Second, true)
+		if serr == nil {
+			f.recordPath(srv.ID, u, false, true, "stealth")
+			return st, rb, nil
+		}
+		if strings.Contains(serr.Error(), "does not match the saved fingerprint") {
+			return 0, nil, serr
 		}
 	}
 
@@ -358,7 +392,7 @@ func (f *fleet) refresh(srv Server) {
 	if err == nil {
 		h.overview = ov
 		h.at = time.Now()
-		if !h.seededHome {
+		if !h.seededHome || (h.route == "jump" && !f.p.hub.connected(srv.ID)) {
 			needSeed = true
 		}
 	}

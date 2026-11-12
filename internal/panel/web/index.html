@@ -164,6 +164,7 @@
             <button type="button" class="seg-btn is-active" data-srv-density="detailed" aria-pressed="true" title="Full server metrics and tunnel details">Detailed</button>
             <button type="button" class="seg-btn" data-srv-density="compact" aria-pressed="false" title="Compact cards for managing many servers">Compact</button>
           </div>
+          <button type="button" id="srv-refresh-btn" class="srv-refresh-btn" title="Re-check all servers right now">Refresh All</button>
         </div>
       </div>
 
@@ -390,7 +391,7 @@
 
     <div class="dialog-body">
       <div id="add-only">
-        <fieldset class="step-box">
+        <fieldset class="step-box" id="add-role-box">
           <legend>Server Role</legend>
           <div class="choice-grid cols-2">
             <label class="choice-card">
@@ -409,27 +410,27 @@
             </label>
           </div>
         </fieldset>
-
-        <fieldset class="step-box" id="add-method-box">
-          <legend>Connection &amp; Pairing Method</legend>
-          <div class="choice-grid cols-2">
-            <label class="choice-card">
-              <input type="radio" name="add-method" value="ssh" checked>
-              <div class="choice-body">
-                <div class="choice-top"><strong>SSH Auto-Setup</strong><span class="pill-tag tag-ok">Auto-Fallback</span></div>
-                <span class="choice-desc">Tries Direct IPv4/IPv6, hops via an online server if blocked, and pairs over Direct, Stealth TLS, Callback, or Jump.</span>
-              </div>
-            </label>
-            <label class="choice-card">
-              <input type="radio" name="add-method" value="join">
-              <div class="choice-body">
-                <div class="choice-top"><strong>1-Line Join Command</strong><span class="pill-tag">No SSH Needed</span></div>
-                <span class="choice-desc">Gives a single command to paste on the server when SSH from the panel is completely blocked or disabled.</span>
-              </div>
-            </label>
-          </div>
-        </fieldset>
       </div>
+
+      <fieldset class="step-box" id="add-method-box">
+        <legend>Connection &amp; Pairing Method</legend>
+        <div class="choice-grid cols-2">
+          <label class="choice-card">
+            <input type="radio" name="add-method" value="ssh" checked>
+            <div class="choice-body">
+              <div class="choice-top"><strong id="add-method-ssh-title">SSH Auto-Setup</strong><span class="pill-tag tag-ok">Auto-Fallback</span></div>
+              <span class="choice-desc">Tries Direct IPv4/IPv6, hops via an online server if blocked, and pairs over Direct, Stealth TLS, Callback, or Jump.</span>
+            </div>
+          </label>
+          <label class="choice-card">
+            <input type="radio" name="add-method" value="join">
+            <div class="choice-body">
+              <div class="choice-top"><strong id="add-method-join-title">1-Line Join Command</strong><span class="pill-tag">No SSH Needed</span></div>
+              <span class="choice-desc">Gives a single command to paste on the server when SSH from the panel is completely blocked or disabled.</span>
+            </div>
+          </label>
+        </div>
+      </fieldset>
 
       <div id="add-only-name">
         <label for="add-name">Display Name <span class="muted">(optional)</span></label>
