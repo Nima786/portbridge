@@ -203,6 +203,30 @@
           <button type="button" class="new-tunnel primary">+ New Tunnel</button>
         </div>
       </div>
+
+      <div class="tunnels-bar" id="tunnels-bar">
+        <div class="servers-search-wrap">
+          <label for="tun-search" class="visually-hidden">Search tunnels</label>
+          <input id="tun-search" type="search" placeholder="Search tunnel, server, port, or transport…" autocapitalize="none" spellcheck="false">
+        </div>
+        <div class="servers-bar-controls">
+          <div class="seg-group" role="group" aria-label="Filter tunnels by status">
+            <button type="button" class="seg-btn is-active" data-tun-filter="all" aria-pressed="true">All</button>
+            <button type="button" class="seg-btn" data-tun-filter="healthy" aria-pressed="false">Healthy</button>
+            <button type="button" class="seg-btn" data-tun-filter="issues" aria-pressed="false">Issues</button>
+          </div>
+          <label for="tun-srv-filter" class="visually-hidden">Filter tunnels by server</label>
+          <select id="tun-srv-filter" class="tun-srv-select" title="Filter tunnels by server">
+            <option value="">All Servers</option>
+          </select>
+          <div class="seg-group" role="group" aria-label="Tunnel grouping layout">
+            <button type="button" class="seg-btn is-active" data-tun-layout="flat" aria-pressed="true" title="Show all tunnels in one flat list">List</button>
+            <button type="button" class="seg-btn" data-tun-layout="relay" aria-pressed="false" title="Group tunnels under each Relay (Iran) server">By Relay</button>
+          </div>
+          <button type="button" id="tun-expand-btn" class="srv-refresh-btn" title="Expand or collapse all tunnel cards">Expand All</button>
+        </div>
+      </div>
+
       <div id="tunnel-list" class="tunnels"></div>
     </section>
 
@@ -605,7 +629,7 @@
     <div class="dialog-header">
       <div>
         <h2 id="tn-title">Create New Tunnel</h2>
-        <p class="muted small">Link a Relay (Iran) server with a Foreign server and configure transport disguise, pooling, and port forwarding.</p>
+        <p id="tn-intro" class="muted small">Link a Relay (Iran) server with a Foreign server and configure transport disguise, pooling, and port forwarding.</p>
       </div>
     </div>
 
@@ -1410,7 +1434,7 @@
 
     <div class="dialog-footer actions">
       <button type="button" id="tn-cancel">Cancel</button>
-      <button type="submit" class="primary">Create Tunnel</button>
+      <button type="submit" id="tn-submit" class="primary">Create Tunnel</button>
     </div>
   </form>
 
@@ -1508,6 +1532,15 @@
     </div>
 
     <div class="dialog-body">
+      <div id="et-mode-banner" class="et-mode-banner" hidden>
+        <div class="et-mode-banner-info">
+          <span class="et-mode-banner-kicker">Current Transport &amp; Direction</span>
+          <strong id="et-mode-summary">—</strong>
+          <span class="muted small">Need to re-benchmark routes or switch transport / Direct ↔ Reverse direction without recreating this tunnel?</span>
+        </div>
+        <button type="button" id="et-switch-mode-btn" class="primary">Switch Transport / Benchmark…</button>
+      </div>
+
       <fieldset id="et-ports-section" class="step-section">
         <legend class="step-header">
           <span class="step-num">1</span>

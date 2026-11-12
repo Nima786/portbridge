@@ -1453,7 +1453,7 @@ func EditEdge(spec EditSpec, confDir string) (EdgeResult, error) {
 
 	text := oldConf
 
-	if curCfg.Role == engine.RoleEdge && (spec.Mode != "" || spec.Transport != "" || spec.Asymmetric != "" || spec.TwinPath != "") {
+	if curCfg.Role == engine.RoleEdge && (spec.Mode != "" || spec.Transport != "" || spec.Asymmetric != "" || spec.TwinPath != "" || spec.GRE != "" || spec.SIT != "") {
 		// Full mode / transport replacement while preserving user ports, service ports,
 		// secret, proxy_protocol, pool, max_conn, spare_ttl, and drain.
 		curUsers := portsIn(curCfg.UserListen)
@@ -1912,9 +1912,13 @@ func EditEdge(spec EditSpec, confDir string) (EdgeResult, error) {
 	if spec.Firewall != "" {
 		switch spec.Firewall {
 		case "on":
-			asymEdge := curCfg.Role == engine.RoleEdge && (curCfg.Asymmetric || spec.Asymmetric == "on")
-			if curCfg.GRE || curCfg.SIT || spec.GRE == "on" || spec.SIT == "on" ||
-				(!asymEdge && (curCfg.CDN || curCfg.AltTarget != "" || spec.CDN == "on" || spec.AltHost != "")) {
+			replacing := spec.Mode != "" || spec.Transport != "" || spec.Asymmetric != "" || spec.TwinPath != "" || spec.GRE != "" || spec.SIT != ""
+			nowGRE := spec.GRE == "on" || (!replacing && curCfg.GRE && spec.GRE != "off")
+			nowSIT := spec.SIT == "on" || (!replacing && curCfg.SIT && spec.SIT != "off")
+			nowCDN := spec.CDN == "on" || spec.AltHost != "" || (!replacing && (curCfg.CDN || curCfg.AltTarget != "") && spec.CDN != "off")
+			nowAsym := spec.Asymmetric == "on" || (!replacing && curCfg.Asymmetric && spec.Asymmetric != "off")
+			asymEdge := curCfg.Role == engine.RoleEdge && nowAsym
+			if nowGRE || nowSIT || (!asymEdge && nowCDN) {
 				res.Warnings = append(res.Warnings, "firewall stays off for CDN, GRE and 6in4 (SIT) tunnels")
 			} else {
 				text = setConfKey(text, "firewall", "on")

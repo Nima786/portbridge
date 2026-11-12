@@ -1563,6 +1563,127 @@
 
   // ---------------------------------------------------------------- tunnels
 
+  let tunSearch = '';
+  let tunFilter = 'all';
+  let tunServerFilter = '';
+  let tunLayout = 'flat';
+  try {
+    const savedTunLayout = localStorage.getItem('pb-tun-layout');
+    if (savedTunLayout === 'flat' || savedTunLayout === 'relay') tunLayout = savedTunLayout;
+  } catch (e) {
+    // Ignore storage errors in private browsing.
+  }
+
+  function tunnelKeyOf(t) {
+    const e = t.edge, o = t.origin;
+    return `${t.name}:${e ? e.server_id : ''}:${o ? o.server_id : ''}`;
+  }
+
+  function isTunnelHealthy(t) {
+    const e = t.edge, o = t.origin;
+    if (!e || !o || !e.info || !o.info) return false;
+    if (!e.info.running || !o.info.running) return false;
+    if (e.info.problem || o.info.problem) return false;
+    const live = e.info.live || o.info.live;
+    if (live && (live.path_state === 'blocked' || live.path_state === 'degraded')) return false;
+    return true;
+  }
+
+  function tunnelMatchesSearch(t, q) {
+    if (!q) return true;
+    const e = t.edge, o = t.origin;
+    const ei = e ? e.info : null, oi = o ? o.info : null;
+    const any = ei || oi || {};
+    const ah = t.auto_heal || {};
+    const userPorts = ei && ei.user_ports && ei.user_ports.length ? ei.user_ports : (oi ? oi.service_ports : null);
+    const servicePorts = oi && oi.service_ports && oi.service_ports.length ? oi.service_ports : (ei ? ei.service_ports : null);
+    const linkPort = (ei && ei.link_port) || (oi && oi.link_port) || '';
+    const hay = [
+      t.name,
+      e && e.server_name,
+      e && e.address,
+      o && o.server_name,
+      o && o.address,
+      shortLinkLabel(any),
+      any.link,
+      any.transport,
+      any.mode,
+      ports(userPorts),
+      ports(servicePorts),
+      String(linkPort),
+      ah.cdn_domain,
+    ].filter(Boolean).join(' ').toLowerCase();
+    return hay.includes(q);
+  }
+
+  function filterVPNTunnels(vpnList) {
+    const q = tunSearch.trim().toLowerCase();
+    return vpnList.filter((t) => {
+      if (tunFilter === 'healthy' && !isTunnelHealthy(t)) return false;
+      if (tunFilter === 'issues' && isTunnelHealthy(t)) return false;
+      if (tunServerFilter) {
+        const matchEdge = t.edge && t.edge.server_id === tunServerFilter;
+        const matchOrig = t.origin && t.origin.server_id === tunServerFilter;
+        if (!matchEdge && !matchOrig) return false;
+      }
+      return tunnelMatchesSearch(t, q);
+    });
+  }
+
+  function currentVisibleVPNTunnels() {
+    const vpnList = (tunnelsCache || []).filter((t) => !isWebsiteBridge(t));
+    return filterVPNTunnels(vpnList);
+  }
+
+  function syncTunnelExpandBtn(visibleList) {
+    const btn = $('tun-expand-btn');
+    if (!btn) return;
+    if (!visibleList.length) {
+      btn.disabled = true;
+      btn.textContent = 'Expand All';
+      return;
+    }
+    btn.disabled = false;
+    const allOpen = visibleList.every((t) => expandedTunnels.has(tunnelKeyOf(t)));
+    btn.textContent = allOpen ? 'Collapse All' : 'Expand All';
+  }
+
+  function populateTunnelServerFilter(vpnList) {
+    const sel = $('tun-srv-filter');
+    if (!sel) return;
+    const counts = {};
+    const names = {};
+    const roles = {};
+    for (const s of serversCache) {
+      names[s.id] = s.name || s.address || s.id;
+      roles[s.id] = s.group === 'foreign' ? 'Foreign' : 'Relay';
+    }
+    for (const t of vpnList) {
+      if (t.edge && t.edge.server_id) {
+        counts[t.edge.server_id] = (counts[t.edge.server_id] || 0) + 1;
+        if (!names[t.edge.server_id]) names[t.edge.server_id] = t.edge.server_name || t.edge.address || t.edge.server_id;
+        if (!roles[t.edge.server_id]) roles[t.edge.server_id] = 'Relay';
+      }
+      if (t.origin && t.origin.server_id) {
+        counts[t.origin.server_id] = (counts[t.origin.server_id] || 0) + 1;
+        if (!names[t.origin.server_id]) names[t.origin.server_id] = t.origin.server_name || t.origin.address || t.origin.server_id;
+        if (!roles[t.origin.server_id]) roles[t.origin.server_id] = 'Foreign';
+      }
+    }
+    const ids = Object.keys(counts).sort((a, b) => {
+      if (roles[a] !== roles[b]) return roles[a] === 'Relay' ? -1 : 1;
+      return (names[a] || '').localeCompare(names[b] || '');
+    });
+    if (tunServerFilter && !counts[tunServerFilter]) {
+      tunServerFilter = '';
+    }
+    sel.replaceChildren(
+      h('option', { value: '' }, `All Servers (${vpnList.length})`),
+      ...ids.map((id) => h('option', { value: id }, `${names[id]} · ${roles[id]} (${counts[id]})`))
+    );
+    sel.value = tunServerFilter;
+  }
+
   async function loadTunnels() {
     const data = await api('GET', '/api/tunnels');
     tunnelsCache = data.tunnels || [];
@@ -1576,16 +1697,118 @@
   function renderTunnels(list) {
     const vpnList = (list || []).filter((t) => !isWebsiteBridge(t));
     const webList = (list || []).filter((t) => isWebsiteBridge(t));
+    if ($('tunnels-bar')) $('tunnels-bar').hidden = !vpnList.length;
+    populateTunnelServerFilter(vpnList);
+    const visible = filterVPNTunnels(vpnList);
+    syncTunnelExpandBtn(visible);
     const box = $('tunnel-list');
     if (box) {
       if (!vpnList.length) {
         box.replaceChildren(h('p', { class: 'empty' },
           'No VPN tunnels yet. Click "+ New Tunnel", or drag a Relay server onto a Foreign server on the Servers tab.'));
+      } else if (!visible.length) {
+        box.replaceChildren(h('p', { class: 'empty' },
+          'No tunnels match the active search or filter.'));
+      } else if (tunLayout === 'relay') {
+        const order = [];
+        const groups = {};
+        for (const t of visible) {
+          const gid = (t.edge && t.edge.server_id) || '__unpaired__';
+          if (!groups[gid]) {
+            groups[gid] = {
+              id: gid,
+              name: t.edge ? (t.edge.server_name || t.edge.address || 'Relay Server') : 'Unpaired Foreign Tunnels',
+              addr: t.edge ? (t.edge.address || '') : '',
+              items: [],
+            };
+            order.push(gid);
+          }
+          groups[gid].items.push(t);
+        }
+        box.replaceChildren(...order.map((gid) => {
+          const g = groups[gid];
+          const healthyCount = g.items.filter(isTunnelHealthy).length;
+          let totalUsers = 0;
+          for (const t of g.items) {
+            const ei = t.edge && t.edge.info;
+            const oi = t.origin && t.origin.info;
+            const live = (ei && ei.live) || (oi && oi.live);
+            totalUsers += (ei && ei.live && typeof ei.live.active_users === 'number')
+              ? (Number(ei.live.active_users) || 0)
+              : (live && typeof live.active_users === 'number' ? (Number(live.active_users) || 0) : 0);
+          }
+          return h('section', { class: 'tunnel-group-block' },
+            h('div', { class: 'tunnel-group-head' },
+              h('div', { class: 'tunnel-group-title' },
+                h('span', { class: 'role-dot ' + (gid === '__unpaired__' ? 'foreign-dot' : 'relay-dot'), 'aria-hidden': 'true' }),
+                h('span', null, g.name),
+                g.addr && g.addr !== g.name ? h('span', { class: 'muted small mono' }, g.addr) : null),
+              h('div', { class: 'column-head-meta' },
+                h('span', { class: 'column-count' }, `${healthyCount}/${g.items.length} healthy`),
+                h('span', { class: 'column-tag' }, `${totalUsers} ${totalUsers === 1 ? 'user' : 'users'}`))),
+            h('div', { class: 'tunnels' }, ...g.items.map(tunnelCard)));
+        }));
       } else {
-        box.replaceChildren(...vpnList.map(tunnelCard));
+        box.replaceChildren(...visible.map(tunnelCard));
       }
     }
     renderWebsiteBridges(webList);
+  }
+
+  for (const btn of document.querySelectorAll('[data-tun-layout]')) {
+    const active = btn.dataset.tunLayout === tunLayout;
+    btn.classList.toggle('is-active', active);
+    btn.setAttribute('aria-pressed', String(active));
+    btn.addEventListener('click', () => {
+      tunLayout = btn.dataset.tunLayout || 'flat';
+      try { localStorage.setItem('pb-tun-layout', tunLayout); } catch (e) {}
+      for (const b of document.querySelectorAll('[data-tun-layout]')) {
+        const on = b.dataset.tunLayout === tunLayout;
+        b.classList.toggle('is-active', on);
+        b.setAttribute('aria-pressed', String(on));
+      }
+      renderTunnels(tunnelsCache);
+    });
+  }
+
+  for (const btn of document.querySelectorAll('[data-tun-filter]')) {
+    btn.addEventListener('click', () => {
+      tunFilter = btn.dataset.tunFilter || 'all';
+      for (const b of document.querySelectorAll('[data-tun-filter]')) {
+        const on = b.dataset.tunFilter === tunFilter;
+        b.classList.toggle('is-active', on);
+        b.setAttribute('aria-pressed', String(on));
+      }
+      renderTunnels(tunnelsCache);
+    });
+  }
+
+  if ($('tun-search')) {
+    $('tun-search').addEventListener('input', (ev) => {
+      tunSearch = ev.target.value || '';
+      renderTunnels(tunnelsCache);
+    });
+  }
+
+  if ($('tun-srv-filter')) {
+    $('tun-srv-filter').addEventListener('change', (ev) => {
+      tunServerFilter = ev.target.value || '';
+      renderTunnels(tunnelsCache);
+    });
+  }
+
+  if ($('tun-expand-btn')) {
+    $('tun-expand-btn').addEventListener('click', () => {
+      const visible = currentVisibleVPNTunnels();
+      if (!visible.length) return;
+      const allOpen = visible.every((t) => expandedTunnels.has(tunnelKeyOf(t)));
+      for (const t of visible) {
+        const k = tunnelKeyOf(t);
+        if (allOpen) expandedTunnels.delete(k);
+        else expandedTunnels.add(k);
+      }
+      renderTunnels(tunnelsCache);
+    });
   }
 
   const PATH_WORDS = {
@@ -1797,6 +2020,7 @@
       card.classList.toggle('is-open', nowOpen);
       toggleBtn.setAttribute('aria-expanded', String(nowOpen));
       bodyEl.hidden = !nowOpen;
+      syncTunnelExpandBtn(currentVisibleVPNTunnels());
     });
 
     return card;
@@ -1837,6 +2061,13 @@
             'data-focus': key + '-autoheal',
             onclick: () => openTunnelAutoHeal(t)
           }, ahOn ? 'Auto-Heal (ON)' : 'Auto-Heal & Failover')
+        : null,
+      target.edge && target.origin
+        ? h('button', {
+            type: 'button',
+            'data-focus': key + '-switch',
+            onclick: () => openSwitchTunnel(t)
+          }, 'Switch Mode')
         : null,
       target.edge ? h('button', { type: 'button', 'data-focus': key + '-edit', onclick: () => openEditTunnel(t) }, 'Edit') : null,
       h('button', { type: 'button', 'data-focus': key + '-diag', onclick: () => openTunnelDiag(t, target) }, 'Diagnose & Speed Test'),
@@ -1996,6 +2227,17 @@
     if ($('et-drain')) $('et-drain').value = (ei && ei.drain) || (oi && oi.drain) || '10s';
     if ($('et-advanced')) $('et-advanced').open = false;
 
+    if ($('et-mode-banner')) {
+      const bothManaged = !!(e && o && e.server_id && o.server_id);
+      $('et-mode-banner').hidden = !bothManaged;
+      if (bothManaged && $('et-mode-summary')) {
+        const relayBridgeIP = (ei && ei.local_ip) || (oi && oi.peer_ip) || '';
+        const foreignBridgeIP = (ei && ei.peer_ip) || (oi && oi.local_ip) || '';
+        const isIPv6 = relayBridgeIP.includes(':') || foreignBridgeIP.includes(':');
+        $('et-mode-summary').textContent = `${any.mode === 'reverse' ? 'Reverse' : 'Direct'}${isIPv6 ? ' (IPv6)' : ''} · ${shortLinkLabel(any)} · Bridge :${linkPort}`;
+      }
+    }
+
     syncEditTunnelCapacityUI();
 
     $('et-error').textContent = '';
@@ -2004,6 +2246,14 @@
     $('et-progress').hidden = true;
     openDialog($('edit-tunnel-dialog'));
     $('et-service').focus();
+  }
+
+  if ($('et-switch-mode-btn')) {
+    $('et-switch-mode-btn').addEventListener('click', () => {
+      const t = editingTunnel;
+      $('edit-tunnel-dialog').close();
+      if (t) openSwitchTunnel(t);
+    });
   }
 
   for (const el of document.querySelectorAll('input[name="et-load"]')) {
@@ -3798,10 +4048,21 @@
     });
   }
 
+  let tunnelModalMode = { kind: 'create' };
   let lastProbeReport = null;
   let appliedProbeID = '';
   let appliedProbeText = '';
   let appliedProbeWarn = false;
+
+  function currentModalOwnTunnelTag() {
+    return tunnelModalMode.kind === 'switch' && tunnelModalMode.tunnel
+      ? `PortBridge tunnel "${tunnelModalMode.tunnel.name}"`
+      : '';
+  }
+
+  function tunnelSubmitLabel() {
+    return tunnelModalMode.kind === 'switch' ? 'Apply & Switch Tunnel Mode' : 'Create Tunnel';
+  }
 
   function applyProbeCandidate(cand) {
     if (!cand) return;
@@ -3859,13 +4120,14 @@
     showTunnelOptions();
     const svc = $('tn-service') ? $('tn-service').value.trim() : '';
     const bport = cand.port || Number(($('tn-linkport') && $('tn-linkport').value) || 0);
+    const submitLabel = tunnelSubmitLabel();
     appliedProbeID = cand.id || cand.label || '';
     appliedProbeWarn = false;
     if (svc) {
-      appliedProbeText = `✓ Applied "${cand.label}" (${cand.score}/100) — Inbound Port(s): ${svc}${bport ? ` · Tunnel Bridge Port: ${bport}` : ''}. Click "Create Tunnel" below when ready.`;
+      appliedProbeText = `✓ Applied "${cand.label}" (${cand.score}/100) — Inbound Port(s): ${svc}${bport ? ` · Tunnel Bridge Port: ${bport}` : ''}. Click "${submitLabel}" below when ready.`;
       setStatus(appliedProbeText);
     } else {
-      appliedProbeText = `✓ Applied "${cand.label}" (${cand.score}/100)${bport ? ` — Tunnel Bridge Port: ${bport}` : ''}. Enter your Inbound Port(s) above, then click "Create Tunnel".`;
+      appliedProbeText = `✓ Applied "${cand.label}" (${cand.score}/100)${bport ? ` — Tunnel Bridge Port: ${bport}` : ''}. Enter your Inbound Port(s) above, then click "${submitLabel}".`;
       setStatus(appliedProbeText);
       if ($('tn-probe-service')) $('tn-probe-service').focus();
       else if ($('tn-service')) $('tn-service').focus();
@@ -3887,13 +4149,15 @@
     const listenSrv = cand.mode === 'reverse' ? $('tn-relay').value : $('tn-foreign').value;
     const listenName = (serverById(listenSrv) || {}).name || (cand.mode === 'reverse' ? 'the Relay server' : 'the Foreign server');
     const base = `Applied "${cand.label}" (Score ${cand.score}/100).`;
+    const ownTag = currentModalOwnTunnelTag();
+    const submitLabel = tunnelSubmitLabel();
     if (listenSrv) {
       try {
         const checkList = (cand.twin_path && !cand.port_hop && cand.port < 65535)
           ? `${cand.port},${cand.port + 1}`
           : String(cand.port);
         const res = await api('POST', '/api/ports', { server: listenSrv, ports: checkList });
-        const st = (res.ports || []).find((p) => p.state !== 'free');
+        const st = (res.ports || []).find((p) => p.state !== 'free' && !(ownTag && p.by === ownTag));
         if (st && st.state !== 'free') {
           const who = st.by ? ` by ${st.by}` : '';
           const msg = `${base} The benchmark tested on port ${cand.port}, but port ${st.port} is now used on ${listenName}${who}, so the Tunnel Bridge Port was left at ${cur}. The result may differ on another port; "Deep Scan" can check which ports get through.`;
@@ -3912,11 +4176,11 @@
     if ($('tn-probe-linkport')) $('tn-probe-linkport').value = String(cand.port);
     appliedProbeWarn = false;
     if (svc) {
-      appliedProbeText = `✓ Applied "${cand.label}" (${cand.score}/100) — Inbound Port(s): ${svc} · Tunnel Bridge Port: ${cand.port} (tested port). Click "Create Tunnel" below when ready.`;
-      setStatus(`${base} Inbound Port(s) set to ${svc} and Tunnel Bridge Port set to ${cand.port} (tested port). Click Create Tunnel when ready.`);
+      appliedProbeText = `✓ Applied "${cand.label}" (${cand.score}/100) — Inbound Port(s): ${svc} · Tunnel Bridge Port: ${cand.port} (tested port). Click "${submitLabel}" below when ready.`;
+      setStatus(`${base} Inbound Port(s) set to ${svc} and Tunnel Bridge Port set to ${cand.port} (tested port). Click "${submitLabel}" when ready.`);
     } else {
-      appliedProbeText = `✓ Applied "${cand.label}" (${cand.score}/100) — Tunnel Bridge Port: ${cand.port} (tested port). Enter your Inbound Port(s) above, then click "Create Tunnel".`;
-      setStatus(`${base} Tunnel Bridge Port set to ${cand.port}, the port the benchmark tested on. Enter your Inbound Port(s) in Step 2 and click Create Tunnel.`);
+      appliedProbeText = `✓ Applied "${cand.label}" (${cand.score}/100) — Tunnel Bridge Port: ${cand.port} (tested port). Enter your Inbound Port(s) above, then click "${submitLabel}".`;
+      setStatus(`${base} Tunnel Bridge Port set to ${cand.port}, the port the benchmark tested on. Enter your Inbound Port(s) in Step 2 and click "${submitLabel}".`);
     }
     if (lastProbeReport) renderProbeResults(lastProbeReport, false, -1);
   }
@@ -4197,6 +4461,30 @@
     });
   }
 
+  function resetTunnelDialogProbeState() {
+    $('tn-error').textContent = '';
+    $('tn-ports-result').replaceChildren();
+    if ($('tn-sni-scan-results')) $('tn-sni-scan-results').replaceChildren();
+    if ($('tn-spoof-test-results')) $('tn-spoof-test-results').replaceChildren();
+    if ($('tn-probe-error')) $('tn-probe-error').textContent = '';
+    if ($('tn-probe-live')) $('tn-probe-live').hidden = true;
+    if ($('tn-explore-error')) $('tn-explore-error').textContent = '';
+    if ($('tn-explore-live')) $('tn-explore-live').hidden = true;
+    if ($('tn-explore-hint')) $('tn-explore-hint').hidden = true;
+    if ($('tn-explore-results')) {
+      $('tn-explore-results').hidden = true;
+      $('tn-explore-results').replaceChildren();
+    }
+    lastProbeReport = null;
+    appliedProbeID = '';
+    appliedProbeText = '';
+    appliedProbeWarn = false;
+    if ($('tn-probe-results')) {
+      $('tn-probe-results').hidden = true;
+      $('tn-probe-results').replaceChildren();
+    }
+  }
+
   async function openNewTunnel(relayID, foreignID) {
     if (!serversCache.length) {
       try { serversCache = (await api('GET', '/api/servers')).servers || []; } catch (e) { setStatus(e.message, true); return; }
@@ -4207,24 +4495,21 @@
       setStatus('A tunnel connects a Relay (Iran) server and a Foreign server. Please add at least one of each first.', true);
       return;
     }
+    tunnelModalMode = { kind: 'create' };
+    $('tn-title').textContent = 'Create New Tunnel';
+    if ($('tn-intro')) {
+      $('tn-intro').textContent = 'Link a Relay (Iran) server with a Foreign server and configure transport disguise, pooling, and port forwarding.';
+    }
+    if ($('tn-submit')) $('tn-submit').textContent = 'Create Tunnel';
+    $('tn-progress-title').textContent = 'Creating Tunnel';
+    $('tn-relay').disabled = false;
+    $('tn-foreign').disabled = false;
+    $('tn-name').disabled = false;
     $('tn-relay').replaceChildren(...relays.map(serverOption));
     $('tn-foreign').replaceChildren(...foreigns.map(serverOption));
     if (relayID) $('tn-relay').value = relayID;
     if (foreignID) $('tn-foreign').value = foreignID;
-    $('tn-error').textContent = '';
-    $('tn-ports-result').replaceChildren();
-    if ($('tn-sni-scan-results')) $('tn-sni-scan-results').replaceChildren();
-    if ($('tn-spoof-test-results')) $('tn-spoof-test-results').replaceChildren();
-    if ($('tn-probe-error')) $('tn-probe-error').textContent = '';
-    if ($('tn-probe-live')) $('tn-probe-live').hidden = true;
-    lastProbeReport = null;
-    appliedProbeID = '';
-    appliedProbeText = '';
-    appliedProbeWarn = false;
-    if ($('tn-probe-results')) {
-      $('tn-probe-results').hidden = true;
-      $('tn-probe-results').replaceChildren();
-    }
+    resetTunnelDialogProbeState();
     if ($('tn-probe-service') && $('tn-service')) {
       $('tn-probe-service').value = $('tn-service').value;
     }
@@ -4241,13 +4526,110 @@
     $('tn-name').focus();
   }
 
+  async function openSwitchTunnel(t) {
+    if (!t || !t.edge || !t.origin || !t.edge.server_id || !t.origin.server_id) {
+      setStatus('Both the Relay and Foreign servers must be managed in this panel to switch transport mode.', true);
+      return;
+    }
+    if (!serversCache.length) {
+      try { serversCache = (await api('GET', '/api/servers')).servers || []; } catch (e) { setStatus(e.message, true); return; }
+    }
+    const e = t.edge, o = t.origin;
+    const ei = e.info || {}, oi = o.info || {};
+    const any = e.info ? e.info : oi;
+    const relays = serversCache.filter((s) => s.group === 'relay' || s.id === e.server_id);
+    const foreigns = serversCache.filter((s) => s.group === 'foreign' || s.id === o.server_id);
+
+    tunnelModalMode = { kind: 'switch', tunnel: t };
+    $('tn-title').textContent = `Switch Mode & Benchmark: ${t.name}`;
+    if ($('tn-intro')) {
+      const rName = e.server_name || e.address || 'Relay';
+      const fName = o.server_name || o.address || 'Foreign';
+      $('tn-intro').textContent = `Benchmark live routes or switch transport & Direct ↔ Reverse direction between ${rName} and ${fName}. Both servers update atomically while keeping this tunnel's pairing secret and name intact.`;
+    }
+    if ($('tn-submit')) $('tn-submit').textContent = 'Apply & Switch Tunnel Mode';
+    $('tn-progress-title').textContent = `Switching Mode: ${t.name}`;
+
+    $('tn-relay').replaceChildren(...(relays.length ? relays.map(serverOption) : [h('option', { value: e.server_id }, e.server_name || e.server_id)]));
+    $('tn-foreign').replaceChildren(...(foreigns.length ? foreigns.map(serverOption) : [h('option', { value: o.server_id }, o.server_name || o.server_id)]));
+    $('tn-relay').value = e.server_id;
+    $('tn-foreign').value = o.server_id;
+    $('tn-name').value = t.name;
+    $('tn-relay').disabled = true;
+    $('tn-foreign').disabled = true;
+    $('tn-name').disabled = true;
+
+    const servicePorts = (oi.service_ports && oi.service_ports.length) ? oi.service_ports : (ei.service_ports || []);
+    const userPorts = (ei.user_ports && ei.user_ports.length) ? ei.user_ports : servicePorts;
+    const linkPort = ei.link_port || oi.link_port || 443;
+    const relayBridgeIP = ei.local_ip || oi.peer_ip || '';
+    const foreignBridgeIP = ei.peer_ip || oi.local_ip || '';
+    const isIPv6 = relayBridgeIP.includes(':') || foreignBridgeIP.includes(':');
+    const linkKey = editTunnelLinkKey(any);
+    const rawLink = String(any.link || oi.link || '');
+    const hostMatch = rawLink.match(/\(([^(),]+)\)/);
+    const hostInLink = hostMatch ? hostMatch[1].trim() : '';
+    const ah = t.auto_heal || {};
+    const cdnDom = (any.cdn ? hostInLink : '') || ah.cdn_domain || '';
+
+    $('tn-service').value = servicePorts.join(',');
+    if ($('tn-probe-service')) $('tn-probe-service').value = servicePorts.join(',');
+    $('tn-users').value = userPorts.join(',') === servicePorts.join(',') ? '' : userPorts.join(',');
+    $('tn-linkport').value = String(linkPort);
+    if ($('tn-probe-linkport')) $('tn-probe-linkport').value = String(linkPort);
+
+    $('tn-gre').checked = !!any.gre;
+    setRadio('tn-mode', any.mode === 'reverse' ? 'reverse' : 'direct');
+    setRadio('tn-link', linkKey === 'gre' ? 'website' : linkKey);
+
+    $('tn-domain').value = cdnDom;
+    if ($('tn-probe-cdn')) $('tn-probe-cdn').value = cdnDom;
+    $('tn-claim').value = (!any.cdn && hostInLink && !/website header/i.test(rawLink))
+      ? hostInLink
+      : (['grpc', 'h3'].includes(linkKey) ? 'www.google.com' : 'www.bing.com');
+    $('tn-cleanips').value = '';
+    $('tn-webheader').checked = /website header/i.test(rawLink);
+    $('tn-webhost').value = (/website header/i.test(rawLink) && hostInLink) ? hostInLink : 'www.bing.com';
+    $('tn-realsite').checked = any.real_site !== false;
+    $('tn-stealth').checked = /fragmented|browser TLS/i.test(rawLink);
+    if ($('tn-snispoof')) $('tn-snispoof').checked = !!any.sni_spoof;
+    if ($('tn-spoofsni')) $('tn-spoofsni').value = any.spoof_sni || 'challenges.cloudflare.com';
+    if ($('tn-spoofip')) $('tn-spoofip').value = any.spoof_ip || '104.18.4.130';
+    $('tn-ipv6').checked = isIPv6;
+
+    const isMux = !!any.mux;
+    const poolVal = ei.pool_size || oi.pool_size || 30;
+    const muxVal = ei.mux_links || oi.mux_links || 4;
+    const maxConnVal = ei.max_conn || oi.max_conn || 2000;
+    setRadio('tn-shared', isMux ? 'shared' : 'one');
+    if ($('tn-pool')) $('tn-pool').value = String(poolVal);
+    if ($('tn-links-n')) $('tn-links-n').value = String(muxVal);
+    if ($('tn-max-conn')) $('tn-max-conn').value = String(maxConnVal);
+    setRadio('tn-load', detectCapacityPreset(linkKey, isMux, Number(poolVal), Number(muxVal), Number(maxConnVal)));
+    sharingTouched = true;
+
+    const pp = ei.proxy_protocol || oi.proxy_protocol || 'off';
+    setRadio('tn-proxy', ['off', 'v1', 'v2'].includes(pp) ? pp : 'off');
+    if ($('tn-autoheal')) $('tn-autoheal').checked = !!ah.enabled;
+    if ($('tn-relayip')) $('tn-relayip').value = '';
+
+    resetTunnelDialogProbeState();
+    populateProbeCFPick();
+    $('tunnel-form').hidden = false;
+    $('tn-progress').hidden = true;
+    showTunnelOptions();
+    openDialog($('tunnel-dialog'));
+    if ($('tn-probe-btn')) $('tn-probe-btn').focus();
+  }
+
   for (const b of document.querySelectorAll('.new-tunnel')) b.addEventListener('click', () => openNewTunnel('', ''));
   $('tn-cancel').addEventListener('click', () => $('tunnel-dialog').close());
   $('tn-close').addEventListener('click', () => $('tunnel-dialog').close());
   $('tn-back').addEventListener('click', () => {
     $('tn-progress').hidden = true;
     $('tunnel-form').hidden = false;
-    $('tn-name').focus();
+    if (tunnelModalMode.kind === 'switch' && $('tn-probe-btn')) $('tn-probe-btn').focus();
+    else $('tn-name').focus();
   });
 
   function tunnelRequest() {
@@ -4447,7 +4829,7 @@
   if ($('tn-scan-cdn')) {
     $('tn-scan-cdn').addEventListener('click', () => {
       const r = tunnelRequest();
-      scanCDNPorts(r.relay, r.foreign, r.mode || 'reverse', '', $('tn-ports-result'), $('tn-linkport'));
+      scanCDNPorts(r.relay, r.foreign, r.mode || 'reverse', currentModalOwnTunnelTag(), $('tn-ports-result'), $('tn-linkport'));
     });
   }
 
@@ -4466,6 +4848,7 @@
     const relayPorts = users + ((r.mode === 'reverse' || r.asymmetric) ? ',' + bridgePorts : '');
     const foreignPorts = r.service_ports + (r.mode === 'direct' ? ',' + bridgePorts : '');
     const isBridgePort = (port) => port === r.link_port || (r.twin_path && !r.port_hop && port === r.link_port + 1);
+    const ownTag = currentModalOwnTunnelTag();
     const describe = async (server, list, role) => {
       const s = serverById(server);
       try {
@@ -4474,15 +4857,19 @@
           let what = 'User listen port';
           if (isBridgePort(p.port) && ((role === 'relay' && (r.mode === 'reverse' || r.asymmetric)) || (role === 'foreign' && r.mode === 'direct'))) what = 'Tunnel bridge port';
           else if (role === 'foreign') what = 'Inbound port';
+          const isSelf = !!(ownTag && p.by === ownTag);
           const by = p.by ? ` (${p.by.replace(/^PortBridge /, '')})` : '';
           let cls = 'good', text;
           if (what === 'Inbound port') {
             text = p.state === 'free' ? 'no service is listening on this port yet (is your X-UI / inbound running?)' : `active service listening${by} (ready)`;
             if (p.state === 'free') cls = 'warn';
-            if (/^PortBridge tunnel/.test(p.by || '')) { cls = 'bad'; text = `already used by ${p.by.replace(/^PortBridge /, '')}`; }
+            if (/^PortBridge tunnel/.test(p.by || '') && !isSelf) { cls = 'bad'; text = `already used by ${p.by.replace(/^PortBridge /, '')}`; }
+          } else if (isSelf || p.state === 'free') {
+            text = isSelf ? `currently used by this tunnel "${r.name}" (will be kept)` : 'available (free)';
+            cls = 'good';
           } else {
-            text = p.state === 'free' ? 'available (free)' : `${p.state}${by}`;
-            if (p.state !== 'free') cls = 'bad';
+            text = `${p.state}${by}`;
+            cls = 'bad';
           }
           return h('li', { class: cls }, `${s ? s.name : server} — ${what} ${p.port}: ${text}`);
         });
@@ -4499,7 +4886,8 @@
     const err = $('tn-error');
     err.textContent = '';
     const r = tunnelRequest();
-    const fail = (msg, el) => { err.textContent = msg; if (el) el.focus(); };
+    const isSwitch = tunnelModalMode.kind === 'switch';
+    const fail = (msg, el) => { err.textContent = msg; if (el && !el.disabled) el.focus(); };
     if (!/^[A-Za-z0-9_-]{1,40}$/.test(r.name)) return fail('Enter a valid tunnel name (letters, numbers, dash or underscore, up to 40 characters).', $('tn-name'));
     if (!r.relay || !r.foreign) return fail('Select both a Relay server and a Foreign server.', $('tn-relay'));
     if (!portList.test(r.service_ports)) return fail('Enter the Foreign Inbound Port(s), separated by commas.', $('tn-service'));
@@ -4515,8 +4903,9 @@
     const btn = ev.target.querySelector('button[type=submit]');
     btn.disabled = true;
     try {
-      const res = await api('POST', '/api/tunnels', r);
-      followTunnelJob(res.job, r.name);
+      const endpoint = isSwitch ? '/api/tunnels/switch' : '/api/tunnels';
+      const res = await api('POST', endpoint, r);
+      followTunnelJob(res.job, r.name, isSwitch);
     } catch (e) {
       fail(e.message);
     } finally {
@@ -4524,11 +4913,13 @@
     }
   });
 
-  function followTunnelJob(id, name) {
+  function followTunnelJob(id, name, isSwitch) {
     $('tunnel-form').hidden = true;
     $('tn-progress').hidden = false;
     $('tn-log').replaceChildren();
-    $('tn-result').textContent = 'Configuring tunnel on both servers...';
+    $('tn-result').textContent = isSwitch
+      ? 'Switching tunnel mode atomically on both servers...'
+      : 'Configuring tunnel on both servers...';
     $('tn-result').className = '';
     $('tn-back').hidden = true;
     $('tn-progress-title').focus();
@@ -4555,13 +4946,15 @@
         return;
       }
       if (job.error) {
-        $('tn-result').textContent = 'Tunnel creation failed. ' + sentence(job.error);
+        $('tn-result').textContent = (isSwitch ? 'Could not switch tunnel mode. ' : 'Tunnel creation failed. ') + sentence(job.error);
         $('tn-result').className = 'bad';
         $('tn-back').hidden = false;
       } else {
-        $('tn-result').textContent = `Success: tunnel "${name}" is active on both servers.`;
+        $('tn-result').textContent = isSwitch
+          ? `Success: tunnel "${name}" switched to the new mode and is running on both servers.`
+          : `Success: tunnel "${name}" is active on both servers.`;
         $('tn-result').className = 'good';
-        $('tn-name').value = '';
+        if (!isSwitch) $('tn-name').value = '';
       }
       lastTunnels = lastServers = '';
       refresh();

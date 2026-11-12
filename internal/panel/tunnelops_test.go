@@ -714,3 +714,110 @@ func TestPhase3WebRTCAndTwinPathSpecsAndAutoHeal(t *testing.T) {
 		t.Fatalf("expected unhealthy twin tunnel to fail over to webrtc candidate, got ok=%v best=%+v", ok, best)
 	}
 }
+
+func TestSwitchTunnelPreservesSecretAndUpdatesBothHalvesAtomically(t *testing.T) {
+	p, foreignID, foreignDir := twoServers(t)
+	_ = foreignID
+
+	// 1. Create an initial Direct Fake TLS tunnel on bridge port 27443.
+	initReq := newTunnel("hotswap")
+	initReq.Mode = "direct"
+	initReq.Link = "website"
+	initReq.ServerName = "www.bing.com"
+	initReq.ServicePorts = "39100"
+	initReq.UserPorts = "29100"
+	initReq.LinkPort = 27443
+	if v := waitJob(t, p, mustCreate(t, p, initReq)); v.Error != "" {
+		t.Fatalf("initial create failed: %s\n%s", v.Error, strings.Join(v.Lines, "\n"))
+	}
+
+	edge0 := agent.TunnelsReport(p.tunnelsDir)
+	orig0 := agent.TunnelsReport(foreignDir)
+	if len(edge0) != 1 || len(orig0) != 1 || edge0[0].PairID == "" || edge0[0].PairID != orig0[0].PairID {
+		t.Fatalf("initial pair mismatch: edge=%+v orig=%+v", edge0, orig0)
+	}
+	pairID := edge0[0].PairID
+
+	// 2. Switch in-place to Reverse WebRTC on the same bridge port (27443).
+	sw1 := initReq
+	sw1.Mode = "reverse"
+	sw1.Link = "webrtc"
+	sw1.Shared = true
+	sw1.SharedLinks = 4
+	sw1.AutoHeal = true
+	job1, err := p.startSwitchTunnel(sw1)
+	if err != nil {
+		t.Fatalf("startSwitchTunnel (webrtc): %v", err)
+	}
+	if v := waitJob(t, p, job1); v.Error != "" {
+		t.Fatalf("switch to webrtc failed: %s\n%s", v.Error, strings.Join(v.Lines, "\n"))
+	}
+
+	edge1 := agent.TunnelsReport(p.tunnelsDir)
+	orig1 := agent.TunnelsReport(foreignDir)
+	if len(edge1) != 1 || len(orig1) != 1 {
+		t.Fatalf("expected 1 tunnel after switch, got %d / %d", len(edge1), len(orig1))
+	}
+	if edge1[0].PairID != pairID || orig1[0].PairID != pairID {
+		t.Fatalf("PairID changed across mode switch: want %s, got edge=%s orig=%s", pairID, edge1[0].PairID, orig1[0].PairID)
+	}
+	if edge1[0].Mode != "reverse" || orig1[0].Mode != "reverse" || edge1[0].Transport != "webrtc" || orig1[0].Transport != "webrtc" {
+		t.Fatalf("expected reverse webrtc on both halves, got edge=%+v orig=%+v", edge1[0], orig1[0])
+	}
+
+	// 3. Switch in-place again from Reverse WebRTC -> Direct SplitHTTP CDN on port 2053.
+	sw2 := initReq
+	sw2.Mode = "direct"
+	sw2.Link = "xhttp-cdn"
+	sw2.Domain = "edge1.example.com"
+	sw2.LinkPort = 2053
+	sw2.Shared = true
+	sw2.SharedLinks = 6
+	sw2.AutoHeal = true
+	job2, err := p.startSwitchTunnel(sw2)
+	if err != nil {
+		t.Fatalf("startSwitchTunnel (xhttp-cdn): %v", err)
+	}
+	if v := waitJob(t, p, job2); v.Error != "" {
+		t.Fatalf("switch to xhttp-cdn failed: %s\n%s", v.Error, strings.Join(v.Lines, "\n"))
+	}
+
+	edge2 := agent.TunnelsReport(p.tunnelsDir)
+	orig2 := agent.TunnelsReport(foreignDir)
+	if edge2[0].PairID != pairID || orig2[0].PairID != pairID {
+		t.Fatalf("PairID changed across second switch: want %s, got edge=%s orig=%s", pairID, edge2[0].PairID, orig2[0].PairID)
+	}
+	if edge2[0].Mode != "direct" || orig2[0].Mode != "direct" || edge2[0].Transport != "xhttp" || !edge2[0].CDN || !orig2[0].CDN || orig2[0].LinkPort != 2053 {
+		t.Fatalf("expected direct xhttp-cdn on port 2053, got edge=%+v orig=%+v", edge2[0], orig2[0])
+	}
+
+	// Auto-Heal state should store CDN domain and manual switch history.
+	st := p.store.get()
+	ahCfg, ok := st.AutoHeal[healKeyFor("this", "hotswap")]
+	if !ok || !ahCfg.Enabled || ahCfg.CDNDomain != "edge1.example.com" || len(ahCfg.History) < 2 {
+		t.Fatalf("expected AutoHeal config & history to be updated, got ok=%v cfg=%+v", ok, ahCfg)
+	}
+	if ahCfg.History[0].Reason != "manual mode switch" || !ahCfg.History[0].Success {
+		t.Fatalf("expected latest history entry to be successful manual mode switch, got %+v", ahCfg.History[0])
+	}
+
+	// 4. Switching onto a port owned by a DIFFERENT tunnel must still be rejected.
+	other := newTunnel("other")
+	other.Mode = "direct"
+	other.LinkPort = 28443
+	other.ServicePorts = "39200"
+	other.UserPorts = "29200"
+	if v := waitJob(t, p, mustCreate(t, p, other)); v.Error != "" {
+		t.Fatalf("creating second tunnel failed: %s", v.Error)
+	}
+	clashSwitch := sw2
+	clashSwitch.Link = "website"
+	clashSwitch.LinkPort = 28443
+	job3, err := p.startSwitchTunnel(clashSwitch)
+	if err != nil {
+		t.Fatalf("startSwitchTunnel (clash): %v", err)
+	}
+	if v := waitJob(t, p, job3); v.Error == "" || !strings.Contains(v.Error, "28443") {
+		t.Fatalf("expected port clash on 28443 to be rejected, got error=%q", v.Error)
+	}
+}

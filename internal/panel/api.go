@@ -65,6 +65,7 @@ func (p *Panel) routes() http.Handler {
 	mux.HandleFunc("GET /api/tunnels", p.withAuth(p.handleTunnels))
 	mux.HandleFunc("POST /api/tunnels", p.withAuth(p.handleCreateTunnel))
 	mux.HandleFunc("POST /api/tunnels/edit", p.withAuth(p.handleEditTunnel))
+	mux.HandleFunc("POST /api/tunnels/switch", p.withAuth(p.handleSwitchTunnel))
 	mux.HandleFunc("POST /api/tunnels/delete", p.withAuth(p.handleDeleteTunnel))
 	mux.HandleFunc("POST /api/tunnels/service", p.withAuth(p.handleServiceTunnel))
 	mux.HandleFunc("POST /api/tunnels/code", p.withAuth(p.handleTunnelCode))
@@ -729,6 +730,19 @@ func (p *Panel) handleEditTunnel(w http.ResponseWriter, r *http.Request, _ authe
 		return
 	}
 	id, err := p.startEditTunnel(req)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, capitalise(err.Error())+".")
+		return
+	}
+	writeJSON(w, http.StatusAccepted, map[string]string{"job": id})
+}
+
+func (p *Panel) handleSwitchTunnel(w http.ResponseWriter, r *http.Request, _ authed) {
+	var req createRequest
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	id, err := p.startSwitchTunnel(req)
 	if err != nil {
 		writeErr(w, http.StatusBadRequest, capitalise(err.Error())+".")
 		return

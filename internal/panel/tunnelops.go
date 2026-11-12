@@ -579,6 +579,21 @@ func intsOf(list string) []int {
 // not be another tunnel's. It is asked first, so a clash is caught before the
 // Iran half is made.
 func (p *Panel) checkForeignPorts(ctx context.Context, j *job, foreignID string, s agent.EdgeSpec) error {
+	return p.checkForeignPortsForTunnel(ctx, j, foreignID, s, "")
+}
+
+func (p *Panel) checkForeignPortsForTunnel(ctx context.Context, j *job, foreignID string, s agent.EdgeSpec, ignoreTunnel string) error {
+	ownTag := ""
+	if ignoreTunnel != "" {
+		ownTag = fmt.Sprintf("PortBridge tunnel %q", ignoreTunnel)
+	}
+	isBusy := func(ps portState) bool {
+		if ownTag != "" && ps.By == ownTag {
+			return false
+		}
+		return ps.State == "busy" || ps.State == "reserved"
+	}
+
 	ask := intsOf(s.ServicePorts)
 	var hopPorts []int
 	var twinPorts []int
@@ -614,7 +629,7 @@ func (p *Panel) checkForeignPorts(ctx context.Context, j *job, foreignID string,
 	if s.Mode == "direct" {
 		if len(hopPorts) > 0 {
 			for _, hp := range hopPorts {
-				if ps := st[hp]; ps.State == "busy" || ps.State == "reserved" {
+				if ps := st[hp]; isBusy(ps) {
 					problems = append(problems, fmt.Sprintf("port-hop bridge port %d is already used on the foreign server%s",
 						hp, byWhom(ps.By)))
 					break
@@ -622,19 +637,19 @@ func (p *Panel) checkForeignPorts(ctx context.Context, j *job, foreignID string,
 			}
 		} else if len(twinPorts) > 0 {
 			for _, tp := range twinPorts {
-				if ps := st[tp]; ps.State == "busy" || ps.State == "reserved" {
+				if ps := st[tp]; isBusy(ps) {
 					problems = append(problems, fmt.Sprintf("twin-path bridge port %d is already used on the foreign server%s",
 						tp, byWhom(ps.By)))
 					break
 				}
 			}
-		} else if ps := st[s.LinkPort]; ps.State == "busy" || ps.State == "reserved" {
+		} else if ps := st[s.LinkPort]; isBusy(ps) {
 			problems = append(problems, fmt.Sprintf("the port between the servers, %d, is already used on the foreign server%s",
 				s.LinkPort, byWhom(ps.By)))
 		}
 	}
 	if s.OutboundProxy == "on" && s.OutboundProxyPort > 0 {
-		if ps := st[s.OutboundProxyPort]; ps.State == "busy" || ps.State == "reserved" {
+		if ps := st[s.OutboundProxyPort]; isBusy(ps) {
 			problems = append(problems, fmt.Sprintf("the outbound local proxy port, %d, is already used on the foreign server%s",
 				s.OutboundProxyPort, byWhom(ps.By)))
 		}
@@ -642,7 +657,7 @@ func (p *Panel) checkForeignPorts(ctx context.Context, j *job, foreignID string,
 	for _, n := range intsOf(s.ServicePorts) {
 		ps := st[n]
 		switch {
-		case strings.HasPrefix(ps.By, "PortBridge tunnel "):
+		case strings.HasPrefix(ps.By, "PortBridge tunnel ") && (ownTag == "" || ps.By != ownTag):
 			problems = append(problems, fmt.Sprintf("service port %d on the foreign server is used by %s, so it cannot also be your service",
 				n, strings.TrimPrefix(ps.By, "PortBridge ")))
 		case ps.State == "free":
@@ -681,6 +696,224 @@ func (p *Panel) startCreate(r createRequest) (string, error) {
 		}
 		return "", nil
 	}), nil
+}
+
+func edgeSpecToEditSpec(s agent.EdgeSpec) agent.EditSpec {
+	onOff := func(v string) string {
+		if v == "on" {
+			return "on"
+		}
+		return "off"
+	}
+	pp := s.ProxyProtocol
+	if pp == "" {
+		pp = "off"
+	}
+	useV6 := s.IPv6
+	return agent.EditSpec{
+		Name:                  s.Name,
+		UserPorts:             s.UserPorts,
+		ServicePorts:          s.ServicePorts,
+		LinkPort:              s.LinkPort,
+		ProxyProtocol:         pp,
+		Pool:                  s.Pool,
+		MuxLinks:              s.MuxLinks,
+		MaxConn:               s.MaxConn,
+		PeerIP:                s.PeerIP,
+		LocalIP:               s.LocalIP,
+		IPv6:                  &useV6,
+		Mode:                  s.Mode,
+		Transport:             s.Transport,
+		ServerName:            s.ServerName,
+		CDN:                   onOff(s.CDN),
+		AltHost:               s.AltHost,
+		CleanIPs:              s.CleanIPs,
+		KeepCleanIPs:          strings.TrimSpace(s.CleanIPs) == "",
+		UTLS:                  s.UTLS,
+		TLSFragment:           s.TLSFragment,
+		HTTPHeader:            s.HTTPHeader,
+		HTTPHost:              s.HTTPHost,
+		RealSite:              s.RealSite,
+		GRE:                   onOff(s.GRE),
+		SIT:                   onOff(s.SIT),
+		SNISpoof:              s.SNISpoof,
+		SpoofSNI:              s.SpoofSNI,
+		IPSpoof:               s.IPSpoof,
+		SpoofIP:               s.SpoofIP,
+		AntiFreeze:            s.AntiFreeze,
+		PortHop:               s.PortHop,
+		PortHopPorts:          s.PortHopPorts,
+		TwinPath:              s.TwinPath,
+		Asymmetric:            onOff(s.Asymmetric),
+		AsymUplink:            s.AsymUplink,
+		AsymDownlink:          s.AsymDownlink,
+		AsymDownPort:          s.AsymDownPort,
+		Mux:                   onOff(s.Mux),
+		WebsiteBridge:         s.WebsiteBridge,
+		WebsiteDomains:        s.WebsiteDomains,
+		OutboundProxy:         s.OutboundProxy,
+		OutboundProxyPort:     s.OutboundProxyPort,
+		OutboundProxyMode:     s.OutboundProxyMode,
+		OutboundIranDomains:   s.OutboundIranDomains,
+		OutboundBypassDomains: s.OutboundBypassDomains,
+	}
+}
+
+func describeSpecMode(s agent.EdgeSpec, linkKey string) string {
+	dir := "Direct"
+	if s.Mode == "reverse" {
+		dir = "Reverse"
+	}
+	if s.IPv6 {
+		dir += " (IPv6)"
+	}
+	modeName := strings.TrimSpace(linkKey)
+	switch linkKey {
+	case "website":
+		modeName = "Fake TLS Website"
+	case "website-cdn-backup":
+		modeName = "Fake TLS + CDN Backup"
+	case "cdn":
+		modeName = "Cloudflare / CDN WebSocket"
+	case "xhttp":
+		modeName = "SplitHTTP / XHTTP"
+	case "xhttp-cdn":
+		modeName = "SplitHTTP / XHTTP via CDN"
+	case "h3":
+		modeName = "QUIC / HTTP/3"
+	case "h3-cdn":
+		modeName = "QUIC / HTTP/3 via CDN"
+	case "asymmetric":
+		modeName = fmt.Sprintf("Asymmetric (%s + %s)", strings.ToUpper(s.AsymUplink), strings.ToUpper(s.AsymDownlink))
+	case "asymmetric-cdn":
+		modeName = fmt.Sprintf("Asymmetric CDN (%s + %s)", strings.ToUpper(s.AsymUplink), strings.ToUpper(s.AsymDownlink))
+	case "webrtc":
+		modeName = "WebRTC (STUN+SRTP)"
+	case "twin":
+		modeName = "Twin-Path 1+1 UDP"
+	case "kcp-hop":
+		modeName = "KCP Port-Hopping UDP"
+	case "kcp":
+		modeName = "KCP over UDP"
+	case "split":
+		modeName = "Split-Stream Anti-Freeze TLS"
+	case "sni-spoof":
+		modeName = "Decoy Whitelisted SNI Spoof"
+	case "grpc":
+		modeName = "gRPC Stream"
+	case "grpc-cdn":
+		modeName = "gRPC via CDN"
+	case "faketcp":
+		modeName = "FakeTCP (KCP+FEC)"
+	case "icmp":
+		modeName = "ICMP Ping (KCP+FEC)"
+	case "ip-spoof":
+		modeName = "Source IP + SNI Spoof"
+	case "sit":
+		modeName = "Private 6in4 (SIT)"
+	case "plain":
+		modeName = "Raw TCP"
+	}
+	if s.GRE == "on" {
+		modeName = "Private GRE (Protocol 47)"
+	}
+	return fmt.Sprintf("%s · %s", dir, modeName)
+}
+
+// startSwitchTunnel validates a mode/transport change on an existing paired
+// tunnel and hot-swaps both halves atomically while preserving its secret.
+func (p *Panel) startSwitchTunnel(r createRequest) (string, error) {
+	spec, err := p.toSpec(r)
+	if err != nil {
+		return "", err
+	}
+	if err := p.knownTarget(tunnelTarget{Name: spec.Name, Edge: r.Relay, Origin: r.Foreign}); err != nil {
+		return "", err
+	}
+	return p.startJob(func(j *job) (string, error) {
+		return "", p.switchTunnel(j, r, spec)
+	}), nil
+}
+
+func (p *Panel) switchTunnel(j *job, r createRequest, spec agent.EdgeSpec) error {
+	if p.healer != nil {
+		defer p.healer.lockServers(r.Relay, r.Foreign)()
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*tunnelOpTimeout)
+	defer cancel()
+
+	relayName, foreignName := p.serverName(r.Relay), p.serverName(r.Foreign)
+	var fromDesc string
+	for _, tv := range pairTunnels(p.fleet.views()) {
+		if tv.Name == spec.Name && tv.Edge != nil && tv.Edge.ServerID == r.Relay {
+			dir := "Direct"
+			if tv.Edge.Info.Mode == "reverse" {
+				dir = "Reverse"
+			}
+			fromDesc = dir + " · " + tv.Edge.Info.Link
+			break
+		}
+	}
+	if fromDesc == "" {
+		fromDesc = "Previous mode"
+	}
+	toDesc := describeSpecMode(spec, r.Link)
+
+	j.say("Checking the ports on %s...", foreignName)
+	if err := p.checkForeignPortsForTunnel(ctx, j, r.Foreign, spec, spec.Name); err != nil {
+		return err
+	}
+
+	editSpec := edgeSpecToEditSpec(spec)
+	if err := switchBothHalves(ctx, p.callJSON, j.say, spec.Name, r.Relay, r.Foreign, relayName, foreignName, toDesc, spec.LinkPort, editSpec); err != nil {
+		return err
+	}
+
+	if p.healer != nil {
+		_ = p.healer.setConfig(r.Relay, spec.Name, r.AutoHeal, strings.TrimSpace(r.Domain))
+		key := healKeyFor(r.Relay, spec.Name)
+		nowISO := time.Now().UTC().Format(time.RFC3339)
+		note := fmt.Sprintf("Manually switched to %s on port %d.", toDesc, spec.LinkPort)
+		p.healer.mu.Lock()
+		rt := p.healer.runtimeOf(key)
+		rt.failCount = 0
+		rt.failures = 0
+		rt.nextTry = time.Time{}
+		rt.lastHeal = time.Now()
+		rt.lastNote = note
+		if r.AutoHeal {
+			rt.state = "monitoring"
+		}
+		p.healer.mu.Unlock()
+		_ = p.store.update(func(st *State) error {
+			if st.AutoHeal == nil {
+				st.AutoHeal = map[string]AutoHealConfig{}
+			}
+			c := st.AutoHeal[key]
+			c.LastHeal = nowISO
+			c.LastNote = note
+			ev := AutoHealEvent{
+				At:        nowISO,
+				FromDesc:  fromDesc,
+				ToDesc:    toDesc,
+				Candidate: r.Link,
+				Score:     100,
+				Reason:    "manual mode switch",
+				Success:   true,
+			}
+			c.History = append([]AutoHealEvent{ev}, c.History...)
+			if len(c.History) > 20 {
+				c.History = c.History[:20]
+			}
+			st.AutoHeal[key] = c
+			return nil
+		})
+	}
+
+	p.refreshOne(r.Relay)
+	p.refreshOne(r.Foreign)
+	j.say("Tunnel %q switched to %s and is running on both servers.", spec.Name, toDesc)
+	return nil
 }
 
 // startJob runs work in the background as a job the page can follow.
