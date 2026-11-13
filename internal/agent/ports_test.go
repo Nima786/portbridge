@@ -107,7 +107,7 @@ func TestPortReportNamesATunnelThatIsRunning(t *testing.T) {
 }
 
 func TestPortLinesAreTabSeparated(t *testing.T) {
-	out := portLines([]portStatus{{443, "busy", "nginx"}, {2083, "free", ""}})
+	out := portLines([]portStatus{{Port: 443, State: "busy", By: "nginx"}, {Port: 2083, State: "free"}})
 	if out != "443\tbusy\tnginx\n2083\tfree\t\n" {
 		t.Fatalf("got %q", out)
 	}

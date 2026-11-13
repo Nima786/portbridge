@@ -1768,6 +1768,9 @@
       ports(servicePorts),
       String(linkPort),
       ah.cdn_domain,
+      ei && ei.route_hosts,
+      any.website_domains,
+      ei && ei.shared_port ? 'shared sni' : '',
     ].filter(Boolean).join(' ').toLowerCase();
     return hay.includes(q);
   }
@@ -2177,6 +2180,16 @@
       if (guardBlocked.length) gParts.push(`${guardBlocked.length} blocked`);
       extraTags.push(`IP Guard (${gParts.join(', ')})`);
     }
+    const routeHostsRaw = (ei && ei.route_hosts) ? String(ei.route_hosts).trim() : '';
+    const routeHostList = routeHostsRaw ? routeHostsRaw.split(',').map((s) => s.trim()).filter(Boolean) : [];
+    const routeDefaultOn = !!(ei && ei.route_default);
+    if (routeHostList.length && routeDefaultOn) {
+      extraTags.push(`Shared-Port SNI (${routeHostList.join(', ')} + Default)`);
+    } else if (routeHostList.length) {
+      extraTags.push(`Shared-Port SNI (${routeHostList.join(', ')})`);
+    } else if (routeDefaultOn) {
+      extraTags.push('Shared-Port Default Fallback');
+    }
 
     let healthParts = [];
     if (live) {
@@ -2260,6 +2273,16 @@
             : 'Per-IP Abuse & Port-Scan Guard active',
         }, abuseDrops > 0 ? `IP Guard · ${abuseDrops} drops` : 'IP Guard')
       : null;
+    let sniBadge = null;
+    if (routeHostList.length || routeDefaultOn) {
+      const sniLabel = routeHostList.length
+        ? `SNI: ${routeHostList[0]}${routeHostList.length > 1 ? ' +' + (routeHostList.length - 1) : ''}${routeDefaultOn ? ' · Default' : ''}`
+        : 'Shared Port · Default';
+      const sniTitle = routeHostList.length
+        ? `Shared-Port SNI/Host routing active for: ${routeHostList.join(', ')}${routeDefaultOn ? ' (plus Default Fallback)' : ''}`
+        : 'Shared-Port Default Fallback route (receives unmatched SNI/Host or raw TCP)';
+      sniBadge = h('span', { class: 'badge badge-sni-route', title: sniTitle }, sniLabel);
+    }
 
     const toggleBtn = h('button', {
       type: 'button',
@@ -2270,6 +2293,7 @@
       h('div', { class: 'tunnel-summary-left' },
         h('span', { class: 'state ' + overall[0] }, overall[1]),
         h('span', { class: 'tunnel-summary-name', id: headingId }, t.name),
+        sniBadge,
         h('span', { class: 'tunnel-summary-route' },
           `${relayName} ↔ ${foreignName}`,
           mainPort ? h('span', { class: 'tunnel-summary-port mono' }, `:${mainPort}`) : null)),
@@ -2457,6 +2481,10 @@
     if ($('et-pool-wrap')) $('et-pool-wrap').hidden = isMux;
     if ($('et-mux-wrap')) $('et-mux-wrap').hidden = !isMux;
     if ($('et-spare-ttl-wrap')) $('et-spare-ttl-wrap').hidden = isMux;
+    if ($('et-sni-route-wrap')) {
+      const hasEdge = !!(editingTunnel && editingTunnel.edge && editingTunnel.edge.server_id);
+      $('et-sni-route-wrap').hidden = !hasEdge || (radio('et-fwd-proto') || 'tcp') !== 'tcp';
+    }
     if ($('et-capacity-hint')) {
       const poolSize = Number(($('et-pool') && $('et-pool').value) || 30);
       const muxLinks = Number(($('et-mux-links') && $('et-mux-links').value) || 4);
@@ -2490,6 +2518,8 @@
     $('et-linkport').value = String(linkPort);
     const curFwdProto = (ei && ei.forward_proto) || (oi && oi.forward_proto) || 'tcp';
     setRadio('et-fwd-proto', ['tcp', 'udp', 'both'].includes(curFwdProto) ? curFwdProto : 'tcp');
+    if ($('et-route-hosts')) $('et-route-hosts').value = (ei && ei.route_hosts) || '';
+    if ($('et-route-default')) $('et-route-default').checked = !!(ei && ei.route_default);
 
     setRadio('et-shared', isMux ? 'shared' : 'one');
     $('et-pool').value = String(poolVal);
@@ -2589,7 +2619,7 @@
     }
   }
   for (const el of document.querySelectorAll('input[name="et-proxy"], input[name="et-fwd-proto"]')) {
-    el.addEventListener('change', () => syncChoiceCards($('edit-tunnel-dialog')));
+    el.addEventListener('change', () => syncEditTunnelCapacityUI());
   }
 
   $('et-cancel').addEventListener('click', () => $('edit-tunnel-dialog').close());
@@ -2701,6 +2731,8 @@
     const relayPorts = userPorts + (mode === 'reverse' ? ',' + linkPort : '');
     const foreignPorts = servicePorts + (mode === 'direct' ? ',' + linkPort : '');
     const ownTag = `PortBridge tunnel "${t.name}"`;
+    const fwdProto = radio('et-fwd-proto') || 'tcp';
+    const hasRouteCfg = fwdProto === 'tcp' && !!(($('et-route-hosts') && $('et-route-hosts').value.trim()) || ($('et-route-default') && $('et-route-default').checked));
     const describe = async (half, list, role) => {
       if (!half) return [];
       const sName = half.server_name || half.server_id;
@@ -2710,13 +2742,25 @@
           let what = 'User listen port';
           if (p.port === linkPort && ((role === 'relay' && mode === 'reverse') || (role === 'foreign' && mode === 'direct'))) what = 'Tunnel bridge port';
           else if (role === 'foreign') what = 'Inbound port';
-          const isSelf = p.by === ownTag;
+          const isSelf = p.by === ownTag || (what === 'User listen port' && p.shared && Array.isArray(p.shared_tunnels) && p.shared_tunnels.length === 1 && p.shared_tunnels[0] === t.name);
           const by = p.by ? ` (${p.by.replace(/^PortBridge /, '')})` : '';
           let cls = 'good', text;
           if (what === 'Inbound port') {
             text = p.state === 'free' ? 'no service is listening on this port yet (is your X-UI / inbound running?)' : `active service listening${by} (ready)`;
             if (p.state === 'free') cls = 'warn';
             if (/^PortBridge tunnel/.test(p.by || '') && !isSelf) { cls = 'bad'; text = `already used by ${p.by.replace(/^PortBridge /, '')}`; }
+          } else if (what === 'User listen port' && p.shared && !isSelf) {
+            if (fwdProto !== 'tcp') {
+              text = `shared SNI/Host port${by} — cannot share with UDP forwarding`;
+              cls = 'bad';
+            } else if (hasRouteCfg) {
+              const hostsNote = p.shared_hosts && p.shared_hosts.length ? ` [routed: ${p.shared_hosts.join(', ')}]` : '';
+              text = `sharable via SNI/Host router${by}${hostsNote}`;
+              cls = 'good';
+            } else {
+              text = `shared SNI/Host port${by} — enter SNI / Host Routing Domain(s) above to share this port`;
+              cls = 'warn';
+            }
           } else if (isSelf || p.state === 'free') {
             text = isSelf ? `currently used by this tunnel "${t.name}" (will be kept)` : 'available (free)';
             cls = 'good';
@@ -2793,6 +2837,15 @@
       if ($('et-blocked-ips')) {
         body.blocked_ips = $('et-blocked-ips').value.trim();
         body.update_blocked_ips = true;
+      }
+      if (body.forward_proto === 'tcp') {
+        body.route_hosts = $('et-route-hosts') ? $('et-route-hosts').value.trim() : '';
+        body.update_route_hosts = true;
+        body.route_default = ($('et-route-default') && $('et-route-default').checked) ? 'on' : 'off';
+      } else {
+        body.route_hosts = '';
+        body.update_route_hosts = true;
+        body.route_default = 'off';
       }
     }
     if ($('et-clean-section') && !$('et-clean-section').hidden && $('et-cleanips')) {
@@ -4945,6 +4998,9 @@
     const mode = radio('tn-mode');
     const gre = $('tn-gre').checked;
     $('tn-links').hidden = gre;
+    if ($('tn-sni-route-wrap')) {
+      $('tn-sni-route-wrap').hidden = (radio('tn-fwd-proto') || 'tcp') !== 'tcp';
+    }
     const backup = $('tn-backup-choice');
     backup.hidden = mode !== 'direct';
     if ($('tn-asym-choice')) $('tn-asym-choice').hidden = mode !== 'direct';
@@ -5963,6 +6019,8 @@
     resetTunnelDialogProbeState();
     if ($('tn-cleanips')) $('tn-cleanips').value = '';
     if ($('tn-probe-cleanips')) $('tn-probe-cleanips').value = '';
+    if ($('tn-route-hosts')) $('tn-route-hosts').value = '';
+    if ($('tn-route-default')) $('tn-route-default').checked = false;
     if ($('tn-max-per-ip')) $('tn-max-per-ip').value = '0';
     if ($('tn-rate-per-ip')) $('tn-rate-per-ip').value = '0';
     if ($('tn-probe-service') && $('tn-service')) {
@@ -6035,6 +6093,8 @@
     if ($('tn-probe-linkport')) $('tn-probe-linkport').value = String(linkPort);
     const curFwdProto = ei.forward_proto || oi.forward_proto || 'tcp';
     setRadio('tn-fwd-proto', ['tcp', 'udp', 'both'].includes(curFwdProto) ? curFwdProto : 'tcp');
+    if ($('tn-route-hosts')) $('tn-route-hosts').value = ei.route_hosts || '';
+    if ($('tn-route-default')) $('tn-route-default').checked = !!ei.route_default;
 
     $('tn-gre').checked = !!any.gre;
     setRadio('tn-mode', any.mode === 'reverse' ? 'reverse' : 'direct');
@@ -6198,6 +6258,8 @@
       user_ports: $('tn-users').value.trim(),
       link_port: Number($('tn-linkport').value || 0),
       forward_proto: radio('tn-fwd-proto') || 'tcp',
+      route_hosts: (radio('tn-fwd-proto') || 'tcp') === 'tcp' && $('tn-route-hosts') ? $('tn-route-hosts').value.trim() : '',
+      route_default: (radio('tn-fwd-proto') || 'tcp') === 'tcp' && !!($('tn-route-default') && $('tn-route-default').checked),
       proxy_protocol: radio('tn-proxy'),
       relay_ip: $('tn-relayip').value.trim(),
       auto_heal: $('tn-autoheal') ? $('tn-autoheal').checked : true,
@@ -6399,6 +6461,7 @@
     const foreignPorts = r.service_ports + (r.mode === 'direct' ? ',' + bridgePorts : '');
     const isBridgePort = (port) => port === r.link_port || (r.twin_path && !r.port_hop && port === r.link_port + 1);
     const ownTag = currentModalOwnTunnelTag();
+    const hasRouteCfg = r.forward_proto === 'tcp' && !!(r.route_hosts || r.route_default);
     const describe = async (server, list, role) => {
       const s = serverById(server);
       try {
@@ -6407,13 +6470,25 @@
           let what = 'User listen port';
           if (isBridgePort(p.port) && ((role === 'relay' && (r.mode === 'reverse' || r.asymmetric)) || (role === 'foreign' && r.mode === 'direct'))) what = 'Tunnel bridge port';
           else if (role === 'foreign') what = 'Inbound port';
-          const isSelf = !!(ownTag && p.by === ownTag);
+          const isSelf = !!(ownTag && (p.by === ownTag || (what === 'User listen port' && p.shared && Array.isArray(p.shared_tunnels) && p.shared_tunnels.length === 1 && p.shared_tunnels[0] === r.name)));
           const by = p.by ? ` (${p.by.replace(/^PortBridge /, '')})` : '';
           let cls = 'good', text;
           if (what === 'Inbound port') {
             text = p.state === 'free' ? 'no service is listening on this port yet (is your X-UI / inbound running?)' : `active service listening${by} (ready)`;
             if (p.state === 'free') cls = 'warn';
             if (/^PortBridge tunnel/.test(p.by || '') && !isSelf) { cls = 'bad'; text = `already used by ${p.by.replace(/^PortBridge /, '')}`; }
+          } else if (what === 'User listen port' && p.shared && !isSelf) {
+            if (r.forward_proto !== 'tcp') {
+              text = `shared SNI/Host port${by} — cannot share with UDP forwarding`;
+              cls = 'bad';
+            } else if (hasRouteCfg) {
+              const hostsNote = p.shared_hosts && p.shared_hosts.length ? ` [routed: ${p.shared_hosts.join(', ')}]` : '';
+              text = `sharable via SNI/Host router${by}${hostsNote}`;
+              cls = 'good';
+            } else {
+              text = `shared SNI/Host port${by} — enter SNI / Host Routing Domain(s) above to share this port`;
+              cls = 'warn';
+            }
           } else if (isSelf || p.state === 'free') {
             text = isSelf ? `currently used by this tunnel "${r.name}" (will be kept)` : 'available (free)';
             cls = 'good';
@@ -7238,6 +7313,9 @@
         mode = radio('wb-mode') || 'direct';
       }
       out.replaceChildren(h('li', null, 'Checking web & proxy ports on both servers...'));
+      const wbDomains = $('wb-domains') ? $('wb-domains').value.trim() : '';
+      const hasWbDomains = !!(wbDomains && wbDomains !== '*');
+      const ownName = (wbMode === 'edit' && editingWebsiteBridge) ? editingWebsiteBridge.name : '';
       const relayPorts = webPorts + (mode === 'reverse' ? ',' + linkPort : '');
       const foreignPorts = webPorts + (mode === 'direct' ? ',' + linkPort : '') + (outOn && outPort ? ',' + outPort : '');
       const checkOne = async (srvId, list, role) => {
@@ -7247,7 +7325,7 @@
         try {
           const res = await api('POST', '/api/ports', { server: srvId, ports: list });
           return (res.ports || []).map((p) => {
-            const isSelf = ownTag && p.by === ownTag;
+            const isSelf = !!(ownTag && (p.by === ownTag || (ownName && p.shared && Array.isArray(p.shared_tunnels) && p.shared_tunnels.length === 1 && p.shared_tunnels[0] === ownName)));
             const by = p.by ? ` (${p.by.replace(/^PortBridge /, '')})` : '';
             if (role === 'foreign' && outOn && p.port === outPort) {
               const ok = p.state === 'free' || isSelf;
@@ -7263,6 +7341,14 @@
               const ok = p.state !== 'free';
               return h('li', { class: ok ? 'good' : 'warn' },
                 `${sName} — Web Server Port ${p.port}: ${ok ? 'web server listening' + by + ' (ready)' : 'nothing listening on port ' + p.port + ' yet (make sure LiteSpeed / Nginx is running)'}`);
+            }
+            if (p.shared && !isSelf) {
+              if (hasWbDomains) {
+                return h('li', { class: 'good' },
+                  `${sName} — Public Web Port ${p.port}: sharable via SNI/Host router${by}`);
+              }
+              return h('li', { class: 'warn' },
+                `${sName} — Public Web Port ${p.port}: shared SNI/Host port${by} — enter Website Domains in Step 1 to share port ${p.port}`);
             }
             const ok = p.state === 'free' || isSelf;
             return h('li', { class: ok ? 'good' : 'bad' },

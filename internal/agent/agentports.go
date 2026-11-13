@@ -254,9 +254,12 @@ func portsIn(list string) []int {
 
 // claimedPort is a port another tunnel on this server already uses.
 type claimedPort struct {
-	port   int
-	tunnel string
-	what   string
+	port         int
+	tunnel       string
+	what         string
+	shared       bool
+	routeHosts   []string
+	routeDefault bool
 }
 
 // portsClaimedByOthers lists the ports the other tunnels on this server use for
@@ -277,22 +280,110 @@ func portsClaimedByOthers(confDir, except string) []claimedPort {
 			(cfg.Role == engine.RoleEdge && cfg.Mode == engine.ModeReverse)
 		if listensForLink {
 			for _, p := range portsIn(cfg.TunnelAddr) {
-				out = append(out, claimedPort{p, name, "the link between its servers"})
+				out = append(out, claimedPort{port: p, tunnel: name, what: "the link between its servers"})
 			}
 		}
 		if cfg.Role == engine.RoleEdge {
+			shared := cfg.UsesSharedPort()
+			var rHosts []string
+			if shared {
+				rHosts = cfg.EffectiveRouteHosts()
+			}
 			for _, p := range portsIn(cfg.UserListen) {
-				out = append(out, claimedPort{p, name, "its users"})
+				out = append(out, claimedPort{
+					port:         p,
+					tunnel:       name,
+					what:         "its users",
+					shared:       shared,
+					routeHosts:   rHosts,
+					routeDefault: shared && cfg.RouteDefault,
+				})
 			}
 			if cfg.Asymmetric {
-				out = append(out, claimedPort{cfg.EffectiveAsymDownPort(), name, "its asymmetric downlink"})
+				out = append(out, claimedPort{port: cfg.EffectiveAsymDownPort(), tunnel: name, what: "its asymmetric downlink"})
 			}
 		}
 		if cfg.Role == engine.RoleOrigin && cfg.OutboundProxy && cfg.OutboundProxyPort > 0 {
-			out = append(out, claimedPort{cfg.OutboundProxyPort, name, "its website outbound proxy"})
+			out = append(out, claimedPort{port: cfg.OutboundProxyPort, tunnel: name, what: "its website outbound proxy"})
 		}
 	}
 	return out
+}
+
+// checkUserPortConflict checks whether user listen port u can be bound (or shared
+// via TLS SNI / HTTP Host routing) alongside other tunnels and processes on this server.
+func checkUserPortConflict(
+	u int,
+	portLabel string,
+	newShared bool,
+	newHosts []string,
+	newDefault bool,
+	alreadyHeldTCP bool,
+	alreadyHeldUDP bool,
+	forwardProto string,
+	claimed []claimedPort,
+	host agentHost,
+) string {
+	var existing []claimedPort
+	for _, c := range claimed {
+		if c.port == u {
+			existing = append(existing, c)
+		}
+	}
+
+	checkTCP := forwardProto != "udp"
+	checkUDP := forwardProto == "udp" || forwardProto == "both"
+
+	if len(existing) > 0 {
+		if !newShared {
+			c := existing[0]
+			if c.shared {
+				return fmt.Sprintf("%s %d is shared via SNI/Host routing by tunnel %q; enter SNI / Host Routing Domain(s) (or enable Default Fallback Route) to share port %d with it", portLabel, u, c.tunnel, u)
+			}
+			return fmt.Sprintf("%s %d is already used on this server by tunnel %q (%s)", portLabel, u, c.tunnel, c.what)
+		}
+		for _, c := range existing {
+			if !c.shared {
+				if c.what == "its users" {
+					return fmt.Sprintf("%s %d is held exclusively by tunnel %q (no SNI/Host routing configured on %q); edit %q to add SNI/Host routing domains first", portLabel, u, c.tunnel, c.tunnel, c.tunnel)
+				}
+				return fmt.Sprintf("%s %d is already used on this server by tunnel %q (%s)", portLabel, u, c.tunnel, c.what)
+			}
+			if newDefault && c.routeDefault {
+				return fmt.Sprintf("%s %d already has a Default Fallback Route on tunnel %q; only one tunnel per shared port can be the default fallback", portLabel, u, c.tunnel)
+			}
+			if dup, bad := engine.RouteHostPatternsConflict(newHosts, c.routeHosts); bad {
+				return fmt.Sprintf("routing domain %q on shared port %d is already claimed by tunnel %q", dup, u, c.tunnel)
+			}
+		}
+		if checkTCP && !alreadyHeldTCP {
+			if err := host.PortFree(engine.TransportPlain, u); err != nil {
+				prog := strings.ToLower(strings.TrimSpace(host.ListenOwner(u)))
+				if prog != "" && !strings.Contains(prog, "portbridge") {
+					return fmt.Sprintf("%s %d is already in use on this server by %s", portLabel, u, prog)
+				}
+			}
+		}
+		return ""
+	}
+
+	if checkTCP && !alreadyHeldTCP {
+		if err := host.PortFree(engine.TransportPlain, u); err != nil {
+			return fmt.Sprintf("%s %d is already in use on this server by another program", portLabel, u)
+		}
+	}
+	if checkUDP && !alreadyHeldUDP {
+		uLabel := portLabel + " UDP"
+		if strings.HasSuffix(portLabel, "port") {
+			uLabel = strings.TrimSuffix(portLabel, "port") + "UDP port"
+		} else if strings.HasSuffix(portLabel, "listen port") {
+			uLabel = strings.TrimSuffix(portLabel, "listen port") + "UDP listen port"
+		}
+		if err := host.PortFree(engine.TransportKCP, u); err != nil {
+			return fmt.Sprintf("%s %d is already in use on this server by another program", uLabel, u)
+		}
+	}
+	return ""
 }
 
 // checkPairingPorts decides whether this server can give a tunnel the ports its

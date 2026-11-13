@@ -156,6 +156,8 @@ type createRequest struct {
 	LinkPort     int    `json:"link_port"`
 
 	ForwardProto  string `json:"forward_proto,omitempty"`
+	RouteHosts    string `json:"route_hosts,omitempty"`
+	RouteDefault  bool   `json:"route_default,omitempty"`
 	ProxyProtocol string `json:"proxy_protocol"`
 	RelayIP       string `json:"relay_ip"` // optional: the relay's address users connect to
 	AutoHeal      bool   `json:"auto_heal"`
@@ -238,7 +240,11 @@ func (p *Panel) toSpec(r createRequest) (agent.EdgeSpec, error) {
 	s := agent.EdgeSpec{Name: strings.TrimSpace(r.Name), Mode: r.Mode, Pool: pool, MaxConn: r.MaxConn,
 		MaxConnPerIP: r.MaxConnPerIP, MaxRatePerIP: r.MaxRatePerIP, BlockedIPs: strings.TrimSpace(r.BlockedIPs),
 		ServicePorts: r.ServicePorts, UserPorts: r.UserPorts, LinkPort: r.LinkPort,
-		ForwardProto: strings.TrimSpace(r.ForwardProto), ProxyProtocol: r.ProxyProtocol}
+		ForwardProto: strings.TrimSpace(r.ForwardProto), RouteHosts: strings.TrimSpace(r.RouteHosts),
+		ProxyProtocol: r.ProxyProtocol}
+	if r.RouteDefault {
+		s.RouteDefault = "on"
+	}
 	if r.WebsiteBridge {
 		s.WebsiteBridge = "on"
 		s.WebsiteDomains = strings.TrimSpace(r.WebsiteDomains)
@@ -565,9 +571,12 @@ func (p *Panel) portsThere(ctx context.Context, id string, ports []int) (map[int
 }
 
 type portState struct {
-	Port  int    `json:"port"`
-	State string `json:"state"`
-	By    string `json:"by,omitempty"`
+	Port          int      `json:"port"`
+	State         string   `json:"state"`
+	By            string   `json:"by,omitempty"`
+	Shared        bool     `json:"shared,omitempty"`
+	SharedTunnels []string `json:"shared_tunnels,omitempty"`
+	SharedHosts   []string `json:"shared_hosts,omitempty"`
 }
 
 func intsOf(list string) []int {
@@ -731,6 +740,9 @@ func edgeSpecToEditSpec(s agent.EdgeSpec) agent.EditSpec {
 		ServicePorts:          s.ServicePorts,
 		LinkPort:              s.LinkPort,
 		ForwardProto:          s.ForwardProto,
+		RouteHosts:            s.RouteHosts,
+		UpdateRouteHosts:      true,
+		RouteDefault:          onOff(s.RouteDefault),
 		ProxyProtocol:         pp,
 		Pool:                  s.Pool,
 		MuxLinks:              s.MuxLinks,
@@ -1162,6 +1174,9 @@ type editTunnelRequest struct {
 	UserPorts             string `json:"user_ports"`
 	LinkPort              int    `json:"link_port"`
 	ForwardProto          string `json:"forward_proto,omitempty"`
+	RouteHosts            string `json:"route_hosts,omitempty"`
+	UpdateRouteHosts      bool   `json:"update_route_hosts,omitempty"`
+	RouteDefault          string `json:"route_default,omitempty"`
 	ProxyProtocol         string `json:"proxy_protocol"`
 	Mux                   string `json:"mux"`
 	Pool                  int    `json:"pool"`
@@ -1211,6 +1226,9 @@ func (p *Panel) editTunnel(j *job, r editTunnelRequest) error {
 		ServicePorts:          strings.TrimSpace(r.ServicePorts),
 		LinkPort:              r.LinkPort,
 		ForwardProto:          strings.TrimSpace(r.ForwardProto),
+		RouteHosts:            strings.TrimSpace(r.RouteHosts),
+		UpdateRouteHosts:      r.UpdateRouteHosts,
+		RouteDefault:          strings.TrimSpace(r.RouteDefault),
 		ProxyProtocol:         strings.TrimSpace(r.ProxyProtocol),
 		Mux:                   strings.TrimSpace(r.Mux),
 		Pool:                  r.Pool,

@@ -967,6 +967,25 @@
             </label>
           </div>
         </div>
+        <div id="tn-sni-route-wrap" class="sub-panel sni-route-box">
+          <div class="sni-route-head">
+            <div class="sni-route-title-row">
+              <strong>Shared-Port SNI / Host Routing</strong>
+              <span class="pill-tag tag-accent">Optional · Share :443 / :80 Across Tunnels</span>
+            </div>
+            <p class="muted small">Let multiple TCP tunnels and Website Bridges on the same Iran Relay server share one public port (<code>443</code>, <code>80</code>, <code>2053</code>, <code>8443</code>, etc.) without Nginx or HAProxy. PortBridge inspects incoming TLS <code>SNI</code> (VLESS/Trojan/WS/gRPC/XHTTP TLS, VLESS-REALITY <code>dest</code> SNI, HTTPS) or HTTP <code>Host</code> and routes each client zero-copy to its Foreign server.</p>
+          </div>
+          <label for="tn-route-hosts">SNI / Host Routing Domain(s) <span class="muted">(Iran Relay · comma-separated, leave empty for exclusive port)</span></label>
+          <span class="field-hint">Exact domain or wildcard (e.g. <code>de.yourdomain.com, *.app.com</code>) — must match the <code>SNI</code> / <code>dest</code> / <code>Host</code> your clients send</span>
+          <input id="tn-route-hosts" autocapitalize="none" spellcheck="false" placeholder="e.g. de.yourdomain.com, *.app.com">
+          <label class="check-card sni-default-card">
+            <input type="checkbox" id="tn-route-default">
+            <div>
+              <strong>Default Fallback Route on Shared Port</strong>
+              <span class="choice-desc">Receives connections on this shared port that have an unmatched domain or non-TLS/HTTP raw TCP payload (at most one fallback tunnel per port).</span>
+            </div>
+          </label>
+        </div>
         <div class="actions left port-check-bar">
           <button type="button" id="tn-check">Test &amp; Verify Ports on Both Servers</button>
           <button type="button" id="tn-scan-cdn">Scan Free CDN Ports</button>
@@ -1799,6 +1818,25 @@
             </label>
           </div>
         </div>
+        <div id="et-sni-route-wrap" class="sub-panel sni-route-box">
+          <div class="sni-route-head">
+            <div class="sni-route-title-row">
+              <strong>Shared-Port SNI / Host Routing</strong>
+              <span class="pill-tag tag-accent">Optional · Share :443 / :80 Across Tunnels</span>
+            </div>
+            <p class="muted small">Share the same Relay user port (<code>443</code>, <code>80</code>, <code>2053</code>, etc.) across multiple TCP tunnels &amp; Website Bridges by TLS <code>SNI</code> or HTTP <code>Host</code>.</p>
+          </div>
+          <label for="et-route-hosts">SNI / Host Routing Domain(s) <span class="muted">(Iran Relay · comma-separated, leave empty for exclusive port)</span></label>
+          <span class="field-hint">Exact domain or wildcard (e.g. <code>de.yourdomain.com, *.app.com</code>)</span>
+          <input id="et-route-hosts" autocapitalize="none" spellcheck="false" placeholder="e.g. de.yourdomain.com, *.app.com">
+          <label class="check-card sni-default-card">
+            <input type="checkbox" id="et-route-default">
+            <div>
+              <strong>Default Fallback Route on Shared Port</strong>
+              <span class="choice-desc">Catches unmatched SNI/Host or raw TCP traffic on this shared port (at most one fallback tunnel per port).</span>
+            </div>
+          </label>
+        </div>
         <div class="actions left port-check-bar">
           <button type="button" id="et-check">Test &amp; Verify Ports on Both Servers</button>
           <button type="button" id="et-scan-cdn">Scan Free CDN Ports</button>
@@ -2520,8 +2558,9 @@
             <input id="wb-name" maxlength="40" autocapitalize="none" spellcheck="false" pattern="[A-Za-z0-9_-]+" placeholder="e.g. uk-wordpress or main-websites">
           </div>
           <div>
-            <label for="wb-domains">Website Domains <span class="muted">(comma-separated, for reference &amp; DNS guide)</span></label>
+            <label for="wb-domains">Website Domains <span class="muted">(comma-separated · enables shared :80/:443)</span></label>
             <input id="wb-domains" autocapitalize="none" spellcheck="false" placeholder="e.g. myshop.ir, example.com">
+            <span class="field-hint">Listing domains also lets multiple Website Bridges &amp; SNI-routed VPN tunnels share <code>80</code> and <code>443</code> on the same Iran server.</span>
           </div>
         </div>
       </section>

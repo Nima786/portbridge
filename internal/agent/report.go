@@ -98,6 +98,9 @@ type TunnelInfo struct {
 	OutboundProxyMode     string      `json:"outbound_proxy_mode,omitempty"`
 	OutboundIranDomains   string      `json:"outbound_iran_domains,omitempty"`
 	OutboundBypassDomains string      `json:"outbound_bypass_domains,omitempty"`
+	RouteHosts            string      `json:"route_hosts,omitempty"`
+	RouteDefault          bool        `json:"route_default,omitempty"`
+	SharedPort            bool        `json:"shared_port,omitempty"`
 	PairID                string      `json:"pair_id,omitempty"`
 	Running               bool        `json:"running"`
 	ServiceNote           string      `json:"service_note,omitempty"`
@@ -201,6 +204,9 @@ func tunnelInfo(path string, host agentHost) TunnelInfo {
 	}
 	ti.WebsiteBridge = cfg.WebsiteBridge
 	ti.WebsiteDomains = cfg.WebsiteDomains
+	ti.RouteHosts = cfg.RouteHosts
+	ti.RouteDefault = cfg.RouteDefault
+	ti.SharedPort = cfg.UsesSharedPort()
 	ti.OutboundProxy = cfg.OutboundProxy
 	if cfg.OutboundProxy {
 		ti.OutboundProxyPort = cfg.OutboundProxyPort

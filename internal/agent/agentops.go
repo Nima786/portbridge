@@ -280,6 +280,16 @@ func (systemHost) Listening(port int) bool {
 func (systemHost) RemoveRuntime(name string) {
 	_ = os.Remove(filepath.Join("/run/portbridge", name+".json"))
 	_ = os.Remove(filepath.Join("/run/portbridge", name+".sock"))
+	if matches, err := filepath.Glob(filepath.Join("/run/portbridge", "sni-port-*-"+name+".json")); err == nil {
+		for _, m := range matches {
+			_ = os.Remove(m)
+		}
+	}
+	if matches, err := filepath.Glob(filepath.Join("/run/portbridge", "sni-h-"+name+"-*.sock")); err == nil {
+		for _, m := range matches {
+			_ = os.Remove(m)
+		}
+	}
 }
 
 // serviceStartSettle is how long a freshly started service is watched. A tunnel

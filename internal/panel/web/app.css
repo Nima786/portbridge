@@ -3632,3 +3632,39 @@ label.check-card.abuse-torrent-card {
   color: var(--accent);
   overflow-wrap: anywhere;
 }
+
+/* ------------------------------------ Shared-Port SNI / Host Routing Box */
+
+.sni-route-box {
+  margin-top: .75rem;
+  border-left: 3px solid var(--accent);
+}
+
+.sni-route-head {
+  margin-bottom: .45rem;
+}
+
+.sni-route-title-row {
+  display: flex;
+  align-items: center;
+  gap: .5rem;
+  flex-wrap: wrap;
+}
+
+.sni-route-head p {
+  margin: .26rem 0 0;
+  line-height: 1.44;
+}
+
+label.check-card.sni-default-card {
+  margin-top: .65rem;
+  background: var(--panel);
+}
+
+.badge-sni-route {
+  background: var(--accent-soft);
+  border: 1px solid var(--accent-border);
+  color: var(--accent);
+  font-weight: 600;
+}
+

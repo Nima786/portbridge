@@ -2,9 +2,201 @@ package engine
 
 import (
 	"encoding/binary"
+	"fmt"
 	"net"
 	"strings"
 )
+
+// ParseRouteHostPatterns validates and normalizes a comma- or whitespace-separated
+// list of SNI / HTTP Host routing patterns (such as "de.example.com" or "*.example.com").
+func ParseRouteHostPatterns(raw string) ([]string, error) {
+	var out []string
+	seen := make(map[string]bool)
+	for _, part := range strings.FieldsFunc(raw, func(r rune) bool {
+		return r == ',' || r == '\n' || r == '\r' || r == ';' || r == ' ' || r == '\t'
+	}) {
+		orig := strings.TrimSpace(part)
+		if orig == "" {
+			continue
+		}
+		d := strings.ToLower(orig)
+		d = strings.TrimPrefix(d, "https://")
+		d = strings.TrimPrefix(d, "http://")
+		if idx := strings.IndexByte(d, '/'); idx >= 0 {
+			d = d[:idx]
+		}
+		if d == "*" {
+			return nil, fmt.Errorf("route_hosts cannot use \"*\"; enable route_default = on for a catch-all fallback route")
+		}
+		wildcard := false
+		if strings.HasPrefix(d, "*.") {
+			wildcard = true
+			d = strings.TrimPrefix(d, "*.")
+		} else if strings.HasPrefix(d, ".") {
+			wildcard = true
+			d = strings.TrimPrefix(d, ".")
+		}
+		base := normalizeWebsiteHost(d)
+		if base == "" || strings.Contains(base, "*") {
+			return nil, fmt.Errorf("invalid routing domain %q", orig)
+		}
+		if net.ParseIP(base) != nil || strings.Contains(base, ":") {
+			return nil, fmt.Errorf("routing domain %q is an IP address; SNI/Host routing requires a domain or subdomain", orig)
+		}
+		if !isValidRouteDomainBase(base) {
+			return nil, fmt.Errorf("invalid routing domain %q (use a full domain or subdomain such as sub.example.com or *.example.com)", orig)
+		}
+		canon := base
+		if wildcard {
+			canon = "*." + base
+		}
+		if !seen[canon] {
+			seen[canon] = true
+			out = append(out, canon)
+		}
+	}
+	return out, nil
+}
+
+func isValidRouteDomainBase(base string) bool {
+	if len(base) == 0 || len(base) > 253 || !strings.Contains(base, ".") {
+		return false
+	}
+	labels := strings.Split(base, ".")
+	if len(labels) < 2 {
+		return false
+	}
+	for _, lbl := range labels {
+		if len(lbl) == 0 || len(lbl) > 63 {
+			return false
+		}
+		if lbl[0] == '-' || lbl[len(lbl)-1] == '-' {
+			return false
+		}
+		for i := 0; i < len(lbl); i++ {
+			c := lbl[i]
+			if !((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '-') {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+// EffectiveRouteHosts returns the normalized SNI / HTTP Host routing patterns
+// for this edge tunnel. When RouteHosts is explicitly set, it takes precedence;
+// otherwise a Website Bridge with specific WebsiteDomains automatically uses
+// those domains so multiple Website Bridges and VPN tunnels can share :80/:443.
+func (cfg *Config) EffectiveRouteHosts() []string {
+	if cfg == nil {
+		return nil
+	}
+	if strings.TrimSpace(cfg.RouteHosts) != "" {
+		list, err := ParseRouteHostPatterns(cfg.RouteHosts)
+		if err == nil {
+			return list
+		}
+	}
+	if cfg.WebsiteBridge && strings.TrimSpace(cfg.WebsiteDomains) != "" {
+		rawPatterns := parseWebsiteDomainPatterns(cfg.WebsiteDomains)
+		for _, p := range rawPatterns {
+			if p == "*" {
+				return nil
+			}
+		}
+		list, err := ParseRouteHostPatterns(cfg.WebsiteDomains)
+		if err == nil {
+			return list
+		}
+	}
+	return nil
+}
+
+// UsesSharedPort reports whether this edge tunnel participates in shared-port
+// TLS SNI / HTTP Host routing on its TCP user_listen ports.
+func (cfg *Config) UsesSharedPort() bool {
+	if cfg == nil || cfg.Role != RoleEdge || !cfg.ForwardsTCP() || cfg.ForwardsUDP() {
+		return false
+	}
+	return len(cfg.EffectiveRouteHosts()) > 0 || cfg.RouteDefault
+}
+
+// MatchRouteHost checks whether host matches any pattern in patterns and returns
+// a specificity score so exact hostnames (e.g. "vpn.example.com") always take
+// priority over wildcard domains (e.g. "*.example.com") on the same shared port.
+func MatchRouteHost(host string, patterns []string, websiteAutoWWW bool) (bool, int) {
+	h := normalizeWebsiteHost(host)
+	if h == "" || len(patterns) == 0 {
+		return false, 0
+	}
+	best := 0
+	for _, p := range patterns {
+		p = strings.ToLower(strings.TrimSpace(p))
+		if p == "" {
+			continue
+		}
+		if strings.HasPrefix(p, "*.") {
+			base := strings.TrimPrefix(p, "*.")
+			suffix := "." + base
+			if h == base || strings.HasSuffix(h, suffix) {
+				score := 1000 + len(base)
+				if score > best {
+					best = score
+				}
+			}
+			continue
+		}
+		if strings.HasPrefix(p, ".") {
+			base := strings.TrimPrefix(p, ".")
+			if h == base || strings.HasSuffix(h, p) {
+				score := 1000 + len(base)
+				if score > best {
+					best = score
+				}
+			}
+			continue
+		}
+		if h == p {
+			score := 10000 + len(p)
+			if score > best {
+				best = score
+			}
+			continue
+		}
+		if websiteAutoWWW {
+			base := strings.TrimPrefix(p, "www.")
+			if h == base || h == "www."+base {
+				score := 5000 + len(base)
+				if score > best {
+					best = score
+				}
+			}
+		}
+	}
+	return best > 0, best
+}
+
+// RouteHostPatternsConflict reports whether two sets of normalized routing
+// patterns claim the exact same canonical pattern on the same port.
+func RouteHostPatternsConflict(a, b []string) (string, bool) {
+	if len(a) == 0 || len(b) == 0 {
+		return "", false
+	}
+	seen := make(map[string]bool, len(a))
+	for _, p := range a {
+		p = strings.ToLower(strings.TrimSpace(p))
+		if p != "" {
+			seen[p] = true
+		}
+	}
+	for _, p := range b {
+		p = strings.ToLower(strings.TrimSpace(p))
+		if p != "" && seen[p] {
+			return p, true
+		}
+	}
+	return "", false
+}
 
 // AllowsWebsiteDomain reports whether host is permitted by cfg.WebsiteDomains.
 // When WebsiteBridge is false or WebsiteDomains is empty (or contains "*"),

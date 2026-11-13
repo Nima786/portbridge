@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -89,6 +90,7 @@ type edge struct {
 	cert   *tls.Certificate
 	asym   *asymEdgeRuntime
 	routes *router
+	sni    *sniRouter
 
 	// health is what this side believes about whether data really flows.
 	health *pathHealth
@@ -275,15 +277,42 @@ func runEdge(ctx context.Context, cfg *Config, st *status) error {
 			_ = prev.Close()
 		}
 	}
+	sharedPort := cfg.UsesSharedPort()
+	var sharedBoundPorts []int
 	if cfg.ForwardsTCP() {
 		for _, addr := range cfg.UserListens {
-			ln, err := net.Listen("tcp", addr)
+			ln, err := listenUserTCP(addr, sharedPort)
 			if err != nil {
 				closeUserListeners()
 				return fmt.Errorf("listening for TCP users on %s: %w", addr, err)
 			}
 			userLns = append(userLns, ln)
+			if sharedPort {
+				if _, pStr, err := net.SplitHostPort(ln.Addr().String()); err == nil {
+					if pNum, err := strconv.Atoi(pStr); err == nil && pNum > 0 {
+						sharedBoundPorts = append(sharedBoundPorts, pNum)
+						if _, cfgPStr, err := net.SplitHostPort(addr); err == nil && cfgPStr == "0" && cfg.listenToPort != nil {
+							tp := cfg.TargetPortFor(addr)
+							cfg.listenToPort[pStr] = tp
+							cfg.listenToPort[":"+pStr] = tp
+						}
+					}
+				}
+			}
 		}
+	}
+	if sharedPort && len(sharedBoundPorts) > 0 {
+		sr, err := newSNIRouter(ctx, e, sharedBoundPorts)
+		if err != nil {
+			closeUserListeners()
+			return err
+		}
+		e.sni = sr
+		defer sr.Close()
+		go func() {
+			<-ctx.Done()
+			sr.Close()
+		}()
 	}
 	if cfg.ForwardsUDP() {
 		for _, addr := range cfg.UserListens {
@@ -410,6 +439,10 @@ func (e *edge) acceptTunnel(ctx context.Context, ln net.Listener) {
 func (e *edge) acceptUsers(ctx context.Context, ln net.Listener, st *status) {
 	listenAddr := ln.Addr().String()
 	targetPort := e.cfg.TargetPortFor(listenAddr)
+	listenPort := 0
+	if _, pStr, err := net.SplitHostPort(listenAddr); err == nil {
+		listenPort, _ = strconv.Atoi(pStr)
+	}
 
 	for {
 		c, err := ln.Accept()
@@ -424,75 +457,93 @@ func (e *edge) acceptUsers(ctx context.Context, ln net.Listener, st *status) {
 			continue
 		}
 
-		clientIP, ce, handle, reason, allowed := st.guard().acquire(c.RemoteAddr(), func() { _ = c.Close() })
-		if !allowed {
-			e.logAbuse.printf("refused user connection from %s (%s)", clientIP, reason)
-			_ = c.Close()
+		if e.sni != nil && listenPort > 0 {
+			e.sni.handleAcceptedConn(ctx, c, listenPort)
 			continue
 		}
 
-		select {
-		case e.active <- struct{}{}:
-			e.wg.Add(1)
-			atomic.AddInt64(&st.activeSessions, 1)
-			go func(user net.Conn, ip string, entry *clientEntry, h uint64) {
-				defer e.wg.Done()
-				defer func() {
-					st.guard().release(ip, h)
-					atomic.AddInt64(&st.activeSessions, -1)
-					<-e.active
-				}()
-				if err := e.serve(ctx, user, targetPort, entry); err != nil {
-					_ = user.Close()
-					if errors.Is(err, errUserWentAway) {
-						// Background noise on a public port. Counted, not logged.
-						atomic.AddInt64(&st.emptyConnections, 1)
-						return
-					}
-					atomic.AddInt64(&st.failedSessions, 1)
-					e.logSession.printf("could not put a user on the tunnel: %v", err)
+		e.admitAndServeUser(ctx, c, false, nil, targetPort)
+	}
+}
+
+func (e *edge) admitAndServeUser(ctx context.Context, c net.Conn, hasPreHead bool, preHead []byte, targetPort uint16) {
+	st := e.st
+	clientIP, ce, handle, reason, allowed := st.guard().acquire(c.RemoteAddr(), func() { _ = c.Close() })
+	if !allowed {
+		e.logAbuse.printf("refused user connection from %s (%s)", clientIP, reason)
+		_ = c.Close()
+		return
+	}
+
+	select {
+	case e.active <- struct{}{}:
+		e.wg.Add(1)
+		atomic.AddInt64(&st.activeSessions, 1)
+		go func(user net.Conn, ip string, entry *clientEntry, h uint64) {
+			defer e.wg.Done()
+			defer func() {
+				st.guard().release(ip, h)
+				atomic.AddInt64(&st.activeSessions, -1)
+				<-e.active
+			}()
+			if err := e.serveWithHead(ctx, user, hasPreHead, preHead, targetPort, entry); err != nil {
+				_ = user.Close()
+				if errors.Is(err, errUserWentAway) {
+					// Background noise on a public port. Counted, not logged.
+					atomic.AddInt64(&st.emptyConnections, 1)
+					return
 				}
-			}(c, clientIP, ce, handle)
-		default:
-			st.guard().release(clientIP, handle)
-			atomic.AddInt64(&st.droppedSessions, 1)
-			e.logCapacity.printf("at capacity (%d sessions); dropping a user", e.cfg.MaxConn)
-			_ = c.Close()
-		}
+				atomic.AddInt64(&st.failedSessions, 1)
+				e.logSession.printf("could not put a user on the tunnel: %v", err)
+			}
+		}(c, clientIP, ce, handle)
+	default:
+		st.guard().release(clientIP, handle)
+		atomic.AddInt64(&st.droppedSessions, 1)
+		e.logCapacity.printf("at capacity (%d sessions); dropping a user", e.cfg.MaxConn)
+		_ = c.Close()
 	}
 }
 
 // serve moves one user across the tunnel, quietly retrying on a fresh connection
 // if a spare turns out to be dead.
 func (e *edge) serve(ctx context.Context, user net.Conn, targetPort uint16, ce *clientEntry) error {
-	// Capture the opening bytes so they can be replayed if the first attempt
-	// fails. Every protocol used here speaks first, so this returns at once.
-	//
-	// The read uses a borrowed buffer and only what arrived is kept. Those
-	// opening bytes have to be held for as long as the session might need a
-	// retry, and every protocol involved opens with tens of bytes, so holding a
-	// whole 16 KB buffer per session to keep sixty bytes would waste tens of
-	// megabytes at capacity for nothing.
-	scratch := headPool.Get().(*[]byte)
-	_ = user.SetReadDeadline(time.Now().Add(headWaitTimeout))
-	n, err := user.Read(*scratch)
-	_ = user.SetReadDeadline(time.Time{})
+	return e.serveWithHead(ctx, user, false, nil, targetPort, ce)
+}
+
+func (e *edge) serveWithHead(ctx context.Context, user net.Conn, hasPreHead bool, preHead []byte, targetPort uint16, ce *clientEntry) error {
 	var head []byte
-	if n > 0 {
-		head = make([]byte, n)
-		copy(head, (*scratch)[:n])
-	}
-	headPool.Put(scratch)
-	if n == 0 && err != nil && !isTimeout(err) {
-		// Connected then vanished without a word: almost always a port scan.
-		// Do not spend a tunnel connection on it, and do not log it.
-		return fmt.Errorf("%w: %v", errUserWentAway, err)
+	if hasPreHead {
+		head = preHead
+	} else {
+		// Capture the opening bytes so they can be replayed if the first attempt
+		// fails. Every protocol used here speaks first, so this returns at once.
+		//
+		// The read uses a borrowed buffer and only what arrived is kept. Those
+		// opening bytes have to be held for as long as the session might need a
+		// retry, and every protocol involved opens with tens of bytes, so holding a
+		// whole 16 KB buffer per session to keep sixty bytes would waste tens of
+		// megabytes at capacity for nothing.
+		scratch := headPool.Get().(*[]byte)
+		_ = user.SetReadDeadline(time.Now().Add(headWaitTimeout))
+		n, err := user.Read(*scratch)
+		_ = user.SetReadDeadline(time.Time{})
+		if n > 0 {
+			head = make([]byte, n)
+			copy(head, (*scratch)[:n])
+		}
+		headPool.Put(scratch)
+		if n == 0 && err != nil && !isTimeout(err) {
+			// Connected then vanished without a word: almost always a port scan.
+			// Do not spend a tunnel connection on it, and do not log it.
+			return fmt.Errorf("%w: %v", errUserWentAway, err)
+		}
 	}
 	if e.cfg.WebsiteBridge && strings.TrimSpace(e.cfg.WebsiteDomains) != "" {
-		if len(head) == 0 {
+		if len(head) == 0 && !hasPreHead {
 			scratch := headPool.Get().(*[]byte)
 			_ = user.SetReadDeadline(time.Now().Add(3 * time.Second))
-			n, err = user.Read(*scratch)
+			n, _ := user.Read(*scratch)
 			_ = user.SetReadDeadline(time.Time{})
 			if n > 0 {
 				head = make([]byte, n)

@@ -272,6 +272,13 @@ type Config struct {
 	OutboundIranDomains   string
 	OutboundBypassDomains string
 
+	// RouteHosts and RouteDefault enable zero-daemon shared-port routing on the
+	// edge: multiple TCP tunnels (and Website Bridges) on the same Iran server
+	// can bind the same public user_listen port (e.g. :443 or :80) and dispatch
+	// each incoming connection by TLS ClientHello SNI or HTTP Host header.
+	RouteHosts   string
+	RouteDefault bool
+
 	fragmentSet   bool
 	resendSet     bool // kcp_resend was written down, so 0 means off rather than unset
 	utlsSet       bool
@@ -520,6 +527,15 @@ func (c *Config) ControlSocketPath() string {
 		return filepath.Join(filepath.Dir(c.StatusFile), c.Name+".sock")
 	}
 	return "/run/portbridge/" + c.Name + ".sock"
+}
+
+// SharedRouteDir returns the local runtime directory used by shared-port edge
+// tunnels to discover sibling SNI/Host routes and handoff sockets.
+func (c *Config) SharedRouteDir() string {
+	if c != nil && c.StatusFile != "" {
+		return filepath.Dir(c.StatusFile)
+	}
+	return "/run/portbridge"
 }
 
 func (c *Config) Set(key, val string) error {
@@ -927,6 +943,25 @@ func (c *Config) Set(key, val string) error {
 			return fmt.Errorf("blocked_ips: %w", err)
 		}
 		c.BlockedIPs = parsed
+	case "route_hosts", "route_host":
+		if strings.TrimSpace(val) == "" {
+			c.RouteHosts = ""
+			return nil
+		}
+		parsed, err := ParseRouteHostPatterns(val)
+		if err != nil {
+			return fmt.Errorf("route_hosts: %w", err)
+		}
+		c.RouteHosts = strings.Join(parsed, ", ")
+	case "route_default":
+		switch strings.ToLower(strings.TrimSpace(val)) {
+		case "on", "yes", "true":
+			c.RouteDefault = true
+		case "off", "no", "false", "":
+			c.RouteDefault = false
+		default:
+			return fmt.Errorf("route_default must be on or off, got %q", val)
+		}
 	default:
 		return fmt.Errorf("unknown setting %q", key)
 	}
@@ -1156,6 +1191,14 @@ func (c *Config) Validate() error {
 				return fmt.Errorf("user_listen port %s cannot be the same as asymmetric downlink port %s", dp, dp)
 			}
 		}
+		if strings.TrimSpace(c.RouteHosts) != "" {
+			if _, err := ParseRouteHostPatterns(c.RouteHosts); err != nil {
+				return fmt.Errorf("route_hosts: %w", err)
+			}
+		}
+		if (strings.TrimSpace(c.RouteHosts) != "" || c.RouteDefault) && c.ForwardsUDP() {
+			return fmt.Errorf("shared-port SNI/Host routing (route_hosts / route_default) requires TCP forwarding (forward_proto = tcp)")
+		}
 
 	case RoleOrigin:
 		if c.InboundAddr == "" {
@@ -1336,6 +1379,17 @@ func (c *Config) Summary() string {
 			fmt.Fprintf(&b, "Users connect to %s (%d ports). ", strings.Join(c.UserListens, ", "), len(c.UserListens))
 		} else {
 			fmt.Fprintf(&b, "Users connect to %s. ", c.UserListen)
+		}
+		if c.UsesSharedPort() {
+			hosts := c.EffectiveRouteHosts()
+			switch {
+			case len(hosts) > 0 && c.RouteDefault:
+				fmt.Fprintf(&b, "Shared-port SNI/Host routing for %s (plus default fallback). ", strings.Join(hosts, ", "))
+			case len(hosts) > 0:
+				fmt.Fprintf(&b, "Shared-port SNI/Host routing for %s. ", strings.Join(hosts, ", "))
+			case c.RouteDefault:
+				b.WriteString("Shared-port default fallback route active. ")
+			}
 		}
 	} else {
 		if len(c.InboundAddrs) > 1 {

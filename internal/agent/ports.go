@@ -30,9 +30,12 @@ const defaultPortsToCheck = "443,2053,2083,2087,2096,8443,80,8080,8880,2052,2082
 
 // portStatus is one port on one server.
 type portStatus struct {
-	Port  int    `json:"port"`
-	State string `json:"state"`        // "free", "busy" or "reserved"
-	By    string `json:"by,omitempty"` // what has it, when that is known
+	Port          int      `json:"port"`
+	State         string   `json:"state"`                    // "free", "busy" or "reserved"
+	By            string   `json:"by,omitempty"`             // what has it, when that is known
+	Shared        bool     `json:"shared,omitempty"`         // true when shared via SNI/Host routing by PortBridge
+	SharedTunnels []string `json:"shared_tunnels,omitempty"` // tunnels sharing this port
+	SharedHosts   []string `json:"shared_hosts,omitempty"`   // routed SNI/Host domains on this port
 }
 
 // parsePortList reads a list of ports separated by commas or spaces. Duplicates
@@ -66,16 +69,15 @@ func parsePortList(s string) ([]int, error) {
 // but one of this server's tunnels is set to use it, so it would clash as soon
 // as that tunnel starts: a stopped tunnel still owns its port.
 func portReport(confDir string, ports []int, host agentHost) []portStatus {
-	claims := map[int]claimedPort{}
+	claims := map[int][]claimedPort{}
 	for _, c := range portsClaimedByOthers(confDir, "") {
-		if _, ok := claims[c.port]; !ok {
-			claims[c.port] = c
-		}
+		claims[c.port] = append(claims[c.port], c)
 	}
 	out := make([]portStatus, 0, len(ports))
 	for _, p := range ports {
 		st := portStatus{Port: p, State: "free"}
-		claim, claimed := claims[p]
+		portClaims := claims[p]
+		claimed := len(portClaims) > 0
 		busy := host.PortFree(engine.TransportPlain, p) != nil
 		owner := ""
 		if busy {
@@ -83,10 +85,32 @@ func portReport(confDir string, ports []int, host agentHost) []portStatus {
 		}
 		switch {
 		case claimed:
+			claim := portClaims[0]
 			st.State = "busy"
 			st.By = fmt.Sprintf("PortBridge tunnel %s (%s)", claim.tunnel, claim.what)
 			if !busy {
 				st.State = "reserved"
+			}
+			allShared := true
+			var tNames []string
+			var hosts []string
+			for _, c := range portClaims {
+				if !c.shared {
+					allShared = false
+					break
+				}
+				tNames = append(tNames, c.tunnel)
+				hosts = append(hosts, c.routeHosts...)
+			}
+			if allShared && (owner == "" || strings.Contains(strings.ToLower(owner), "portbridge")) {
+				st.Shared = true
+				st.SharedTunnels = tNames
+				st.SharedHosts = hosts
+				if len(tNames) > 1 {
+					st.By = fmt.Sprintf("PortBridge shared SNI/Host port (%s)", strings.Join(tNames, ", "))
+				} else {
+					st.By = fmt.Sprintf("PortBridge tunnel %s (shared SNI/Host port)", claim.tunnel)
+				}
 			}
 		case busy:
 			st.State = "busy"

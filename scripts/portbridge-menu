@@ -492,6 +492,8 @@ DG_CDN=off
 # DG_ALTHOST is the domain to fall back to through a CDN when the foreign
 # server's own address stops being reachable. Empty means no second route.
 DG_ALTHOST=""
+DG_ROUTE_HOSTS=""
+DG_ROUTE_DEFAULT=off
 
 # ask_site_name <prompt> <default> - a name for the link to claim, checked as the
 # other server will check it when it joins: letters, digits, dots and dashes. A
@@ -848,6 +850,8 @@ ask_disguise() {
     DG_WSPATH=""
     DG_CDN=off
     DG_ALTHOST=""
+DG_ROUTE_HOSTS=""
+DG_ROUTE_DEFAULT=off
     DG_CLEAN_IPS=""
     DG_UTLS=off
     DG_FRAGMENT=off
@@ -1800,6 +1804,10 @@ write_tunnel() {
         fi
         printf 'tunnel_addr = %s\n' "$taddr"
         [ -n "$ulisten" ] && printf '\n# Where your users connect.\nuser_listen = %s\n' "$ulisten"
+        if [ "$role" = edge ]; then
+            [ -n "${DG_ROUTE_HOSTS-}" ] && printf 'route_hosts = %s\n' "$DG_ROUTE_HOSTS"
+            [ "${DG_ROUTE_DEFAULT:-off}" = on ] && printf 'route_default = on\n'
+        fi
         [ -n "$inbound" ] && printf '\n# Your Xray inbound.\ninbound_addr = %s\n' "$inbound"
         [ -n "$sinport" ] && printf '\n# The inbound port on the foreign server, kept for the code.\nserver_inbound_port = %s\n' "$sinport"
         printf '\n# The other machine.\n'
@@ -1902,7 +1910,8 @@ discard_tunnel() {
     # Starting it may already have set a firewall rule or a GRE link, so those go
     # while the settings that name them are still here.
     "$FIREWALL" remove "$1" >/dev/null 2>&1
-    rm -f "$(conf_of "$1")" "$(secret_of "$1")" "$RUN_DIR/$1.json" \
+    rm -f "$(conf_of "$1")" "$(secret_of "$1")" "$RUN_DIR/$1.json" "$RUN_DIR/$1.sock" \
+        "$RUN_DIR"/sni-port-*-"$1".json "$RUN_DIR"/sni-h-"$1"-*.sock \
         "$CONF_DIR/$1.crt" "$CONF_DIR/$1.key"
     systemctl daemon-reload
     "$FIREWALL" sweep quiet >/dev/null 2>&1
@@ -2105,6 +2114,8 @@ create_tunnel() {
         DG_WSPATH=""
         DG_CDN=off
         DG_ALTHOST=""
+DG_ROUTE_HOSTS=""
+DG_ROUTE_DEFAULT=off
         DG_CLEAN_IPS=""
         DG_UTLS=off
         DG_FRAGMENT=off
@@ -3474,7 +3485,28 @@ edit_tunnel_settings() {
 
     local role cur_u
     role=$(read_conf "$name" role)
-    if [ "$role" != edge ]; then
+    if [ "$role" = edge ]; then
+        local cur_rh new_rh cur_rd new_rd
+        cur_rh=$(read_conf "$name" route_hosts)
+        say "${DIM}Shared-Port SNI / Host routing (optional): enter domain(s) (e.g. de.example.com, *.app.com)${R}"
+        say "${DIM}so multiple TCP tunnels can share one Iran user port (:443, :80, etc.), or 'off' to clear.${R}"
+        new_rh=$(ask "Shared-port SNI / Host domain(s)" "$cur_rh")
+        if [ "$new_rh" = off ]; then
+            new_rh=""
+        fi
+        if [ "$new_rh" != "$cur_rh" ]; then
+            write_conf "$name" route_hosts "$new_rh"
+            changed=1
+        fi
+        cur_rd=$(read_conf "$name" route_default); [ -n "$cur_rd" ] || cur_rd=off
+        new_rd=$(ask "Shared-port default fallback route (on/off)" "$cur_rd")
+        if [ "$new_rd" != "$cur_rd" ]; then
+            case "$new_rd" in
+                on | off) write_conf "$name" route_default "$new_rd"; changed=1 ;;
+                *) err "  Enter on or off; leaving it as it was." ;;
+            esac
+        fi
+    else
         say "${DIM}The service address is where this server sends your users' traffic. The ports${R}"
         say "${DIM}it leads from are changed on the Iran server (Edit, Change ports).${R}"
         cur_u=$(read_conf "$name" inbound_addr)
@@ -3565,7 +3597,8 @@ delete_tunnel() {
     # The certificate goes too. Left behind, a later tunnel with the same name
     # would pick it up and claim whatever hostname this one claimed.
     rm -f "$(conf_of "$name")" "$(secret_of "$name")" "$RUN_DIR/$name.json" \
-        "$RUN_DIR/$name.sock" "$CONF_DIR/$name.crt" "$CONF_DIR/$name.key"
+        "$RUN_DIR/$name.sock" "$RUN_DIR"/sni-port-*-"$name".json "$RUN_DIR"/sni-h-"$name"-*.sock \
+        "$CONF_DIR/$name.crt" "$CONF_DIR/$name.key"
     systemctl daemon-reload
     # Whatever the steps above or the other server's clean-up missed, now that the
     # settings are gone nothing of this tunnel's can be mistaken for something wanted.

@@ -81,6 +81,8 @@ type EdgeSpec struct {
 
 	WebsiteBridge         string `json:"website_bridge,omitempty"`
 	WebsiteDomains        string `json:"website_domains,omitempty"`
+	RouteHosts            string `json:"route_hosts,omitempty"`
+	RouteDefault          string `json:"route_default,omitempty"`
 	OutboundProxy         string `json:"outbound_proxy,omitempty"`
 	OutboundProxyPort     int    `json:"outbound_proxy_port,omitempty"`
 	OutboundProxyMode     string `json:"outbound_proxy_mode,omitempty"`
@@ -310,6 +312,35 @@ func (s *EdgeSpec) dialsOut() bool { return s.Mode == "direct" }
 
 func (s *EdgeSpec) cdnInvolved() bool { return s.CDN == "on" || s.AltHost != "" }
 
+func (s *EdgeSpec) effectiveSharedRouting() (bool, []string, bool) {
+	if s.ForwardProto == "udp" || s.ForwardProto == "both" {
+		return false, nil, false
+	}
+	var hosts []string
+	if strings.TrimSpace(s.RouteHosts) != "" {
+		if parsed, err := engine.ParseRouteHostPatterns(s.RouteHosts); err == nil {
+			hosts = parsed
+		}
+	} else if s.WebsiteBridge == "on" && strings.TrimSpace(s.WebsiteDomains) != "" {
+		hasStar := false
+		for _, tok := range strings.FieldsFunc(s.WebsiteDomains, func(r rune) bool {
+			return r == ',' || r == ';' || r == ' ' || r == '\t' || r == '\n' || r == '\r'
+		}) {
+			if strings.TrimSpace(tok) == "*" {
+				hasStar = true
+				break
+			}
+		}
+		if !hasStar {
+			if parsed, err := engine.ParseRouteHostPatterns(s.WebsiteDomains); err == nil {
+				hosts = parsed
+			}
+		}
+	}
+	defRoute := s.RouteDefault == "on"
+	return len(hosts) > 0 || defRoute, hosts, defRoute
+}
+
 // check refuses what the menu would not have let through.
 func (s *EdgeSpec) check() error {
 	if err := validTunnelName(s.Name); err != nil {
@@ -329,6 +360,7 @@ func (s *EdgeSpec) check() error {
 		{"sni_spoof", s.SNISpoof}, {"ip_spoof", s.IPSpoof}, {"anti_freeze", s.AntiFreeze},
 		{"port_hop", s.PortHop}, {"twin_path", s.TwinPath}, {"asymmetric", s.Asymmetric},
 		{"website_bridge", s.WebsiteBridge}, {"outbound_proxy", s.OutboundProxy},
+		{"route_default", s.RouteDefault},
 	} {
 		if f.val != "" && f.val != "on" && f.val != "off" {
 			return fmt.Errorf("%s must be on or off, got %q", f.name, f.val)
@@ -344,6 +376,14 @@ func (s *EdgeSpec) check() error {
 	}
 	if s.WebsiteBridge == "on" && s.ForwardProto == "udp" {
 		return errors.New("website bridges require TCP forwarding (forward_proto cannot be udp)")
+	}
+	if strings.TrimSpace(s.RouteHosts) != "" {
+		if _, err := engine.ParseRouteHostPatterns(s.RouteHosts); err != nil {
+			return fmt.Errorf("route_hosts: %w", err)
+		}
+	}
+	if (strings.TrimSpace(s.RouteHosts) != "" || s.RouteDefault == "on") && (s.ForwardProto == "udp" || s.ForwardProto == "both") {
+		return errors.New("shared-port SNI/Host routing requires TCP forwarding (forward_proto = tcp)")
 	}
 	if !engine.ValidAsymDownlink(s.AsymDownlink) {
 		return fmt.Errorf("asym_downlink %q is not supported", s.AsymDownlink)
@@ -739,6 +779,12 @@ func buildEdgeConf(s *EdgeSpec, l edgeLayout, confDir string, now time.Time) str
 	if list, err := engine.ParseBlockedIPList(s.BlockedIPs); err == nil && len(list) > 0 {
 		w("blocked_ips = %s\n", strings.Join(list, ", "))
 	}
+	if list, err := engine.ParseRouteHostPatterns(s.RouteHosts); err == nil && len(list) > 0 {
+		w("route_hosts = %s\n", strings.Join(list, ", "))
+	}
+	if s.RouteDefault == "on" {
+		w("route_default = on\n")
+	}
 	w("max_pending = 512\n")
 	w("spare_ttl = 10m\n")
 	w("park_timeout = 15m\n")
@@ -990,22 +1036,10 @@ func checkEdgePorts(s *EdgeSpec, confDir string, host agentHost) error {
 		}
 		return ""
 	}
-	checkTCPUser := s.ForwardProto != "udp"
-	checkUDPUser := s.ForwardProto == "udp" || s.ForwardProto == "both"
+	shared, rHosts, rDef := s.effectiveSharedRouting()
 	for _, u := range portsIn(s.UserPorts) {
-		if o := owner(u); o != "" {
-			problems = append(problems, fmt.Sprintf("users' port %d is already used on this server by %s", u, o))
-		} else {
-			if checkTCPUser {
-				if err := host.PortFree(engine.TransportPlain, u); err != nil {
-					problems = append(problems, fmt.Sprintf("users' port %d is already in use on this server by another program", u))
-				}
-			}
-			if checkUDPUser {
-				if err := host.PortFree(engine.TransportKCP, u); err != nil {
-					problems = append(problems, fmt.Sprintf("users' UDP port %d is already in use on this server by another program", u))
-				}
-			}
+		if msg := checkUserPortConflict(u, "users' port", shared, rHosts, rDef, false, false, s.ForwardProto, claimed, host); msg != "" {
+			problems = append(problems, msg)
 		}
 	}
 	if !s.dialsOut() {
@@ -1328,6 +1362,9 @@ type EditSpec struct {
 
 	WebsiteBridge         string `json:"website_bridge,omitempty"`
 	WebsiteDomains        string `json:"website_domains,omitempty"`
+	RouteHosts            string `json:"route_hosts,omitempty"`
+	UpdateRouteHosts      bool   `json:"update_route_hosts,omitempty"`
+	RouteDefault          string `json:"route_default,omitempty"`
 	OutboundProxy         string `json:"outbound_proxy,omitempty"`
 	OutboundProxyPort     int    `json:"outbound_proxy_port,omitempty"`
 	OutboundProxyMode     string `json:"outbound_proxy_mode,omitempty"`
@@ -1635,6 +1672,22 @@ func EditEdge(spec EditSpec, confDir string) (EdgeResult, error) {
 		if spec.UpdateBlockedIPs {
 			blockedIPs = spec.BlockedIPs
 		}
+		routeHosts := curCfg.RouteHosts
+		if spec.UpdateRouteHosts {
+			routeHosts = spec.RouteHosts
+		} else if strings.TrimSpace(spec.RouteHosts) != "" {
+			routeHosts = spec.RouteHosts
+		}
+		routeDefault := ""
+		if curCfg.RouteDefault {
+			routeDefault = "on"
+		}
+		switch strings.ToLower(strings.TrimSpace(spec.RouteDefault)) {
+		case "on":
+			routeDefault = "on"
+		case "off":
+			routeDefault = ""
+		}
 
 		es := EdgeSpec{
 			Name:                  spec.Name,
@@ -1680,6 +1733,8 @@ func EditEdge(spec EditSpec, confDir string) (EdgeResult, error) {
 			ServicePorts:          sPorts,
 			WebsiteBridge:         wb,
 			WebsiteDomains:        wd,
+			RouteHosts:            routeHosts,
+			RouteDefault:          routeDefault,
 			OutboundProxy:         op,
 			OutboundProxyPort:     opp,
 			OutboundProxyMode:     opm,
@@ -1702,23 +1757,13 @@ func EditEdge(spec EditSpec, confDir string) (EdgeResult, error) {
 			}
 			return ""
 		}
-		checkTCPUser := es.ForwardProto != "udp"
-		checkUDPUser := es.ForwardProto == "udp" || es.ForwardProto == "both"
+		shared, rHosts, rDef := es.effectiveSharedRouting()
 		for _, u := range portsIn(es.UserPorts) {
-			if o := owner(u); o != "" {
-				problems = append(problems, fmt.Sprintf("user listen port %d is already used on this server by %s", u, o))
-			} else {
-				alreadyHeldPort := intInSlice(u, curUsers) || (curCfg.Mode == engine.ModeReverse && u == curLink)
-				if checkTCPUser && !(alreadyHeldPort && curCfg.ForwardsTCP()) {
-					if err := host.PortFree(engine.TransportPlain, u); err != nil {
-						problems = append(problems, fmt.Sprintf("user listen port %d is already in use on this server by another program", u))
-					}
-				}
-				if checkUDPUser && !(intInSlice(u, curUsers) && curCfg.ForwardsUDP()) {
-					if err := host.PortFree(engine.TransportKCP, u); err != nil {
-						problems = append(problems, fmt.Sprintf("user UDP listen port %d is already in use on this server by another program", u))
-					}
-				}
+			alreadyHeldPort := intInSlice(u, curUsers) || (curCfg.Mode == engine.ModeReverse && u == curLink)
+			alreadyHeldTCP := alreadyHeldPort && curCfg.ForwardsTCP()
+			alreadyHeldUDP := intInSlice(u, curUsers) && curCfg.ForwardsUDP()
+			if msg := checkUserPortConflict(u, "user listen port", shared, rHosts, rDef, alreadyHeldTCP, alreadyHeldUDP, es.ForwardProto, claimed, host); msg != "" {
+				problems = append(problems, msg)
 			}
 		}
 		if !es.dialsOut() {
@@ -1866,6 +1911,53 @@ func EditEdge(spec EditSpec, confDir string) (EdgeResult, error) {
 			return res, errors.New("website reverse bridge requires TCP (use forward_proto = tcp or both)")
 		}
 
+		effWB := ""
+		if curCfg.WebsiteBridge {
+			effWB = "on"
+		}
+		if spec.WebsiteBridge == "on" || spec.WebsiteBridge == "off" {
+			effWB = spec.WebsiteBridge
+		}
+		effWD := curCfg.WebsiteDomains
+		if spec.WebsiteDomains != "" {
+			effWD = spec.WebsiteDomains
+		}
+		effRouteHosts := curCfg.RouteHosts
+		if spec.UpdateRouteHosts {
+			effRouteHosts = spec.RouteHosts
+		} else if strings.TrimSpace(spec.RouteHosts) != "" {
+			effRouteHosts = spec.RouteHosts
+		}
+		if strings.TrimSpace(effRouteHosts) != "" {
+			if _, err := engine.ParseRouteHostPatterns(effRouteHosts); err != nil {
+				return res, fmt.Errorf("route_hosts: %w", err)
+			}
+		}
+		effRouteDef := ""
+		if curCfg.RouteDefault {
+			effRouteDef = "on"
+		}
+		switch strings.ToLower(strings.TrimSpace(spec.RouteDefault)) {
+		case "on":
+			effRouteDef = "on"
+		case "off":
+			effRouteDef = ""
+		case "":
+		default:
+			return res, fmt.Errorf("route_default must be on or off, got %q", spec.RouteDefault)
+		}
+		if (strings.TrimSpace(effRouteHosts) != "" || effRouteDef == "on") && (effForwardProto == "udp" || effForwardProto == "both") {
+			return res, errors.New("shared-port SNI/Host routing requires TCP forwarding (forward_proto = tcp)")
+		}
+		probeSpec := EdgeSpec{
+			ForwardProto:   effForwardProto,
+			WebsiteBridge:  effWB,
+			WebsiteDomains: effWD,
+			RouteHosts:     effRouteHosts,
+			RouteDefault:   effRouteDef,
+		}
+		shared, rHosts, rDef := probeSpec.effectiveSharedRouting()
+
 		// Check port clashes on this Relay server, ignoring ports already held by this tunnel itself.
 		var problems []string
 		claimed := portsClaimedByOthers(confDir, spec.Name)
@@ -1877,23 +1969,12 @@ func EditEdge(spec EditSpec, confDir string) (EdgeResult, error) {
 			}
 			return ""
 		}
-		checkTCPUser := effForwardProto != "udp"
-		checkUDPUser := effForwardProto == "udp" || effForwardProto == "both"
 		for _, u := range users {
-			if o := owner(u); o != "" {
-				problems = append(problems, fmt.Sprintf("user listen port %d is already used on this server by %s", u, o))
-			} else {
-				alreadyHeldPort := intInSlice(u, curUsers) || (curCfg.Mode == engine.ModeReverse && u == curLink)
-				if checkTCPUser && !(alreadyHeldPort && curCfg.ForwardsTCP()) {
-					if err := host.PortFree(engine.TransportPlain, u); err != nil {
-						problems = append(problems, fmt.Sprintf("user listen port %d is already in use on this server by another program", u))
-					}
-				}
-				if checkUDPUser && !(intInSlice(u, curUsers) && curCfg.ForwardsUDP()) {
-					if err := host.PortFree(engine.TransportKCP, u); err != nil {
-						problems = append(problems, fmt.Sprintf("user UDP listen port %d is already in use on this server by another program", u))
-					}
-				}
+			alreadyHeldPort := intInSlice(u, curUsers) || (curCfg.Mode == engine.ModeReverse && u == curLink)
+			alreadyHeldTCP := alreadyHeldPort && curCfg.ForwardsTCP()
+			alreadyHeldUDP := intInSlice(u, curUsers) && curCfg.ForwardsUDP()
+			if msg := checkUserPortConflict(u, "user listen port", shared, rHosts, rDef, alreadyHeldTCP, alreadyHeldUDP, effForwardProto, claimed, host); msg != "" {
+				problems = append(problems, msg)
 			}
 		}
 		if curCfg.Mode == engine.ModeReverse {
@@ -2037,6 +2118,35 @@ func EditEdge(spec EditSpec, confDir string) (EdgeResult, error) {
 			text = dropConfKey(text, "blocked_ips")
 		} else {
 			text = setConfKey(text, "blocked_ips", strings.Join(list, ", "))
+		}
+	}
+	if curCfg.Role == engine.RoleEdge {
+		if spec.UpdateRouteHosts {
+			if strings.TrimSpace(spec.RouteHosts) == "" {
+				text = dropConfKey(text, "route_hosts")
+			} else {
+				list, err := engine.ParseRouteHostPatterns(spec.RouteHosts)
+				if err != nil {
+					return res, fmt.Errorf("route_hosts: %w", err)
+				}
+				text = setConfKey(text, "route_hosts", strings.Join(list, ", "))
+			}
+		} else if strings.TrimSpace(spec.RouteHosts) != "" {
+			list, err := engine.ParseRouteHostPatterns(spec.RouteHosts)
+			if err != nil {
+				return res, fmt.Errorf("route_hosts: %w", err)
+			}
+			text = setConfKey(text, "route_hosts", strings.Join(list, ", "))
+		}
+		if spec.RouteDefault != "" {
+			switch strings.ToLower(strings.TrimSpace(spec.RouteDefault)) {
+			case "on":
+				text = setConfKey(text, "route_default", "on")
+			case "off":
+				text = dropConfKey(text, "route_default")
+			default:
+				return res, fmt.Errorf("route_default must be on or off, got %q", spec.RouteDefault)
+			}
 		}
 	}
 	if ttl := strings.TrimSpace(spec.SpareTTL); ttl != "" && !muxNow {
@@ -2280,9 +2390,23 @@ func CheckTunnel(confDir, name string) (TunnelCheckReport, error) {
 	}
 
 	if cfg.Role == engine.RoleEdge {
+		if cfg.UsesSharedPort() {
+			hosts := cfg.EffectiveRouteHosts()
+			detail := "Default fallback route on shared port"
+			if len(hosts) > 0 && cfg.RouteDefault {
+				detail = fmt.Sprintf("SNI / HTTP Host routing for %s (+ default fallback)", strings.Join(hosts, ", "))
+			} else if len(hosts) > 0 {
+				detail = fmt.Sprintf("SNI / HTTP Host routing for %s", strings.Join(hosts, ", "))
+			}
+			add("Shared-port SNI/Host router", "ok", detail, "Shares public TCP user port(s) zero-copy with other SNI/Host-routed tunnels on this server.")
+		}
 		for _, p := range ti.UserPorts {
 			if host.Listening(p) {
-				add(fmt.Sprintf("User listen port %d", p), "ok", "Listening for user connections", "")
+				if cfg.UsesSharedPort() {
+					add(fmt.Sprintf("User listen port %d", p), "ok", "Listening (shared via SNI/Host router)", "")
+				} else {
+					add(fmt.Sprintf("User listen port %d", p), "ok", "Listening for user connections", "")
+				}
 			} else {
 				add(fmt.Sprintf("User listen port %d", p), "bad", fmt.Sprintf("Nothing listening on port %d", p), "Start the tunnel service to accept user connections.")
 			}
