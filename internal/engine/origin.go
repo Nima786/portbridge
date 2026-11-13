@@ -179,6 +179,15 @@ func (o *origin) runDirect(ctx context.Context) error {
 	}
 
 	var ln net.Listener
+	if o.cfg.Transport == TransportXHTTP || (o.cfg.Transport == TransportH3 && o.cfg.CDN) {
+		o.cfg.xhttpPromoted = func(promoted net.Conn) {
+			if ctx.Err() != nil {
+				_ = promoted.Close()
+				return
+			}
+			go o.serveAcceptedDirectConn(ctx, promoted, func() {})
+		}
+	}
 	if o.cfg.Transport.IsPacketBased() {
 		ln, err = kcpListen(o.cfg.TunnelAddr, o.cfg)
 	} else if o.cfg.Transport == TransportH3 {
@@ -229,60 +238,7 @@ func (o *origin) runDirect(ctx context.Context) error {
 					_ = raw.Close()
 					return
 				}
-				if o.asym != nil {
-					paired, err := o.asym.PairAcceptedUplink(ctx, c)
-					if err != nil {
-						o.logAuth.printf("asymmetric downlink pairing with %s failed: %v", c.RemoteAddr(), err)
-						_ = c.Close()
-						return
-					}
-					c = paired
-				}
-				purpose, err := recvAuthPurpose(c, o.cfg.secret, o.guard)
-				if err != nil {
-					o.logAuth.printf("refused a tunnel connection from %s: %v", c.RemoteAddr(), err)
-					sinkGarbageAndClose(c)
-					return
-				}
-				if purpose == authPurposeSpeedtest {
-					log.Printf("[%s] connection from %s requested in-tunnel speedtest", o.cfg.Name, c.RemoteAddr())
-					release()
-					runSpeedtestServer(c)
-					return
-				}
-				if !isTunnelPurpose(purpose) {
-					o.logAuth.printf("refused a tunnel connection from %s: unknown purpose %d", c.RemoteAddr(), purpose)
-					_ = c.Close()
-					return
-				}
-				// Say by name when the two servers disagree about shared
-				// connections, instead of letting users hang.
-				if err := checkTunnelPurpose(o.cfg, purpose); err != nil {
-					o.logAuth.printf("refused a tunnel connection from %s: %v", c.RemoteAddr(), err)
-					writeReason(c, rejMuxMismatch)
-					_ = c.Close()
-					return
-				}
-				// Authenticated, so it no longer counts as unestablished.
-				// Holding the slot while parked capped the number of spares that
-				// could wait at the limit meant for half-open connections.
-				release()
-				if o.links != nil {
-					// One connection, many sessions: hold it and let the
-					// sessions arrive inside it.
-					if !o.links.add(c) {
-						_ = c.Close()
-					}
-					return
-				}
-				atomic.AddInt64(&o.st.parkedSpares, 1)
-				a, err := o.parkUntilActivated(ctx, c, o.cfg.ParkTimeout)
-				atomic.AddInt64(&o.st.parkedSpares, -1)
-				if err != nil {
-					_ = c.Close()
-					return
-				}
-				o.handleActivated(c, a)
+				o.serveAcceptedDirectConn(ctx, c, release)
 			}(c)
 		default:
 			o.logCapacity.printf("too many unestablished tunnel connections (%d); dropping one", o.cfg.MaxPending)
@@ -298,6 +254,63 @@ func (o *origin) runDirect(ctx context.Context) error {
 		o.links.closeAll()
 	}
 	return nil
+}
+
+func (o *origin) serveAcceptedDirectConn(ctx context.Context, c net.Conn, release func()) {
+	if o.asym != nil {
+		paired, err := o.asym.PairAcceptedUplink(ctx, c)
+		if err != nil {
+			o.logAuth.printf("asymmetric downlink pairing with %s failed: %v", c.RemoteAddr(), err)
+			_ = c.Close()
+			return
+		}
+		c = paired
+	}
+	purpose, err := recvAuthPurpose(c, o.cfg.secret, o.guard)
+	if err != nil {
+		o.logAuth.printf("refused a tunnel connection from %s: %v", c.RemoteAddr(), err)
+		sinkGarbageAndClose(c)
+		return
+	}
+	if purpose == authPurposeSpeedtest {
+		log.Printf("[%s] connection from %s requested in-tunnel speedtest", o.cfg.Name, c.RemoteAddr())
+		release()
+		runSpeedtestServer(c)
+		return
+	}
+	if !isTunnelPurpose(purpose) {
+		o.logAuth.printf("refused a tunnel connection from %s: unknown purpose %d", c.RemoteAddr(), purpose)
+		_ = c.Close()
+		return
+	}
+	// Say by name when the two servers disagree about shared
+	// connections, instead of letting users hang.
+	if err := checkTunnelPurpose(o.cfg, purpose); err != nil {
+		o.logAuth.printf("refused a tunnel connection from %s: %v", c.RemoteAddr(), err)
+		writeReason(c, rejMuxMismatch)
+		_ = c.Close()
+		return
+	}
+	// Authenticated, so it no longer counts as unestablished.
+	// Holding the slot while parked capped the number of spares that
+	// could wait at the limit meant for half-open connections.
+	release()
+	if o.links != nil {
+		// One connection, many sessions: hold it and let the
+		// sessions arrive inside it.
+		if !o.links.add(c) {
+			_ = c.Close()
+		}
+		return
+	}
+	atomic.AddInt64(&o.st.parkedSpares, 1)
+	a, err := o.parkUntilActivated(ctx, c, o.cfg.ParkTimeout)
+	atomic.AddInt64(&o.st.parkedSpares, -1)
+	if err != nil {
+		_ = c.Close()
+		return
+	}
+	o.handleActivated(c, a)
 }
 
 // runReverse keeps a fixed number of connections open into the edge.

@@ -849,6 +849,12 @@ func (l *h3Listener) handleH3Request(w http.ResponseWriter, r *http.Request, cfg
 				_ = sc.Close()
 				return
 			}
+			var flushPad [1024]byte
+			_, _ = rand.Read(flushPad[:])
+			if err := writeXHTTPDownFrameMode(str, xhttpFrameKeepAlive, flushPad[:], true); err != nil {
+				_ = sc.Close()
+				return
+			}
 			_ = str.SetWriteDeadline(time.Time{})
 
 			sc.startBackground(nil)

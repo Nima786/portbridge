@@ -996,6 +996,7 @@ func newAgentHandler(token, confDir string, allowUpdates func() bool) *http.Serv
 		var req struct {
 			PreferredPort int   `json:"preferred_port"`
 			AvoidPorts    []int `json:"avoid_ports"`
+			HTTP1Only     bool  `json:"http1_only,omitempty"`
 		}
 		_ = json.NewDecoder(io.LimitReader(r.Body, 4096)).Decode(&req)
 		// Never test on a port a tunnel here owns, running or stopped: the
@@ -1018,6 +1019,9 @@ func newAgentHandler(token, confDir string, allowUpdates func() bool) *http.Serv
 		if err != nil {
 			writeJSONReply(w, http.StatusUnprocessableEntity, map[string]any{"ok": false, "error": err.Error()})
 			return
+		}
+		if req.HTTP1Only {
+			pl.SetHTTP1Only(true)
 		}
 		id := registerProbeListener(pl)
 		writeJSONReply(w, http.StatusOK, map[string]any{

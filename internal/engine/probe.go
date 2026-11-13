@@ -11,6 +11,7 @@ import (
 	"crypto/x509/pkix"
 	"encoding/base64"
 	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -19,12 +20,17 @@ import (
 	"math"
 	"math/big"
 	"net"
+	"net/http"
 	"os"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
+
+	"golang.org/x/net/http2"
+	"golang.org/x/net/http2/hpack"
 )
 
 // CDNHTTPSPorts lists the HTTPS ports supported by Cloudflare's proxy.
@@ -106,9 +112,17 @@ type ProbeListener struct {
 	fakeTCPLn net.Listener
 	splitMgr  *splitSessionManager
 	xhttpMgr  *xhttpSessionManager
+	http1Only atomic.Bool
 	cert      tls.Certificate
 	closed    chan struct{}
 	once      sync.Once
+}
+
+// SetHTTP1Only restricts the TLS listener's ALPN offer to ["http/1.1"], matching
+// a real WSS, XHTTP, or H3-CDN Origin tunnel so Cloudflare's "HTTP/2 to Origin"
+// feature stays on HTTP/1.1 during Clean-IP scans.
+func (pl *ProbeListener) SetHTTP1Only(on bool) {
+	pl.http1Only.Store(on)
 }
 
 type peekedConn struct {
@@ -440,9 +454,13 @@ func (pl *ProbeListener) handleTCPConn(raw net.Conn) {
 
 	switch first[0] {
 	case 0x16: // TLS Handshake record
+		nextProtos := []string{"h2", "http/1.1"}
+		if pl.http1Only.Load() {
+			nextProtos = []string{"http/1.1"}
+		}
 		tlsCfg := &tls.Config{
 			Certificates: []tls.Certificate{pl.cert},
-			NextProtos:   []string{"h2", "http/1.1"},
+			NextProtos:   nextProtos,
 			MinVersion:   tls.VersionTLS12,
 		}
 		ts := tls.Server(pconn, tlsCfg)
@@ -513,6 +531,13 @@ func (pl *ProbeListener) handleTCPConn(raw net.Conn) {
 				xhttpCfg := &Config{
 					Transport: TransportXHTTP,
 					secret:    pl.Secret,
+					xhttpPromoted: func(promoted net.Conn) {
+						if _, err := recvAuthPurpose(promoted, pl.Secret, nil); err != nil {
+							_ = promoted.Close()
+							return
+						}
+						runSpeedtestServer(promoted)
+					},
 				}
 				_, err := pl.xhttpMgr.AcceptConn(fullPeek, xhttpCfg, nil)
 				if err != nil && !errors.Is(err, errXHTTPUplinkAttached) {
@@ -520,12 +545,26 @@ func (pl *ProbeListener) handleTCPConn(raw net.Conn) {
 				}
 				return
 			}
+			// When Cloudflare has "HTTP/2 to Origin" enabled (the default on all
+			// Cloudflare zones), XHTTP and H3-CDN requests arrive at ProbeListener
+			// as HTTP/2 GET/POST /api/v1/stream/... rather than gRPC. Peek the
+			// first HEADERS :path and serve XHTTP over HTTP/2 when matched.
+			h2Path, replayConn := peekH2FirstPath(fullPeek)
+			if strings.HasPrefix(h2Path, defaultXHTTPPath+"/") {
+				_ = ts.SetDeadline(time.Time{})
+				h2Srv := &http2.Server{}
+				h2Srv.ServeConn(replayConn, &http2.ServeConnOpts{
+					Handler: http.HandlerFunc(pl.serveH2XHTTP),
+				})
+				_ = ts.Close()
+				return
+			}
 			h2Cfg := &Config{
 				Transport: TransportGRPC,
 				WSPath:    defaultWSPath,
 				secret:    pl.Secret,
 			}
-			h2Conn, err := h2Accept(fullPeek, h2Cfg)
+			h2Conn, err := h2Accept(replayConn, h2Cfg)
 			if err != nil {
 				_ = ts.Close()
 				return
@@ -587,6 +626,197 @@ func (pl *ProbeListener) handleTCPConn(raw net.Conn) {
 			return
 		}
 		runSpeedtestServer(pconn)
+	}
+}
+
+type recordingReader struct {
+	r   io.Reader
+	buf bytes.Buffer
+}
+
+func (rr *recordingReader) Read(p []byte) (int, error) {
+	n, err := rr.r.Read(p)
+	if n > 0 {
+		_, _ = rr.buf.Write(p[:n])
+	}
+	return n, err
+}
+
+// peekH2FirstPath non-destructively inspects the initial HTTP/2 client flight
+// to read :path on the first HEADERS frame, returning a replay net.Conn that
+// yields every byte from the start of the HTTP/2 connection preface.
+func peekH2FirstPath(c net.Conn) (string, net.Conn) {
+	rec := &recordingReader{r: c}
+	_ = c.SetReadDeadline(time.Now().Add(1200 * time.Millisecond))
+	defer func() {
+		_ = c.SetReadDeadline(time.Now().Add(15 * time.Second))
+	}()
+
+	var preface [len(h2ClientPreface)]byte
+	if _, err := io.ReadFull(rec, preface[:]); err != nil || string(preface[:]) != h2ClientPreface {
+		return "", &peekedConn{Conn: c, peeked: append([]byte(nil), rec.buf.Bytes()...)}
+	}
+	path := ""
+	for i := 0; i < 8; i++ {
+		fType, flags, streamID, payload, err := readH2Frame(rec)
+		if err != nil {
+			break
+		}
+		if fType == h2FrameHeaders {
+			if block, berr := h2HeaderBlock(rec, flags, streamID, payload); berr == nil {
+				dec := hpack.NewDecoder(4096, func(f hpack.HeaderField) {
+					if f.Name == ":path" && path == "" {
+						path = f.Value
+					}
+				})
+				_, _ = dec.Write(block)
+				_ = dec.Close()
+			}
+			break
+		}
+	}
+	return path, &peekedConn{Conn: c, peeked: append([]byte(nil), rec.buf.Bytes()...)}
+}
+
+type probeH2DownConn struct {
+	w        http.ResponseWriter
+	rc       *http.ResponseController
+	reqDone  <-chan struct{}
+	closedCh chan struct{}
+	closed   atomic.Bool
+	once     sync.Once
+	wmu      sync.Mutex
+}
+
+func newProbeH2DownConn(w http.ResponseWriter, reqDone <-chan struct{}) *probeH2DownConn {
+	return &probeH2DownConn{
+		w:        w,
+		rc:       http.NewResponseController(w),
+		reqDone:  reqDone,
+		closedCh: make(chan struct{}),
+	}
+}
+
+func (d *probeH2DownConn) Done() <-chan struct{} { return d.reqDone }
+
+func (d *probeH2DownConn) Read(_ []byte) (int, error) {
+	select {
+	case <-d.closedCh:
+	case <-d.reqDone:
+	}
+	return 0, io.EOF
+}
+
+func (d *probeH2DownConn) Write(p []byte) (int, error) {
+	if d.closed.Load() {
+		return 0, net.ErrClosed
+	}
+	d.wmu.Lock()
+	defer d.wmu.Unlock()
+	if d.closed.Load() {
+		return 0, net.ErrClosed
+	}
+	n, err := d.w.Write(p)
+	if n > 0 {
+		_ = d.rc.Flush()
+	}
+	return n, err
+}
+
+func (d *probeH2DownConn) Close() error {
+	d.once.Do(func() {
+		d.closed.Store(true)
+		close(d.closedCh)
+	})
+	return nil
+}
+
+func (d *probeH2DownConn) LocalAddr() net.Addr                { return &net.TCPAddr{} }
+func (d *probeH2DownConn) RemoteAddr() net.Addr               { return &net.TCPAddr{} }
+func (d *probeH2DownConn) SetDeadline(t time.Time) error      { return d.rc.SetWriteDeadline(t) }
+func (d *probeH2DownConn) SetReadDeadline(_ time.Time) error  { return nil }
+func (d *probeH2DownConn) SetWriteDeadline(t time.Time) error { return d.rc.SetWriteDeadline(t) }
+
+func (pl *ProbeListener) serveH2XHTTP(w http.ResponseWriter, r *http.Request) {
+	prefix := defaultXHTTPPath + "/"
+	if !strings.HasPrefix(r.URL.Path, prefix) {
+		if r.Body != nil {
+			_ = r.Body.Close()
+		}
+		writeH3Decoy404(w)
+		return
+	}
+	rest := strings.TrimPrefix(r.URL.Path, prefix)
+	xhttpCfg := &Config{
+		Transport: TransportXHTTP,
+		secret:    pl.Secret,
+	}
+
+	switch r.Method {
+	case http.MethodGet:
+		if r.Body != nil {
+			_ = r.Body.Close()
+		}
+		sidBytes, err := hex.DecodeString(rest)
+		if err != nil || len(sidBytes) != 16 {
+			writeH3Decoy404(w)
+			return
+		}
+		var sid [16]byte
+		copy(sid[:], sidBytes)
+
+		adapter := newProbeH2DownConn(w, r.Context().Done())
+		sc, hello, err := pl.xhttpMgr.AcceptH3Get(sid, adapter, r.Header.Get("X-Session-Token"), xhttpCfg, nil)
+		if err != nil {
+			writeH3Decoy404(w)
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/octet-stream")
+		w.Header().Set("Cache-Control", "no-store, no-transform")
+		w.Header().Set("X-Accel-Buffering", "no")
+		w.Header().Set("X-Padding", xhttpPaddingHeader())
+		w.WriteHeader(http.StatusOK)
+
+		_ = adapter.SetWriteDeadline(time.Now().Add(10 * time.Second))
+		if err := writeXHTTPDownFrameMode(adapter, xhttpFrameHello, hello[:], true); err != nil {
+			_ = sc.Close()
+			return
+		}
+		var flushPad [1024]byte
+		_, _ = rand.Read(flushPad[:])
+		if err := writeXHTTPDownFrameMode(adapter, xhttpFrameKeepAlive, flushPad[:], true); err != nil {
+			_ = sc.Close()
+			return
+		}
+		_ = adapter.SetWriteDeadline(time.Time{})
+
+		sc.startBackground(nil)
+		if _, err := recvAuthPurpose(sc, pl.Secret, nil); err == nil {
+			runSpeedtestServer(sc)
+		}
+		_ = sc.Close()
+
+	case http.MethodPost:
+		status, err := pl.xhttpMgr.DeliverH3Post(rest, r.Header, r.Body, xhttpCfg)
+		if err != nil {
+			if status == http.StatusNotFound {
+				writeH3Decoy404(w)
+			} else {
+				w.WriteHeader(status)
+			}
+			return
+		}
+		w.Header().Set("Content-Type", "text/plain")
+		w.Header().Set("Cache-Control", "no-store")
+		w.Header().Set("X-Padding", xhttpPaddingHeader())
+		w.WriteHeader(http.StatusOK)
+
+	default:
+		if r.Body != nil {
+			_ = r.Body.Close()
+		}
+		writeH3Decoy404(w)
 	}
 }
 

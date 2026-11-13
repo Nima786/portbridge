@@ -3089,14 +3089,12 @@
               }, `Reset Top ${rec.length}`)
             : null);
 
-        boxEl.replaceChildren(
-          summaryBar,
-          listEl,
-          moreBtn,
-          (rep.notes && rep.notes.length && selected.size > 0)
-            ? h('p', { class: 'cfscan-notes' }, rep.notes.join(' '))
-            : null
-        );
+        const boxKids = [summaryBar, listEl];
+        if (moreBtn) boxKids.push(moreBtn);
+        if (rep.notes && rep.notes.length && selected.size > 0) {
+          boxKids.push(h('p', { class: 'cfscan-notes' }, rep.notes.join(' ')));
+        }
+        boxEl.replaceChildren(...boxKids);
         boxEl.hidden = false;
       }
     } catch (e) {
@@ -5529,7 +5527,7 @@
         tunnel: (tunnelModalMode && tunnelModalMode.kind === 'switch' && tunnelModalMode.tunnel) ? tunnelModalMode.tunnel.name : '',
         domain: dom,
         port: Number(($('tn-probe-linkport') && $('tn-probe-linkport').value) || ($('tn-linkport') && $('tn-linkport').value) || 0),
-        transport: isCDNLink ? curLink : 'xhttp-cdn',
+        transport: isCDNLink ? curLink : 'cdn',
         inputEl: $('tn-probe-cleanips'),
         mirrorInputEl: $('tn-cleanips'),
         msgEl: $('tn-probe-cfscan-msg'),

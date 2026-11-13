@@ -793,8 +793,8 @@
               </div>
             </div>
             <div class="port-box probe-port-card probe-clean-card">
-              <label for="tn-probe-cleanips">Cloudflare Clean Edge IPs <span class="muted">(optional — scan 44 CF /24 subnets end-to-end from Relay)</span></label>
-              <span class="field-hint">Finds fast, unblocked Cloudflare Edge IPs for your Iran ISP and uses them automatically in Benchmark &amp; Tunnel creation</span>
+              <label for="tn-probe-cleanips">Cloudflare Clean Edge IPs <span class="muted">(optional — tests your domain's DNS + 44 official CF Anycast /24 subnets)</span></label>
+              <span class="field-hint">Every Cloudflare Anycast IP serves your subdomain via SNI/Host — scanning finds unthrottled CF Edge IPs for your Iran ISP</span>
               <div class="cf-quick-row cfscan-input-row">
                 <input id="tn-probe-cleanips" placeholder="104.16.12.34, 172.67.45.67 (or click Scan Clean CF IPs →)" autocapitalize="none" spellcheck="false">
                 <button type="button" id="tn-probe-cfscan-btn">Scan Clean CF IPs</button>
@@ -1207,7 +1207,7 @@
               <div class="cfscan-head">
                 <div>
                   <label for="tn-cleanips">Cloudflare Clean Edge IPs <span class="muted">(optional, comma-separated)</span></label>
-                  <p class="muted small cfscan-sub">Tests 44 Cloudflare <code>/24</code> subnets end-to-end from your Iran Relay server through your CDN domain into your Foreign server (real handshake + sustained anti-freeze transfer).</p>
+                  <p class="muted small cfscan-sub">Tests your subdomain's DNS IPs plus 44 official Cloudflare Anycast <code>/24</code> subnets (<code>AS13335</code>) end-to-end from your Iran Relay through your CDN domain into your Foreign server.</p>
                 </div>
               </div>
               <div class="cf-quick-row cfscan-input-row">

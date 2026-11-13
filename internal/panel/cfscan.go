@@ -172,6 +172,39 @@ func (p *Panel) scanCloudflareCleanIPs(parent context.Context, req cfScanPanelRe
 		maxSelect = 5
 	}
 
+	candidates := req.Candidates
+	if len(candidates) == 0 && !loopback {
+		dnsCtx, dnsCancel := context.WithTimeout(parent, 2500*time.Millisecond)
+		ips, dnsErr := net.DefaultResolver.LookupIP(dnsCtx, "ip4", domain)
+		dnsCancel()
+		if dnsErr == nil && len(ips) > 0 {
+			var seedIPs []string
+			for _, ip := range ips {
+				v4 := ip.To4()
+				if v4 == nil {
+					continue
+				}
+				for _, sv := range p.fleet.views() {
+					sv4, _ := serverAddresses(sv)
+					for _, own := range []string{sv4, sv.Address} {
+						if own != "" && net.ParseIP(own) != nil && net.ParseIP(own).Equal(v4) {
+							return nil, fmt.Errorf(
+								"%s currently resolves directly to your server IP %s (Cloudflare Proxy / Orange Cloud is OFF). Turn ON Orange Cloud in Cloudflare DNS first",
+								domain, v4.String(),
+							)
+						}
+					}
+				}
+				if v4.IsGlobalUnicast() && !v4.IsPrivate() && len(seedIPs) < 2 {
+					seedIPs = append(seedIPs, v4.String())
+				}
+			}
+			if len(seedIPs) > 0 {
+				candidates = append(seedIPs, engine.DefaultCloudflareSubnets...)
+			}
+		}
+	}
+
 	// Fast path: reuse the live Foreign Origin tunnel if it is already listening
 	// on a compatible Direct CDN transport and Cloudflare HTTPS port.
 	if livePort, liveTr, ok := p.canReuseLiveOriginForCFScan(relayID, foreignID, req.Tunnel, req.Transport, req.Port, loopback); ok {
@@ -183,7 +216,7 @@ func (p *Panel) scanCloudflareCleanIPs(parent context.Context, req cfScanPanelRe
 			"domain":      domain,
 			"port":        livePort,
 			"transport":   liveTr,
-			"candidates":  req.Candidates,
+			"candidates":  candidates,
 			"max_select":  maxSelect,
 		}, &rep)
 		if errors.Is(err, errTooOld) {
@@ -203,6 +236,7 @@ func (p *Panel) scanCloudflareCleanIPs(parent context.Context, req cfScanPanelRe
 
 	// Ephemeral path: open a temporary ProbeListener on Foreign on one of
 	// Cloudflare's 6 Orange-Cloud HTTPS ports (preferring req.Port or 2053).
+	tr := normalisePanelCDNTransport(req.Transport)
 	prefPort := 2053
 	if req.Port > 0 && (isCDNCapablePort(req.Port) || loopback) {
 		prefPort = req.Port
@@ -211,6 +245,7 @@ func (p *Panel) scanCloudflareCleanIPs(parent context.Context, req cfScanPanelRe
 	var lrep probeListenReply
 	_, lerr := p.callJSON(lctx, foreignID, "/api/probe/listen", map[string]any{
 		"preferred_port": prefPort,
+		"http1_only":     tr != "grpc",
 	}, &lrep)
 	lcancel()
 	if errors.Is(lerr, errTooOld) {
@@ -240,7 +275,6 @@ func (p *Panel) scanCloudflareCleanIPs(parent context.Context, req cfScanPanelRe
 		)
 	}
 
-	tr := normalisePanelCDNTransport(req.Transport)
 	sctx, scancel := context.WithTimeout(parent, 90*time.Second)
 	defer scancel()
 	var rep cfScanAgentReply
@@ -249,7 +283,7 @@ func (p *Panel) scanCloudflareCleanIPs(parent context.Context, req cfScanPanelRe
 		"port":       lrep.Port,
 		"transport":  tr,
 		"secret":     lrep.Secret,
-		"candidates": req.Candidates,
+		"candidates": candidates,
 		"max_select": maxSelect,
 	}, &rep)
 	if errors.Is(err, errTooOld) {

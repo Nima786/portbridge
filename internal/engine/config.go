@@ -277,10 +277,11 @@ type Config struct {
 	// are what makes a repeat connection cheap; see prepareTLS in transport.go
 	// for why building them per connection was costing more than everything else
 	// put together.
-	tlsServer   *tls.Config
-	tlsClients  map[string]*tls.Config
-	utlsClients map[string]*utls.Config
-	utlsCache   utls.ClientSessionCache
+	tlsServer     *tls.Config
+	tlsClients    map[string]*tls.Config
+	utlsClients   map[string]*utls.Config
+	utlsCache     utls.ClientSessionCache
+	xhttpPromoted func(net.Conn)
 }
 
 // EffectiveSpoofSNI returns SpoofSNI when set, or DefaultSpoofSNI otherwise.

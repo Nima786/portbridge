@@ -244,6 +244,11 @@ func (m *xhttpSessionManager) AcceptParsedRequest(c net.Conn, br *bufio.Reader, 
 			"X-Padding: " + xhttpPaddingHeader() + "\r\n" +
 			"Connection: keep-alive\r\n\r\n")
 		_ = writeXHTTPDownFrame(&respBuf, xhttpFrameHello, hello[:])
+		// Push initial chunked response past 1 KB so CDN edges (Cloudflare) flush
+		// the 200 OK + greeting frame immediately without response buffering.
+		var flushPad [1024]byte
+		_, _ = rand.Read(flushPad[:])
+		_ = writeXHTTPDownFrame(&respBuf, xhttpFrameKeepAlive, flushPad[:])
 
 		if _, err := c.Write(respBuf.Bytes()); err != nil {
 			_ = sc.Close()
@@ -268,7 +273,7 @@ func (m *xhttpSessionManager) AcceptParsedRequest(c net.Conn, br *bufio.Reader, 
 			_ = c.Close()
 			return nil, errXHTTPUplinkAttached
 		}
-		go m.serveUplinkKeepAlive(c, br, cfg)
+		go m.serveUplinkKeepAlive(c, br, cfg, guard)
 		return nil, errXHTTPUplinkAttached
 
 	default:
@@ -372,8 +377,13 @@ func (m *xhttpSessionManager) lookupSessionWait(sid [16]byte) *xhttpServerConn {
 	return sc
 }
 
-func (m *xhttpSessionManager) serveUplinkKeepAlive(c net.Conn, br *bufio.Reader, cfg *Config) {
-	defer func() { _ = c.Close() }()
+func (m *xhttpSessionManager) serveUplinkKeepAlive(c net.Conn, br *bufio.Reader, cfg *Config, guard *replayGuard) {
+	transferred := false
+	defer func() {
+		if !transferred {
+			_ = c.Close()
+		}
+	}()
 	basePrefix := cfg.effectiveXHTTPPath() + "/"
 	for {
 		if err := c.SetReadDeadline(time.Now().Add(90 * time.Second)); err != nil {
@@ -381,6 +391,18 @@ func (m *xhttpSessionManager) serveUplinkKeepAlive(c net.Conn, br *bufio.Reader,
 		}
 		req, err := http.ReadRequest(br)
 		if err != nil {
+			return
+		}
+		// CDN edges (Cloudflare HTTP/1.1 Keep-Alive pools) share idle backend
+		// connections across requests, so a socket previously used for POST may
+		// receive the next session's GET stream request.
+		if req.Method == http.MethodGet && strings.HasPrefix(req.URL.Path, basePrefix) && cfg.xhttpPromoted != nil {
+			sc, err := m.AcceptParsedRequest(c, br, req, cfg, guard)
+			if err != nil {
+				return
+			}
+			transferred = true
+			cfg.xhttpPromoted(sc)
 			return
 		}
 		if req.Method != http.MethodPost || !strings.HasPrefix(req.URL.Path, basePrefix) {

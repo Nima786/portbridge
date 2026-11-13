@@ -3,9 +3,17 @@ package engine
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
+	"fmt"
 	"net"
+	"net/http"
+	"net/http/httptest"
+	"net/http/httputil"
+	"net/url"
 	"testing"
 	"time"
+
+	"golang.org/x/net/http2"
 )
 
 func TestExpandCFScanCandidatesDefaultSubnets(t *testing.T) {
@@ -170,4 +178,122 @@ func TestRouterCleanIPsPrimaryAndCDNBackup(t *testing.T) {
 	if _, pref := r2.inUse(); pref {
 		t.Fatal("CDN backup clean IP target[1] must report preferred=false (OnBackupRoute=true)")
 	}
+}
+
+func TestCFScanThroughSimulatedCloudflareH2OriginProxy(t *testing.T) {
+	// Subtest 1: ProbeListener in default multi-mode (NextProtos: ["h2", "http/1.1"],
+	// as used by Find Best Tunnel Mode) behind a TLS reverse proxy that speaks
+	// HTTP/2 to Origin (matching Cloudflare's default "HTTP/2 to Origin" setting).
+	t.Run("h2_to_origin_xhttp", func(t *testing.T) {
+		pl, err := StartProbeListener("127.0.0.1", 0, nil, time.Minute)
+		if err != nil {
+			t.Fatalf("StartProbeListener: %v", err)
+		}
+		defer pl.Close()
+
+		originURL, err := url.Parse(fmt.Sprintf("https://127.0.0.1:%d", pl.Port))
+		if err != nil {
+			t.Fatal(err)
+		}
+		rp := httputil.NewSingleHostReverseProxy(originURL)
+		rp.FlushInterval = -1
+		rp.Transport = &http2.Transport{
+			TLSClientConfig: &tls.Config{
+				InsecureSkipVerify: true, //nolint:gosec // loopback self-signed probe cert
+				NextProtos:         []string{"h2"},
+			},
+		}
+
+		edgeProxy := httptest.NewTLSServer(rp)
+		defer edgeProxy.Close()
+		proxyPort := edgeProxy.Listener.Addr().(*net.TCPAddr).Port
+
+		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+		defer cancel()
+
+		rep, err := ScanCloudflareCleanIPs(ctx, CFScanRequest{
+			Domain:     "ae.example.com",
+			Port:       proxyPort,
+			Transport:  "xhttp",
+			Secret:     pl.Secret,
+			Candidates: []string{"127.0.0.1"},
+			MaxSelect:  3,
+		})
+		if err != nil {
+			t.Fatalf("ScanCloudflareCleanIPs over H2-to-Origin proxy: %v", err)
+		}
+		if rep.VerifiedCount != 1 || len(rep.Recommended) != 1 {
+			t.Fatalf("expected 1 verified clean IP over H2-to-Origin proxy, got %+v", rep)
+		}
+
+		// Also verify Find Best Tunnel Mode's probeOneSpec (xhttp-cdn) succeeds
+		// through the same HTTP/2-to-Origin proxy.
+		cand := probeOneSpec(ctx, ProbeCandidateSpec{
+			ID:         "direct-xhttp-cdn",
+			Label:      "Cloudflare / CDN SplitHTTP (XHTTP)",
+			Mode:       "direct",
+			Link:       "xhttp-cdn",
+			TargetAddr: fmt.Sprintf("ae.example.com:%d", proxyPort),
+			Port:       proxyPort,
+			Transport:  "xhttp",
+			ServerName: "ae.example.com",
+			Domain:     "ae.example.com",
+			CDN:        true,
+			CleanIPs:   []string{"127.0.0.1"},
+		}, pl.Secret, 64*1024)
+		if cand.Status != "ok" {
+			t.Fatalf("probeOneSpec(xhttp-cdn) over H2-to-Origin proxy failed: %+v", cand)
+		}
+	})
+
+	// Subtest 2: ProbeListener with SetHTTP1Only(true) forces an HTTP/2-capable
+	// reverse proxy (ForceAttemptHTTP2: true) to negotiate HTTP/1.1 to Origin so
+	// both WSS (HTTP/1.1 Upgrade) and XHTTP succeed end-to-end.
+	t.Run("http1_only_wss_and_xhttp", func(t *testing.T) {
+		pl, err := StartProbeListener("127.0.0.1", 0, nil, time.Minute)
+		if err != nil {
+			t.Fatalf("StartProbeListener: %v", err)
+		}
+		defer pl.Close()
+		pl.SetHTTP1Only(true)
+
+		originURL, err := url.Parse(fmt.Sprintf("https://127.0.0.1:%d", pl.Port))
+		if err != nil {
+			t.Fatal(err)
+		}
+		rp := httputil.NewSingleHostReverseProxy(originURL)
+		rp.FlushInterval = -1
+		rp.Transport = &http.Transport{
+			ForceAttemptHTTP2: true,
+			TLSClientConfig: &tls.Config{
+				InsecureSkipVerify: true, //nolint:gosec // loopback self-signed probe cert
+			},
+		}
+
+		edgeProxy := httptest.NewTLSServer(rp)
+		defer edgeProxy.Close()
+		proxyPort := edgeProxy.Listener.Addr().(*net.TCPAddr).Port
+
+		for _, tr := range []string{"wss", "xhttp"} {
+			t.Run(tr, func(t *testing.T) {
+				ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+				defer cancel()
+
+				rep, err := ScanCloudflareCleanIPs(ctx, CFScanRequest{
+					Domain:     "ae.example.com",
+					Port:       proxyPort,
+					Transport:  tr,
+					Secret:     pl.Secret,
+					Candidates: []string{"127.0.0.1"},
+					MaxSelect:  3,
+				})
+				if err != nil {
+					t.Fatalf("ScanCloudflareCleanIPs(%s) with HTTP1Only: %v", tr, err)
+				}
+				if rep.VerifiedCount != 1 || len(rep.Recommended) != 1 {
+					t.Fatalf("expected 1 verified clean IP for %s with HTTP1Only, got %+v", tr, rep)
+				}
+			})
+		}
+	})
 }

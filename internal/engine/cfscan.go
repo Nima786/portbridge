@@ -327,12 +327,12 @@ func extractHTTPCode(s string) string {
 // runCFStage1 performs a fast end-to-end handshake + HMAC Origin authentication +
 // 2 rapid RTT pings through a single candidate Cloudflare IP.
 func runCFStage1(parent context.Context, ip string, port int, domain string, tr Transport, wsPath string, secret []byte) (hsMS, rttMS float64, err error) {
-	ctx, cancel := context.WithTimeout(parent, 4200*time.Millisecond)
+	ctx, cancel := context.WithTimeout(parent, 8500*time.Millisecond)
 	defer cancel()
 
 	cfg, routes := buildSingleIPProbeConfig(ip, port, domain, tr, wsPath, secret)
 	t0 := time.Now()
-	raw, claim, err := routes.dial(1800 * time.Millisecond)
+	raw, claim, err := routes.dial(2500 * time.Millisecond)
 	if err != nil {
 		return 0, 0, err
 	}
@@ -346,7 +346,7 @@ func runCFStage1(parent context.Context, ip string, port int, domain string, tr 
 	})
 	defer stop()
 
-	_ = raw.SetDeadline(time.Now().Add(2600 * time.Millisecond))
+	_ = raw.SetDeadline(time.Now().Add(5500 * time.Millisecond))
 	c, err := wrapDialPurpose(raw, cfg.withClaimedName(claim), authPurposeSpeedtest)
 	if err != nil {
 		return 0, 0, err
@@ -360,7 +360,7 @@ func runCFStage1(parent context.Context, ip string, port int, domain string, tr 
 
 	var rtts []float64
 	for i := 0; i < 2; i++ {
-		_ = c.SetDeadline(time.Now().Add(1600 * time.Millisecond))
+		_ = c.SetDeadline(time.Now().Add(2000 * time.Millisecond))
 		pStart := time.Now()
 		var req [9]byte
 		req[0] = 0x01
