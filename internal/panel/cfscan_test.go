@@ -2,6 +2,7 @@ package panel
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -212,5 +213,88 @@ func TestCloudflareCleanIPAutoHealRotation(t *testing.T) {
 	hist := p.store.get().AutoHeal[key].History
 	if len(hist) != 1 || hist[0].Candidate != "cf-clean-rotate" || !hist[0].Success {
 		t.Fatalf("expected cf-clean-rotate history entry, got %+v", hist)
+	}
+}
+
+func TestProbeBenchmarkUsesCleanIPs(t *testing.T) {
+	p, foreignID, _ := twoServers(t)
+	ts := startPanel(t, p)
+	b := newBrowser(t, ts)
+	if b.login("admin", testPassword) != http.StatusOK {
+		t.Fatal("could not log in")
+	}
+
+	var sess probeSession
+	code, startOut, _ := b.do(http.MethodPost, "/api/tunnels/probe", map[string]any{
+		"action":     "start",
+		"relay":      "this",
+		"foreign":    foreignID,
+		"cdn_domain": "unresolvable-cdn.invalid",
+		"clean_ips":  "127.0.0.1",
+	}, nil)
+	if code != http.StatusOK {
+		t.Fatalf("probe start answered %d: %v", code, startOut)
+	}
+	if raw, err := json.Marshal(startOut); err != nil || json.Unmarshal(raw, &sess) != nil {
+		t.Fatalf("could not decode probeSession: %v", startOut)
+	}
+	defer func() {
+		_, _, _ = b.do(http.MethodPost, "/api/tunnels/probe", map[string]any{
+			"action":  "finish",
+			"session": sess,
+		}, nil)
+	}()
+
+	var cdnCand *engine.ProbeCandidateSpec
+	var directCand *engine.ProbeCandidateSpec
+	for i := range sess.Candidates {
+		c := &sess.Candidates[i]
+		if c.CDN {
+			if !slices.Equal(c.CleanIPs, []string{"127.0.0.1"}) {
+				t.Fatalf("CDN candidate %s CleanIPs = %v, want [127.0.0.1]", c.ID, c.CleanIPs)
+			}
+			if c.ID == "direct-cdn-xhttp" {
+				cdnCand = c
+			}
+		} else {
+			if len(c.CleanIPs) != 0 {
+				t.Fatalf("non-CDN candidate %s unexpectedly has CleanIPs %v", c.ID, c.CleanIPs)
+			}
+			if directCand == nil && c.Mode == "direct" {
+				directCand = c
+			}
+		}
+	}
+	if cdnCand == nil || directCand == nil {
+		t.Fatalf("missing expected CDN or Direct candidate in %d candidates", len(sess.Candidates))
+	}
+
+	// Step through the CDN candidate: unresolvable-cdn.invalid only succeeds
+	// if probeOneSpec actually dials CleanIPs ("127.0.0.1") instead of DNS.
+	var stepRes engine.ProbeCandidateResult
+	code, out, _ := b.do(http.MethodPost, "/api/tunnels/probe", map[string]any{
+		"action":    "step",
+		"dialer_id": sess.RelayID,
+		"secret":    sess.DirectSecret,
+		"spec":      *cdnCand,
+	}, nil)
+	if raw, err := json.Marshal(out); err == nil {
+		_ = json.Unmarshal(raw, &stepRes)
+	}
+	if code != http.StatusOK || stepRes.Status != "ok" {
+		t.Fatalf("CDN probe step with CleanIPs answered %d (status=%q err=%q): %v", code, stepRes.Status, stepRes.Error, out)
+	}
+
+	// Attempting to pass CleanIPs on a non-CDN candidate must be rejected by checkProbeStep.
+	tampered := *directCand
+	tampered.CleanIPs = []string{"127.0.0.1"}
+	code, _, _ = b.do(http.MethodPost, "/api/tunnels/probe", map[string]any{
+		"action":    "step",
+		"dialer_id": sess.RelayID,
+		"secret":    sess.DirectSecret,
+		"spec":      tampered,
+	}, nil)
+	if code != http.StatusUnprocessableEntity {
+		t.Fatalf("tampered non-CDN CleanIPs step answered %d, want 422", code)
 	}
 }

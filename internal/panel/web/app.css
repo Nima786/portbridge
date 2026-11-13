@@ -2247,6 +2247,12 @@ label.choice-card.probe-goal-card.is-selected {
 .port-box.probe-port-card label {
   margin-top: 0;
 }
+.port-box.probe-clean-card {
+  margin-top: .65rem;
+}
+.transport-group > .sub-panel {
+  margin-top: .75rem;
+}
 .probe-cta-bar {
   margin-top: .9rem;
   padding-top: .85rem;

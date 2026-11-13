@@ -854,6 +854,7 @@ func (p *Panel) handleProbeTunnel(w http.ResponseWriter, r *http.Request, _ auth
 		Relay        string                        `json:"relay"`
 		Foreign      string                        `json:"foreign"`
 		CDNDomain    string                        `json:"cdn_domain"`
+		CleanIPs     string                        `json:"clean_ips,omitempty"`
 		ServicePorts string                        `json:"service_ports"`
 		UserPorts    string                        `json:"user_ports"`
 		LinkPort     int                           `json:"link_port"`
@@ -879,10 +880,22 @@ func (p *Panel) handleProbeTunnel(w http.ResponseWriter, r *http.Request, _ auth
 		}
 		writeJSON(w, http.StatusOK, map[string]any{"ids": ids})
 	case "start":
+		cleanIPs, err := normaliseCleanIPList(req.CleanIPs, nil)
+		if err != nil {
+			writeErr(w, http.StatusBadRequest, capitalise(err.Error())+".")
+			return
+		}
 		sess, err := p.startProbeSessionWithPorts(r.Context(), strings.TrimSpace(req.Relay), strings.TrimSpace(req.Foreign), strings.TrimSpace(req.CDNDomain), strings.TrimSpace(req.ServicePorts), strings.TrimSpace(req.UserPorts), req.LinkPort)
 		if err != nil {
 			writeErr(w, http.StatusUnprocessableEntity, capitalise(plainAgentError(err))+".")
 			return
+		}
+		if len(cleanIPs) > 0 {
+			for i := range sess.Candidates {
+				if sess.Candidates[i].CDN {
+					sess.Candidates[i].CleanIPs = append([]string(nil), cleanIPs...)
+				}
+			}
 		}
 		writeJSON(w, http.StatusOK, sess)
 	case "step":

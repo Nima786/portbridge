@@ -2934,7 +2934,7 @@
   }
 
   async function runCloudflareCleanIPScan(opts) {
-    const { btn, relay, foreign, tunnel, domain, port, transport, inputEl, msgEl, boxEl, domainInputEl } = opts;
+    const { btn, relay, foreign, tunnel, domain, port, transport, inputEl, mirrorInputEl, msgEl, boxEl, domainInputEl } = opts;
     if (!relay || !foreign) {
       if (msgEl) {
         msgEl.textContent = 'Select both the Relay (Iran) and Foreign servers first.';
@@ -2979,9 +2979,9 @@
       const rec = rep.recommended || [];
       const selected = new Set(rec);
       const syncInput = () => {
-        if (inputEl) {
-          inputEl.value = Array.from(selected).join(', ');
-        }
+        const val = Array.from(selected).join(', ');
+        if (inputEl) inputEl.value = val;
+        if (mirrorInputEl) mirrorInputEl.value = val;
       };
       if (selected.size > 0) {
         syncInput();
@@ -4015,6 +4015,7 @@
               await openNewTunnel('', foreignID);
               setRadio('tn-link', 'cdn');
               $('tn-domain').value = r.name;
+              if ($('tn-probe-cdn')) $('tn-probe-cdn').value = r.name;
               showTunnelOptions();
               $('tn-name').focus();
             }
@@ -4306,6 +4307,7 @@
     $('tn-cf-pick').addEventListener('change', (ev) => {
       if (ev.target.value) {
         $('tn-domain').value = ev.target.value;
+        if ($('tn-probe-cdn')) $('tn-probe-cdn').value = ev.target.value;
       }
     });
   }
@@ -4343,6 +4345,7 @@
           comment: 'PortBridge CDN tunnel',
         });
         $('tn-domain').value = created.name;
+        if ($('tn-probe-cdn')) $('tn-probe-cdn').value = created.name;
         $('tn-cf-sub').value = '';
         msg.className = 'small okay';
         msg.textContent = `Created ${created.name} → ${ip} (Proxied ON) and filled above.`;
@@ -4874,9 +4877,28 @@
 
   if ($('tn-probe-cf-pick')) {
     $('tn-probe-cf-pick').addEventListener('change', (ev) => {
-      if (ev.target.value && $('tn-probe-cdn')) {
-        $('tn-probe-cdn').value = ev.target.value;
+      if (ev.target.value) {
+        if ($('tn-probe-cdn')) $('tn-probe-cdn').value = ev.target.value;
+        if ($('tn-domain')) $('tn-domain').value = ev.target.value;
       }
+    });
+  }
+
+  if ($('tn-probe-cdn') && $('tn-domain')) {
+    $('tn-probe-cdn').addEventListener('input', () => {
+      $('tn-domain').value = $('tn-probe-cdn').value;
+    });
+    $('tn-domain').addEventListener('input', () => {
+      $('tn-probe-cdn').value = $('tn-domain').value;
+    });
+  }
+
+  if ($('tn-probe-cleanips') && $('tn-cleanips')) {
+    $('tn-probe-cleanips').addEventListener('input', () => {
+      $('tn-cleanips').value = $('tn-probe-cleanips').value;
+    });
+    $('tn-cleanips').addEventListener('input', () => {
+      $('tn-probe-cleanips').value = $('tn-cleanips').value;
     });
   }
 
@@ -4945,6 +4967,12 @@
     }
     if (cand.domain) {
       $('tn-domain').value = cand.domain;
+      if ($('tn-probe-cdn')) $('tn-probe-cdn').value = cand.domain;
+    }
+    if (Array.isArray(cand.clean_ips) && cand.clean_ips.length) {
+      const joinedClean = cand.clean_ips.join(', ');
+      if ($('tn-cleanips')) $('tn-cleanips').value = joinedClean;
+      if ($('tn-probe-cleanips')) $('tn-probe-cleanips').value = joinedClean;
     }
     const preset = radio('tn-load') || 'light';
     if (cand.gaming && ['plain', 'website', 'sni-spoof'].includes(cand.link)) {
@@ -5173,9 +5201,12 @@
       const relay = $('tn-relay').value;
       const foreign = $('tn-foreign').value;
       const cdn = ($('tn-probe-cdn') && $('tn-probe-cdn').value.trim()) || ($('tn-domain') && $('tn-domain').value.trim()) || '';
+      const cleanIPs = ($('tn-probe-cleanips') && $('tn-probe-cleanips').value.trim()) || ($('tn-cleanips') && $('tn-cleanips').value.trim()) || '';
       const servicePorts = ($('tn-probe-service') && $('tn-probe-service').value.trim()) || ($('tn-service') && $('tn-service').value.trim()) || '';
       const userPorts = ($('tn-users') && $('tn-users').value.trim()) || '';
       const linkPort = Number(($('tn-probe-linkport') && $('tn-probe-linkport').value) || ($('tn-linkport') && $('tn-linkport').value) || 0);
+      if (cdn && $('tn-domain')) $('tn-domain').value = cdn;
+      if (cleanIPs && $('tn-cleanips')) $('tn-cleanips').value = cleanIPs;
       if (servicePorts && $('tn-service')) $('tn-service').value = servicePorts;
       if (linkPort > 0 && $('tn-linkport')) $('tn-linkport').value = String(linkPort);
 
@@ -5203,6 +5234,7 @@
           relay,
           foreign,
           cdn_domain: cdn,
+          clean_ips: cleanIPs,
           service_ports: servicePorts,
           user_ports: userPorts,
           link_port: linkPort,
@@ -5333,6 +5365,7 @@
       $('tn-probe-results').replaceChildren();
     }
     resetCleanIPScanUI('tn-cfscan-msg', 'tn-cfscan-results');
+    resetCleanIPScanUI('tn-probe-cfscan-msg', 'tn-probe-cfscan-results');
   }
 
   async function openNewTunnel(relayID, foreignID) {
@@ -5361,6 +5394,7 @@
     if (foreignID) $('tn-foreign').value = foreignID;
     resetTunnelDialogProbeState();
     if ($('tn-cleanips')) $('tn-cleanips').value = '';
+    if ($('tn-probe-cleanips')) $('tn-probe-cleanips').value = '';
     if ($('tn-probe-service') && $('tn-service')) {
       $('tn-probe-service').value = $('tn-service').value;
     }
@@ -5441,7 +5475,9 @@
     $('tn-claim').value = (!any.cdn && hostInLink && !/website header/i.test(rawLink))
       ? hostInLink
       : (['grpc', 'h3'].includes(linkKey) ? 'www.google.com' : 'www.bing.com');
-    $('tn-cleanips').value = ((ei && ei.clean_ips) || (any && any.clean_ips) || []).join(', ');
+    const existingClean = ((ei && ei.clean_ips) || (any && any.clean_ips) || []).join(', ');
+    $('tn-cleanips').value = existingClean;
+    if ($('tn-probe-cleanips')) $('tn-probe-cleanips').value = existingClean;
     $('tn-webheader').checked = /website header/i.test(rawLink);
     $('tn-webhost').value = (/website header/i.test(rawLink) && hostInLink) ? hostInLink : 'www.bing.com';
     $('tn-realsite').checked = any.real_site !== false;
@@ -5477,17 +5513,48 @@
   }
 
   for (const b of document.querySelectorAll('.new-tunnel')) b.addEventListener('click', () => openNewTunnel('', ''));
+  if ($('tn-probe-cfscan-btn')) {
+    $('tn-probe-cfscan-btn').addEventListener('click', () => {
+      const dom = ($('tn-probe-cdn') && $('tn-probe-cdn').value.trim()) || ($('tn-domain') && $('tn-domain').value.trim()) || '';
+      if (dom) {
+        if ($('tn-probe-cdn')) $('tn-probe-cdn').value = dom;
+        if ($('tn-domain')) $('tn-domain').value = dom;
+      }
+      const curLink = radio('tn-link') || '';
+      const isCDNLink = ['cdn', 'website-cdn-backup', 'xhttp-cdn', 'h3-cdn', 'asymmetric-cdn', 'grpc-cdn'].includes(curLink);
+      runCloudflareCleanIPScan({
+        btn: $('tn-probe-cfscan-btn'),
+        relay: $('tn-relay').value,
+        foreign: $('tn-foreign').value,
+        tunnel: (tunnelModalMode && tunnelModalMode.kind === 'switch' && tunnelModalMode.tunnel) ? tunnelModalMode.tunnel.name : '',
+        domain: dom,
+        port: Number(($('tn-probe-linkport') && $('tn-probe-linkport').value) || ($('tn-linkport') && $('tn-linkport').value) || 0),
+        transport: isCDNLink ? curLink : 'xhttp-cdn',
+        inputEl: $('tn-probe-cleanips'),
+        mirrorInputEl: $('tn-cleanips'),
+        msgEl: $('tn-probe-cfscan-msg'),
+        boxEl: $('tn-probe-cfscan-results'),
+        domainInputEl: $('tn-probe-cdn'),
+      });
+    });
+  }
   if ($('tn-cfscan-btn')) {
     $('tn-cfscan-btn').addEventListener('click', () => {
+      const dom = ($('tn-domain') && $('tn-domain').value.trim()) || ($('tn-probe-cdn') && $('tn-probe-cdn').value.trim()) || '';
+      if (dom) {
+        if ($('tn-domain')) $('tn-domain').value = dom;
+        if ($('tn-probe-cdn')) $('tn-probe-cdn').value = dom;
+      }
       runCloudflareCleanIPScan({
         btn: $('tn-cfscan-btn'),
         relay: $('tn-relay').value,
         foreign: $('tn-foreign').value,
         tunnel: (tunnelModalMode && tunnelModalMode.kind === 'switch' && tunnelModalMode.tunnel) ? tunnelModalMode.tunnel.name : '',
-        domain: $('tn-domain').value.trim(),
+        domain: dom,
         port: Number($('tn-linkport').value || 0),
         transport: radio('tn-link') || 'cdn',
         inputEl: $('tn-cleanips'),
+        mirrorInputEl: $('tn-probe-cleanips'),
         msgEl: $('tn-cfscan-msg'),
         boxEl: $('tn-cfscan-results'),
         domainInputEl: $('tn-domain'),
@@ -5524,7 +5591,7 @@
       link,
       server_name: $('tn-claim').value.trim(),
       domain: $('tn-domain').value.trim(),
-      clean_ips: $('tn-cleanips').value.replace(/\s+/g, ''),
+      clean_ips: (($('tn-cleanips') && $('tn-cleanips').value) || ($('tn-probe-cleanips') && $('tn-probe-cleanips').value) || '').replace(/\s+/g, ''),
       stealth: ['sni-spoof', 'split', 'asymmetric'].includes(link) || $('tn-stealth').checked,
       web_header: !gre && $('tn-webheader').checked,
       web_host: $('tn-webhost').value.trim(),

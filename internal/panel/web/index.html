@@ -775,7 +775,7 @@
 
           <div class="probe-subblock">
             <div class="probe-subhead-row">
-              <span class="probe-subhead">3. Optional Cloudflare / CDN Domain</span>
+              <span class="probe-subhead">3. Optional Cloudflare / CDN Domain &amp; Clean IP Scanner</span>
               <span class="pill-tag">Leave empty for Direct / Reverse only</span>
             </div>
             <div class="probe-cdn-row">
@@ -791,6 +791,16 @@
                   <option value="">— Select Cloudflare record —</option>
                 </select>
               </div>
+            </div>
+            <div class="port-box probe-port-card probe-clean-card">
+              <label for="tn-probe-cleanips">Cloudflare Clean Edge IPs <span class="muted">(optional — scan 44 CF /24 subnets end-to-end from Relay)</span></label>
+              <span class="field-hint">Finds fast, unblocked Cloudflare Edge IPs for your Iran ISP and uses them automatically in Benchmark &amp; Tunnel creation</span>
+              <div class="cf-quick-row cfscan-input-row">
+                <input id="tn-probe-cleanips" placeholder="104.16.12.34, 172.67.45.67 (or click Scan Clean CF IPs →)" autocapitalize="none" spellcheck="false">
+                <button type="button" id="tn-probe-cfscan-btn">Scan Clean CF IPs</button>
+              </div>
+              <p id="tn-probe-cfscan-msg" class="small" role="status"></p>
+              <div id="tn-probe-cfscan-results" class="cfscan-results" hidden></div>
             </div>
           </div>
 
@@ -1164,6 +1174,49 @@
                 </div>
               </label>
             </div>
+
+            <div id="tn-opt-domain" class="sub-panel" hidden>
+              <label for="tn-domain">Your CDN Domain <span class="muted">(pointed at the Foreign server with CDN proxy enabled)</span></label>
+              <input id="tn-domain" placeholder="link.example.com" autocapitalize="none" spellcheck="false">
+              <div id="tn-cf-helper" class="cf-tunnel-helper" hidden>
+                <div class="row2">
+                  <div>
+                    <label for="tn-cf-zone">Cloudflare Domain (Zone)</label>
+                    <select id="tn-cf-zone"></select>
+                  </div>
+                  <div>
+                    <label for="tn-cf-pick">Pick Existing Cloudflare Record</label>
+                    <select id="tn-cf-pick">
+                      <option value="">— Select a subdomain —</option>
+                    </select>
+                  </div>
+                </div>
+                <div class="cf-quick-create">
+                  <label for="tn-cf-sub">Or Quick-Create New Subdomain <span class="muted">(points to selected Foreign server IP with Proxy ON)</span></label>
+                  <div class="cf-quick-row">
+                    <input id="tn-cf-sub" placeholder="e.g. edge1" autocapitalize="none" spellcheck="false">
+                    <button type="button" id="tn-cf-create-btn">Create &amp; Use</button>
+                  </div>
+                  <p id="tn-cf-msg" class="small" role="status"></p>
+                </div>
+              </div>
+              <p class="muted small hint-box">Set Cloudflare SSL/TLS mode to <strong>Full</strong> (not Flexible, not Full Strict). Supported Cloudflare HTTPS ports: <code>443, 2053, 2083, 2087, 2096, 8443</code>.</p>
+            </div>
+
+            <div id="tn-opt-clean" class="sub-panel" hidden>
+              <div class="cfscan-head">
+                <div>
+                  <label for="tn-cleanips">Cloudflare Clean Edge IPs <span class="muted">(optional, comma-separated)</span></label>
+                  <p class="muted small cfscan-sub">Tests 44 Cloudflare <code>/24</code> subnets end-to-end from your Iran Relay server through your CDN domain into your Foreign server (real handshake + sustained anti-freeze transfer).</p>
+                </div>
+              </div>
+              <div class="cf-quick-row cfscan-input-row">
+                <input id="tn-cleanips" placeholder="104.16.12.34, 172.67.45.67 (leave empty for default DNS)" autocapitalize="none" spellcheck="false">
+                <button type="button" id="tn-cfscan-btn">Scan Clean CF IPs</button>
+              </div>
+              <p id="tn-cfscan-msg" class="small" role="status"></p>
+              <div id="tn-cfscan-results" class="cfscan-results" hidden></div>
+            </div>
           </div>
 
           <!-- Group 4: Emergency Raw-Socket, Layer-3 & Unfiltered Modes -->
@@ -1252,49 +1305,6 @@
         <div id="tn-opt-claim" class="sub-panel" hidden>
           <label for="tn-claim">Camouflage Domain / SNI <span class="muted">(any popular HTTPS site; does not need to be yours)</span></label>
           <input id="tn-claim" value="www.bing.com" autocapitalize="none" spellcheck="false">
-        </div>
-
-        <div id="tn-opt-domain" class="sub-panel" hidden>
-          <label for="tn-domain">Your CDN Domain <span class="muted">(pointed at the Foreign server with CDN proxy enabled)</span></label>
-          <input id="tn-domain" placeholder="link.example.com" autocapitalize="none" spellcheck="false">
-          <div id="tn-cf-helper" class="cf-tunnel-helper" hidden>
-            <div class="row2">
-              <div>
-                <label for="tn-cf-zone">Cloudflare Domain (Zone)</label>
-                <select id="tn-cf-zone"></select>
-              </div>
-              <div>
-                <label for="tn-cf-pick">Pick Existing Cloudflare Record</label>
-                <select id="tn-cf-pick">
-                  <option value="">— Select a subdomain —</option>
-                </select>
-              </div>
-            </div>
-            <div class="cf-quick-create">
-              <label for="tn-cf-sub">Or Quick-Create New Subdomain <span class="muted">(points to selected Foreign server IP with Proxy ON)</span></label>
-              <div class="cf-quick-row">
-                <input id="tn-cf-sub" placeholder="e.g. edge1" autocapitalize="none" spellcheck="false">
-                <button type="button" id="tn-cf-create-btn">Create &amp; Use</button>
-              </div>
-              <p id="tn-cf-msg" class="small" role="status"></p>
-            </div>
-          </div>
-          <p class="muted small hint-box">Set Cloudflare SSL/TLS mode to <strong>Full</strong> (not Flexible, not Full Strict). Supported Cloudflare HTTPS ports: <code>443, 2053, 2083, 2087, 2096, 8443</code>.</p>
-        </div>
-
-        <div id="tn-opt-clean" class="sub-panel" hidden>
-          <div class="cfscan-head">
-            <div>
-              <label for="tn-cleanips">Cloudflare Clean Edge IPs <span class="muted">(optional, comma-separated)</span></label>
-              <p class="muted small cfscan-sub">Tests 44 Cloudflare <code>/24</code> subnets end-to-end from your Iran Relay server through your CDN domain into your Foreign server (real handshake + sustained anti-freeze transfer).</p>
-            </div>
-          </div>
-          <div class="cf-quick-row cfscan-input-row">
-            <input id="tn-cleanips" placeholder="104.16.12.34, 172.67.45.67 (leave empty for default DNS)" autocapitalize="none" spellcheck="false">
-            <button type="button" id="tn-cfscan-btn">Scan Clean CF IPs</button>
-          </div>
-          <p id="tn-cfscan-msg" class="small" role="status"></p>
-          <div id="tn-cfscan-results" class="cfscan-results" hidden></div>
         </div>
 
         <div id="tn-opt-stealth" class="sub-panel" hidden>

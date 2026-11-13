@@ -1854,6 +1854,19 @@ func (p *Panel) checkProbeStep(dialerID, secret string, spec engine.ProbeCandida
 	if port, err := strconv.Atoi(portStr); err != nil || port < 1 || port > 65535 {
 		return errors.New("the probe target port is not valid")
 	}
+	if len(spec.CleanIPs) > 0 {
+		if !spec.CDN {
+			return errors.New("clean addresses are only for CDN candidates")
+		}
+		if len(spec.CleanIPs) > 16 {
+			return errors.New("too many clean addresses")
+		}
+		for _, ip := range spec.CleanIPs {
+			if err := engine.CheckCleanIP(ip); err != nil {
+				return fmt.Errorf("clean addresses: %w", err)
+			}
+		}
+	}
 	if net.ParseIP(host) == nil {
 		// A name is for CDN checks, or a server added by hostname whose DNS
 		// was not resolved yet.

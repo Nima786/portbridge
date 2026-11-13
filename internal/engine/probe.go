@@ -34,31 +34,32 @@ var CDNHTTPSPorts = []int{2053, 2083, 2087, 2096, 8443, 443}
 
 // ProbeCandidateSpec describes one tunnel configuration to benchmark.
 type ProbeCandidateSpec struct {
-	ID           string `json:"id"`
-	Label        string `json:"label"`
-	Mode         string `json:"mode"`       // "direct" or "reverse"
-	Link         string `json:"link"`       // panel/CLI link key: "website", "sni-spoof", "split", "website-cdn-backup", "cdn", "grpc", "grpc-cdn", "kcp", "ip-spoof", "faketcp", "icmp", "plain"
-	Transport    string `json:"transport"`  // engine transport: "tls", "wss", "grpc", "kcp", "icmp", "faketcp", "plain"
-	Stealth      bool   `json:"stealth"`    // uTLS browser fingerprint + ClientHello fragmentation
-	WebHeader    bool   `json:"web_header"` // HTTP header obfuscation on plain TCP
-	SNISpoof     bool   `json:"sni_spoof,omitempty"`
-	SpoofSNI     string `json:"spoof_sni,omitempty"`
-	IPSpoof      bool   `json:"ip_spoof,omitempty"`
-	SpoofIP      string `json:"spoof_ip,omitempty"`
-	AntiFreeze   bool   `json:"anti_freeze,omitempty"`
-	PortHop      bool   `json:"port_hop,omitempty"`
-	TwinPath     bool   `json:"twin_path,omitempty"`
-	Asymmetric   bool   `json:"asymmetric,omitempty"`
-	AsymUplink   string `json:"asym_uplink,omitempty"`
-	AsymDownlink string `json:"asym_downlink,omitempty"`
-	CDN          bool   `json:"cdn"`
-	IPv6         bool   `json:"ipv6"`
-	Shared       bool   `json:"shared"` // recommended pooling mode (mux vs pool)
-	Gaming       bool   `json:"gaming,omitempty"`
-	ServerName   string `json:"server_name,omitempty"`
-	Domain       string `json:"domain,omitempty"`
-	TargetAddr   string `json:"target_addr"` // host:port to dial
-	Port         int    `json:"port"`
+	ID           string   `json:"id"`
+	Label        string   `json:"label"`
+	Mode         string   `json:"mode"`       // "direct" or "reverse"
+	Link         string   `json:"link"`       // panel/CLI link key: "website", "sni-spoof", "split", "website-cdn-backup", "cdn", "grpc", "grpc-cdn", "kcp", "ip-spoof", "faketcp", "icmp", "plain"
+	Transport    string   `json:"transport"`  // engine transport: "tls", "wss", "grpc", "kcp", "icmp", "faketcp", "plain"
+	Stealth      bool     `json:"stealth"`    // uTLS browser fingerprint + ClientHello fragmentation
+	WebHeader    bool     `json:"web_header"` // HTTP header obfuscation on plain TCP
+	SNISpoof     bool     `json:"sni_spoof,omitempty"`
+	SpoofSNI     string   `json:"spoof_sni,omitempty"`
+	IPSpoof      bool     `json:"ip_spoof,omitempty"`
+	SpoofIP      string   `json:"spoof_ip,omitempty"`
+	AntiFreeze   bool     `json:"anti_freeze,omitempty"`
+	PortHop      bool     `json:"port_hop,omitempty"`
+	TwinPath     bool     `json:"twin_path,omitempty"`
+	Asymmetric   bool     `json:"asymmetric,omitempty"`
+	AsymUplink   string   `json:"asym_uplink,omitempty"`
+	AsymDownlink string   `json:"asym_downlink,omitempty"`
+	CDN          bool     `json:"cdn"`
+	IPv6         bool     `json:"ipv6"`
+	Shared       bool     `json:"shared"` // recommended pooling mode (mux vs pool)
+	Gaming       bool     `json:"gaming,omitempty"`
+	ServerName   string   `json:"server_name,omitempty"`
+	Domain       string   `json:"domain,omitempty"`
+	CleanIPs     []string `json:"clean_ips,omitempty"`
+	TargetAddr   string   `json:"target_addr"` // host:port to dial
+	Port         int      `json:"port"`
 }
 
 // ProbeCandidateResult holds the measured metrics and computed score for one candidate.
@@ -1138,6 +1139,7 @@ func probeOneSpec(parentCtx context.Context, spec ProbeCandidateSpec, secret []b
 		Transport:       Transport(spec.Transport),
 		ServerName:      spec.ServerName,
 		CDN:             spec.CDN,
+		CleanIPs:        append([]string(nil), spec.CleanIPs...),
 		HTTPHeader:      spec.WebHeader,
 		HTTPHost:        spec.ServerName,
 		SNISpoof:        spec.SNISpoof,
@@ -1871,6 +1873,7 @@ func FinalizeProbeReport(results []ProbeCandidateResult, cdnDomain string) *Prob
 				Shared:     true,
 				ServerName: bestDirectTLS.ServerName,
 				Domain:     dom,
+				CleanIPs:   append([]string(nil), bestCDNWS.CleanIPs...),
 				TargetAddr: bestDirectTLS.TargetAddr,
 				Port:       bestDirectTLS.Port,
 			},
@@ -1967,6 +1970,7 @@ func FinalizeProbeReport(results []ProbeCandidateResult, cdnDomain string) *Prob
 				Shared:       true,
 				ServerName:   dom,
 				Domain:       dom,
+				CleanIPs:     append([]string(nil), bestCDNAsymUp.CleanIPs...),
 				TargetAddr:   bestCDNAsymUp.TargetAddr,
 				Port:         bestCDNAsymUp.Port,
 			},
