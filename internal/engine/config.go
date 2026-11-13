@@ -199,6 +199,11 @@ type Config struct {
 	ECHConfig        string
 	CleanIPs         []string
 
+	// Per-client-IP abuse & port-scan protection on Edge user ports (0 = unlimited).
+	MaxConnPerIP int
+	MaxRatePerIP int
+	BlockedIPs   []string
+
 	// RealSite passes any stranger who connects without proving who they are
 	// straight through to the real website (e.g. Bing), presenting Microsoft's
 	// genuine certificate instead of ours. On for direct website/TLS, HTTP/2,
@@ -908,6 +913,20 @@ func (c *Config) Set(key, val string) error {
 		default:
 			return fmt.Errorf("forward_proto must be tcp, udp, or both, got %q", val)
 		}
+	case "max_per_ip":
+		return num(&c.MaxConnPerIP)
+	case "rate_per_ip":
+		return num(&c.MaxRatePerIP)
+	case "blocked_ips", "blocked_ip":
+		if strings.TrimSpace(val) == "" {
+			c.BlockedIPs = nil
+			return nil
+		}
+		parsed, err := ParseBlockedIPList(val)
+		if err != nil {
+			return fmt.Errorf("blocked_ips: %w", err)
+		}
+		c.BlockedIPs = parsed
 	default:
 		return fmt.Errorf("unknown setting %q", key)
 	}
@@ -1065,6 +1084,17 @@ func (c *Config) Validate() error {
 	}
 	if err := c.validateSIT(); err != nil {
 		return err
+	}
+	if c.MaxConnPerIP < 0 || c.MaxConnPerIP > 100000 {
+		return fmt.Errorf("max_per_ip must be between 0 and 100000, got %d", c.MaxConnPerIP)
+	}
+	if c.MaxRatePerIP < 0 || c.MaxRatePerIP > 100000 {
+		return fmt.Errorf("rate_per_ip must be between 0 and 100000, got %d", c.MaxRatePerIP)
+	}
+	for _, b := range c.BlockedIPs {
+		if _, err := CheckBlockedIPOrCIDR(b); err != nil {
+			return fmt.Errorf("blocked_ips: %w", err)
+		}
 	}
 
 	switch c.Role {

@@ -1492,6 +1492,28 @@
           </div>
           <p id="tn-capacity-hint" class="muted small hint-box capacity-rec-note"></p>
         </div>
+
+        <div class="sub-panel guard-numbers-box">
+          <div class="guard-box-head">
+            <div>
+              <span class="capacity-subhead">Per-IP Connection &amp; Port-Scan Guard <span class="muted">(Optional · Protects against abusive users &amp; floods)</span></span>
+              <p class="muted small">Caps how many simultaneous streams and new connections/sec a single client IP may open on the Relay. Leave <code>0</code> for unlimited.</p>
+            </div>
+            <button type="button" id="tn-guard-rec-btn">Use Recommended (128 max · 30/s)</button>
+          </div>
+          <div class="row2">
+            <div>
+              <label for="tn-max-per-ip">Max Concurrent Sessions per Client IP</label>
+              <span class="field-hint">0 = unlimited · 128 allows ~3–4 devices on 1 home Wi-Fi while blocking abuse</span>
+              <input id="tn-max-per-ip" type="number" min="0" max="100000" value="0" inputmode="numeric">
+            </div>
+            <div>
+              <label for="tn-rate-per-ip">Max New Connections/sec per Client IP</label>
+              <span class="field-hint">0 = unlimited · 30/s stops port scanners &amp; reconnect loops instantly</span>
+              <input id="tn-rate-per-ip" type="number" min="0" max="100000" value="0" inputmode="numeric">
+            </div>
+          </div>
+        </div>
       </fieldset>
 
       <!-- STEP 6: Visitor Addresses & Advanced -->
@@ -1826,6 +1848,32 @@
           </div>
           <p id="et-capacity-hint" class="muted small hint-box capacity-rec-note"></p>
         </div>
+
+        <div id="et-guard-wrap" class="sub-panel guard-numbers-box">
+          <div class="guard-box-head">
+            <div>
+              <span class="capacity-subhead">Per-IP Connection &amp; Abuse Guard</span>
+              <p class="muted small">Protect this tunnel from single-IP floods, credential sharing, and port scans. Set <code>0</code> for unlimited.</p>
+            </div>
+            <button type="button" id="et-guard-rec-btn">Use Recommended (128 max · 30/s)</button>
+          </div>
+          <div class="row2">
+            <div>
+              <label for="et-max-per-ip">Max Concurrent Sessions per Client IP</label>
+              <span class="field-hint">0 = unlimited · Recommended: 128</span>
+              <input id="et-max-per-ip" type="number" min="0" max="100000" value="0" inputmode="numeric">
+            </div>
+            <div>
+              <label for="et-rate-per-ip">Max New Connections/sec per Client IP</label>
+              <span class="field-hint">0 = unlimited · Recommended: 30/s</span>
+              <input id="et-rate-per-ip" type="number" min="0" max="100000" value="0" inputmode="numeric">
+            </div>
+          </div>
+          <div class="field-block">
+            <label for="et-blocked-ips">Blocked Client IPs / Subnets <span class="muted">(comma-separated IPv4/IPv6 or CIDR, e.g. 198.51.100.7, 203.0.113.0/24)</span></label>
+            <input id="et-blocked-ips" placeholder="None blocked" autocapitalize="none" spellcheck="false">
+          </div>
+        </div>
       </fieldset>
 
       <fieldset id="et-proxy-section" class="step-section">
@@ -1973,6 +2021,36 @@
     <div class="dialog-body">
       <div id="diag-checks" class="diag-grid"></div>
 
+      <section id="diag-guard-box" class="step-section speedtest-box" hidden>
+        <div class="speedtest-head">
+          <div>
+            <h3>Per-IP Abuse Guard &amp; Live Client Inspector</h3>
+            <p class="muted small">Inspect connected and rate-limited client IPs in real time, update per-IP limits live with <strong>zero tunnel downtime</strong>, or block abusive IPs in 1 click (immediately terminating their open sessions).</p>
+          </div>
+          <div class="actions">
+            <button type="button" id="diag-guard-rec-btn">Recommended (128 · 30/s)</button>
+            <button type="button" id="diag-clients-refresh-btn">Refresh Clients</button>
+          </div>
+        </div>
+        <div class="row2">
+          <div>
+            <label for="diag-max-per-ip">Max Sessions / Client IP <span class="muted">(0 = off)</span></label>
+            <input id="diag-max-per-ip" type="number" min="0" max="100000" value="0" inputmode="numeric">
+          </div>
+          <div>
+            <label for="diag-rate-per-ip">Max New Conns/sec / Client IP <span class="muted">(0 = off)</span></label>
+            <input id="diag-rate-per-ip" type="number" min="0" max="100000" value="0" inputmode="numeric">
+          </div>
+        </div>
+        <div class="cf-quick-row cfscan-input-row guard-save-row">
+          <input id="diag-blocked-ips" placeholder="Blocked IPs or subnets, comma-separated (e.g. 198.51.100.12, 203.0.113.0/24)" autocapitalize="none" spellcheck="false">
+          <button type="button" id="diag-guard-save-btn" class="primary">Save Guard Live</button>
+        </div>
+        <p id="diag-guard-msg" class="small" role="status"></p>
+        <div id="diag-clients-stats" class="guard-stats-strip"></div>
+        <div id="diag-clients-list" class="guard-clients-wrap"></div>
+      </section>
+
       <section id="diag-clean-box" class="step-section speedtest-box" hidden>
         <div class="speedtest-head">
           <div>
@@ -2029,16 +2107,36 @@
   </div>
 </dialog>
 
-<!-- Server Bridge Port Firewall Manager -->
-<dialog id="fw-dialog" aria-labelledby="fw-title">
+<!-- Server Bridge Port Firewall & Abuse Shield Manager -->
+<dialog id="fw-dialog" class="wide" aria-labelledby="fw-title">
   <div>
     <div class="dialog-header">
       <div>
-        <h2 id="fw-title">Bridge Port Firewall</h2>
-        <p id="fw-sub" class="muted small">PortBridge only ever locks the internal Tunnel Bridge Port between your servers. User listen ports, SSH, and panels are never blocked.</p>
+        <h2 id="fw-title">Firewall &amp; Outbound Abuse Shield</h2>
+        <p id="fw-sub" class="muted small">Protect strict Foreign VPS providers (Hetzner, OVH, Netcup) from automated netscan/torrent abuse notices, and lock internal Tunnel Bridge Ports to your peer server IPs.</p>
       </div>
     </div>
     <div class="dialog-body">
+      <section id="fw-abuse-box" class="step-section abuse-shield-box">
+        <div class="abuse-shield-head">
+          <div>
+            <div class="probe-title-row">
+              <strong>Outbound Abuse, Port-Scan &amp; Torrent Shield</strong>
+              <span id="fw-abuse-badge" class="pill-tag">OFF</span>
+            </div>
+            <p class="muted small">Blocks outbound traffic from tunneled users toward private/RFC1918/CGNAT ranges (<code>10.0.0.0/8</code>, <code>172.16.0.0/12</code>, <code>192.168.0.0/16</code>, <code>100.64.0.0/10</code>, <code>169.254.0.0/16</code> — Hetzner's #1 automated suspension trigger), SMTP spam ports (<code>25, 465, 587, 2525</code>), and SMB/NetBIOS/RPC/Telnet/MSSQL worm ports, while keeping cloud VPC gateways, metadata, and your PortBridge tunnels untouched.</p>
+          </div>
+          <button type="button" id="fw-abuse-toggle" class="primary">Enable Abuse Shield</button>
+        </div>
+        <label class="check-card abuse-torrent-card">
+          <input type="checkbox" id="fw-abuse-torrent" checked>
+          <span><strong>Also block BitTorrent / P2P traffic</strong> <span class="muted">— Drops BitTorrent ports (<code>6881–6889, 6969</code>) and kernel P2P/DHT/tracker packet signatures to prevent DMCA / copyright abuse tickets.</span></span>
+        </label>
+      </section>
+
+      <div class="capacity-label-row">
+        <span class="capacity-subhead">Tunnel Bridge Port Firewall Rules</span>
+      </div>
       <p id="fw-msg" class="good" hidden role="status"></p>
       <pre id="fw-status" class="log-view"></pre>
       <p id="fw-error" class="error" role="alert"></p>

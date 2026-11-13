@@ -98,6 +98,7 @@ type edge struct {
 	logSession  *throttled
 	logAuth     *throttled
 	logRelay    *throttled
+	logAbuse    *throttled
 
 	cancel       context.CancelFunc
 	teardownOnce sync.Once
@@ -119,6 +120,7 @@ func runEdge(ctx context.Context, cfg *Config, st *status) error {
 		logSession:  newThrottled(),
 		logAuth:     newThrottled(),
 		logRelay:    newThrottled(),
+		logAbuse:    newThrottled(),
 	}
 
 	// In reverse mode this side accepts, so it needs a certificate before the
@@ -422,19 +424,25 @@ func (e *edge) acceptUsers(ctx context.Context, ln net.Listener, st *status) {
 			continue
 		}
 
+		clientIP, ce, handle, reason, allowed := st.guard().acquire(c.RemoteAddr(), func() { _ = c.Close() })
+		if !allowed {
+			e.logAbuse.printf("refused user connection from %s (%s)", clientIP, reason)
+			_ = c.Close()
+			continue
+		}
+
 		select {
 		case e.active <- struct{}{}:
 			e.wg.Add(1)
 			atomic.AddInt64(&st.activeSessions, 1)
-			clientIP := st.addClient(c.RemoteAddr())
-			go func(user net.Conn, ip string) {
+			go func(user net.Conn, ip string, entry *clientEntry, h uint64) {
 				defer e.wg.Done()
 				defer func() {
-					st.removeClient(ip)
+					st.guard().release(ip, h)
 					atomic.AddInt64(&st.activeSessions, -1)
 					<-e.active
 				}()
-				if err := e.serve(ctx, user, targetPort); err != nil {
+				if err := e.serve(ctx, user, targetPort, entry); err != nil {
 					_ = user.Close()
 					if errors.Is(err, errUserWentAway) {
 						// Background noise on a public port. Counted, not logged.
@@ -444,8 +452,9 @@ func (e *edge) acceptUsers(ctx context.Context, ln net.Listener, st *status) {
 					atomic.AddInt64(&st.failedSessions, 1)
 					e.logSession.printf("could not put a user on the tunnel: %v", err)
 				}
-			}(c, clientIP)
+			}(c, clientIP, ce, handle)
 		default:
+			st.guard().release(clientIP, handle)
 			atomic.AddInt64(&st.droppedSessions, 1)
 			e.logCapacity.printf("at capacity (%d sessions); dropping a user", e.cfg.MaxConn)
 			_ = c.Close()
@@ -455,7 +464,7 @@ func (e *edge) acceptUsers(ctx context.Context, ln net.Listener, st *status) {
 
 // serve moves one user across the tunnel, quietly retrying on a fresh connection
 // if a spare turns out to be dead.
-func (e *edge) serve(ctx context.Context, user net.Conn, targetPort uint16) error {
+func (e *edge) serve(ctx context.Context, user net.Conn, targetPort uint16, ce *clientEntry) error {
 	// Capture the opening bytes so they can be replayed if the first attempt
 	// fails. Every protocol used here speaks first, so this returns at once.
 	//
@@ -546,10 +555,18 @@ func (e *edge) serve(ctx context.Context, user net.Conn, targetPort uint16) erro
 			continue
 		}
 		e.health.activationOK()
+		var ceUp, ceDown *int64
+		if ce != nil {
+			ceUp = &ce.bytesUp
+			ceDown = &ce.bytesDown
+		}
 		if len(head) > 0 {
 			atomic.AddInt64(&e.st.bytesUp, int64(len(head)))
+			if ceUp != nil {
+				atomic.AddInt64(ceUp, int64(len(head)))
+			}
 		}
-		if err := relayCounted(user, tunnel, &e.st.bytesUp, &e.st.bytesDown); err != nil {
+		if err := relayCountedDual(user, tunnel, &e.st.bytesUp, &e.st.bytesDown, ceUp, ceDown); err != nil {
 			// The user has already been served as far as it got, so this is a
 			// report rather than a failure: their download was cut short by the
 			// tunnel rather than by them.
@@ -785,6 +802,24 @@ func handleControlConn(c net.Conn, e *edge) {
 		if err := e.TeardownRemote(ctx); err != nil {
 			_, _ = fmt.Fprintf(c, "err: %v\n", err)
 			return
+		}
+		_, _ = fmt.Fprintln(c, "ok")
+	case "reload-guard":
+		if e.cfg == nil || e.cfg.Path == "" {
+			_, _ = fmt.Fprintln(c, "err: no config path")
+			return
+		}
+		fresh, err := LoadConfig(e.cfg.Path)
+		if err != nil {
+			_, _ = fmt.Fprintf(c, "err: %v\n", err)
+			return
+		}
+		if e.st != nil {
+			killed := e.st.guard().updateRules(fresh.MaxConnPerIP, fresh.MaxRatePerIP, fresh.BlockedIPs)
+			if killed > 0 {
+				log.Printf("reloaded client IP guard rules and terminated %d blocked session(s)", killed)
+			}
+			e.st.writeOnce()
 		}
 		_, _ = fmt.Fprintln(c, "ok")
 	case "speedtest":

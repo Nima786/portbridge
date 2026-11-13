@@ -56,6 +56,10 @@ func relay(local, tunnel net.Conn) error {
 // relayCounted moves bytes both ways like relay while atomically adding bytes
 // written from local->tunnel to localToTunnel and tunnel->local to tunnelToLocal.
 func relayCounted(local, tunnel net.Conn, localToTunnel, tunnelToLocal *int64) error {
+	return relayCountedDual(local, tunnel, localToTunnel, tunnelToLocal, nil, nil)
+}
+
+func relayCountedDual(local, tunnel net.Conn, up1, down1, up2, down2 *int64) error {
 	defer local.Close()
 	defer tunnel.Close()
 
@@ -69,10 +73,10 @@ func relayCounted(local, tunnel net.Conn, localToTunnel, tunnelToLocal *int64) e
 
 	var incomingErr error
 
-	pipe := func(dst, src net.Conn, counter *int64, watch bool) {
+	pipe := func(dst, src net.Conn, c1, c2 *int64, watch bool) {
 		defer wg.Done()
 
-		_, err := copyStreamCounted(dst, src, counter)
+		_, err := copyStreamCountedDual(dst, src, c1, c2)
 		if watch && worthReporting(err) {
 			// Written by this goroutine only, and read after both have
 			// finished, so no lock is needed.
@@ -91,8 +95,8 @@ func relayCounted(local, tunnel net.Conn, localToTunnel, tunnelToLocal *int64) e
 		}
 	}
 
-	go pipe(tunnel, local, localToTunnel, false)
-	go pipe(local, tunnel, tunnelToLocal, true)
+	go pipe(tunnel, local, up1, up2, false)
+	go pipe(local, tunnel, down1, down2, true)
 	wg.Wait()
 
 	return incomingErr
@@ -118,8 +122,12 @@ func copyStream(dst, src net.Conn) (int64, error) {
 const kernelSpliceStep = 256 * 1024
 
 func copyStreamCounted(dst, src net.Conn, counter *int64) (int64, error) {
+	return copyStreamCountedDual(dst, src, counter, nil)
+}
+
+func copyStreamCountedDual(dst, src net.Conn, c1, c2 *int64) (int64, error) {
 	if kernelCanCopy(dst, src) {
-		if counter == nil {
+		if c1 == nil && c2 == nil {
 			return io.Copy(dst, src)
 		}
 		var total int64
@@ -127,7 +135,12 @@ func copyStreamCounted(dst, src net.Conn, counter *int64) (int64, error) {
 			n, err := io.CopyN(dst, src, kernelSpliceStep)
 			if n > 0 {
 				total += n
-				atomic.AddInt64(counter, n)
+				if c1 != nil {
+					atomic.AddInt64(c1, n)
+				}
+				if c2 != nil {
+					atomic.AddInt64(c2, n)
+				}
 			}
 			if err != nil {
 				if errors.Is(err, io.EOF) {
@@ -139,7 +152,7 @@ func copyStreamCounted(dst, src net.Conn, counter *int64) (int64, error) {
 	}
 	buf := bufPool.Get().(*[]byte)
 	defer bufPool.Put(buf)
-	return copyThroughCounted(dst, src, *buf, counter)
+	return copyThroughCountedDual(dst, src, *buf, c1, c2)
 }
 
 // kernelCanCopy reports whether io.Copy will hand this pair straight to the
@@ -163,6 +176,10 @@ func copyThrough(dst io.Writer, src io.Reader, buf []byte) (int64, error) {
 }
 
 func copyThroughCounted(dst io.Writer, src io.Reader, buf []byte, counter *int64) (int64, error) {
+	return copyThroughCountedDual(dst, src, buf, counter, nil)
+}
+
+func copyThroughCountedDual(dst io.Writer, src io.Reader, buf []byte, c1, c2 *int64) (int64, error) {
 	var written int64
 	for {
 		nr, rerr := src.Read(buf)
@@ -170,8 +187,11 @@ func copyThroughCounted(dst io.Writer, src io.Reader, buf []byte, counter *int64
 			nw, werr := dst.Write(buf[:nr])
 			if nw > 0 {
 				written += int64(nw)
-				if counter != nil {
-					atomic.AddInt64(counter, int64(nw))
+				if c1 != nil {
+					atomic.AddInt64(c1, int64(nw))
+				}
+				if c2 != nil {
+					atomic.AddInt64(c2, int64(nw))
 				}
 			}
 			if werr != nil {

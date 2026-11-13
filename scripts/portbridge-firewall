@@ -32,6 +32,8 @@
 set -uo pipefail
 
 CONF_DIR=${PORTBRIDGE_CONF_DIR:-/etc/portbridge/tunnels}
+ABUSE_CONF="$(dirname "$CONF_DIR")/abuse-shield.conf"
+ABUSE_TAG="portbridge-abuse:shield"
 
 # Every tunnel's unit runs this at start, and at boot they all start together.
 # Without -w, the second one to ask iptables for its lock fails at once instead
@@ -65,6 +67,10 @@ Usage:
   portbridge-firewall sit-addr <this-ip> <other-ip>
                                              the 6in4 link's name and the two private IPv6 addresses
   portbridge-firewall sit-test <tunnel-name> is the other end of the 6in4 link answering?
+  portbridge-firewall abuse-status           outbound netscan / spam / torrent shield status
+  portbridge-firewall abuse-on [torrent|notorrent]
+                                             enable outbound abuse & port-scan shield
+  portbridge-firewall abuse-off              disable outbound abuse & port-scan shield
 EOF
     exit 2
 }
@@ -1083,6 +1089,7 @@ cmd_apply() {
     link_apply "$name" || rc=1
     sit_apply "$name" || rc=1
     firewall_apply "$name"
+    abuse_restore_if_enabled
     # Starting a tunnel is a good moment to clear away what deleted ones left.
     cmd_sweep quiet
     return "$rc"
@@ -1174,6 +1181,276 @@ cmd_status() {
         fi
         printf '%-16s %-13s %s <-> %s  (%s)\n' "$name" "$SIT_IFACE" "$SIT_OWN" "$SIT_PEER" "$up"
     done
+
+    local ab_en="" ab_tor=""
+    if [ -f "$ABUSE_CONF" ]; then
+        ab_en=$(read_conf "$ABUSE_CONF" enabled)
+        ab_tor=$(read_conf "$ABUSE_CONF" block_torrent)
+    fi
+    if [ "$ab_en" = on ]; then
+        printf '\nOUTBOUND ABUSE SHIELD: active (RFC1918/CGNAT netscan + SMTP spam + SMB/worm scan blocked'
+        if [ "$ab_tor" != off ]; then
+            printf ', BitTorrent blocked)\n'
+        else
+            printf ')\n'
+        fi
+    fi
+}
+
+# ------------------------------------------- outbound abuse & netscan shield
+#
+# Prevents strict datacenter abuse tickets (e.g. Hetzner "Abuse: Netscan",
+# Spamhaus SMTP blocks, SMB/RPC worm scans, and optional BitTorrent notices)
+# when user traffic exits this server. Local interfaces, established replies,
+# attached cloud VPC routes, cloud metadata (169.254.169.254), and PortBridge
+# peers/links are always exempted first.
+
+abuse_purge() {
+    local tool chain ch rule
+    for tool in iptables ip6tables; do
+        have "$tool" || continue
+        ch="PORTBRIDGE_ABUSE"
+        [ "$tool" = ip6tables ] && ch="PORTBRIDGE_ABUSE6"
+        for chain in OUTPUT FORWARD; do
+            while read -r rule; do
+                case "$rule" in
+                    *"$ABUSE_TAG"* | *"-j $ch"*)
+                        delete_rule "$tool" "$rule"
+                        ;;
+                esac
+            done < <("$tool" -S "$chain" 2>/dev/null)
+        done
+        "$tool" -F "$ch" 2>/dev/null || true
+        "$tool" -X "$ch" 2>/dev/null || true
+    done
+    if have nft; then
+        nft flush chain inet portbridge pb_abuse_out 2>/dev/null || true
+        nft delete chain inet portbridge pb_abuse_out 2>/dev/null || true
+        nft flush chain inet portbridge pb_abuse_fwd 2>/dev/null || true
+        nft delete chain inet portbridge pb_abuse_fwd 2>/dev/null || true
+    fi
+}
+
+abuse_apply_rules() {
+    local block_torrent=${1:-on} ifc sub gw f p cidr kw
+
+    abuse_purge
+
+    if ! have iptables && ! have ip6tables; then
+        if have nft; then
+            nft add table inet portbridge 2>/dev/null || return 1
+            nft "add chain inet portbridge pb_abuse_out { type filter hook output priority -5; policy accept; }" 2>/dev/null || return 1
+            nft flush chain inet portbridge pb_abuse_out 2>/dev/null || return 1
+            nft add rule inet portbridge pb_abuse_out oifname '"lo"' return 2>/dev/null || true
+            nft add rule inet portbridge pb_abuse_out ct state established,related return 2>/dev/null || true
+            nft add rule inet portbridge pb_abuse_out ip daddr 169.254.169.254 return 2>/dev/null || true
+            for cidr in 10.0.0.0/8 100.64.0.0/10 169.254.0.0/16 172.16.0.0/12 192.168.0.0/16 198.18.0.0/15; do
+                nft add rule inet portbridge pb_abuse_out ip daddr "$cidr" drop 2>/dev/null || true
+            done
+            nft add rule inet portbridge pb_abuse_out tcp dport '{ 23, 25, 135, 137-139, 445, 465, 587, 1433, 2525 }' drop 2>/dev/null || true
+            nft add rule inet portbridge pb_abuse_out udp dport '{ 23, 135, 137-139, 445, 1433 }' drop 2>/dev/null || true
+            if [ "$block_torrent" = on ]; then
+                nft add rule inet portbridge pb_abuse_out tcp dport '{ 6881-6889, 6969 }' drop 2>/dev/null || true
+                nft add rule inet portbridge pb_abuse_out udp dport '{ 6881-6889, 6969 }' drop 2>/dev/null || true
+            fi
+            return 0
+        fi
+        echo "portbridge-firewall: neither iptables nor nft is installed" >&2
+        return 1
+    fi
+
+    if have iptables; then
+        iptables -N PORTBRIDGE_ABUSE 2>/dev/null || iptables -F PORTBRIDGE_ABUSE
+        iptables -A PORTBRIDGE_ABUSE -o lo -j RETURN
+        for ifc in pbg+ pbs+ docker+ br-+ wg+ tun+ tap+ veth+; do
+            iptables -A PORTBRIDGE_ABUSE -o "$ifc" -j RETURN 2>/dev/null || true
+        done
+        iptables -A PORTBRIDGE_ABUSE -m conntrack --ctstate ESTABLISHED,RELATED -j RETURN 2>/dev/null ||
+            iptables -A PORTBRIDGE_ABUSE -m state --state ESTABLISHED,RELATED -j RETURN 2>/dev/null || true
+        iptables -A PORTBRIDGE_ABUSE -p udp --dport 67:68 -j RETURN 2>/dev/null || true
+        iptables -A PORTBRIDGE_ABUSE -d 169.254.169.254/32 -j RETURN
+
+        if have ip; then
+            while read -r sub; do
+                case "$sub" in
+                    [0-9]*.[0-9]*.[0-9]*.[0-9]*)
+                        iptables -A PORTBRIDGE_ABUSE -d "$sub" -j RETURN 2>/dev/null || true
+                        ;;
+                esac
+            done < <(ip -4 route show scope link 2>/dev/null | awk '{print $1}')
+
+            while read -r gw; do
+                if valid_ipv4 "$gw"; then
+                    iptables -A PORTBRIDGE_ABUSE -d "$gw" -j RETURN 2>/dev/null || true
+                fi
+            done < <(ip -4 route show default 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="via") print $(i+1)}')
+        fi
+
+        if [ -d "$CONF_DIR" ]; then
+            for f in "$CONF_DIR"/*.conf; do
+                [ -e "$f" ] || continue
+                p=$(read_conf "$f" peer_ip)
+                if [ -n "$p" ] && valid_ipv4 "$p"; then
+                    iptables -A PORTBRIDGE_ABUSE -d "$p" -j RETURN 2>/dev/null || true
+                fi
+            done
+        fi
+
+        for cidr in \
+            0.0.0.0/8 \
+            10.0.0.0/8 \
+            100.64.0.0/10 \
+            169.254.0.0/16 \
+            172.16.0.0/12 \
+            192.0.0.0/24 \
+            192.0.2.0/24 \
+            192.168.0.0/16 \
+            198.18.0.0/15 \
+            198.51.100.0/24 \
+            203.0.113.0/24 \
+            224.0.0.0/4 \
+            240.0.0.0/4; do
+            iptables -A PORTBRIDGE_ABUSE -d "$cidr" -j DROP
+        done
+
+        for p in 25 465 587 2525; do
+            iptables -A PORTBRIDGE_ABUSE -p tcp --dport "$p" -j DROP
+        done
+        for p in 23 135 137:139 445 1433; do
+            iptables -A PORTBRIDGE_ABUSE -p tcp --dport "$p" -j DROP
+            iptables -A PORTBRIDGE_ABUSE -p udp --dport "$p" -j DROP
+        done
+
+        if [ "$block_torrent" = on ]; then
+            for p in 6881:6889 6969; do
+                iptables -A PORTBRIDGE_ABUSE -p tcp --dport "$p" -j DROP
+                iptables -A PORTBRIDGE_ABUSE -p udp --dport "$p" -j DROP
+            done
+            for kw in "BitTorrent" "BitTorrent protocol" "peer_id=" ".torrent" "announce.php?passkey=" "info_hash" "get_peers" "announce_peer" "find_node"; do
+                iptables -A PORTBRIDGE_ABUSE -m string --algo bm --string "$kw" -j DROP 2>/dev/null || true
+            done
+        fi
+
+        iptables -I OUTPUT 1 -m comment --comment "$ABUSE_TAG" -j PORTBRIDGE_ABUSE 2>/dev/null ||
+            iptables -I OUTPUT 1 -j PORTBRIDGE_ABUSE
+        iptables -I FORWARD 1 -m comment --comment "$ABUSE_TAG" -j PORTBRIDGE_ABUSE 2>/dev/null ||
+            iptables -I FORWARD 1 -j PORTBRIDGE_ABUSE 2>/dev/null || true
+    fi
+
+    if have ip6tables; then
+        ip6tables -N PORTBRIDGE_ABUSE6 2>/dev/null || ip6tables -F PORTBRIDGE_ABUSE6
+        ip6tables -A PORTBRIDGE_ABUSE6 -o lo -j RETURN
+        for ifc in pbs+ docker+ br-+ wg+ tun+ tap+ veth+; do
+            ip6tables -A PORTBRIDGE_ABUSE6 -o "$ifc" -j RETURN 2>/dev/null || true
+        done
+        ip6tables -A PORTBRIDGE_ABUSE6 -p ipv6-icmp -j RETURN 2>/dev/null || true
+        ip6tables -A PORTBRIDGE_ABUSE6 -m conntrack --ctstate ESTABLISHED,RELATED -j RETURN 2>/dev/null ||
+            ip6tables -A PORTBRIDGE_ABUSE6 -m state --state ESTABLISHED,RELATED -j RETURN 2>/dev/null || true
+
+        if [ -d "$CONF_DIR" ]; then
+            for f in "$CONF_DIR"/*.conf; do
+                [ -e "$f" ] || continue
+                p=$(read_conf "$f" peer_ip)
+                case "$p" in
+                    *:*) ip6tables -A PORTBRIDGE_ABUSE6 -d "$p" -j RETURN 2>/dev/null || true ;;
+                esac
+            done
+        fi
+
+        for cidr in fc00::/7 2001:db8::/32; do
+            ip6tables -A PORTBRIDGE_ABUSE6 -d "$cidr" -j DROP 2>/dev/null || true
+        done
+        for p in 25 465 587 2525; do
+            ip6tables -A PORTBRIDGE_ABUSE6 -p tcp --dport "$p" -j DROP 2>/dev/null || true
+        done
+        for p in 23 135 137:139 445 1433; do
+            ip6tables -A PORTBRIDGE_ABUSE6 -p tcp --dport "$p" -j DROP 2>/dev/null || true
+            ip6tables -A PORTBRIDGE_ABUSE6 -p udp --dport "$p" -j DROP 2>/dev/null || true
+        done
+        if [ "$block_torrent" = on ]; then
+            for p in 6881:6889 6969; do
+                ip6tables -A PORTBRIDGE_ABUSE6 -p tcp --dport "$p" -j DROP 2>/dev/null || true
+                ip6tables -A PORTBRIDGE_ABUSE6 -p udp --dport "$p" -j DROP 2>/dev/null || true
+            done
+            for kw in "BitTorrent" "BitTorrent protocol" "peer_id=" ".torrent" "announce.php?passkey=" "info_hash" "get_peers" "announce_peer" "find_node"; do
+                ip6tables -A PORTBRIDGE_ABUSE6 -m string --algo bm --string "$kw" -j DROP 2>/dev/null || true
+            done
+        fi
+
+        ip6tables -I OUTPUT 1 -m comment --comment "$ABUSE_TAG" -j PORTBRIDGE_ABUSE6 2>/dev/null ||
+            ip6tables -I OUTPUT 1 -j PORTBRIDGE_ABUSE6 2>/dev/null || true
+        ip6tables -I FORWARD 1 -m comment --comment "$ABUSE_TAG" -j PORTBRIDGE_ABUSE6 2>/dev/null ||
+            ip6tables -I FORWARD 1 -j PORTBRIDGE_ABUSE6 2>/dev/null || true
+    fi
+    return 0
+}
+
+abuse_restore_if_enabled() {
+    local en="" tor="on"
+    [ -f "$ABUSE_CONF" ] || return 0
+    en=$(read_conf "$ABUSE_CONF" enabled)
+    [ "$en" = on ] || return 0
+    if have iptables && iptables -S OUTPUT 2>/dev/null | grep -q 'PORTBRIDGE_ABUSE'; then
+        return 0
+    fi
+    tor=$(read_conf "$ABUSE_CONF" block_torrent)
+    [ "$tor" = off ] || tor=on
+    abuse_apply_rules "$tor" >/dev/null 2>&1 || true
+}
+
+cmd_abuse_on() {
+    local mode=${1:-torrent} tor="on" conf_parent
+    case "$mode" in
+        torrent | on | "") tor=on ;;
+        notorrent | off) tor=off ;;
+        *) usage ;;
+    esac
+    conf_parent=$(dirname "$ABUSE_CONF")
+    mkdir -p "$conf_parent"
+    abuse_apply_rules "$tor" || exit 1
+    cat >"$ABUSE_CONF" <<EOF
+# PortBridge Outbound Abuse & Port-Scan Shield
+enabled = on
+block_torrent = $tor
+EOF
+    if [ "$tor" = on ]; then
+        echo "outbound abuse shield enabled (RFC1918/CGNAT netscan, SMTP spam, SMB/worm scan, and BitTorrent blocked)"
+    else
+        echo "outbound abuse shield enabled (RFC1918/CGNAT netscan, SMTP spam, and SMB/worm scan blocked)"
+    fi
+}
+
+cmd_abuse_off() {
+    local conf_parent
+    abuse_purge
+    if [ -f "$ABUSE_CONF" ]; then
+        conf_parent=$(dirname "$ABUSE_CONF")
+        mkdir -p "$conf_parent"
+        cat >"$ABUSE_CONF" <<EOF
+# PortBridge Outbound Abuse & Port-Scan Shield
+enabled = off
+block_torrent = off
+EOF
+    fi
+    echo "outbound abuse shield disabled"
+}
+
+cmd_abuse_status() {
+    local en="off" tor="on" live="no"
+    if [ -f "$ABUSE_CONF" ]; then
+        en=$(read_conf "$ABUSE_CONF" enabled)
+        tor=$(read_conf "$ABUSE_CONF" block_torrent)
+    fi
+    if have iptables && iptables -S OUTPUT 2>/dev/null | grep -q 'PORTBRIDGE_ABUSE'; then
+        live=yes
+    elif have nft && nft list chain inet portbridge pb_abuse_out >/dev/null 2>&1; then
+        live=yes
+    fi
+    if [ "$en" = on ] || [ "$live" = yes ]; then
+        echo "active (block_torrent=${tor:-on}, kernel_rules=$live)"
+    else
+        echo "off"
+    fi
 }
 
 cmd_show() {
@@ -1209,5 +1486,9 @@ case "${1-}:$#" in
     sit-check:1) cmd_sit_check ;;
     sit-addr:3) cmd_sit_addr "$2" "$3" ;;
     sit-test:2) cmd_sit_test "$2" ;;
+    abuse-status:1) cmd_abuse_status ;;
+    abuse-on:1) cmd_abuse_on "torrent" ;;
+    abuse-on:2) cmd_abuse_on "$2" ;;
+    abuse-off:1) cmd_abuse_off ;;
     *) usage ;;
 esac

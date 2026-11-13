@@ -26,24 +26,26 @@ import (
 
 // TunnelLive is the live part of a running tunnel's status file.
 type TunnelLive struct {
-	PID            int    `json:"pid,omitempty"`
-	StartedAt      string `json:"started_at,omitempty"`
-	UptimeSeconds  int64  `json:"uptime_seconds"`
-	ActiveSessions int64  `json:"active_sessions"`
-	ActiveUsers    int    `json:"active_users"`
-	ParkedSpares   int64  `json:"parked_spares"`
-	PoolTarget     int    `json:"pool_target"`
-	Links          int    `json:"links"`
-	LinkTarget     int    `json:"link_target"`
-	BytesUp        int64  `json:"bytes_up"`
-	BytesDown      int64  `json:"bytes_down"`
-	UpBps          int64  `json:"up_bps"`
-	DownBps        int64  `json:"down_bps"`
-	PathState      string `json:"path_state"`
-	PathNote       string `json:"path_note"`
-	RouteInUse     string `json:"route_in_use"`
-	OnBackupRoute  bool   `json:"on_backup_route"`
-	UpdatedAt      string `json:"updated_at"`
+	PID            int                     `json:"pid,omitempty"`
+	StartedAt      string                  `json:"started_at,omitempty"`
+	UptimeSeconds  int64                   `json:"uptime_seconds"`
+	ActiveSessions int64                   `json:"active_sessions"`
+	ActiveUsers    int                     `json:"active_users"`
+	ParkedSpares   int64                   `json:"parked_spares"`
+	PoolTarget     int                     `json:"pool_target"`
+	Links          int                     `json:"links"`
+	LinkTarget     int                     `json:"link_target"`
+	BytesUp        int64                   `json:"bytes_up"`
+	BytesDown      int64                   `json:"bytes_down"`
+	UpBps          int64                   `json:"up_bps"`
+	DownBps        int64                   `json:"down_bps"`
+	PathState      string                  `json:"path_state"`
+	PathNote       string                  `json:"path_note"`
+	RouteInUse     string                  `json:"route_in_use"`
+	OnBackupRoute  bool                    `json:"on_backup_route"`
+	AbuseDrops     int64                   `json:"abuse_drops,omitempty"`
+	TopClients     []engine.ClientSnapshot `json:"top_clients,omitempty"`
+	UpdatedAt      string                  `json:"updated_at"`
 }
 
 // TunnelInfo is one half of a tunnel, as this server has it.
@@ -62,6 +64,9 @@ type TunnelInfo struct {
 	MuxLinks              int         `json:"mux_links,omitempty"`
 	PoolSize              int         `json:"pool_size,omitempty"`
 	MaxConn               int         `json:"max_conn,omitempty"`
+	MaxConnPerIP          int         `json:"max_per_ip,omitempty"`
+	MaxRatePerIP          int         `json:"rate_per_ip,omitempty"`
+	BlockedIPs            []string    `json:"blocked_ips,omitempty"`
 	SpareTTL              string      `json:"spare_ttl,omitempty"`
 	Drain                 string      `json:"drain,omitempty"`
 	Firewall              bool        `json:"firewall"`
@@ -110,6 +115,8 @@ type Overview struct {
 	IPv6              []string     `json:"ipv6"`
 	BBRActive         bool         `json:"bbr_active"`
 	TunedByPB         bool         `json:"tuned_by_pb"`
+	AbuseShieldActive bool         `json:"abuse_shield_active,omitempty"`
+	AbuseBlockTorrent bool         `json:"abuse_block_torrent,omitempty"`
 	CongestionControl string       `json:"congestion_control,omitempty"`
 	CPUPercent        float64      `json:"cpu_percent"`
 	CPUCores          int          `json:"cpu_cores,omitempty"`
@@ -202,6 +209,11 @@ func tunnelInfo(path string, host agentHost) TunnelInfo {
 		ti.OutboundBypassDomains = cfg.OutboundBypassDomains
 	}
 	ti.MaxConn = cfg.MaxConn
+	ti.MaxConnPerIP = cfg.MaxConnPerIP
+	ti.MaxRatePerIP = cfg.MaxRatePerIP
+	if len(cfg.BlockedIPs) > 0 {
+		ti.BlockedIPs = append([]string(nil), cfg.BlockedIPs...)
+	}
 	if cfg.SpareTTL > 0 {
 		ti.SpareTTL = cfg.SpareTTL.String()
 	}
@@ -271,6 +283,7 @@ func LocalOverview(confDir string) Overview {
 	v4, v6 := localPublicAddresses()
 	host, _ := os.Hostname()
 	tune := readTuneStatus(confDir)
+	abuseActive, abuseTor := readAbuseShieldState(confDir)
 	ov := Overview{
 		OK:                true,
 		Version:           engine.Version,
@@ -280,6 +293,8 @@ func LocalOverview(confDir string) Overview {
 		IPv6:              v6,
 		BBRActive:         tune.BBRActive,
 		TunedByPB:         tune.TunedByPB,
+		AbuseShieldActive: abuseActive,
+		AbuseBlockTorrent: abuseActive && abuseTor,
 		CongestionControl: tune.CongestionControl,
 		Tunnels:           TunnelsReport(confDir),
 	}

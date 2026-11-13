@@ -869,6 +869,54 @@ func newAgentHandler(token, confDir string, allowUpdates func() bool) *http.Serv
 		writeJSONReply(w, http.StatusOK, rep)
 	})
 
+	// POST /api/tunnel/clients: live connected/rate-limited client IP telemetry and abuse guard settings.
+	mux.HandleFunc("/api/tunnel/clients", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, `{"error":"method not allowed"}`, http.StatusMethodNotAllowed)
+			return
+		}
+		if !checkAgentAuth(r, token) {
+			http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
+			return
+		}
+		var req struct {
+			Name string `json:"name"`
+		}
+		if err := json.NewDecoder(io.LimitReader(r.Body, 4096)).Decode(&req); err != nil || req.Name == "" {
+			writeJSONReply(w, http.StatusBadRequest, ClientInspectorReport{Error: "name required"})
+			return
+		}
+		rep, err := ReadClientInspector(confDir, req.Name)
+		if err != nil {
+			writeJSONReply(w, http.StatusUnprocessableEntity, ClientInspectorReport{Error: err.Error()})
+			return
+		}
+		writeJSONReply(w, http.StatusOK, rep)
+	})
+
+	// POST /api/tunnel/client-guard: update per-IP limits or block/unblock client IPs live.
+	mux.HandleFunc("/api/tunnel/client-guard", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, `{"error":"method not allowed"}`, http.StatusMethodNotAllowed)
+			return
+		}
+		if !checkAgentAuth(r, token) {
+			http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
+			return
+		}
+		var req ClientGuardUpdateRequest
+		if err := json.NewDecoder(io.LimitReader(r.Body, 32*1024)).Decode(&req); err != nil || req.Name == "" {
+			writeJSONReply(w, http.StatusBadRequest, ClientInspectorReport{Error: "name required"})
+			return
+		}
+		rep, err := UpdateClientGuard(confDir, req)
+		if err != nil {
+			writeJSONReply(w, http.StatusUnprocessableEntity, ClientInspectorReport{Error: err.Error()})
+			return
+		}
+		writeJSONReply(w, http.StatusOK, rep)
+	})
+
 	// POST /api/tunnel/speedtest: run in-tunnel latency & throughput test.
 	mux.HandleFunc("/api/tunnel/speedtest", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
@@ -969,13 +1017,14 @@ func newAgentHandler(token, confDir string, allowUpdates func() bool) *http.Serv
 			return
 		}
 		var req struct {
-			Action string `json:"action"` // "sweep", "on-all", "off-all"
+			Action       string `json:"action"` // "sweep", "on-all", "off-all", "abuse-on", "abuse-off"
+			BlockTorrent *bool  `json:"block_torrent,omitempty"`
 		}
 		if err := json.NewDecoder(io.LimitReader(r.Body, 4096)).Decode(&req); err != nil || req.Action == "" {
 			writeJSONReply(w, http.StatusBadRequest, map[string]any{"ok": false, "error": "action required"})
 			return
 		}
-		info, err := applyFirewallAction(confDir, req.Action)
+		info, err := applyFirewallAction(confDir, req.Action, req.BlockTorrent)
 		if err != nil {
 			writeJSONReply(w, http.StatusUnprocessableEntity, map[string]any{"ok": false, "error": err.Error()})
 			return

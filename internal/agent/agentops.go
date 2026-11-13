@@ -58,6 +58,9 @@ type agentHost interface {
 	// FirewallSweep removes what is left in the firewall by tunnels that no
 	// longer exist.
 	FirewallSweep() error
+	// AbuseShieldApply turns the server-wide outbound netscan / spam / torrent
+	// abuse shield on or off via portbridge-firewall.
+	AbuseShieldApply(enable, blockTorrent bool) error
 	Reload() error
 	// Enable turns the service on and starts it.
 	Enable(name string) error
@@ -98,6 +101,7 @@ func (noHost) PortFree(engine.Transport, int) error { return nil }
 func (noHost) FirewallApply(string) error           { return nil }
 func (noHost) FirewallRemove(string) error          { return nil }
 func (noHost) FirewallSweep() error                 { return nil }
+func (noHost) AbuseShieldApply(bool, bool) error    { return nil }
 func (noHost) Reload() error                        { return nil }
 func (noHost) Enable(string) error                  { return nil }
 func (noHost) Disable(string) error                 { return nil }
@@ -183,6 +187,29 @@ func (systemHost) FirewallSweep() error {
 	}
 	if out, err := hostRun(firewallHelper, "sweep", "quiet"); err != nil {
 		return fmt.Errorf("firewall sweep: %s: %w", out, err)
+	}
+	return nil
+}
+
+func (systemHost) AbuseShieldApply(enable, blockTorrent bool) error {
+	if err := needRoot(); err != nil {
+		return err
+	}
+	if _, err := os.Stat(firewallHelper); err != nil {
+		return errors.New("portbridge-firewall helper is not installed on this server")
+	}
+	if enable {
+		mode := "torrent"
+		if !blockTorrent {
+			mode = "notorrent"
+		}
+		if out, err := hostRun(firewallHelper, "abuse-on", mode); err != nil {
+			return fmt.Errorf("enabling outbound abuse shield: %s: %w", out, err)
+		}
+		return nil
+	}
+	if out, err := hostRun(firewallHelper, "abuse-off"); err != nil {
+		return fmt.Errorf("disabling outbound abuse shield: %s: %w", out, err)
 	}
 	return nil
 }

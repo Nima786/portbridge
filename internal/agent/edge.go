@@ -68,6 +68,9 @@ type EdgeSpec struct {
 	MuxLinks      int    `json:"mux_links,omitempty"`
 	Pool          int    `json:"pool,omitempty"`
 	MaxConn       int    `json:"max_conn,omitempty"`
+	MaxConnPerIP  int    `json:"max_per_ip,omitempty"`
+	MaxRatePerIP  int    `json:"rate_per_ip,omitempty"`
+	BlockedIPs    string `json:"blocked_ips,omitempty"`
 
 	PeerIP       string `json:"peer_ip"`        // the foreign server, as the link reaches it
 	LocalIP      string `json:"local_ip"`       // this server, as the link reaches it
@@ -425,6 +428,17 @@ func (s *EdgeSpec) check() error {
 	if s.MaxConn != 0 && (s.MaxConn < 1 || s.MaxConn > 100000) {
 		return errors.New("max_conn must be from 1 to 100000")
 	}
+	if s.MaxConnPerIP != 0 && (s.MaxConnPerIP < 1 || s.MaxConnPerIP > 100000) {
+		return errors.New("max_per_ip must be from 1 to 100000")
+	}
+	if s.MaxRatePerIP != 0 && (s.MaxRatePerIP < 1 || s.MaxRatePerIP > 100000) {
+		return errors.New("rate_per_ip must be from 1 to 100000")
+	}
+	if strings.TrimSpace(s.BlockedIPs) != "" {
+		if _, err := engine.ParseBlockedIPList(s.BlockedIPs); err != nil {
+			return fmt.Errorf("blocked_ips: %w", err)
+		}
+	}
 	switch s.ProxyProtocol {
 	case "", "off", "v1", "v2":
 	default:
@@ -716,6 +730,15 @@ func buildEdgeConf(s *EdgeSpec, l edgeLayout, confDir string, now time.Time) str
 	}
 	w("\npool_size = %d\n", s.Pool)
 	w("max_conn = %d\n", maxConn)
+	if s.MaxConnPerIP > 0 {
+		w("max_per_ip = %d\n", s.MaxConnPerIP)
+	}
+	if s.MaxRatePerIP > 0 {
+		w("rate_per_ip = %d\n", s.MaxRatePerIP)
+	}
+	if list, err := engine.ParseBlockedIPList(s.BlockedIPs); err == nil && len(list) > 0 {
+		w("blocked_ips = %s\n", strings.Join(list, ", "))
+	}
 	w("max_pending = 512\n")
 	w("spare_ttl = 10m\n")
 	w("park_timeout = 15m\n")
@@ -1247,22 +1270,26 @@ func tunnelService(confDir, name, action string) error {
 // "Edit a tunnel" options (ports, real user IP, pool/mux links, max_conn, firewall)
 // as well as full mode/transport hot-swaps for Auto-Heal and Smart Failover.
 type EditSpec struct {
-	Name          string `json:"name"`
-	UserPorts     string `json:"user_ports,omitempty"`
-	ServicePorts  string `json:"service_ports,omitempty"`
-	LinkPort      int    `json:"link_port,omitempty"`
-	ForwardProto  string `json:"forward_proto,omitempty"`  // "tcp", "udp" or "both"
-	ProxyProtocol string `json:"proxy_protocol,omitempty"` // "off", "v1" or "v2"
-	Pool          int    `json:"pool,omitempty"`
-	MuxLinks      int    `json:"mux_links,omitempty"`
-	MaxConn       int    `json:"max_conn,omitempty"`
-	SpareTTL      string `json:"spare_ttl,omitempty"`
-	Drain         string `json:"drain,omitempty"`
-	PeerIP        string `json:"peer_ip,omitempty"`
-	LocalIP       string `json:"local_ip,omitempty"`
-	Firewall      string `json:"firewall,omitempty"` // "on" or "off"
-	Stage         string `json:"stage,omitempty"`    // "", "prepare", "commit", "rollback"
-	OldConf       string `json:"old_conf,omitempty"`
+	Name             string `json:"name"`
+	UserPorts        string `json:"user_ports,omitempty"`
+	ServicePorts     string `json:"service_ports,omitempty"`
+	LinkPort         int    `json:"link_port,omitempty"`
+	ForwardProto     string `json:"forward_proto,omitempty"`  // "tcp", "udp" or "both"
+	ProxyProtocol    string `json:"proxy_protocol,omitempty"` // "off", "v1" or "v2"
+	Pool             int    `json:"pool,omitempty"`
+	MuxLinks         int    `json:"mux_links,omitempty"`
+	MaxConn          int    `json:"max_conn,omitempty"`
+	MaxConnPerIP     *int   `json:"max_per_ip,omitempty"`
+	MaxRatePerIP     *int   `json:"rate_per_ip,omitempty"`
+	BlockedIPs       string `json:"blocked_ips,omitempty"`
+	UpdateBlockedIPs bool   `json:"update_blocked_ips,omitempty"`
+	SpareTTL         string `json:"spare_ttl,omitempty"`
+	Drain            string `json:"drain,omitempty"`
+	PeerIP           string `json:"peer_ip,omitempty"`
+	LocalIP          string `json:"local_ip,omitempty"`
+	Firewall         string `json:"firewall,omitempty"` // "on" or "off"
+	Stage            string `json:"stage,omitempty"`    // "", "prepare", "commit", "rollback"
+	OldConf          string `json:"old_conf,omitempty"`
 
 	// Optional transport / mode replacement fields:
 	Mode       string `json:"mode,omitempty"`        // "direct" or "reverse"
@@ -1596,6 +1623,18 @@ func EditEdge(spec EditSpec, confDir string) (EdgeResult, error) {
 		if cleanIPs == "" && spec.KeepCleanIPs && (spec.CDN == "on" || spec.AltHost != "") {
 			cleanIPs = strings.ReplaceAll(kv["clean_ips"], " ", "")
 		}
+		maxPerIP := curCfg.MaxConnPerIP
+		if spec.MaxConnPerIP != nil {
+			maxPerIP = *spec.MaxConnPerIP
+		}
+		ratePerIP := curCfg.MaxRatePerIP
+		if spec.MaxRatePerIP != nil {
+			ratePerIP = *spec.MaxRatePerIP
+		}
+		blockedIPs := strings.Join(curCfg.BlockedIPs, ", ")
+		if spec.UpdateBlockedIPs {
+			blockedIPs = spec.BlockedIPs
+		}
 
 		es := EdgeSpec{
 			Name:                  spec.Name,
@@ -1630,6 +1669,9 @@ func EditEdge(spec EditSpec, confDir string) (EdgeResult, error) {
 			Mux:                   mux,
 			MuxLinks:              muxLinks,
 			Pool:                  pool,
+			MaxConnPerIP:          maxPerIP,
+			MaxRatePerIP:          ratePerIP,
+			BlockedIPs:            blockedIPs,
 			PeerIP:                peerIP,
 			LocalIP:               localIP,
 			IPv6:                  useV6,
@@ -1963,6 +2005,39 @@ func EditEdge(spec EditSpec, confDir string) (EdgeResult, error) {
 			return res, errors.New("max_conn must be from 1 to 100000")
 		}
 		text = setConfKey(text, "max_conn", strconv.Itoa(spec.MaxConn))
+	}
+	if spec.MaxConnPerIP != nil {
+		v := *spec.MaxConnPerIP
+		if v < 0 || v > 100000 {
+			return res, errors.New("max_per_ip must be 0 (off) or from 1 to 100000")
+		}
+		if v == 0 {
+			text = dropConfKey(text, "max_per_ip")
+		} else {
+			text = setConfKey(text, "max_per_ip", strconv.Itoa(v))
+		}
+	}
+	if spec.MaxRatePerIP != nil {
+		v := *spec.MaxRatePerIP
+		if v < 0 || v > 100000 {
+			return res, errors.New("rate_per_ip must be 0 (off) or from 1 to 100000")
+		}
+		if v == 0 {
+			text = dropConfKey(text, "rate_per_ip")
+		} else {
+			text = setConfKey(text, "rate_per_ip", strconv.Itoa(v))
+		}
+	}
+	if spec.UpdateBlockedIPs {
+		list, err := engine.ParseBlockedIPList(spec.BlockedIPs)
+		if err != nil {
+			return res, fmt.Errorf("blocked_ips: %w", err)
+		}
+		if len(list) == 0 {
+			text = dropConfKey(text, "blocked_ips")
+		} else {
+			text = setConfKey(text, "blocked_ips", strings.Join(list, ", "))
+		}
 	}
 	if ttl := strings.TrimSpace(spec.SpareTTL); ttl != "" && !muxNow {
 		if d, err := time.ParseDuration(ttl); err != nil || d < 5*time.Second || d > 24*time.Hour {
@@ -2311,6 +2386,32 @@ func CheckTunnel(confDir, name string) (TunnelCheckReport, error) {
 		}
 	}
 
+	if cfg.Role == engine.RoleEdge && (cfg.MaxConnPerIP > 0 || cfg.MaxRatePerIP > 0 || len(cfg.BlockedIPs) > 0) {
+		var parts []string
+		if cfg.MaxConnPerIP > 0 {
+			parts = append(parts, fmt.Sprintf("max %d sessions/IP", cfg.MaxConnPerIP))
+		}
+		if cfg.MaxRatePerIP > 0 {
+			parts = append(parts, fmt.Sprintf("max %d new conns/s/IP", cfg.MaxRatePerIP))
+		}
+		if len(cfg.BlockedIPs) > 0 {
+			parts = append(parts, fmt.Sprintf("%d blocked IP/subnet(s)", len(cfg.BlockedIPs)))
+		}
+		detail := strings.Join(parts, ", ")
+		if ti.Live != nil && ti.Live.AbuseDrops > 0 {
+			detail += fmt.Sprintf(" — %d connection(s) rejected", ti.Live.AbuseDrops)
+		}
+		add("Per-IP abuse guard", "ok", detail, "")
+	} else if cfg.Role == engine.RoleOrigin {
+		if active, blockTor := readAbuseShieldState(confDir); active {
+			mode := "RFC1918/CGNAT netscans + SMTP/SMB blocked"
+			if blockTor {
+				mode += " + BitTorrent/P2P blocked"
+			}
+			add("Outbound abuse shield", "ok", mode, "")
+		}
+	}
+
 	return rep, nil
 }
 
@@ -2487,12 +2588,49 @@ type FirewallTunnelRule struct {
 	CDNOrGRE bool   `json:"cdn_or_gre"`
 }
 
-// FirewallInfo describes the PortBridge bridge-port firewall rules on a server.
+// FirewallInfo describes the PortBridge bridge-port firewall rules and outbound
+// abuse shield state on a server.
 type FirewallInfo struct {
-	OK      bool                 `json:"ok"`
-	Status  string               `json:"status"`
-	Output  string               `json:"output,omitempty"`
-	Tunnels []FirewallTunnelRule `json:"tunnels"`
+	OK                bool                 `json:"ok"`
+	Status            string               `json:"status"`
+	Output            string               `json:"output,omitempty"`
+	AbuseShieldActive bool                 `json:"abuse_shield_active"`
+	AbuseBlockTorrent bool                 `json:"abuse_block_torrent"`
+	Tunnels           []FirewallTunnelRule `json:"tunnels"`
+}
+
+func abuseShieldConfPath(confDir string) string {
+	if confDir == "" {
+		confDir = defaultTunnelsDir
+	}
+	return filepath.Join(filepath.Dir(filepath.Clean(confDir)), "abuse-shield.conf")
+}
+
+func readAbuseShieldState(confDir string) (active bool, blockTorrent bool) {
+	b, err := os.ReadFile(abuseShieldConfPath(confDir))
+	if err != nil {
+		return false, true
+	}
+	blockTorrent = true
+	for _, line := range strings.Split(string(b), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		k, v, ok := strings.Cut(line, "=")
+		if !ok {
+			continue
+		}
+		k = strings.TrimSpace(k)
+		v = strings.Trim(strings.TrimSpace(v), `"'`)
+		switch k {
+		case "enabled", "ABUSE_SHIELD":
+			active = (v == "on")
+		case "block_torrent", "ABUSE_BLOCK_TORRENT":
+			blockTorrent = (v != "off")
+		}
+	}
+	return active, blockTorrent
 }
 
 func readFirewallStatus(confDir string) FirewallInfo {
@@ -2500,6 +2638,7 @@ func readFirewallStatus(confDir string) FirewallInfo {
 		confDir = defaultTunnelsDir
 	}
 	host := hostFor(confDir)
+	abuseActive, abuseTor := readAbuseShieldState(confDir)
 	var rules []FirewallTunnelRule
 	for _, ti := range TunnelsReport(confDir) {
 		cfg, err := engine.LoadConfig(filepath.Join(confDir, ti.Name+".conf"))
@@ -2533,10 +2672,10 @@ func readFirewallStatus(confDir string) FirewallInfo {
 		}
 	}
 	if statusText == "" {
+		var lines []string
 		if len(rules) == 0 {
-			statusText = "No tunnels on this server."
+			lines = append(lines, "No tunnels on this server.")
 		} else {
-			var lines []string
 			for _, r := range rules {
 				switch {
 				case r.DialsOut:
@@ -2549,17 +2688,28 @@ func readFirewallStatus(confDir string) FirewallInfo {
 					lines = append(lines, fmt.Sprintf("%s: bridge port %d open to any IP (firewall off)", r.Name, r.LinkPort))
 				}
 			}
-			statusText = strings.Join(lines, "\n")
 		}
+		if abuseActive {
+			if abuseTor {
+				lines = append(lines, "Outbound Abuse Shield: ACTIVE (RFC1918/CGNAT netscans, SMTP spam, SMB/RPC, BitTorrent/P2P blocked)")
+			} else {
+				lines = append(lines, "Outbound Abuse Shield: ACTIVE (RFC1918/CGNAT netscans, SMTP spam, SMB/RPC blocked)")
+			}
+		} else {
+			lines = append(lines, "Outbound Abuse Shield: OFF")
+		}
+		statusText = strings.Join(lines, "\n")
 	}
 	return FirewallInfo{
-		OK:      true,
-		Status:  statusText,
-		Tunnels: rules,
+		OK:                true,
+		Status:            statusText,
+		AbuseShieldActive: abuseActive,
+		AbuseBlockTorrent: abuseTor,
+		Tunnels:           rules,
 	}
 }
 
-func applyFirewallAction(confDir, action string) (FirewallInfo, error) {
+func applyFirewallAction(confDir, action string, blockTorrent *bool) (FirewallInfo, error) {
 	if confDir == "" {
 		confDir = defaultTunnelsDir
 	}
@@ -2569,6 +2719,32 @@ func applyFirewallAction(confDir, action string) (FirewallInfo, error) {
 
 	var outMsg string
 	switch action {
+	case "abuse-on":
+		tor := true
+		if blockTorrent != nil {
+			tor = *blockTorrent
+		}
+		if err := host.AbuseShieldApply(true, tor); err != nil {
+			return FirewallInfo{}, err
+		}
+		torVal := "on"
+		if !tor {
+			torVal = "off"
+		}
+		confPath := abuseShieldConfPath(confDir)
+		_ = os.MkdirAll(filepath.Dir(confPath), 0o700)
+		_ = writeFileAtomic(confPath, []byte(fmt.Sprintf("# PortBridge Outbound Abuse & Port-Scan Shield\nenabled = on\nblock_torrent = %s\n", torVal)), 0o600)
+		if tor {
+			outMsg = "Outbound Abuse, Netscan & Torrent Shield enabled (RFC1918/CGNAT scans, SMTP spam, SMB/RPC worm ports, and BitTorrent/P2P blocked)."
+		} else {
+			outMsg = "Outbound Abuse & Netscan Shield enabled (RFC1918/CGNAT scans, SMTP spam, and SMB/RPC worm ports blocked; BitTorrent allowed)."
+		}
+	case "abuse-off":
+		if err := host.AbuseShieldApply(false, false); err != nil {
+			return FirewallInfo{}, err
+		}
+		_ = os.Remove(abuseShieldConfPath(confDir))
+		outMsg = "Outbound Abuse Shield disabled."
 	case "sweep":
 		if err := host.FirewallSweep(); err != nil {
 			return FirewallInfo{}, err
@@ -2967,4 +3143,228 @@ func TestOutboundProxy(confDir, name, customHost string) (OutboundTestResult, er
 
 	res.OK = true
 	return res, nil
+}
+
+// ClientInspectorReport returns the per-IP abuse guard configuration and live
+// connected/rejected client IP telemetry for an Edge tunnel.
+type ClientInspectorReport struct {
+	OK           bool                    `json:"ok"`
+	Name         string                  `json:"name"`
+	Running      bool                    `json:"running"`
+	MaxConnPerIP int                     `json:"max_per_ip"`
+	MaxRatePerIP int                     `json:"rate_per_ip"`
+	BlockedIPs   []string                `json:"blocked_ips"`
+	ActiveUsers  int                     `json:"active_users"`
+	AbuseDrops   int64                   `json:"abuse_drops"`
+	TopClients   []engine.ClientSnapshot `json:"top_clients"`
+	ReloadedLive bool                    `json:"reloaded_live,omitempty"`
+	Message      string                  `json:"message,omitempty"`
+	Error        string                  `json:"error,omitempty"`
+}
+
+// ClientGuardUpdateRequest updates per-IP limits and/or blocks or unblocks client IPs
+// on an Edge tunnel with zero-downtime live hot-reload over the control socket.
+type ClientGuardUpdateRequest struct {
+	Name         string  `json:"name"`
+	MaxConnPerIP *int    `json:"max_per_ip,omitempty"`
+	MaxRatePerIP *int    `json:"rate_per_ip,omitempty"`
+	BlockedIPs   *string `json:"blocked_ips,omitempty"`
+	BlockIP      string  `json:"block_ip,omitempty"`
+	UnblockIP    string  `json:"unblock_ip,omitempty"`
+}
+
+// ReadClientInspector returns live per-client-IP connection telemetry and abuse guard settings.
+func ReadClientInspector(confDir, name string) (ClientInspectorReport, error) {
+	if confDir == "" {
+		confDir = defaultTunnelsDir
+	}
+	if err := validTunnelName(name); err != nil {
+		return ClientInspectorReport{}, err
+	}
+	confPath := filepath.Join(confDir, name+".conf")
+	cfg, err := engine.LoadConfig(confPath)
+	if err != nil {
+		return ClientInspectorReport{}, fmt.Errorf("there is no tunnel %q on this server", name)
+	}
+	if cfg.Role != engine.RoleEdge {
+		return ClientInspectorReport{}, fmt.Errorf("tunnel %q is not a Relay (edge) tunnel", name)
+	}
+	ti := tunnelInfo(confPath, hostFor(confDir))
+	blocked := append([]string{}, cfg.BlockedIPs...)
+	if blocked == nil {
+		blocked = []string{}
+	}
+	top := []engine.ClientSnapshot{}
+	activeUsers := 0
+	var abuseDrops int64
+	if ti.Live != nil {
+		activeUsers = ti.Live.ActiveUsers
+		abuseDrops = ti.Live.AbuseDrops
+		if len(ti.Live.TopClients) > 0 {
+			top = append([]engine.ClientSnapshot{}, ti.Live.TopClients...)
+		}
+	}
+	return ClientInspectorReport{
+		OK:           true,
+		Name:         name,
+		Running:      ti.Running,
+		MaxConnPerIP: cfg.MaxConnPerIP,
+		MaxRatePerIP: cfg.MaxRatePerIP,
+		BlockedIPs:   blocked,
+		ActiveUsers:  activeUsers,
+		AbuseDrops:   abuseDrops,
+		TopClients:   top,
+	}, nil
+}
+
+// UpdateClientGuard writes updated per-IP guard rules to disk and hot-reloads the
+// running Edge process via its Unix control socket without restarting the tunnel.
+func UpdateClientGuard(confDir string, req ClientGuardUpdateRequest) (ClientInspectorReport, error) {
+	if confDir == "" {
+		confDir = defaultTunnelsDir
+	}
+	if err := validTunnelName(req.Name); err != nil {
+		return ClientInspectorReport{}, err
+	}
+
+	agentOpMu.Lock()
+	confFile := filepath.Join(confDir, req.Name+".conf")
+	oldBytes, err := os.ReadFile(confFile)
+	if err != nil {
+		agentOpMu.Unlock()
+		return ClientInspectorReport{}, fmt.Errorf("there is no tunnel %q on this server", req.Name)
+	}
+	oldConf := string(oldBytes)
+	curCfg, err := engine.LoadConfig(confFile)
+	if err != nil {
+		agentOpMu.Unlock()
+		return ClientInspectorReport{}, err
+	}
+	if curCfg.Role != engine.RoleEdge {
+		agentOpMu.Unlock()
+		return ClientInspectorReport{}, fmt.Errorf("tunnel %q is not a Relay (edge) tunnel", req.Name)
+	}
+
+	text := oldConf
+	if req.MaxConnPerIP != nil {
+		v := *req.MaxConnPerIP
+		if v < 0 || v > 100000 {
+			agentOpMu.Unlock()
+			return ClientInspectorReport{}, errors.New("max_per_ip must be 0 (off) or from 1 to 100000")
+		}
+		if v == 0 {
+			text = dropConfKey(text, "max_per_ip")
+		} else {
+			text = setConfKey(text, "max_per_ip", strconv.Itoa(v))
+		}
+	}
+	if req.MaxRatePerIP != nil {
+		v := *req.MaxRatePerIP
+		if v < 0 || v > 100000 {
+			agentOpMu.Unlock()
+			return ClientInspectorReport{}, errors.New("rate_per_ip must be 0 (off) or from 1 to 100000")
+		}
+		if v == 0 {
+			text = dropConfKey(text, "rate_per_ip")
+		} else {
+			text = setConfKey(text, "rate_per_ip", strconv.Itoa(v))
+		}
+	}
+
+	blockedChanged := false
+	curList := append([]string(nil), curCfg.BlockedIPs...)
+	if req.BlockedIPs != nil {
+		parsed, err := engine.ParseBlockedIPList(*req.BlockedIPs)
+		if err != nil {
+			agentOpMu.Unlock()
+			return ClientInspectorReport{}, fmt.Errorf("blocked_ips: %w", err)
+		}
+		curList = parsed
+		blockedChanged = true
+	}
+	if bip := strings.TrimSpace(req.BlockIP); bip != "" {
+		norm, err := engine.CheckBlockedIPOrCIDR(bip)
+		if err != nil {
+			agentOpMu.Unlock()
+			return ClientInspectorReport{}, err
+		}
+		exists := false
+		for _, item := range curList {
+			if item == norm {
+				exists = true
+				break
+			}
+		}
+		if !exists {
+			curList = append(curList, norm)
+		}
+		blockedChanged = true
+	}
+	if uip := strings.TrimSpace(req.UnblockIP); uip != "" {
+		norm, err := engine.CheckBlockedIPOrCIDR(uip)
+		if err != nil {
+			norm = uip
+		}
+		filtered := curList[:0]
+		for _, item := range curList {
+			if item == norm || item == uip {
+				continue
+			}
+			// Also remove any CIDR in blocked_ips that covers this single IP if requested?
+			// Keep exact entry removal predictable unless exact match; if user clicked Unblock on a client IP
+			// that was blocked via a CIDR, also drop covering /32 or exact match.
+			filtered = append(filtered, item)
+		}
+		curList = filtered
+		blockedChanged = true
+	}
+	if blockedChanged {
+		if len(curList) == 0 {
+			text = dropConfKey(text, "blocked_ips")
+		} else {
+			text = setConfKey(text, "blocked_ips", strings.Join(curList, ", "))
+		}
+	}
+
+	if err := writeFileAtomic(confFile, []byte(text), 0o600); err != nil {
+		agentOpMu.Unlock()
+		return ClientInspectorReport{}, fmt.Errorf("writing settings: %w", err)
+	}
+	newCfg, err := engine.LoadConfig(confFile)
+	if err == nil {
+		err = newCfg.Validate()
+	}
+	if err != nil {
+		_ = writeFileAtomic(confFile, []byte(oldConf), 0o600)
+		agentOpMu.Unlock()
+		return ClientInspectorReport{}, err
+	}
+
+	host := hostFor(confDir)
+	reloadedLive := false
+	if err := engine.ReloadGuardControl(newCfg.ControlSocketPath()); err == nil {
+		reloadedLive = true
+	} else if _, isSys := host.(systemHost); isSys {
+		if active, _ := host.Active(req.Name); active {
+			_ = host.Restart(req.Name)
+		}
+	}
+	agentOpMu.Unlock()
+
+	rep, err := ReadClientInspector(confDir, req.Name)
+	if err != nil {
+		return rep, err
+	}
+	rep.ReloadedLive = reloadedLive
+	switch {
+	case strings.TrimSpace(req.BlockIP) != "":
+		rep.Message = fmt.Sprintf("Blocked %s and terminated any active sessions.", strings.TrimSpace(req.BlockIP))
+	case strings.TrimSpace(req.UnblockIP) != "":
+		rep.Message = fmt.Sprintf("Unblocked %s.", strings.TrimSpace(req.UnblockIP))
+	case reloadedLive:
+		rep.Message = "Per-IP abuse guard updated live without restarting the tunnel."
+	default:
+		rep.Message = "Per-IP abuse guard saved."
+	}
+	return rep, nil
 }

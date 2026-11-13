@@ -143,10 +143,13 @@ type createRequest struct {
 	SpoofIP      string `json:"spoof_ip"`
 	IPv6         bool   `json:"ipv6"`
 
-	Shared      bool `json:"shared"`
-	SharedLinks int  `json:"shared_links"`
-	Pool        int  `json:"pool"`
-	MaxConn     int  `json:"max_conn"`
+	Shared       bool   `json:"shared"`
+	SharedLinks  int    `json:"shared_links"`
+	Pool         int    `json:"pool"`
+	MaxConn      int    `json:"max_conn"`
+	MaxConnPerIP int    `json:"max_per_ip,omitempty"`
+	MaxRatePerIP int    `json:"rate_per_ip,omitempty"`
+	BlockedIPs   string `json:"blocked_ips,omitempty"`
 
 	ServicePorts string `json:"service_ports"`
 	UserPorts    string `json:"user_ports"`
@@ -233,6 +236,7 @@ func (p *Panel) toSpec(r createRequest) (agent.EdgeSpec, error) {
 		pool = 25
 	}
 	s := agent.EdgeSpec{Name: strings.TrimSpace(r.Name), Mode: r.Mode, Pool: pool, MaxConn: r.MaxConn,
+		MaxConnPerIP: r.MaxConnPerIP, MaxRatePerIP: r.MaxRatePerIP, BlockedIPs: strings.TrimSpace(r.BlockedIPs),
 		ServicePorts: r.ServicePorts, UserPorts: r.UserPorts, LinkPort: r.LinkPort,
 		ForwardProto: strings.TrimSpace(r.ForwardProto), ProxyProtocol: r.ProxyProtocol}
 	if r.WebsiteBridge {
@@ -712,6 +716,15 @@ func edgeSpecToEditSpec(s agent.EdgeSpec) agent.EditSpec {
 		pp = "off"
 	}
 	useV6 := s.IPv6
+	var maxPerIP, ratePerIP *int
+	if s.MaxConnPerIP > 0 {
+		v := s.MaxConnPerIP
+		maxPerIP = &v
+	}
+	if s.MaxRatePerIP > 0 {
+		v := s.MaxRatePerIP
+		ratePerIP = &v
+	}
 	return agent.EditSpec{
 		Name:                  s.Name,
 		UserPorts:             s.UserPorts,
@@ -722,6 +735,10 @@ func edgeSpecToEditSpec(s agent.EdgeSpec) agent.EditSpec {
 		Pool:                  s.Pool,
 		MuxLinks:              s.MuxLinks,
 		MaxConn:               s.MaxConn,
+		MaxConnPerIP:          maxPerIP,
+		MaxRatePerIP:          ratePerIP,
+		BlockedIPs:            s.BlockedIPs,
+		UpdateBlockedIPs:      strings.TrimSpace(s.BlockedIPs) != "",
 		PeerIP:                s.PeerIP,
 		LocalIP:               s.LocalIP,
 		IPv6:                  &useV6,
@@ -1150,6 +1167,10 @@ type editTunnelRequest struct {
 	Pool                  int    `json:"pool"`
 	MuxLinks              int    `json:"mux_links"`
 	MaxConn               int    `json:"max_conn"`
+	MaxConnPerIP          *int   `json:"max_per_ip,omitempty"`
+	MaxRatePerIP          *int   `json:"rate_per_ip,omitempty"`
+	BlockedIPs            string `json:"blocked_ips,omitempty"`
+	UpdateBlockedIPs      bool   `json:"update_blocked_ips,omitempty"`
 	SpareTTL              string `json:"spare_ttl"`
 	Drain                 string `json:"drain"`
 	PeerIP                string `json:"peer_ip"`
@@ -1195,6 +1216,10 @@ func (p *Panel) editTunnel(j *job, r editTunnelRequest) error {
 		Pool:                  r.Pool,
 		MuxLinks:              r.MuxLinks,
 		MaxConn:               r.MaxConn,
+		MaxConnPerIP:          r.MaxConnPerIP,
+		MaxRatePerIP:          r.MaxRatePerIP,
+		BlockedIPs:            strings.TrimSpace(r.BlockedIPs),
+		UpdateBlockedIPs:      r.UpdateBlockedIPs,
 		SpareTTL:              strings.TrimSpace(r.SpareTTL),
 		Drain:                 strings.TrimSpace(r.Drain),
 		PeerIP:                strings.TrimSpace(r.PeerIP),
@@ -1629,14 +1654,18 @@ func (p *Panel) getServerFirewall(parent context.Context, id string) (agent.Fire
 	return info, nil
 }
 
-func (p *Panel) setServerFirewall(parent context.Context, id, action string) (agent.FirewallInfo, error) {
+func (p *Panel) setServerFirewall(parent context.Context, id, action string, blockTorrent *bool) (agent.FirewallInfo, error) {
 	ctx, cancel := context.WithTimeout(parent, agentTimeout)
 	defer cancel()
+	payload := map[string]any{"action": action}
+	if blockTorrent != nil {
+		payload["block_torrent"] = *blockTorrent
+	}
 	var rep struct {
 		agent.FirewallInfo
 		Error string `json:"error"`
 	}
-	_, err := p.callJSON(ctx, id, "/api/firewall", map[string]string{"action": action}, &rep)
+	_, err := p.callJSON(ctx, id, "/api/firewall", payload, &rep)
 	if err != nil {
 		return agent.FirewallInfo{}, err
 	}
@@ -1644,6 +1673,40 @@ func (p *Panel) setServerFirewall(parent context.Context, id, action string) (ag
 		return agent.FirewallInfo{}, errors.New(rep.Error)
 	}
 	return rep.FirewallInfo, nil
+}
+
+func (p *Panel) tunnelClients(parent context.Context, edgeID, name string) (agent.ClientInspectorReport, error) {
+	ctx, cancel := context.WithTimeout(parent, agentTimeout)
+	defer cancel()
+	var rep agent.ClientInspectorReport
+	_, err := p.callJSON(ctx, edgeID, "/api/tunnel/clients", map[string]string{"name": name}, &rep)
+	if err != nil {
+		return agent.ClientInspectorReport{}, err
+	}
+	if !rep.OK {
+		if rep.Error != "" {
+			return agent.ClientInspectorReport{}, errors.New(rep.Error)
+		}
+		return agent.ClientInspectorReport{}, errors.New("could not read client inspector")
+	}
+	return rep, nil
+}
+
+func (p *Panel) updateTunnelClientGuard(parent context.Context, edgeID string, req agent.ClientGuardUpdateRequest) (agent.ClientInspectorReport, error) {
+	ctx, cancel := context.WithTimeout(parent, agentTimeout)
+	defer cancel()
+	var rep agent.ClientInspectorReport
+	_, err := p.callJSON(ctx, edgeID, "/api/tunnel/client-guard", req, &rep)
+	if err != nil {
+		return agent.ClientInspectorReport{}, err
+	}
+	if !rep.OK {
+		if rep.Error != "" {
+			return agent.ClientInspectorReport{}, errors.New(rep.Error)
+		}
+		return agent.ClientInspectorReport{}, errors.New("could not update client guard")
+	}
+	return rep, nil
 }
 
 func serverAddresses(v serverView) (v4, v6 string) {

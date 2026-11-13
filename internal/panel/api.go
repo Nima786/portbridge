@@ -80,6 +80,8 @@ func (p *Panel) routes() http.Handler {
 	mux.HandleFunc("POST /api/probe/spoof-test", p.withAuth(p.handleProbeSpoofTest))
 	mux.HandleFunc("POST /api/probe/cf-scan", p.withAuth(p.handleProbeCFScan))
 	mux.HandleFunc("POST /api/tunnels/clean-ips", p.withAuth(p.handleSetTunnelCleanIPs))
+	mux.HandleFunc("POST /api/tunnels/clients", p.withAuth(p.handleTunnelClients))
+	mux.HandleFunc("POST /api/tunnels/client-guard", p.withAuth(p.handleUpdateTunnelClientGuard))
 	mux.HandleFunc("POST /api/tunnels/autoheal", p.withAuth(p.handleSetTunnelAutoHeal))
 	mux.HandleFunc("POST /api/tunnels/autoheal/trigger", p.withAuth(p.handleTriggerTunnelAutoHeal))
 	mux.HandleFunc("POST /api/tunnels/traffic", p.withAuth(p.handleTunnelTraffic))
@@ -1119,18 +1121,19 @@ func (p *Panel) handleSetServerFirewall(w http.ResponseWriter, r *http.Request, 
 		return
 	}
 	var req struct {
-		Action string `json:"action"`
+		Action       string `json:"action"`
+		BlockTorrent *bool  `json:"block_torrent,omitempty"`
 	}
 	if !decodeJSON(w, r, &req) {
 		return
 	}
 	switch req.Action {
-	case "sweep", "on-all", "off-all":
+	case "sweep", "on-all", "off-all", "abuse-on", "abuse-off":
 	default:
-		writeErr(w, http.StatusBadRequest, "The firewall action must be sweep, on-all or off-all.")
+		writeErr(w, http.StatusBadRequest, "The firewall action must be sweep, on-all, off-all, abuse-on or abuse-off.")
 		return
 	}
-	info, err := p.setServerFirewall(r.Context(), id, req.Action)
+	info, err := p.setServerFirewall(r.Context(), id, req.Action, req.BlockTorrent)
 	if err != nil {
 		writeErr(w, http.StatusBadGateway, capitalise(plainAgentError(err))+".")
 		return
@@ -1150,6 +1153,69 @@ func (p *Panel) handleTunnelTraffic(w http.ResponseWriter, r *http.Request, _ au
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "traffic": view})
+}
+
+func (p *Panel) handleTunnelClients(w http.ResponseWriter, r *http.Request, _ authed) {
+	var t tunnelTarget
+	if !decodeJSON(w, r, &t) {
+		return
+	}
+	t.Edge = strings.TrimSpace(t.Edge)
+	t.Origin = strings.TrimSpace(t.Origin)
+	t.Name = strings.TrimSpace(t.Name)
+	if t.Edge == "" {
+		writeErr(w, http.StatusBadRequest, "Client IP telemetry is recorded on the Relay (Iran) server, which is not in the panel for this tunnel.")
+		return
+	}
+	if err := p.knownTarget(t); err != nil {
+		writeErr(w, http.StatusBadRequest, capitalise(err.Error())+".")
+		return
+	}
+	rep, err := p.tunnelClients(r.Context(), t.Edge, t.Name)
+	if err != nil {
+		writeErr(w, http.StatusBadGateway, capitalise(plainAgentError(err))+".")
+		return
+	}
+	writeJSON(w, http.StatusOK, rep)
+}
+
+func (p *Panel) handleUpdateTunnelClientGuard(w http.ResponseWriter, r *http.Request, _ authed) {
+	var req struct {
+		Edge         string  `json:"edge"`
+		Name         string  `json:"name"`
+		MaxConnPerIP *int    `json:"max_per_ip,omitempty"`
+		MaxRatePerIP *int    `json:"rate_per_ip,omitempty"`
+		BlockedIPs   *string `json:"blocked_ips,omitempty"`
+		BlockIP      string  `json:"block_ip,omitempty"`
+		UnblockIP    string  `json:"unblock_ip,omitempty"`
+	}
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	edgeID := strings.TrimSpace(req.Edge)
+	name := strings.TrimSpace(req.Name)
+	if edgeID == "" {
+		writeErr(w, http.StatusBadRequest, "Per-IP client guard runs on the Relay (Iran) server, which is not in the panel for this tunnel.")
+		return
+	}
+	if err := p.knownTarget(tunnelTarget{Name: name, Edge: edgeID}); err != nil {
+		writeErr(w, http.StatusBadRequest, capitalise(err.Error())+".")
+		return
+	}
+	rep, err := p.updateTunnelClientGuard(r.Context(), edgeID, agent.ClientGuardUpdateRequest{
+		Name:         name,
+		MaxConnPerIP: req.MaxConnPerIP,
+		MaxRatePerIP: req.MaxRatePerIP,
+		BlockedIPs:   req.BlockedIPs,
+		BlockIP:      strings.TrimSpace(req.BlockIP),
+		UnblockIP:    strings.TrimSpace(req.UnblockIP),
+	})
+	if err != nil {
+		writeErr(w, http.StatusUnprocessableEntity, capitalise(plainAgentError(err))+".")
+		return
+	}
+	p.refreshOne(edgeID)
+	writeJSON(w, http.StatusOK, rep)
 }
 
 func (p *Panel) handleGetNotifications(w http.ResponseWriter, _ *http.Request, _ authed) {

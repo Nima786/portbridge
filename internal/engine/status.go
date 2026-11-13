@@ -37,8 +37,8 @@ type status struct {
 	lastUpBps     int64
 	lastDownBps   int64
 
-	clientMu  sync.Mutex
-	clientIPs map[string]int
+	clientMu sync.Mutex
+	clients  *clientGuard
 }
 
 type statusFile struct {
@@ -89,11 +89,29 @@ type statusFile struct {
 	// it never has since start.
 	PathLastOKSeconds *int64 `json:"path_last_ok_seconds,omitempty"`
 
+	// Per-client-IP abuse & rate-limit telemetry on Edge tunnels.
+	AbuseDrops int64            `json:"abuse_drops,omitempty"`
+	TopClients []ClientSnapshot `json:"top_clients,omitempty"`
+
 	UpdatedAt string `json:"updated_at"`
 }
 
 func newStatus(cfg *Config) *status {
-	return &status{cfg: cfg, started: time.Now()}
+	return &status{
+		cfg:     cfg,
+		started: time.Now(),
+		clients: newClientGuard(cfg),
+	}
+}
+
+func (s *status) guard() *clientGuard {
+	s.clientMu.Lock()
+	if s.clients == nil {
+		s.clients = newClientGuard(s.cfg)
+	}
+	g := s.clients
+	s.clientMu.Unlock()
+	return g
 }
 
 // publish writes the status file every few seconds until the context ends, then
@@ -181,6 +199,8 @@ func (s *status) writeOnce() {
 	upBps, downBps := s.lastUpBps, s.lastDownBps
 	s.rateMu.Unlock()
 
+	activeUsers, abuseDrops, topClients := s.guard().snapshot(25)
+
 	sf := statusFile{
 		Name:             s.cfg.Name,
 		Mode:             string(s.cfg.Mode),
@@ -193,7 +213,7 @@ func (s *status) writeOnce() {
 		StartedAt:        s.started.UTC().Format(time.RFC3339),
 		UptimeSeconds:    int64(now.Sub(s.started).Seconds()),
 		ActiveSessions:   atomic.LoadInt64(&s.activeSessions),
-		ActiveUsers:      s.uniqueClients(),
+		ActiveUsers:      activeUsers,
 		ParkedSpares:     parked,
 		PoolTarget:       s.cfg.PoolSize,
 		Mux:              s.cfg.Mux,
@@ -215,6 +235,8 @@ func (s *status) writeOnce() {
 		PathState:         pathState,
 		PathNote:          pathNote,
 		PathLastOKSeconds: pathLastOK,
+		AbuseDrops:        abuseDrops,
+		TopClients:        topClients,
 
 		UpdatedAt: now.UTC().Format(time.RFC3339),
 	}
@@ -255,36 +277,17 @@ func normalizeClientIP(addr net.Addr) string {
 }
 
 func (s *status) addClient(addr net.Addr) string {
-	ip := normalizeClientIP(addr)
-	if ip == "" {
+	ip, _, _, _, ok := s.guard().acquire(addr, nil)
+	if !ok {
 		return ""
 	}
-	s.clientMu.Lock()
-	if s.clientIPs == nil {
-		s.clientIPs = make(map[string]int)
-	}
-	s.clientIPs[ip]++
-	s.clientMu.Unlock()
 	return ip
 }
 
 func (s *status) removeClient(ip string) {
-	if ip == "" {
-		return
-	}
-	s.clientMu.Lock()
-	if s.clientIPs != nil {
-		s.clientIPs[ip]--
-		if s.clientIPs[ip] <= 0 {
-			delete(s.clientIPs, ip)
-		}
-	}
-	s.clientMu.Unlock()
+	s.guard().release(ip, 0)
 }
 
 func (s *status) uniqueClients() int {
-	s.clientMu.Lock()
-	n := len(s.clientIPs)
-	s.clientMu.Unlock()
-	return n
+	return s.guard().uniqueActiveCount()
 }

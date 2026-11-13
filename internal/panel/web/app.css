@@ -3282,3 +3282,209 @@ button.is-loading::before {
     justify-content: flex-start;
   }
 }
+
+/* ------------------ Per-IP Abuse Guard & Outbound Abuse Shield ------------------ */
+
+.guard-numbers-box {
+  margin-top: .75rem;
+}
+
+.guard-box-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: .75rem;
+  flex-wrap: wrap;
+  margin-bottom: .55rem;
+}
+
+.guard-box-head p {
+  margin: .22rem 0 0;
+  line-height: 1.42;
+}
+
+.guard-box-head button {
+  flex-shrink: 0;
+  white-space: nowrap;
+}
+
+.guard-save-row {
+  margin-top: .55rem;
+}
+
+.guard-stats-strip {
+  display: flex;
+  align-items: center;
+  gap: .45rem;
+  flex-wrap: wrap;
+  margin-top: .55rem;
+}
+
+.guard-stat-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: .28rem;
+  padding: .22rem .58rem;
+  border-radius: 999px;
+  font-size: .79rem;
+  background: var(--well);
+  border: 1px solid var(--line);
+  color: var(--text);
+}
+
+.guard-stat-chip.is-warn {
+  background: var(--warn-soft);
+  border-color: var(--warn-border);
+  color: var(--warn);
+}
+
+.guard-stat-chip.is-blocked {
+  background: var(--bad-soft);
+  border-color: var(--bad-border);
+  color: var(--bad);
+}
+
+.guard-clients-wrap {
+  margin-top: .55rem;
+  display: flex;
+  flex-direction: column;
+  gap: .38rem;
+  max-height: 17rem;
+  overflow-y: auto;
+}
+
+.guard-empty-note {
+  margin: .25rem 0 0;
+}
+
+.guard-client-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: .65rem;
+  padding: .46rem .65rem;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--line);
+  background: var(--well);
+  font-size: .84rem;
+}
+
+.guard-client-row.is-blocked {
+  background: var(--bad-soft);
+  border-color: var(--bad-border);
+}
+
+.guard-client-left {
+  display: flex;
+  align-items: center;
+  gap: .5rem;
+  flex-wrap: wrap;
+  min-width: 0;
+}
+
+.guard-client-ip {
+  font-weight: 700;
+  font-size: .86rem;
+}
+
+.guard-client-meta {
+  display: flex;
+  align-items: center;
+  gap: .4rem;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+
+.guard-meta-pill {
+  font-size: .77rem;
+  padding: .12rem .45rem;
+  border-radius: 999px;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  white-space: nowrap;
+}
+
+.guard-meta-pill.is-warn {
+  background: var(--warn-soft);
+  border-color: var(--warn-border);
+  color: var(--warn);
+}
+
+.guard-row-btn {
+  padding: .24rem .62rem;
+  font-size: .79rem;
+  min-height: 1.85rem;
+}
+
+.badge-guard {
+  background: var(--ok-soft);
+  border: 1px solid var(--ok-border);
+  color: var(--ok);
+}
+
+.badge-guard.has-drops {
+  background: var(--warn-soft);
+  border-color: var(--warn-border);
+  color: var(--warn);
+}
+
+.badge-guard.is-blocked {
+  background: var(--bad-soft);
+  border-color: var(--bad-border);
+  color: var(--bad);
+}
+
+.abuse-shield-box {
+  margin-bottom: 1rem;
+  padding: .95rem 1.05rem;
+  background: var(--panel-2);
+  border: 1px solid var(--accent-border);
+  border-left: 3.5px solid var(--ok);
+  border-radius: var(--radius-sm);
+}
+
+.abuse-shield-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: .85rem;
+  flex-wrap: wrap;
+}
+
+.abuse-shield-head p {
+  margin: .32rem 0 0;
+  line-height: 1.45;
+}
+
+.abuse-shield-head button {
+  flex-shrink: 0;
+  white-space: nowrap;
+}
+
+label.check-card.abuse-torrent-card {
+  margin-top: .75rem;
+  background: var(--panel);
+}
+
+@media (max-width: 640px) {
+  .guard-box-head,
+  .abuse-shield-head {
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .guard-box-head button,
+  .abuse-shield-head button {
+    width: 100%;
+  }
+
+  .guard-client-row {
+    flex-direction: column;
+    align-items: flex-start;
+  }
+
+  .guard-client-meta {
+    width: 100%;
+    justify-content: flex-start;
+  }
+}

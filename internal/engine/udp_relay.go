@@ -44,6 +44,8 @@ var udpBufPool = sync.Pool{
 
 type edgeUDPSession struct {
 	clientAddr net.Addr
+	clientIP   string
+	ce         *clientEntry
 	firstPkt   []byte
 	txCh       chan []byte
 	lastActive atomic.Int64
@@ -132,6 +134,12 @@ func (e *edge) acceptUDPUsers(ctx context.Context, pc net.PacketConn, listenAddr
 		mu.Lock()
 		sess := sessions[key]
 		if sess != nil && !sess.closed.Load() {
+			if st.guard().isBlocked(sess.clientIP) {
+				sess.close()
+				delete(sessions, key)
+				mu.Unlock()
+				continue
+			}
 			sess.lastActive.Store(nowNS)
 			select {
 			case sess.txCh <- pkt:
@@ -142,30 +150,40 @@ func (e *edge) acceptUDPUsers(ctx context.Context, pc net.PacketConn, listenAddr
 			continue
 		}
 
-		select {
-		case e.active <- struct{}{}:
-		default:
-			mu.Unlock()
-			atomic.AddInt64(&st.droppedSessions, 1)
-			e.logCapacity.printf("at capacity (%d sessions); dropping a UDP user session", e.cfg.MaxConn)
-			continue
-		}
-
-		sess = &edgeUDPSession{
+		cand := &edgeUDPSession{
 			clientAddr: clientAddr,
 			firstPkt:   pkt,
 			txCh:       make(chan []byte, udpSessionQueueCap),
 			done:       make(chan struct{}),
 		}
+		clientIP, ce, handle, reason, allowed := st.guard().acquire(clientAddr, cand.close)
+		if !allowed {
+			mu.Unlock()
+			e.logAbuse.printf("refused UDP user session from %s (%s)", clientIP, reason)
+			continue
+		}
+
+		select {
+		case e.active <- struct{}{}:
+		default:
+			mu.Unlock()
+			st.guard().release(clientIP, handle)
+			atomic.AddInt64(&st.droppedSessions, 1)
+			e.logCapacity.printf("at capacity (%d sessions); dropping a UDP user session", e.cfg.MaxConn)
+			continue
+		}
+
+		sess = cand
+		sess.clientIP = clientIP
+		sess.ce = ce
 		sess.lastActive.Store(nowNS)
 		sessions[key] = sess
 		e.wg.Add(1)
 		mu.Unlock()
 
-		go func(key string, s *edgeUDPSession) {
+		go func(key string, s *edgeUDPSession, ip string, h uint64) {
 			defer e.wg.Done()
 			atomic.AddInt64(&st.activeSessions, 1)
-			clientIP := st.addClient(s.clientAddr)
 			defer func() {
 				s.close()
 				mu.Lock()
@@ -173,7 +191,7 @@ func (e *edge) acceptUDPUsers(ctx context.Context, pc net.PacketConn, listenAddr
 					delete(sessions, key)
 				}
 				mu.Unlock()
-				st.removeClient(clientIP)
+				st.guard().release(ip, h)
 				atomic.AddInt64(&st.activeSessions, -1)
 				<-e.active
 			}()
@@ -181,7 +199,7 @@ func (e *edge) acceptUDPUsers(ctx context.Context, pc net.PacketConn, listenAddr
 			if err := e.serveUDPSession(ctx, pc, targetPort, s, st); err != nil && ctx.Err() == nil {
 				e.logSession.printf("could not carry UDP user session over tunnel: %v", err)
 			}
-		}(key, sess)
+		}(key, sess, clientIP, handle)
 	}
 }
 
@@ -232,7 +250,11 @@ func (e *edge) serveUDPSession(ctx context.Context, pc net.PacketConn, targetPor
 	}
 
 	e.health.activationOK()
-	atomic.AddInt64(&st.bytesUp, int64(len(s.firstPkt)))
+	initLen := int64(len(s.firstPkt))
+	atomic.AddInt64(&st.bytesUp, initLen)
+	if s.ce != nil {
+		atomic.AddInt64(&s.ce.bytesUp, initLen)
+	}
 	s.firstPkt = nil // release initial slice once sent
 
 	var closeTunnelOnce sync.Once
@@ -275,6 +297,9 @@ func (e *edge) serveUDPSession(ctx context.Context, pc net.PacketConn, targetPor
 				}
 				s.lastActive.Store(time.Now().UnixNano())
 				atomic.AddInt64(&st.bytesUp, int64(len(pkt)))
+				if s.ce != nil {
+					atomic.AddInt64(&s.ce.bytesUp, int64(len(pkt)))
+				}
 			}
 		}
 	}()
@@ -318,6 +343,9 @@ func (e *edge) serveUDPSession(ctx context.Context, pc net.PacketConn, targetPor
 		s.lastActive.Store(time.Now().UnixNano())
 		if _, werr := pc.WriteTo(rxBuf[:dgramLen], s.clientAddr); werr == nil {
 			atomic.AddInt64(&st.bytesDown, int64(dgramLen))
+			if s.ce != nil {
+				atomic.AddInt64(&s.ce.bytesDown, int64(dgramLen))
+			}
 		}
 	}
 

@@ -874,6 +874,13 @@
     } else if (ov && ov.congestion_control) {
       badges.push(h('span', { class: 'badge', title: `TCP congestion control: ${ov.congestion_control}` }, `TCP: ${ov.congestion_control}`));
     }
+    if (ov && ov.abuse_shield_active) {
+      const btNote = ov.abuse_block_torrent !== false ? ' + BitTorrent/P2P blocked' : '';
+      badges.push(h('span', {
+        class: 'badge badge-ok',
+        title: `Outbound Abuse & Netscan Shield active on this server${btNote}.`,
+      }, 'Abuse Shield'));
+    }
 
     if (s.online) delete retryDiagByServer[s.id];
 
@@ -952,8 +959,8 @@
           : null,
         h('button', { type: 'button', 'data-focus': `srv-${s.id}-tune`, 'aria-label': `Network tuning for ${name}`, onclick: () => openServerTune(s) },
           'Network Tuning'),
-        h('button', { type: 'button', 'data-focus': `srv-${s.id}-fw`, 'aria-label': `Firewall rules for ${name}`, onclick: () => openServerFirewall(s) },
-          'Firewall'),
+        h('button', { type: 'button', 'data-focus': `srv-${s.id}-fw`, 'aria-label': `Firewall and Outbound Abuse Shield for ${name}`, onclick: () => openServerFirewall(s) },
+          'Firewall & Shield'),
         !s.online && !s.this
           ? h('button', { type: 'button', 'data-focus': `srv-${s.id}-repair`, 'aria-label': `Repair or reconnect ${name}`, onclick: () => openRepairServer(s) },
               'Repair')
@@ -2147,6 +2154,16 @@
     if (cleanList.length) {
       extraTags.push(`${cleanList.length} Clean CF ${cleanList.length === 1 ? 'IP' : 'IPs'}`);
     }
+    const guardMaxIP = (ei && ei.max_per_ip) || 0;
+    const guardRateIP = (ei && ei.rate_per_ip) || 0;
+    const guardBlocked = (ei && ei.blocked_ips && ei.blocked_ips.length) ? ei.blocked_ips : [];
+    if (guardMaxIP || guardRateIP || guardBlocked.length) {
+      const gParts = [];
+      if (guardMaxIP) gParts.push(`${guardMaxIP}/IP`);
+      if (guardRateIP) gParts.push(`${guardRateIP}/s`);
+      if (guardBlocked.length) gParts.push(`${guardBlocked.length} blocked`);
+      extraTags.push(`IP Guard (${gParts.join(', ')})`);
+    }
 
     let healthParts = [];
     if (live) {
@@ -2220,6 +2237,16 @@
       : (fwdProto === 'both'
           ? h('span', { class: 'badge badge-proto-udp', title: 'Both TCP and UDP user-port forwarding active' }, 'TCP+UDP')
           : null);
+    const abuseDrops = live ? (Number(live.abuse_drops) || 0) : 0;
+    const hasGuard = !!(guardMaxIP || guardRateIP || guardBlocked.length || abuseDrops > 0);
+    const guardBadge = hasGuard
+      ? h('span', {
+          class: 'badge badge-guard' + (abuseDrops > 0 ? ' has-drops' : ''),
+          title: abuseDrops > 0
+            ? `Per-IP Abuse Guard dropped ${abuseDrops} abusive or blocked connection attempts`
+            : 'Per-IP Abuse & Port-Scan Guard active',
+        }, abuseDrops > 0 ? `IP Guard · ${abuseDrops} drops` : 'IP Guard')
+      : null;
 
     const toggleBtn = h('button', {
       type: 'button',
@@ -2237,6 +2264,7 @@
         tfWidgets.rateBadge,
         ahBadge,
         protoBadge,
+        guardBadge,
         tfWidgets.trafficBadge,
         h('span', { class: 'badge badge-transport' }, `${reverse ? 'Reverse' : 'Direct'}${isIPv6 ? ' (IPv6)' : ''} · ${shortLink}`),
         live ? h('span', { class: 'badge badge-users', title: 'Unique connected client IPs · Active sessions' }, userBadgeText) : null,
@@ -2309,7 +2337,8 @@
         : null,
       target.edge ? h('button', { type: 'button', 'data-focus': key + '-edit', onclick: () => openEditTunnel(t) }, 'Edit') : null,
       h('button', { type: 'button', 'data-focus': key + '-traffic', onclick: () => openTunnelTraffic(t) }, 'Traffic & Quota'),
-      h('button', { type: 'button', 'data-focus': key + '-diag', onclick: () => openTunnelDiag(t, target) }, 'Diagnose & Speed Test'),
+      target.edge ? h('button', { type: 'button', 'data-focus': key + '-guard', onclick: () => openTunnelDiag(t, target, true) }, 'Clients & Abuse Guard') : null,
+      h('button', { type: 'button', 'data-focus': key + '-diag', onclick: () => openTunnelDiag(t, target, false) }, 'Diagnose & Speed Test'),
       h('button', { type: 'button', 'data-focus': key + '-logs', onclick: () => openTunnelLogs(t, target) }, 'Logs'),
       h('button', { type: 'button', 'data-focus': key + '-restart', onclick: service('restart', 'Restarting') }, 'Restart'),
       allRunning
@@ -2468,6 +2497,13 @@
     if ($('et-drain')) $('et-drain').value = (ei && ei.drain) || (oi && oi.drain) || '10s';
     if ($('et-advanced')) $('et-advanced').open = false;
 
+    if ($('et-guard-wrap')) {
+      $('et-guard-wrap').hidden = !(e && e.server_id);
+      if ($('et-max-per-ip')) $('et-max-per-ip').value = String((ei && ei.max_per_ip) || 0);
+      if ($('et-rate-per-ip')) $('et-rate-per-ip').value = String((ei && ei.rate_per_ip) || 0);
+      if ($('et-blocked-ips')) $('et-blocked-ips').value = ((ei && ei.blocked_ips) || []).join(', ');
+    }
+
     const isEditCDN = !!(e && e.server_id && (any.cdn || any.alt_host));
     if ($('et-clean-section')) {
       $('et-clean-section').hidden = !isEditCDN;
@@ -2503,6 +2539,12 @@
       const t = editingTunnel;
       $('edit-tunnel-dialog').close();
       if (t) openSwitchTunnel(t);
+    });
+  }
+  if ($('et-guard-rec-btn')) {
+    $('et-guard-rec-btn').addEventListener('click', () => {
+      if ($('et-max-per-ip')) $('et-max-per-ip').value = '128';
+      if ($('et-rate-per-ip')) $('et-rate-per-ip').value = '30';
     });
   }
 
@@ -2694,6 +2736,8 @@
     const poolSize = Number($('et-pool').value || 0);
     const muxLinks = Number($('et-mux-links').value || 0);
     const maxConn = Number($('et-max-conn').value || 0);
+    const maxPerIP = Number(($('et-max-per-ip') && $('et-max-per-ip').value) || 0);
+    const ratePerIP = Number(($('et-rate-per-ip') && $('et-rate-per-ip').value) || 0);
     const proxyProto = radio('et-proxy') || 'off';
     const firewall = $('et-firewall').checked ? 'on' : 'off';
     const peerIP = $('et-peer-ip') ? $('et-peer-ip').value.trim() : '';
@@ -2709,6 +2753,8 @@
     if (!isMux && !(poolSize >= 1 && poolSize <= 10000)) return fail('Connection Pool Size must be between 1 and 10000.', $('et-pool'));
     if (isMux && !(muxLinks >= 1 && muxLinks <= 16)) return fail('Shared Mux Connections must be between 1 and 16.', $('et-mux-links'));
     if (!(maxConn >= 1 && maxConn <= 100000)) return fail('Max Concurrent User Sessions must be between 1 and 100000.', $('et-max-conn'));
+    if (!(maxPerIP >= 0 && maxPerIP <= 100000)) return fail('Max Concurrent Sessions per Client IP must be between 0 and 100000.', $('et-max-per-ip'));
+    if (!(ratePerIP >= 0 && ratePerIP <= 100000)) return fail('Max New Connections/sec per Client IP must be between 0 and 100000.', $('et-rate-per-ip'));
 
     const body = {
       name: t.name,
@@ -2728,6 +2774,14 @@
       proxy_protocol: proxyProto,
       firewall,
     };
+    if (t.edge && t.edge.server_id) {
+      body.max_per_ip = Math.floor(maxPerIP);
+      body.rate_per_ip = Math.floor(ratePerIP);
+      if ($('et-blocked-ips')) {
+        body.blocked_ips = $('et-blocked-ips').value.trim();
+        body.update_blocked_ips = true;
+      }
+    }
     if ($('et-clean-section') && !$('et-clean-section').hidden && $('et-cleanips')) {
       body.clean_ips = $('et-cleanips').value.trim();
       body.update_clean_ips = true;
@@ -2892,15 +2946,199 @@
     }
   }
 
-  function openTunnelDiag(t, target) {
+  function renderClientInspector(rep, syncInputs) {
+    const statsEl = $('diag-clients-stats');
+    const listEl = $('diag-clients-list');
+    if (!statsEl || !listEl) return;
+    if (!rep) {
+      statsEl.replaceChildren();
+      listEl.replaceChildren();
+      return;
+    }
+    const blockedList = Array.isArray(rep.blocked_ips) ? rep.blocked_ips : [];
+    const blockedSet = new Set(blockedList);
+    if (syncInputs) {
+      if ($('diag-max-per-ip')) $('diag-max-per-ip').value = String(rep.max_per_ip || 0);
+      if ($('diag-rate-per-ip')) $('diag-rate-per-ip').value = String(rep.rate_per_ip || 0);
+      if ($('diag-blocked-ips')) $('diag-blocked-ips').value = blockedList.join(', ');
+    }
+    const drops = Number(rep.abuse_drops) || 0;
+    const chips = [
+      h('span', { class: 'guard-stat-chip' },
+        h('strong', null, String(rep.active_users || 0)), ' online ', rep.active_users === 1 ? 'IP' : 'IPs'),
+      h('span', { class: 'guard-stat-chip' + (drops > 0 ? ' is-warn' : '') },
+        h('strong', null, String(drops)), ' guard ', drops === 1 ? 'drop' : 'drops'),
+      h('span', { class: 'guard-stat-chip' },
+        'Max/IP: ', h('strong', null, rep.max_per_ip ? `${rep.max_per_ip} conns` : 'Unlimited')),
+      h('span', { class: 'guard-stat-chip' },
+        'Rate/IP: ', h('strong', null, rep.rate_per_ip ? `${rep.rate_per_ip}/s` : 'Unlimited')),
+      h('span', { class: 'guard-stat-chip' + (blockedList.length ? ' is-blocked' : '') },
+        'Blocked: ', h('strong', null, String(blockedList.length))),
+    ];
+    statsEl.replaceChildren(...chips);
+
+    const seenIPs = new Set();
+    const rowsData = [];
+    for (const c of (rep.top_clients || [])) {
+      if (!c || !c.ip) continue;
+      seenIPs.add(c.ip);
+      rowsData.push(c);
+    }
+    for (const b of blockedList) {
+      if (!seenIPs.has(b)) {
+        rowsData.push({
+          ip: b,
+          active: 0,
+          total_conns: 0,
+          rejected: 0,
+          bytes_up: 0,
+          bytes_down: 0,
+          blocked: true,
+          last_seen_sec: -1,
+        });
+      }
+    }
+
+    if (!rowsData.length) {
+      listEl.replaceChildren(h('p', { class: 'muted small guard-empty-note' },
+        rep.running
+          ? 'No client connections or blocked IPs recorded yet on this Relay tunnel.'
+          : 'Tunnel is currently stopped on the Relay server. Start it to inspect live client IPs.'));
+      return;
+    }
+
+    const rowEls = rowsData.map((c) => {
+      const isBlocked = !!(c.blocked || blockedSet.has(c.ip));
+      const statePill = isBlocked
+        ? h('span', { class: 'badge badge-guard is-blocked' }, 'Blocked')
+        : (c.active > 0
+            ? h('span', { class: 'badge badge-ok' }, `${c.active} active`)
+            : h('span', { class: 'badge' }, 'Idle'));
+      const seenText = c.active > 0
+        ? 'connected now'
+        : (typeof c.last_seen_sec === 'number' && c.last_seen_sec >= 0
+            ? `${duration(c.last_seen_sec)} ago`
+            : 'blocklist rule');
+
+      const metaKids = [];
+      if (c.total_conns > 0 || c.active > 0) {
+        metaKids.push(h('span', { class: 'guard-meta-pill mono' }, `${c.total_conns || 0} conns`));
+      }
+      if (c.rejected > 0) {
+        metaKids.push(h('span', { class: 'guard-meta-pill is-warn mono' }, `${c.rejected} rejected`));
+      }
+      if ((c.bytes_up || 0) > 0 || (c.bytes_down || 0) > 0) {
+        metaKids.push(h('span', { class: 'guard-meta-pill mono' }, `↑ ${fmtTrafficBytes(c.bytes_up || 0)} · ↓ ${fmtTrafficBytes(c.bytes_down || 0)}`));
+      }
+
+      const actionBtn = isBlocked
+        ? h('button', {
+            type: 'button',
+            class: 'guard-row-btn',
+            onclick: (ev) => applyClientGuardUpdate({ unblock_ip: c.ip }, ev.currentTarget),
+          }, 'Unblock')
+        : h('button', {
+            type: 'button',
+            class: 'guard-row-btn danger-text',
+            onclick: (ev) => applyClientGuardUpdate({ block_ip: c.ip }, ev.currentTarget),
+          }, 'Block IP');
+
+      return h('div', { class: 'guard-client-row' + (isBlocked ? ' is-blocked' : '') },
+        h('div', { class: 'guard-client-left' },
+          h('code', { class: 'mono guard-client-ip' }, c.ip),
+          statePill,
+          h('span', { class: 'muted small' }, seenText)),
+        h('div', { class: 'guard-client-meta' }, ...metaKids, actionBtn));
+    });
+    listEl.replaceChildren(...rowEls);
+  }
+
+  async function loadTunnelClients(syncInputs) {
+    if (!activeDiagTarget || !activeDiagTarget.edge) return;
+    const btn = $('diag-clients-refresh-btn');
+    if (btn) btn.disabled = true;
+    try {
+      const rep = await api('POST', '/api/tunnels/clients', activeDiagTarget);
+      renderClientInspector(rep, !!syncInputs);
+    } catch (e) {
+      if ($('diag-clients-list')) {
+        $('diag-clients-list').replaceChildren(h('p', { class: 'error small' }, e.message));
+      }
+    } finally {
+      if (btn) btn.disabled = false;
+    }
+  }
+
+  async function applyClientGuardUpdate(patch, btn) {
+    if (!activeDiagTarget || !activeDiagTarget.edge) return;
+    const msgEl = $('diag-guard-msg');
+    if (msgEl) {
+      msgEl.textContent = '';
+      msgEl.className = 'small';
+    }
+    const origText = btn ? btn.textContent : '';
+    if (btn) {
+      btn.disabled = true;
+      btn.classList.add('is-loading');
+    }
+    try {
+      const rep = await api('POST', '/api/tunnels/client-guard', {
+        edge: activeDiagTarget.edge,
+        name: activeDiagTarget.name,
+        ...patch,
+      });
+      renderClientInspector(rep, true);
+      if (msgEl) {
+        msgEl.textContent = rep.message || 'Per-IP guard updated.';
+        msgEl.className = 'small good';
+      }
+      if (activeDiagTunnel && activeDiagTunnel.edge && activeDiagTunnel.edge.info) {
+        activeDiagTunnel.edge.info.max_per_ip = rep.max_per_ip || 0;
+        activeDiagTunnel.edge.info.rate_per_ip = rep.rate_per_ip || 0;
+        activeDiagTunnel.edge.info.blocked_ips = Array.isArray(rep.blocked_ips) ? rep.blocked_ips : [];
+      }
+      lastTunnels = '';
+      refresh();
+    } catch (e) {
+      if (msgEl) {
+        msgEl.textContent = e.message;
+        msgEl.className = 'small bad';
+      }
+    } finally {
+      if (btn) {
+        btn.classList.remove('is-loading');
+        if (origText) btn.textContent = origText;
+        btn.disabled = false;
+      }
+    }
+  }
+
+  function openTunnelDiag(t, target, focusGuard) {
     activeDiagTarget = target;
     activeDiagTunnel = t;
     $('diag-title').textContent = `Diagnose & Speed Test: ${t.name}`;
     const where = [t.edge && t.edge.server_name, t.origin && t.origin.server_name].filter(Boolean).join(' ↔ ');
     if ($('diag-sub')) {
-      $('diag-sub').textContent = where ? `Health verification and throughput testing across ${where}.` : 'Health verification and throughput testing.';
+      $('diag-sub').textContent = where ? `Health verification, live client IP guard, and throughput testing across ${where}.` : 'Health verification and throughput testing.';
     }
     const ei = t.edge && t.edge.info ? t.edge.info : null;
+    const hasEdge = !!(t.edge && t.edge.server_id);
+    if ($('diag-guard-box')) {
+      $('diag-guard-box').hidden = !hasEdge;
+      if (hasEdge) {
+        if ($('diag-max-per-ip')) $('diag-max-per-ip').value = String((ei && ei.max_per_ip) || 0);
+        if ($('diag-rate-per-ip')) $('diag-rate-per-ip').value = String((ei && ei.rate_per_ip) || 0);
+        if ($('diag-blocked-ips')) $('diag-blocked-ips').value = (ei && ei.blocked_ips ? ei.blocked_ips : []).join(', ');
+        if ($('diag-guard-msg')) {
+          $('diag-guard-msg').textContent = '';
+          $('diag-guard-msg').className = 'small';
+        }
+        if ($('diag-clients-stats')) $('diag-clients-stats').replaceChildren();
+        if ($('diag-clients-list')) {
+          $('diag-clients-list').replaceChildren(h('p', { class: 'muted small' }, 'Loading live client IPs from Relay...'));
+        }
+      }
+    }
     const canDiagCF = !!(ei && (ei.cdn || ei.alt_host) && t.edge && t.edge.server_id && t.origin && t.origin.server_id);
     if ($('diag-clean-box')) {
       $('diag-clean-box').hidden = !canDiagCF;
@@ -2914,10 +3152,51 @@
     if ($('speedtest-error')) $('speedtest-error').textContent = '';
     openDialog($('diag-dialog'));
     runTunnelChecks();
-    $('diag-close').focus();
+    if (hasEdge) loadTunnelClients(true);
+    if (focusGuard && hasEdge && $('diag-guard-box')) {
+      if ($('diag-max-per-ip')) $('diag-max-per-ip').focus();
+      $('diag-guard-box').scrollIntoView({ block: 'start' });
+    } else {
+      $('diag-close').focus();
+    }
   }
 
-  $('diag-refresh').addEventListener('click', runTunnelChecks);
+  $('diag-refresh').addEventListener('click', () => {
+    runTunnelChecks();
+    if (activeDiagTarget && activeDiagTarget.edge) loadTunnelClients(false);
+  });
+  if ($('diag-guard-rec-btn')) {
+    $('diag-guard-rec-btn').addEventListener('click', () => {
+      if ($('diag-max-per-ip')) $('diag-max-per-ip').value = '128';
+      if ($('diag-rate-per-ip')) $('diag-rate-per-ip').value = '30';
+    });
+  }
+  if ($('diag-clients-refresh-btn')) {
+    $('diag-clients-refresh-btn').addEventListener('click', () => loadTunnelClients(false));
+  }
+  if ($('diag-guard-save-btn')) {
+    $('diag-guard-save-btn').addEventListener('click', () => {
+      const maxPerIP = Number(($('diag-max-per-ip') && $('diag-max-per-ip').value) || 0);
+      const ratePerIP = Number(($('diag-rate-per-ip') && $('diag-rate-per-ip').value) || 0);
+      const msgEl = $('diag-guard-msg');
+      if (!(maxPerIP >= 0 && maxPerIP <= 100000)) {
+        if (msgEl) { msgEl.textContent = 'Max Sessions / Client IP must be between 0 and 100000.'; msgEl.className = 'small bad'; }
+        if ($('diag-max-per-ip')) $('diag-max-per-ip').focus();
+        return;
+      }
+      if (!(ratePerIP >= 0 && ratePerIP <= 100000)) {
+        if (msgEl) { msgEl.textContent = 'Max New Conns/sec / Client IP must be between 0 and 100000.'; msgEl.className = 'small bad'; }
+        if ($('diag-rate-per-ip')) $('diag-rate-per-ip').focus();
+        return;
+      }
+      const blockedStr = $('diag-blocked-ips') ? $('diag-blocked-ips').value.trim() : '';
+      applyClientGuardUpdate({
+        max_per_ip: Math.floor(maxPerIP),
+        rate_per_ip: Math.floor(ratePerIP),
+        blocked_ips: blockedStr,
+      }, $('diag-guard-save-btn'));
+    });
+  }
   $('diag-close').addEventListener('click', () => $('diag-dialog').close());
 
   function resetCleanIPScanUI(msgId, boxId) {
@@ -3315,8 +3594,29 @@
   // ------------------------------------------------ server firewall manager
 
   let firewallServer = null;
+  let firewallAbuseActive = false;
 
   function renderFirewallDialog(info) {
+    firewallAbuseActive = !!(info && info.abuse_shield_active);
+    if ($('fw-abuse-badge')) {
+      if (firewallAbuseActive) {
+        $('fw-abuse-badge').textContent = (info && info.abuse_block_torrent !== false)
+          ? 'ACTIVE · Netscan + Torrent Blocked'
+          : 'ACTIVE · Netscan Blocked';
+        $('fw-abuse-badge').className = 'pill-tag tag-good';
+      } else {
+        $('fw-abuse-badge').textContent = 'OFF';
+        $('fw-abuse-badge').className = 'pill-tag';
+      }
+    }
+    if ($('fw-abuse-torrent')) {
+      $('fw-abuse-torrent').checked = info ? info.abuse_block_torrent !== false : true;
+    }
+    if ($('fw-abuse-toggle')) {
+      $('fw-abuse-toggle').textContent = firewallAbuseActive ? 'Disable Abuse Shield' : 'Enable Abuse Shield';
+      $('fw-abuse-toggle').classList.toggle('primary', !firewallAbuseActive);
+    }
+    syncChoiceCards($('fw-dialog'));
     if ($('fw-status')) {
       $('fw-status').textContent = (info && info.status) || 'No firewall rules reported.';
     }
@@ -3333,10 +3633,16 @@
 
   async function openServerFirewall(s) {
     firewallServer = s;
-    $('fw-title').textContent = `Bridge Port Firewall: ${s.name || s.address}`;
+    firewallAbuseActive = !!(s.overview && s.overview.abuse_shield_active);
+    $('fw-title').textContent = `Firewall & Abuse Shield: ${s.name || s.address}`;
     if ($('fw-error')) $('fw-error').textContent = '';
     if ($('fw-msg')) { $('fw-msg').hidden = true; $('fw-msg').textContent = ''; }
-    if ($('fw-status')) $('fw-status').textContent = 'Reading firewall rules...';
+    if ($('fw-status')) $('fw-status').textContent = 'Reading firewall & abuse shield rules...';
+    renderFirewallDialog(s.overview ? {
+      abuse_shield_active: !!s.overview.abuse_shield_active,
+      abuse_block_torrent: s.overview.abuse_block_torrent !== false,
+      status: 'Reading firewall & abuse shield rules...',
+    } : null);
     openDialog($('fw-dialog'));
     $('fw-close').focus();
     try {
@@ -3348,13 +3654,15 @@
     }
   }
 
-  async function applyServerFirewall(action) {
+  async function applyServerFirewall(action, blockTorrent) {
     if (!firewallServer) return;
-    const btns = [$('fw-sweep'), $('fw-on-all'), $('fw-off-all')].filter(Boolean);
+    const btns = [$('fw-sweep'), $('fw-on-all'), $('fw-off-all'), $('fw-abuse-toggle'), $('fw-abuse-torrent')].filter(Boolean);
     for (const b of btns) b.disabled = true;
     if ($('fw-error')) $('fw-error').textContent = '';
     try {
-      const info = await api('POST', '/api/servers/' + encodeURIComponent(firewallServer.id) + '/firewall', { action });
+      const payload = { action };
+      if (typeof blockTorrent === 'boolean') payload.block_torrent = blockTorrent;
+      const info = await api('POST', '/api/servers/' + encodeURIComponent(firewallServer.id) + '/firewall', payload);
       renderFirewallDialog(info);
       lastServers = lastTunnels = '';
       refresh();
@@ -3365,6 +3673,19 @@
     }
   }
 
+  if ($('fw-abuse-toggle')) {
+    $('fw-abuse-toggle').addEventListener('click', () => {
+      const bt = $('fw-abuse-torrent') ? $('fw-abuse-torrent').checked : true;
+      applyServerFirewall(firewallAbuseActive ? 'abuse-off' : 'abuse-on', bt);
+    });
+  }
+  if ($('fw-abuse-torrent')) {
+    $('fw-abuse-torrent').addEventListener('change', () => {
+      if (firewallAbuseActive) {
+        applyServerFirewall('abuse-on', $('fw-abuse-torrent').checked);
+      }
+    });
+  }
   if ($('fw-sweep')) $('fw-sweep').addEventListener('click', () => applyServerFirewall('sweep'));
   if ($('fw-on-all')) $('fw-on-all').addEventListener('click', () => applyServerFirewall('on-all'));
   if ($('fw-off-all')) $('fw-off-all').addEventListener('click', () => applyServerFirewall('off-all'));
@@ -5393,6 +5714,8 @@
     resetTunnelDialogProbeState();
     if ($('tn-cleanips')) $('tn-cleanips').value = '';
     if ($('tn-probe-cleanips')) $('tn-probe-cleanips').value = '';
+    if ($('tn-max-per-ip')) $('tn-max-per-ip').value = '0';
+    if ($('tn-rate-per-ip')) $('tn-rate-per-ip').value = '0';
     if ($('tn-probe-service') && $('tn-service')) {
       $('tn-probe-service').value = $('tn-service').value;
     }
@@ -5493,6 +5816,8 @@
     if ($('tn-pool')) $('tn-pool').value = String(poolVal);
     if ($('tn-links-n')) $('tn-links-n').value = String(muxVal);
     if ($('tn-max-conn')) $('tn-max-conn').value = String(maxConnVal);
+    if ($('tn-max-per-ip')) $('tn-max-per-ip').value = String(ei.max_per_ip || 0);
+    if ($('tn-rate-per-ip')) $('tn-rate-per-ip').value = String(ei.rate_per_ip || 0);
     setRadio('tn-load', detectCapacityPreset(linkKey, isMux, Number(poolVal), Number(muxVal), Number(maxConnVal)));
     sharingTouched = true;
 
@@ -5511,6 +5836,12 @@
   }
 
   for (const b of document.querySelectorAll('.new-tunnel')) b.addEventListener('click', () => openNewTunnel('', ''));
+  if ($('tn-guard-rec-btn')) {
+    $('tn-guard-rec-btn').addEventListener('click', () => {
+      if ($('tn-max-per-ip')) $('tn-max-per-ip').value = '128';
+      if ($('tn-rate-per-ip')) $('tn-rate-per-ip').value = '30';
+    });
+  }
   if ($('tn-probe-cfscan-btn')) {
     $('tn-probe-cfscan-btn').addEventListener('click', () => {
       const dom = ($('tn-probe-cdn') && $('tn-probe-cdn').value.trim()) || ($('tn-domain') && $('tn-domain').value.trim()) || '';
@@ -5609,6 +5940,11 @@
       shared_links: shared ? Number($('tn-links-n').value || 4) : 0,
       pool: !shared ? Number(($('tn-pool') && $('tn-pool').value) || 30) : 0,
       max_conn: Number(($('tn-max-conn') && $('tn-max-conn').value) || 2000),
+      max_per_ip: Math.floor(Number(($('tn-max-per-ip') && $('tn-max-per-ip').value) || 0)),
+      rate_per_ip: Math.floor(Number(($('tn-rate-per-ip') && $('tn-rate-per-ip').value) || 0)),
+      blocked_ips: (tunnelModalMode && tunnelModalMode.kind === 'switch' && tunnelModalMode.tunnel && tunnelModalMode.tunnel.edge && tunnelModalMode.tunnel.edge.info && Array.isArray(tunnelModalMode.tunnel.edge.info.blocked_ips))
+        ? tunnelModalMode.tunnel.edge.info.blocked_ips.join(', ')
+        : '',
       service_ports: $('tn-service').value.trim(),
       user_ports: $('tn-users').value.trim(),
       link_port: Number($('tn-linkport').value || 0),
@@ -5865,6 +6201,8 @@
     if (!r.shared && !(r.pool >= 1 && r.pool <= 10000)) return fail('Connection Pool Size must be between 1 and 10000.', $('tn-pool'));
     if (r.shared && !(r.shared_links >= 1 && r.shared_links <= 16)) return fail('Number of shared Mux connections must be between 1 and 16.', $('tn-links-n'));
     if (!(r.max_conn >= 1 && r.max_conn <= 100000)) return fail('Max Concurrent User Sessions must be between 1 and 100000.', $('tn-max-conn'));
+    if (!(r.max_per_ip >= 0 && r.max_per_ip <= 100000)) return fail('Max Concurrent Sessions per Client IP must be between 0 and 100000.', $('tn-max-per-ip'));
+    if (!(r.rate_per_ip >= 0 && r.rate_per_ip <= 100000)) return fail('Max New Connections/sec per Client IP must be between 0 and 100000.', $('tn-rate-per-ip'));
     const btn = ev.target.querySelector('button[type=submit]');
     btn.disabled = true;
     try {
