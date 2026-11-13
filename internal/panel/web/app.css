@@ -3538,6 +3538,20 @@ label.check-card.abuse-torrent-card {
   line-height: 1.42;
 }
 
+.pacc-fields-row {
+  align-items: end;
+}
+
+.pacc-fields-row > div {
+  display: flex;
+  flex-direction: column;
+  justify-content: flex-end;
+}
+
+.pacc-fields-row label {
+  margin-top: 0;
+}
+
 .pacc-path-block {
   margin-top: .75rem;
 }
