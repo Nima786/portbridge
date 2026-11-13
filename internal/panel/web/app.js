@@ -170,17 +170,66 @@
     statusTimer = msg && !bad ? setTimeout(() => setStatus(''), 8000) : null;
   }
 
-  // Re-drawing a list must not throw away where the keyboard was.
+  let pointerPressedUntil = 0;
+  document.addEventListener('pointerdown', () => { pointerPressedUntil = Date.now() + 900; }, true);
+  document.addEventListener('pointerup', () => { pointerPressedUntil = 0; }, true);
+  document.addEventListener('pointercancel', () => { pointerPressedUntil = 0; }, true);
+
+  function pickScrollAnchor() {
+    const main = $('main');
+    if (!main || window.scrollY <= 4) return null;
+    const topBar = document.querySelector('.top');
+    const topEdge = topBar ? Math.max(0, topBar.getBoundingClientRect().bottom) : 56;
+    const vh = window.innerHeight || document.documentElement.clientHeight || 800;
+    let spanning = null;
+    for (const el of main.querySelectorAll('[data-scroll-anchor]')) {
+      if (el.hidden || el.offsetParent === null) continue;
+      const r = el.getBoundingClientRect();
+      if (r.height <= 0 || r.bottom <= topEdge + 4 || r.top >= vh - 4) continue;
+      if (r.top >= topEdge - 6) {
+        return { key: el.dataset.scrollAnchor, top: r.top };
+      }
+      spanning = { key: el.dataset.scrollAnchor, top: r.top };
+    }
+    return spanning;
+  }
+
+  // Re-drawing a list must neither throw away keyboard focus nor scroll-jump
+  // the viewport when live traffic updates off-screen summary buttons.
   function keepFocus(draw) {
-    const key = document.activeElement && document.activeElement.dataset ? document.activeElement.dataset.focus : '';
+    const sx = window.scrollX;
+    const sy = window.scrollY;
+    const anchor = pickScrollAnchor();
+    const active = document.activeElement;
+    const key = active && active.dataset ? active.dataset.focus : '';
     draw();
     if (key) {
       const el = document.querySelector(`[data-focus="${CSS.escape(key)}"]`);
-      if (el) el.focus();
+      if (el && document.activeElement !== el) {
+        try {
+          el.focus({ preventScroll: true });
+        } catch (_) {
+          el.focus();
+        }
+      }
+    }
+    if (sy > 4 && anchor && anchor.key) {
+      const nextEl = document.querySelector(`[data-scroll-anchor="${CSS.escape(anchor.key)}"]`);
+      if (nextEl && !nextEl.hidden && nextEl.offsetParent !== null) {
+        if (window.scrollY !== sy || window.scrollX !== sx) window.scrollTo(sx, sy);
+        const delta = nextEl.getBoundingClientRect().top - anchor.top;
+        if (Math.abs(delta) >= 0.5) {
+          window.scrollTo(sx, Math.max(0, window.scrollY + delta));
+        }
+        return;
+      }
+    }
+    if (window.scrollY !== sy || window.scrollX !== sx) {
+      window.scrollTo(sx, sy);
     }
   }
 
-  // Dialogs give the keyboard back to whatever opened them.
+  // Dialogs give the keyboard back to whatever opened them without scrolling.
   function openDialog(dlg) {
     const key = document.activeElement && document.activeElement.dataset ? document.activeElement.dataset.focus : '';
     dlg.dataset.returnTo = key || '';
@@ -191,7 +240,13 @@
     dlg.addEventListener('close', () => {
       const key = dlg.dataset.returnTo;
       const el = key ? document.querySelector(`[data-focus="${CSS.escape(key)}"]`) : null;
-      if (el) el.focus();
+      if (el) {
+        try {
+          el.focus({ preventScroll: true });
+        } catch (_) {
+          el.focus();
+        }
+      }
     });
   }
 
@@ -391,15 +446,16 @@
     }
   }
 
-  async function refresh() {
+  async function refresh(bg) {
     if ($('shell').hidden) return;
+    if (bg && Date.now() < pointerPressedUntil) return;
     try {
       if (currentTab === 'servers') {
-        await Promise.all([loadServers(), loadTunnels()]);
+        await Promise.all([loadServers(bg), loadTunnels(bg)]);
       } else if (currentTab === 'tunnels' || currentTab === 'websites') {
-        await Promise.all([loadTunnels(), loadServers()]);
+        await Promise.all([loadTunnels(bg), loadServers(bg)]);
       } else if (currentTab === 'dns') {
-        await Promise.all([loadServers(), loadCloudflare(false)]);
+        await Promise.all([loadServers(bg), loadCloudflare(false)]);
       } else {
         await loadSettings();
       }
@@ -415,7 +471,7 @@
     stopRefresh();
     refreshTimer = setInterval(() => {
       // Settings holds a form; refreshing it would wipe what is being typed.
-      if (document.visibilityState === 'visible' && currentTab !== 'settings') refresh();
+      if (document.visibilityState === 'visible' && currentTab !== 'settings') refresh(true);
     }, REFRESH_MS);
   }
 
@@ -425,7 +481,7 @@
   }
 
   document.addEventListener('visibilitychange', () => {
-    if (document.visibilityState === 'visible' && currentTab !== 'settings') refresh();
+    if (document.visibilityState === 'visible' && currentTab !== 'settings') refresh(true);
   });
 
   // ---------------------------------------------------------------- servers
@@ -563,15 +619,20 @@
   }
   window.addEventListener('resize', updateStickyServerColumns);
 
-  async function loadServers() {
+  async function loadServers(bg) {
     const [data] = await Promise.all([api('GET', '/api/servers'), loadUpdates()]);
     serversCache = data.servers || [];
-    updateSummaryStrip();
-    if (dragged) return;
+    if (dragged || (bg && Date.now() < pointerPressedUntil)) return;
     const text = JSON.stringify(serversCache) + JSON.stringify(updatesCache && updatesCache.servers);
-    if (text === lastServers) return;
+    if (text === lastServers) {
+      keepFocus(() => updateSummaryStrip());
+      return;
+    }
     lastServers = text;
-    keepFocus(() => renderServers(serversCache));
+    keepFocus(() => {
+      updateSummaryStrip();
+      renderServers(serversCache);
+    });
   }
 
   function renderServers(list) {
@@ -869,7 +930,11 @@
         'Upgrade via SSH')) : null;
 
     const compactClass = srvDensity === 'compact' ? ' is-compact' : '';
-    const card = h('article', { class: 'card server' + roleClass + compactClass, 'aria-labelledby': headingId },
+    const card = h('article', {
+      class: 'card server' + roleClass + compactClass,
+      'aria-labelledby': headingId,
+      'data-scroll-anchor': 'srv:' + s.id,
+    },
       h('div', { class: 'head' },
         h('div', { class: 'server-title-wrap' },
           isDraggable ? h('span', { class: 'drag-grip', 'aria-hidden': 'true', title: 'Drag onto a server in the other column to link them' }, '⠿') : null,
@@ -1755,14 +1820,20 @@
     sel.value = tunServerFilter;
   }
 
-  async function loadTunnels() {
+  async function loadTunnels(bg) {
     const data = await api('GET', '/api/tunnels');
     tunnelsCache = data.tunnels || [];
-    updateSummaryStrip();
+    if (bg && Date.now() < pointerPressedUntil) return;
     const text = JSON.stringify(tunnelsCache);
-    if (text === lastTunnels) return;
+    if (text === lastTunnels) {
+      keepFocus(() => updateSummaryStrip());
+      return;
+    }
     lastTunnels = text;
-    keepFocus(() => renderTunnels(tunnelsCache));
+    keepFocus(() => {
+      updateSummaryStrip();
+      renderTunnels(tunnelsCache);
+    });
   }
 
   function renderTunnels(list) {
@@ -2119,7 +2190,11 @@
     const problems = halves.filter((x) => x.info.problem).map((x) => `${x.server_name}: ${sentence(x.info.problem)}`);
     if (live && live.path_note && live.path_state !== 'ok') problems.push(sentence(live.path_note));
 
-    const bodyEl = h('div', { class: 'tunnel-body', hidden: !isOpen },
+    const bodyEl = h('div', {
+      class: 'tunnel-body',
+      hidden: !isOpen,
+      'data-scroll-anchor': 'tun-body:' + tunKey,
+    },
       detailsGrid,
       tfWidgets.stripEl,
       problems.map((p) => h('p', { class: 'problem' }, p)),
@@ -2155,15 +2230,19 @@
           `${relayName} ↔ ${foreignName}`,
           mainPort ? h('span', { class: 'tunnel-summary-port mono' }, `:${mainPort}`) : null)),
       h('div', { class: 'tunnel-summary-right' },
+        tfWidgets.rateBadge,
         ahBadge,
         protoBadge,
-        tfWidgets.rateBadge,
         tfWidgets.trafficBadge,
         h('span', { class: 'badge badge-transport' }, `${reverse ? 'Reverse' : 'Direct'}${isIPv6 ? ' (IPv6)' : ''} · ${shortLink}`),
         live ? h('span', { class: 'badge badge-users', title: 'Unique connected client IPs · Active sessions' }, userBadgeText) : null,
         h('span', { class: 'tunnel-chevron', 'aria-hidden': 'true' }, '▾')));
 
-    const card = h('article', { class: 'card tunnel' + (isOpen ? ' is-open' : ''), 'aria-labelledby': headingId },
+    const card = h('article', {
+      class: 'card tunnel' + (isOpen ? ' is-open' : ''),
+      'aria-labelledby': headingId,
+      'data-scroll-anchor': 'tun:' + tunKey,
+    },
       toggleBtn,
       bodyEl);
 
@@ -2208,7 +2287,7 @@
     };
     const ahOn = !!(t.auto_heal && t.auto_heal.enabled);
     const canOpenAH = !!(target.edge && (target.origin || ahOn || (t.auto_heal && (t.auto_heal.primary_foreign_id || t.auto_heal.standby_foreign_id))));
-    return h('div', { class: 'actions left tunnel-actions' },
+    return h('div', { class: 'actions left tunnel-actions', 'data-scroll-anchor': 'tun-act:' + key },
       canOpenAH
         ? h('button', {
             type: 'button',
@@ -5915,7 +5994,11 @@
     const problems = halves.filter((x) => x.info.problem).map((x) => `${x.server_name}: ${sentence(x.info.problem)}`);
     if (live && live.path_note && live.path_state !== 'ok') problems.push(sentence(live.path_note));
 
-    const bodyEl = h('div', { class: 'tunnel-body', hidden: !isOpen },
+    const bodyEl = h('div', {
+      class: 'tunnel-body',
+      hidden: !isOpen,
+      'data-scroll-anchor': 'wb-body:' + tunKey,
+    },
       detailsGrid,
       tfWidgets.stripEl,
       problems.map((p) => h('p', { class: 'problem' }, p)),
@@ -5944,14 +6027,18 @@
           `${relayName} ↔ ${foreignName}`,
           h('span', { class: 'tunnel-summary-port mono' }, `:${mainPort}`))),
       h('div', { class: 'tunnel-summary-right' },
-        ahBadge,
         tfWidgets.rateBadge,
+        ahBadge,
         tfWidgets.trafficBadge,
         outboundOn ? h('span', { class: 'badge badge-transport mono' }, `Proxy 127.0.0.1:${outboundPort}`) : null,
         live ? h('span', { class: 'badge badge-users' }, visitorBadgeText) : null,
         h('span', { class: 'tunnel-chevron', 'aria-hidden': 'true' }, '▾')));
 
-    const card = h('article', { class: 'card tunnel' + (isOpen ? ' is-open' : ''), 'aria-labelledby': headingId },
+    const card = h('article', {
+      class: 'card tunnel' + (isOpen ? ' is-open' : ''),
+      'aria-labelledby': headingId,
+      'data-scroll-anchor': 'wb:' + tunKey,
+    },
       toggleBtn,
       bodyEl);
 
@@ -5994,7 +6081,7 @@
       }
     };
     const ahOn = !!(t.auto_heal && t.auto_heal.enabled);
-    return h('div', { class: 'actions left tunnel-actions' },
+    return h('div', { class: 'actions left tunnel-actions', 'data-scroll-anchor': 'tun-act:' + key },
       h('button', {
         type: 'button',
         class: 'primary',

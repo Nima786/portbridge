@@ -1287,8 +1287,11 @@ button.tunnel-summary:active:not(:disabled) {
 .tunnel-summary-right {
   display: flex;
   align-items: center;
-  gap: .5rem;
-  flex: none;
+  justify-content: flex-end;
+  flex-wrap: wrap;
+  gap: .45rem .5rem;
+  flex: 0 1 auto;
+  min-width: 0;
 }
 .tunnel-chevron {
   width: 1.75rem;
@@ -2605,26 +2608,60 @@ button.btn-autoheal.is-on {
     display: flex;
     flex-wrap: wrap;
     align-items: center;
-    padding: .75rem .9rem;
-    gap: .45rem .5rem;
+    padding: .72rem .85rem;
+    gap: .4rem .42rem;
+    width: 100%;
+    max-width: 100%;
+    min-width: 0;
+    box-sizing: border-box;
   }
-  .tunnel-summary-left {
+  .tunnel-summary-left,
+  .tunnel-summary-right {
     display: contents;
   }
-  .tunnel-summary-name {
-    margin-right: auto;
+  button.tunnel-summary .state {
+    order: 1;
+    flex: 0 0 auto;
   }
-  .tunnel-summary-right {
+  .tunnel-summary-name {
+    order: 2;
+    flex: 1 1 0;
+    min-width: 0;
+    margin-right: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .tunnel-chevron {
+    order: 3;
+    flex: 0 0 auto;
     margin-left: auto;
   }
   .tunnel-summary-route {
     order: 4;
     flex: 1 1 100%;
     width: 100%;
+    min-width: 0;
+  }
+  button.tunnel-summary .badge {
+    order: 5;
+    font-size: .71rem;
+    padding: .12rem .46rem;
+    max-width: 100%;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  button.tunnel-summary .badge-rate {
+    order: 6;
   }
   .badge-transport { display: none; }
-  .tunnel-body { padding: 0 .9rem .95rem; }
+  .tunnel-body { padding: 0 .85rem .95rem; }
   .tunnel-details-grid { grid-template-columns: 1fr; gap: .5rem; margin-top: .75rem; }
+  .detail-item, .detail-sub { min-width: 0; overflow-wrap: anywhere; }
+  .tunnel-traffic-strip { padding: .55rem .72rem; gap: .45rem .75rem; font-size: .78rem; }
+  .tunnel-traffic-metrics { gap: .38rem .85rem; min-width: 0; }
+  .tunnel-traffic-quota { min-width: 0; width: 100%; flex-wrap: wrap; }
   .tunnel-actions {
     display: grid;
     grid-template-columns: repeat(2, 1fr);
