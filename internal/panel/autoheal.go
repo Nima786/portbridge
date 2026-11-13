@@ -54,8 +54,9 @@ type tunnelHealRuntime struct {
 
 	// failures counts failed heals in a row; nextTry is the earliest the next
 	// automatic attempt may start.
-	failures int
-	nextTry  time.Time
+	failures        int
+	nextTry         time.Time
+	lastCleanRotate time.Time
 }
 
 type autoHealer struct {
@@ -69,7 +70,8 @@ type autoHealer struct {
 	serverMu map[string]*sync.Mutex
 
 	// probeFn overrides p.probeBetweenServers in tests.
-	probeFn func(ctx context.Context, relayID, foreignID, cdnDomain string) (*engine.ProbeBenchmarkReport, error)
+	probeFn  func(ctx context.Context, relayID, foreignID, cdnDomain string) (*engine.ProbeBenchmarkReport, error)
+	cfScanFn func(ctx context.Context, req cfScanPanelRequest) (*engine.CFScanReport, error)
 }
 
 func (ah *autoHealer) probe(ctx context.Context, relayID, foreignID, cdnDomain string) (*engine.ProbeBenchmarkReport, error) {
@@ -77,6 +79,13 @@ func (ah *autoHealer) probe(ctx context.Context, relayID, foreignID, cdnDomain s
 		return ah.probeFn(ctx, relayID, foreignID, cdnDomain)
 	}
 	return ah.p.probeBetweenServers(ctx, relayID, foreignID, cdnDomain)
+}
+
+func (ah *autoHealer) scanCleanIPs(ctx context.Context, req cfScanPanelRequest) (*engine.CFScanReport, error) {
+	if ah.cfScanFn != nil {
+		return ah.cfScanFn(ctx, req)
+	}
+	return ah.p.scanCloudflareCleanIPs(ctx, req)
 }
 
 func newAutoHealer(p *Panel) *autoHealer {
@@ -1217,7 +1226,7 @@ func (ah *autoHealer) buildFailoverEditSpec(ctx context.Context, name, relayID, 
 		CDN:          onOff(best.CDN),
 		AltHost:      altHost,
 		CleanIPs:     "",
-		KeepCleanIPs: best.CDN && !toStandby,
+		KeepCleanIPs: (best.CDN || altHost != "") && !toStandby,
 		UTLS:         onOff(best.Stealth),
 		TLSFragment:  onOff(best.Stealth),
 		HTTPHeader:   onOff(best.WebHeader),
@@ -1685,6 +1694,58 @@ func (ah *autoHealer) healTunnel(ctx context.Context, j *job, key, name, relayID
 			say("Tunnel %q recovered on its own before failover started.", name)
 			ev.FromDesc = "" // do not record a spurious event
 			return nil
+		}
+	}
+
+	// Stage 0 for CDN tunnels: before tearing down and switching transport modes,
+	// try scanning & rotating verified Cloudflare Clean IPs on the Iran Relay.
+	if !force && !curStoreCfg.OnStandby && curInfo.Mode == "direct" && curInfo.CDN && cdnDomain != "" {
+		canTryCleanRotate := ah.cfScanFn != nil || ah.probeFn == nil
+		ah.mu.Lock()
+		if rt := ah.rt[key]; rt != nil && !rt.lastCleanRotate.IsZero() && time.Since(rt.lastCleanRotate) < 10*time.Minute {
+			canTryCleanRotate = false
+		}
+		if canTryCleanRotate {
+			if rt := ah.rt[key]; rt != nil {
+				rt.state = "probing"
+				rt.lastNote = fmt.Sprintf("Scanning clean Cloudflare IPs for %s...", cdnDomain)
+			}
+		}
+		ah.mu.Unlock()
+
+		if canTryCleanRotate {
+			say("Tunnel %q is on Cloudflare CDN (%s); scanning clean Cloudflare edge IPs first...", name, cdnDomain)
+			cfRep, cfErr := ah.scanCleanIPs(ctx, cfScanPanelRequest{
+				Relay:     relayID,
+				Foreign:   foreignID,
+				Tunnel:    name,
+				Domain:    cdnDomain,
+				Port:      curInfo.LinkPort,
+				Transport: curInfo.Transport,
+				MaxSelect: 5,
+			})
+			if cfErr == nil && cfRep != nil && len(cfRep.Recommended) > 0 && !slices.Equal(cfRep.Recommended, curInfo.CleanIPs) {
+				applied, aerr := ah.p.applyTunnelCleanIPsLocked(ctx, relayID, name, cfRep.Recommended)
+				if aerr == nil && len(applied) > 0 {
+					topScore := 85
+					if len(cfRep.Results) > 0 && cfRep.Results[0].Score > 0 {
+						topScore = cfRep.Results[0].Score
+					}
+					ah.mu.Lock()
+					if rt := ah.rt[key]; rt != nil {
+						rt.lastCleanRotate = time.Now()
+					}
+					ah.mu.Unlock()
+
+					ev.Candidate = "cf-clean-rotate"
+					ev.Score = topScore
+					ev.ToDesc = fmt.Sprintf("%s · Clean IPs [%s]", ev.FromDesc, strings.Join(applied, ", "))
+					say("Rotated %d verified Cloudflare Clean IPs (%s) on %s (Score %d/100).",
+						len(applied), strings.Join(applied, ", "), ah.p.serverName(relayID), topScore)
+					return nil
+				}
+			}
+			say("Clean-IP rotation could not restore %q; proceeding with full multi-mode benchmark...", name)
 		}
 	}
 

@@ -1283,8 +1283,18 @@
         </div>
 
         <div id="tn-opt-clean" class="sub-panel" hidden>
-          <label for="tn-cleanips">Clean Cloudflare IPs <span class="muted">(optional, comma-separated clean edge IPs)</span></label>
-          <input id="tn-cleanips" placeholder="104.16.12.34, 172.67.45.67" autocapitalize="none" spellcheck="false">
+          <div class="cfscan-head">
+            <div>
+              <label for="tn-cleanips">Cloudflare Clean Edge IPs <span class="muted">(optional, comma-separated)</span></label>
+              <p class="muted small cfscan-sub">Tests 44 Cloudflare <code>/24</code> subnets end-to-end from your Iran Relay server through your CDN domain into your Foreign server (real handshake + sustained anti-freeze transfer).</p>
+            </div>
+          </div>
+          <div class="cf-quick-row cfscan-input-row">
+            <input id="tn-cleanips" placeholder="104.16.12.34, 172.67.45.67 (leave empty for default DNS)" autocapitalize="none" spellcheck="false">
+            <button type="button" id="tn-cfscan-btn">Scan Clean CF IPs</button>
+          </div>
+          <p id="tn-cfscan-msg" class="small" role="status"></p>
+          <div id="tn-cfscan-results" class="cfscan-results" hidden></div>
         </div>
 
         <div id="tn-opt-stealth" class="sub-panel" hidden>
@@ -1858,6 +1868,22 @@
         </label>
       </fieldset>
 
+      <fieldset id="et-clean-section" class="step-section" hidden>
+        <legend class="step-header">
+          <span class="step-num">CF</span>
+          <span>
+            <span class="step-title">Cloudflare Clean Edge IPs</span>
+            <span class="step-sub">Dial verified clean Cloudflare Anycast IPs from the Iran Relay instead of default DNS, or clear the field to revert to standard Cloudflare DNS.</span>
+          </span>
+        </legend>
+        <div class="cf-quick-row cfscan-input-row">
+          <input id="et-cleanips" placeholder="104.16.12.34, 172.67.45.67 (leave empty for default DNS)" autocapitalize="none" spellcheck="false">
+          <button type="button" id="et-cfscan-btn">Scan Clean CF IPs</button>
+        </div>
+        <p id="et-cfscan-msg" class="small" role="status"></p>
+        <div id="et-cfscan-results" class="cfscan-results" hidden></div>
+      </fieldset>
+
       <details id="et-advanced" class="advanced-details">
         <summary>Advanced Settings <span class="muted">(Peer Server IP &amp; Connection Timing)</span></summary>
         <div class="advanced-body">
@@ -1936,6 +1962,22 @@
     </div>
     <div class="dialog-body">
       <div id="diag-checks" class="diag-grid"></div>
+
+      <section id="diag-clean-box" class="step-section speedtest-box" hidden>
+        <div class="speedtest-head">
+          <div>
+            <h3>Cloudflare Clean-IP Scanner &amp; Rotator</h3>
+            <p class="muted small">Scans 44 Cloudflare <code>/24</code> ranges from your Iran Relay server into this Foreign tunnel with real transport authentication &amp; sustained upload/download verification, then applies the cleanest subnet-diverse IPs in 1 click.</p>
+          </div>
+          <button type="button" id="diag-cfscan-btn">Scan Clean CF IPs</button>
+        </div>
+        <div class="cf-quick-row cfscan-input-row">
+          <input id="diag-cleanips" placeholder="No Clean IPs pinned (using default Cloudflare DNS)" autocapitalize="none" spellcheck="false">
+          <button type="button" id="diag-cfscan-apply" class="primary">Apply Clean IPs</button>
+        </div>
+        <p id="diag-cfscan-msg" class="small" role="status"></p>
+        <div id="diag-cfscan-results" class="cfscan-results" hidden></div>
+      </section>
 
       <section class="step-section speedtest-box">
         <div class="speedtest-head">
@@ -2115,7 +2157,7 @@
         <input type="checkbox" id="ah-enabled">
         <span>
           <strong>Enable Automatic Failover (Auto-Heal)</strong>
-          <span class="muted"> — Checks this tunnel every 20 seconds. If the route is blocked or loses all links for consecutive checks, the panel benchmarks all available modes (even if Foreign IPv4 is blocked from Iran, via IPv6 or Reverse Hub) and switches both servers automatically.</span>
+          <span class="muted"> — Checks this tunnel every 20 seconds. On Cloudflare CDN tunnels, it first scans &amp; rotates fresh Clean Cloudflare IPs on the Iran Relay; if still blocked, it benchmarks all 19 transport modes (Direct / Reverse / IPv4 / IPv6 / CDN) and switches both servers automatically.</span>
         </span>
       </label>
 

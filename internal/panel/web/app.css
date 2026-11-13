@@ -3130,3 +3130,149 @@ button.is-loading::before {
     grid-template-columns: 1fr;
   }
 }
+
+/* Cloudflare Clean-IP Scanner */
+.cfscan-head {
+  margin-bottom: .35rem;
+}
+
+.cfscan-head label {
+  margin-top: 0;
+}
+
+.cfscan-sub {
+  margin: .2rem 0 .45rem;
+}
+
+.cfscan-input-row {
+  margin-top: .35rem;
+}
+
+.cfscan-results {
+  margin-top: .55rem;
+  border: 1px solid var(--border);
+  border-radius: .6rem;
+  background: var(--surface-2, rgba(148, 163, 184, .06));
+  padding: .6rem .7rem;
+}
+
+.cfscan-summary-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: .5rem;
+  flex-wrap: wrap;
+  margin-bottom: .45rem;
+  padding-bottom: .4rem;
+  border-bottom: 1px solid var(--border);
+  font-size: .82rem;
+}
+
+.cfscan-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: .35rem;
+  max-height: 16rem;
+  overflow-y: auto;
+}
+
+.cfscan-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: .6rem;
+  padding: .42rem .55rem;
+  border-radius: .45rem;
+  border: 1px solid var(--border);
+  background: var(--card, var(--bg));
+  font-size: .84rem;
+}
+
+.cfscan-row.is-selected {
+  border-color: var(--accent);
+  background: rgba(14, 165, 233, .07);
+}
+
+.cfscan-row.is-failed {
+  opacity: .72;
+}
+
+.cfscan-row-left {
+  display: flex;
+  align-items: center;
+  gap: .5rem;
+  min-width: 0;
+  flex-wrap: wrap;
+}
+
+.cfscan-row-left input[type="checkbox"] {
+  width: auto;
+  margin: 0;
+  cursor: pointer;
+}
+
+.cfscan-ip {
+  font-weight: 650;
+  font-size: .86rem;
+}
+
+.cfscan-subnet {
+  font-size: .75rem;
+  color: var(--muted);
+}
+
+.cfscan-row-metrics {
+  display: flex;
+  align-items: center;
+  gap: .4rem;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+
+.cfscan-metric {
+  font-size: .78rem;
+  padding: .1rem .42rem;
+  border-radius: 999px;
+  background: rgba(148, 163, 184, .13);
+  white-space: nowrap;
+}
+
+.cfscan-score {
+  font-weight: 700;
+  color: var(--ok);
+}
+
+.cfscan-notes {
+  margin: .45rem 0 0;
+  font-size: .8rem;
+  color: var(--muted);
+}
+
+.cfscan-toggle-more {
+  margin-top: .45rem;
+  font-size: .8rem;
+  padding: .25rem .6rem;
+}
+
+@media (max-width: 640px) {
+  .cfscan-input-row {
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .cfscan-input-row button {
+    width: 100%;
+  }
+
+  .cfscan-row {
+    flex-direction: column;
+    align-items: flex-start;
+  }
+
+  .cfscan-row-metrics {
+    justify-content: flex-start;
+  }
+}

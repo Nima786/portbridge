@@ -103,9 +103,11 @@ func newRouter(cfg *Config) *router {
 		port = p
 	}
 
-	// 1. Clean IPs (if configured) take top priority for dialing. They are
-	// different addresses that all lead to the same place, so they take turns.
-	if len(cfg.CleanIPs) > 0 {
+	// 1. Clean IPs (when primary link is CDN, or no separate CDN backup domain is set)
+	// take top priority for dialing. They are different addresses that all lead to
+	// the same place, so they take turns.
+	cdnBackupOnly := !cfg.CDN && cfg.AltTarget != ""
+	if len(cfg.CleanIPs) > 0 && !cdnBackupOnly {
 		seen := map[string]bool{}
 		for _, ip := range cfg.CleanIPs {
 			addr := cleanAddr(ip, port)
@@ -137,6 +139,24 @@ func newRouter(cfg *Config) *router {
 		name := cfg.AltServerName
 		if name == "" {
 			name = cfg.ServerName
+		}
+		altPort := port
+		if _, ap, err := net.SplitHostPort(alt); err == nil && ap != "" {
+			altPort = ap
+		}
+		if cdnBackupOnly && len(cfg.CleanIPs) > 0 {
+			seen := map[string]bool{}
+			for _, t := range targets {
+				seen[t.addr] = true
+			}
+			for _, ip := range cfg.CleanIPs {
+				addr := cleanAddr(ip, altPort)
+				if addr == "" || seen[addr] {
+					continue
+				}
+				seen[addr] = true
+				targets = append(targets, route{addr: addr, name: name, cdn: true, clean: true})
+			}
 		}
 		alreadyAlt := false
 		for _, t := range targets {
@@ -288,7 +308,8 @@ func (r *router) inUse() (addr string, preferred bool) {
 	if r.current >= len(r.targets) {
 		return "", true
 	}
-	return r.targets[r.current].addr, r.current == 0
+	primary := r.current == 0 || (r.targets[0].clean && r.targets[r.current].clean)
+	return r.targets[r.current].addr, primary
 }
 
 // hasFallback reports whether there is a second route at all.

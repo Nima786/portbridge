@@ -68,6 +68,7 @@ type TunnelInfo struct {
 	CDN                   bool        `json:"cdn"`
 	ServerName            string      `json:"server_name,omitempty"`
 	AltHost               string      `json:"alt_host,omitempty"`
+	CleanIPs              []string    `json:"clean_ips,omitempty"`
 	GRE                   bool        `json:"gre"`
 	SIT                   bool        `json:"sit"`
 	RealSite              bool        `json:"real_site"`
@@ -169,6 +170,9 @@ func tunnelInfo(path string, host agentHost) TunnelInfo {
 	ti.CDN = cfg.CDN
 	ti.ServerName = cfg.ServerName
 	ti.AltHost = cfg.AltServerName
+	if len(cfg.CleanIPs) > 0 {
+		ti.CleanIPs = append([]string(nil), cfg.CleanIPs...)
+	}
 	ti.GRE = cfg.GRE
 	ti.SIT = cfg.SIT
 	ti.RealSite = cfg.RealSite

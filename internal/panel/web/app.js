@@ -2143,6 +2143,10 @@
     } else if (ahInfo.standby_foreign_name) {
       extraTags.push(`HA Backup: ${ahInfo.standby_foreign_name}`);
     }
+    const cleanList = (ei && ei.clean_ips && ei.clean_ips.length) ? ei.clean_ips : ((any.clean_ips && any.clean_ips.length) ? any.clean_ips : []);
+    if (cleanList.length) {
+      extraTags.push(`${cleanList.length} Clean CF ${cleanList.length === 1 ? 'IP' : 'IPs'}`);
+    }
 
     let healthParts = [];
     if (live) {
@@ -2464,6 +2468,15 @@
     if ($('et-drain')) $('et-drain').value = (ei && ei.drain) || (oi && oi.drain) || '10s';
     if ($('et-advanced')) $('et-advanced').open = false;
 
+    const isEditCDN = !!(e && e.server_id && (any.cdn || any.alt_host));
+    if ($('et-clean-section')) {
+      $('et-clean-section').hidden = !isEditCDN;
+      if ($('et-cleanips')) {
+        $('et-cleanips').value = ((ei && ei.clean_ips) || []).join(', ');
+      }
+      resetCleanIPScanUI('et-cfscan-msg', 'et-cfscan-results');
+    }
+
     if ($('et-mode-banner')) {
       const bothManaged = !!(e && o && e.server_id && o.server_id);
       $('et-mode-banner').hidden = !bothManaged;
@@ -2715,6 +2728,10 @@
       proxy_protocol: proxyProto,
       firewall,
     };
+    if ($('et-clean-section') && !$('et-clean-section').hidden && $('et-cleanips')) {
+      body.clean_ips = $('et-cleanips').value.trim();
+      body.update_clean_ips = true;
+    }
 
     const btn = ev.target.querySelector('button[type=submit]');
     btn.disabled = true;
@@ -2812,6 +2829,7 @@
   // ----------------------------------------- tunnel diagnostics & speed test
 
   let activeDiagTarget = null;
+  let activeDiagTunnel = null;
 
   async function runTunnelChecks() {
     if (!activeDiagTarget) return;
@@ -2876,10 +2894,20 @@
 
   function openTunnelDiag(t, target) {
     activeDiagTarget = target;
+    activeDiagTunnel = t;
     $('diag-title').textContent = `Diagnose & Speed Test: ${t.name}`;
     const where = [t.edge && t.edge.server_name, t.origin && t.origin.server_name].filter(Boolean).join(' ↔ ');
     if ($('diag-sub')) {
       $('diag-sub').textContent = where ? `Health verification and throughput testing across ${where}.` : 'Health verification and throughput testing.';
+    }
+    const ei = t.edge && t.edge.info ? t.edge.info : null;
+    const canDiagCF = !!(ei && (ei.cdn || ei.alt_host) && t.edge && t.edge.server_id && t.origin && t.origin.server_id);
+    if ($('diag-clean-box')) {
+      $('diag-clean-box').hidden = !canDiagCF;
+      if ($('diag-cleanips')) {
+        $('diag-cleanips').value = (ei && ei.clean_ips ? ei.clean_ips : []).join(', ');
+      }
+      resetCleanIPScanUI('diag-cfscan-msg', 'diag-cfscan-results');
     }
     $('speedtest-out').hidden = true;
     $('speedtest-out').textContent = '';
@@ -2891,6 +2919,287 @@
 
   $('diag-refresh').addEventListener('click', runTunnelChecks);
   $('diag-close').addEventListener('click', () => $('diag-dialog').close());
+
+  function resetCleanIPScanUI(msgId, boxId) {
+    const msgEl = $(msgId);
+    if (msgEl) {
+      msgEl.textContent = '';
+      msgEl.className = 'small';
+    }
+    const boxEl = $(boxId);
+    if (boxEl) {
+      boxEl.hidden = true;
+      boxEl.replaceChildren();
+    }
+  }
+
+  async function runCloudflareCleanIPScan(opts) {
+    const { btn, relay, foreign, tunnel, domain, port, transport, inputEl, msgEl, boxEl, domainInputEl } = opts;
+    if (!relay || !foreign) {
+      if (msgEl) {
+        msgEl.textContent = 'Select both the Relay (Iran) and Foreign servers first.';
+        msgEl.className = 'small bad';
+      }
+      return;
+    }
+    if (!domain) {
+      if (msgEl) {
+        msgEl.textContent = 'Enter or select your Cloudflare-proxied subdomain first so PortBridge can verify Clean IPs end-to-end.';
+        msgEl.className = 'small bad';
+      }
+      if (domainInputEl) domainInputEl.focus();
+      return;
+    }
+    const origText = btn ? btn.textContent : 'Scan Clean CF IPs';
+    if (btn) {
+      btn.disabled = true;
+      btn.classList.add('is-loading');
+      btn.textContent = 'Scanning 44 CF Subnets…';
+    }
+    if (msgEl) {
+      msgEl.textContent = `Scanning 44 Cloudflare /24 subnets from your Iran Relay through ${domain} into your Foreign server (typically 8–18s)…`;
+      msgEl.className = 'small muted';
+    }
+    if (boxEl) {
+      boxEl.hidden = true;
+      boxEl.replaceChildren();
+    }
+    try {
+      const res = await api('POST', '/api/probe/cf-scan', {
+        relay,
+        foreign,
+        tunnel: tunnel || '',
+        domain,
+        port: Number(port || 0),
+        transport: transport || 'wss',
+        max_select: 5,
+      });
+      const rep = res.report || {};
+      const allResults = rep.results || [];
+      const rec = rep.recommended || [];
+      const selected = new Set(rec);
+      const syncInput = () => {
+        if (inputEl) {
+          inputEl.value = Array.from(selected).join(', ');
+        }
+      };
+      if (selected.size > 0) {
+        syncInput();
+        if (msgEl) {
+          msgEl.textContent = `Found ${rep.verified_count || selected.size} verified Clean Cloudflare IPs — top ${selected.size} subnet-diverse IPs selected below.`;
+          msgEl.className = 'small good';
+        }
+      } else if (msgEl) {
+        msgEl.textContent = (rep.notes && rep.notes[0]) || 'No Cloudflare edge IPs completed sustained transfer verification.';
+        msgEl.className = 'small bad';
+      }
+
+      if (boxEl && allResults.length) {
+        const primaryRows = allResults.filter((r) => r.status !== 'blocked');
+        const blockedRows = allResults.filter((r) => r.status === 'blocked');
+        const rowSyncFns = [];
+
+        const buildRow = (r) => {
+          const canCheck = r.status === 'ok' || r.status === 'stage1_ok';
+          const isChecked = selected.has(r.ip);
+          const rowEl = h('li', {
+            class: 'cfscan-row' + (isChecked ? ' is-selected' : '') + (r.status === 'blocked' ? ' is-failed' : ''),
+          });
+          let cb = null;
+          if (canCheck) {
+            cb = h('input', { type: 'checkbox', checked: isChecked });
+            cb.addEventListener('change', () => {
+              if (cb.checked) {
+                selected.add(r.ip);
+                rowEl.classList.add('is-selected');
+              } else {
+                selected.delete(r.ip);
+                rowEl.classList.remove('is-selected');
+              }
+              syncInput();
+            });
+            rowSyncFns.push(() => {
+              const on = selected.has(r.ip);
+              cb.checked = on;
+              rowEl.classList.toggle('is-selected', on);
+            });
+          }
+          const left = h('div', { class: 'cfscan-row-left' },
+            cb,
+            h('span', { class: 'cfscan-ip mono' }, r.ip),
+            r.subnet ? h('span', { class: 'cfscan-subnet mono' }, r.subnet) : null);
+
+          const metrics = h('div', { class: 'cfscan-row-metrics' });
+          if (r.status === 'ok') {
+            if (r.rtt_ms > 0) metrics.append(h('span', { class: 'cfscan-metric mono' }, `${Math.round(r.rtt_ms)} ms`));
+            metrics.append(h('span', { class: 'cfscan-metric mono' }, `↓ ${r.down_mbps} / ↑ ${r.up_mbps} Mbps`));
+            metrics.append(h('span', { class: 'cfscan-metric cfscan-score' }, `Score ${r.score}`));
+          } else if (r.status === 'stage1_ok') {
+            metrics.append(h('span', { class: 'cfscan-metric mono' }, `${Math.round(r.rtt_ms || r.handshake_ms || 0)} ms (handshake OK)`));
+          } else if (r.status === 'throttled') {
+            metrics.append(h('span', { class: 'state warn' }, 'Throttled mid-stream'));
+          } else {
+            metrics.append(h('span', { class: 'muted small' }, r.error || 'Blocked'));
+          }
+          rowEl.append(left, metrics);
+          return rowEl;
+        };
+
+        const listEl = h('ul', { class: 'cfscan-list' });
+        for (const r of primaryRows) listEl.append(buildRow(r));
+
+        let moreBtn = null;
+        if (blockedRows.length) {
+          let showingBlocked = primaryRows.length === 0;
+          const blockedNodes = blockedRows.slice(0, 16).map(buildRow);
+          if (showingBlocked) {
+            for (const n of blockedNodes) listEl.append(n);
+          } else {
+            moreBtn = h('button', {
+              type: 'button',
+              class: 'cfscan-toggle-more',
+              onclick: () => {
+                showingBlocked = !showingBlocked;
+                if (showingBlocked) {
+                  for (const n of blockedNodes) listEl.append(n);
+                  moreBtn.textContent = 'Hide blocked subnets';
+                } else {
+                  for (const n of blockedNodes) n.remove();
+                  moreBtn.textContent = `Show ${blockedNodes.length} blocked subnets`;
+                }
+              }
+            }, `Show ${blockedNodes.length} blocked subnets`);
+          }
+        }
+
+        const summaryBar = h('div', { class: 'cfscan-summary-bar' },
+          h('span', null,
+            h('strong', null, `${rep.verified_count || 0} verified clean`),
+            ` · ${rep.passed_stage1 || 0}/${rep.scanned_count || allResults.length} handshakes (${String(rep.transport || 'wss').toUpperCase()} :${rep.port || port || 443})`),
+          selected.size > 0
+            ? h('button', {
+                type: 'button',
+                class: 'use-port-btn',
+                onclick: () => {
+                  selected.clear();
+                  for (const ip of rec) selected.add(ip);
+                  for (const fn of rowSyncFns) fn();
+                  syncInput();
+                }
+              }, `Reset Top ${rec.length}`)
+            : null);
+
+        boxEl.replaceChildren(
+          summaryBar,
+          listEl,
+          moreBtn,
+          (rep.notes && rep.notes.length && selected.size > 0)
+            ? h('p', { class: 'cfscan-notes' }, rep.notes.join(' '))
+            : null
+        );
+        boxEl.hidden = false;
+      }
+    } catch (e) {
+      if (msgEl) {
+        msgEl.textContent = e.message;
+        msgEl.className = 'small bad';
+      }
+    } finally {
+      if (btn) {
+        btn.classList.remove('is-loading');
+        btn.textContent = origText;
+        btn.disabled = false;
+      }
+    }
+  }
+
+  if ($('et-cfscan-btn')) {
+    $('et-cfscan-btn').addEventListener('click', () => {
+      if (!editingTunnel || !editingTunnel.edge || !editingTunnel.origin) return;
+      const ei = editingTunnel.edge.info || {};
+      const oi = editingTunnel.origin.info || {};
+      const dom = ei.alt_host || (ei.cdn ? ei.server_name : '') || (editingTunnel.auto_heal && editingTunnel.auto_heal.cdn_domain) || '';
+      runCloudflareCleanIPScan({
+        btn: $('et-cfscan-btn'),
+        relay: editingTunnel.edge.server_id,
+        foreign: editingTunnel.origin.server_id,
+        tunnel: editingTunnel.name,
+        domain: dom,
+        port: Number($('et-linkport').value || ei.link_port || oi.link_port || 2053),
+        transport: ei.transport || oi.transport || 'wss',
+        inputEl: $('et-cleanips'),
+        msgEl: $('et-cfscan-msg'),
+        boxEl: $('et-cfscan-results'),
+      });
+    });
+  }
+
+  if ($('diag-cfscan-btn')) {
+    $('diag-cfscan-btn').addEventListener('click', () => {
+      if (!activeDiagTarget || !activeDiagTunnel) return;
+      const ei = (activeDiagTunnel.edge && activeDiagTunnel.edge.info) || {};
+      const dom = ei.alt_host || (ei.cdn ? ei.server_name : '') || (activeDiagTunnel.auto_heal && activeDiagTunnel.auto_heal.cdn_domain) || '';
+      runCloudflareCleanIPScan({
+        btn: $('diag-cfscan-btn'),
+        relay: activeDiagTarget.edge,
+        foreign: activeDiagTarget.origin,
+        tunnel: activeDiagTarget.name,
+        domain: dom,
+        port: ei.link_port || 2053,
+        transport: ei.transport || 'wss',
+        inputEl: $('diag-cleanips'),
+        msgEl: $('diag-cfscan-msg'),
+        boxEl: $('diag-cfscan-results'),
+      });
+    });
+  }
+
+  if ($('diag-cfscan-apply')) {
+    $('diag-cfscan-apply').addEventListener('click', async () => {
+      if (!activeDiagTarget || !activeDiagTarget.edge) return;
+      const btn = $('diag-cfscan-apply');
+      const msgEl = $('diag-cfscan-msg');
+      const raw = $('diag-cleanips') ? $('diag-cleanips').value.trim() : '';
+      btn.disabled = true;
+      btn.classList.add('is-loading');
+      const orig = btn.textContent;
+      btn.textContent = 'Applying…';
+      if (msgEl) {
+        msgEl.textContent = 'Updating Clean Cloudflare IPs and restarting Relay service…';
+        msgEl.className = 'small muted';
+      }
+      try {
+        const res = await api('POST', '/api/tunnels/clean-ips', {
+          name: activeDiagTarget.name,
+          edge: activeDiagTarget.edge,
+          clean_ips: raw,
+        });
+        const applied = res.clean_ips || [];
+        if ($('diag-cleanips')) $('diag-cleanips').value = applied.join(', ');
+        if (activeDiagTunnel && activeDiagTunnel.edge && activeDiagTunnel.edge.info) {
+          activeDiagTunnel.edge.info.clean_ips = applied;
+        }
+        if (msgEl) {
+          msgEl.textContent = applied.length
+            ? `Applied ${applied.length} Clean Cloudflare ${applied.length === 1 ? 'IP' : 'IPs'} (${applied.join(', ')}) on the Iran Relay.`
+            : 'Cleared Clean Cloudflare IPs (reverted to default Cloudflare DNS).';
+          msgEl.className = 'small good';
+        }
+        lastTunnels = '';
+        refresh();
+        runTunnelChecks();
+      } catch (e) {
+        if (msgEl) {
+          msgEl.textContent = e.message;
+          msgEl.className = 'small bad';
+        }
+      } finally {
+        btn.classList.remove('is-loading');
+        btn.textContent = orig;
+        btn.disabled = false;
+      }
+    });
+  }
 
   $('speedtest-run').addEventListener('click', async () => {
     if (!activeDiagTarget) return;
@@ -4079,7 +4388,7 @@
     const needDomain = ['cdn', 'website-cdn-backup', 'xhttp-cdn', 'h3-cdn', 'asymmetric-cdn', 'grpc-cdn'].includes(link);
     $('tn-opt-domain').hidden = !needDomain;
     if (needDomain) ensureTunnelCFHelper();
-    $('tn-opt-clean').hidden = !['cdn', 'xhttp-cdn', 'h3-cdn', 'asymmetric-cdn', 'grpc-cdn'].includes(link);
+    $('tn-opt-clean').hidden = !['cdn', 'website-cdn-backup', 'xhttp-cdn', 'h3-cdn', 'asymmetric-cdn', 'grpc-cdn'].includes(link);
     $('tn-opt-stealth').hidden = !['website', 'split', 'sit', 'sni-spoof', 'xhttp', 'grpc'].includes(link);
     if ($('tn-opt-snispoof')) {
       $('tn-opt-snispoof').hidden = gre || ['kcp', 'kcp-hop', 'webrtc', 'twin', 'h3', 'h3-cdn', 'asymmetric', 'asymmetric-cdn', 'icmp', 'faketcp', 'sit'].includes(link);
@@ -5023,6 +5332,7 @@
       $('tn-probe-results').hidden = true;
       $('tn-probe-results').replaceChildren();
     }
+    resetCleanIPScanUI('tn-cfscan-msg', 'tn-cfscan-results');
   }
 
   async function openNewTunnel(relayID, foreignID) {
@@ -5050,6 +5360,7 @@
     if (relayID) $('tn-relay').value = relayID;
     if (foreignID) $('tn-foreign').value = foreignID;
     resetTunnelDialogProbeState();
+    if ($('tn-cleanips')) $('tn-cleanips').value = '';
     if ($('tn-probe-service') && $('tn-service')) {
       $('tn-probe-service').value = $('tn-service').value;
     }
@@ -5111,7 +5422,7 @@
     const hostMatch = rawLink.match(/\(([^(),]+)\)/);
     const hostInLink = hostMatch ? hostMatch[1].trim() : '';
     const ah = t.auto_heal || {};
-    const cdnDom = (any.cdn ? hostInLink : '') || ah.cdn_domain || '';
+    const cdnDom = (any.cdn ? (any.server_name || hostInLink) : (any.alt_host || '')) || ah.cdn_domain || '';
 
     $('tn-service').value = servicePorts.join(',');
     if ($('tn-probe-service')) $('tn-probe-service').value = servicePorts.join(',');
@@ -5130,7 +5441,7 @@
     $('tn-claim').value = (!any.cdn && hostInLink && !/website header/i.test(rawLink))
       ? hostInLink
       : (['grpc', 'h3'].includes(linkKey) ? 'www.google.com' : 'www.bing.com');
-    $('tn-cleanips').value = '';
+    $('tn-cleanips').value = ((ei && ei.clean_ips) || (any && any.clean_ips) || []).join(', ');
     $('tn-webheader').checked = /website header/i.test(rawLink);
     $('tn-webhost').value = (/website header/i.test(rawLink) && hostInLink) ? hostInLink : 'www.bing.com';
     $('tn-realsite').checked = any.real_site !== false;
@@ -5166,6 +5477,23 @@
   }
 
   for (const b of document.querySelectorAll('.new-tunnel')) b.addEventListener('click', () => openNewTunnel('', ''));
+  if ($('tn-cfscan-btn')) {
+    $('tn-cfscan-btn').addEventListener('click', () => {
+      runCloudflareCleanIPScan({
+        btn: $('tn-cfscan-btn'),
+        relay: $('tn-relay').value,
+        foreign: $('tn-foreign').value,
+        tunnel: (tunnelModalMode && tunnelModalMode.kind === 'switch' && tunnelModalMode.tunnel) ? tunnelModalMode.tunnel.name : '',
+        domain: $('tn-domain').value.trim(),
+        port: Number($('tn-linkport').value || 0),
+        transport: radio('tn-link') || 'cdn',
+        inputEl: $('tn-cleanips'),
+        msgEl: $('tn-cfscan-msg'),
+        boxEl: $('tn-cfscan-results'),
+        domainInputEl: $('tn-domain'),
+      });
+    });
+  }
   $('tn-cancel').addEventListener('click', () => $('tunnel-dialog').close());
   $('tn-close').addEventListener('click', () => $('tunnel-dialog').close());
   $('tn-back').addEventListener('click', () => {

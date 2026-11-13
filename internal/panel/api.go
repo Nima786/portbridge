@@ -78,6 +78,8 @@ func (p *Panel) routes() http.Handler {
 	mux.HandleFunc("POST /api/probe/sni-scan", p.withAuth(p.handleProbeSNIScan))
 	mux.HandleFunc("POST /api/probe/sni-test", p.withAuth(p.handleProbeSNITest))
 	mux.HandleFunc("POST /api/probe/spoof-test", p.withAuth(p.handleProbeSpoofTest))
+	mux.HandleFunc("POST /api/probe/cf-scan", p.withAuth(p.handleProbeCFScan))
+	mux.HandleFunc("POST /api/tunnels/clean-ips", p.withAuth(p.handleSetTunnelCleanIPs))
 	mux.HandleFunc("POST /api/tunnels/autoheal", p.withAuth(p.handleSetTunnelAutoHeal))
 	mux.HandleFunc("POST /api/tunnels/autoheal/trigger", p.withAuth(p.handleTriggerTunnelAutoHeal))
 	mux.HandleFunc("POST /api/tunnels/traffic", p.withAuth(p.handleTunnelTraffic))

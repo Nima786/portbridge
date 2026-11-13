@@ -1275,28 +1275,29 @@ type EditSpec struct {
 	// link when CleanIPs is empty. A mode switch by Auto-Heal sets it, so a
 	// switch does not throw the list away; the Edit form leaves it off, so
 	// clearing the list there still works.
-	KeepCleanIPs bool   `json:"keep_clean_ips,omitempty"`
-	UTLS         string `json:"utls,omitempty"`         // "on" or "off"
-	TLSFragment  string `json:"tls_fragment,omitempty"` // "on" or "off"
-	HTTPHeader   string `json:"http_header,omitempty"`  // "on" or "off"
-	HTTPHost     string `json:"http_host,omitempty"`    // HTTP host header
-	RealSite     string `json:"real_site,omitempty"`    // "on" or "off"
-	GRE          string `json:"gre,omitempty"`          // "on" or "off"
-	SIT          string `json:"sit,omitempty"`          // "on" or "off"
-	SNISpoof     string `json:"sni_spoof,omitempty"`    // "on" or "off"
-	SpoofSNI     string `json:"spoof_sni,omitempty"`    // whitelisted SNI hostname
-	IPSpoof      string `json:"ip_spoof,omitempty"`     // "on" or "off"
-	SpoofIP      string `json:"spoof_ip,omitempty"`     // whitelisted IPv4 address
-	AntiFreeze   string `json:"anti_freeze,omitempty"`  // "on" or "off"
-	PortHop      string `json:"port_hop,omitempty"`     // "on" or "off"
-	PortHopPorts int    `json:"port_hop_ports,omitempty"`
-	TwinPath     string `json:"twin_path,omitempty"`  // "on" or "off"
-	Asymmetric   string `json:"asymmetric,omitempty"` // "on" or "off"
-	AsymUplink   string `json:"asym_uplink,omitempty"`
-	AsymDownlink string `json:"asym_downlink,omitempty"`
-	AsymDownPort int    `json:"asym_down_port,omitempty"`
-	IPv6         *bool  `json:"ipv6,omitempty"` // true for IPv6 bridge, false for IPv4
-	Mux          string `json:"mux,omitempty"`  // "on" or "off"
+	KeepCleanIPs   bool   `json:"keep_clean_ips,omitempty"`
+	UpdateCleanIPs bool   `json:"update_clean_ips,omitempty"`
+	UTLS           string `json:"utls,omitempty"`         // "on" or "off"
+	TLSFragment    string `json:"tls_fragment,omitempty"` // "on" or "off"
+	HTTPHeader     string `json:"http_header,omitempty"`  // "on" or "off"
+	HTTPHost       string `json:"http_host,omitempty"`    // HTTP host header
+	RealSite       string `json:"real_site,omitempty"`    // "on" or "off"
+	GRE            string `json:"gre,omitempty"`          // "on" or "off"
+	SIT            string `json:"sit,omitempty"`          // "on" or "off"
+	SNISpoof       string `json:"sni_spoof,omitempty"`    // "on" or "off"
+	SpoofSNI       string `json:"spoof_sni,omitempty"`    // whitelisted SNI hostname
+	IPSpoof        string `json:"ip_spoof,omitempty"`     // "on" or "off"
+	SpoofIP        string `json:"spoof_ip,omitempty"`     // whitelisted IPv4 address
+	AntiFreeze     string `json:"anti_freeze,omitempty"`  // "on" or "off"
+	PortHop        string `json:"port_hop,omitempty"`     // "on" or "off"
+	PortHopPorts   int    `json:"port_hop_ports,omitempty"`
+	TwinPath       string `json:"twin_path,omitempty"`  // "on" or "off"
+	Asymmetric     string `json:"asymmetric,omitempty"` // "on" or "off"
+	AsymUplink     string `json:"asym_uplink,omitempty"`
+	AsymDownlink   string `json:"asym_downlink,omitempty"`
+	AsymDownPort   int    `json:"asym_down_port,omitempty"`
+	IPv6           *bool  `json:"ipv6,omitempty"` // true for IPv6 bridge, false for IPv4
+	Mux            string `json:"mux,omitempty"`  // "on" or "off"
 
 	WebsiteBridge         string `json:"website_bridge,omitempty"`
 	WebsiteDomains        string `json:"website_domains,omitempty"`
@@ -1592,7 +1593,7 @@ func EditEdge(spec EditSpec, confDir string) (EdgeResult, error) {
 		}
 
 		cleanIPs := spec.CleanIPs
-		if cleanIPs == "" && spec.KeepCleanIPs && spec.CDN == "on" {
+		if cleanIPs == "" && spec.KeepCleanIPs && (spec.CDN == "on" || spec.AltHost != "") {
 			cleanIPs = strings.ReplaceAll(kv["clean_ips"], " ", "")
 		}
 
@@ -1991,6 +1992,28 @@ func EditEdge(spec EditSpec, confDir string) (EdgeResult, error) {
 				}
 				text = setConfKey(text, "tunnel_addr", net.JoinHostPort(pip, p))
 			}
+		}
+	}
+	if spec.UpdateCleanIPs && spec.Mode == "" && spec.Transport == "" {
+		var cleaned []string
+		seen := map[string]bool{}
+		for _, raw := range strings.Split(spec.CleanIPs, ",") {
+			ip := strings.TrimSpace(raw)
+			if ip == "" {
+				continue
+			}
+			if err := engine.CheckCleanIP(ip); err != nil {
+				return res, fmt.Errorf("clean addresses: %w", err)
+			}
+			if !seen[ip] {
+				seen[ip] = true
+				cleaned = append(cleaned, ip)
+			}
+		}
+		if len(cleaned) == 0 || !curCfg.Dials() || curCfg.GRE || curCfg.SIT || curCfg.RealSite {
+			text = dropConfKey(text, "clean_ips")
+		} else {
+			text = setConfKey(text, "clean_ips", strings.Join(cleaned, ", "))
 		}
 	}
 	if spec.Firewall != "" {

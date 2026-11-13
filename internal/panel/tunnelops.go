@@ -327,7 +327,7 @@ func (p *Panel) toSpec(r createRequest) (agent.EdgeSpec, error) {
 		if r.Mode != "direct" {
 			return s, errors.New("the CDN standing by is only for direct tunnels")
 		}
-		s.Transport, s.AltHost, s.ServerName = "wss", domain, claimed
+		s.Transport, s.AltHost, s.ServerName, s.CleanIPs = "wss", domain, claimed, r.CleanIPs
 		if s.ServerName == "" {
 			s.ServerName = "www.bing.com"
 		}
@@ -1153,6 +1153,8 @@ type editTunnelRequest struct {
 	SpareTTL              string `json:"spare_ttl"`
 	Drain                 string `json:"drain"`
 	PeerIP                string `json:"peer_ip"`
+	CleanIPs              string `json:"clean_ips,omitempty"`
+	UpdateCleanIPs        bool   `json:"update_clean_ips,omitempty"`
 	Firewall              string `json:"firewall"`
 	WebsiteDomains        string `json:"website_domains"`
 	OutboundProxy         string `json:"outbound_proxy"`
@@ -1196,6 +1198,8 @@ func (p *Panel) editTunnel(j *job, r editTunnelRequest) error {
 		SpareTTL:              strings.TrimSpace(r.SpareTTL),
 		Drain:                 strings.TrimSpace(r.Drain),
 		PeerIP:                strings.TrimSpace(r.PeerIP),
+		CleanIPs:              strings.TrimSpace(r.CleanIPs),
+		UpdateCleanIPs:        r.UpdateCleanIPs,
 		Firewall:              strings.TrimSpace(r.Firewall),
 		WebsiteDomains:        strings.TrimSpace(r.WebsiteDomains),
 		OutboundProxy:         strings.TrimSpace(r.OutboundProxy),

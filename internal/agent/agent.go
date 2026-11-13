@@ -1096,6 +1096,109 @@ func newAgentHandler(token, confDir string, allowUpdates func() bool) *http.Serv
 		writeJSONReply(w, http.StatusOK, map[string]any{"ok": true, "results": results})
 	})
 
+	// POST /api/probe/cf-scan: end-to-end Cloudflare Clean-IP scan from this Relay server.
+	mux.HandleFunc("/api/probe/cf-scan", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, `{"error":"method not allowed"}`, http.StatusMethodNotAllowed)
+			return
+		}
+		if !checkAgentAuth(r, token) {
+			http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
+			return
+		}
+		var req struct {
+			TunnelName  string   `json:"tunnel_name"`
+			Domain      string   `json:"domain"`
+			Port        int      `json:"port"`
+			Transport   string   `json:"transport"`
+			WSPath      string   `json:"ws_path"`
+			Secret      string   `json:"secret"`
+			Candidates  []string `json:"candidates"`
+			MaxSelect   int      `json:"max_select"`
+			Stage2Limit int      `json:"stage2_limit"`
+		}
+		if err := json.NewDecoder(io.LimitReader(r.Body, 32*1024)).Decode(&req); err != nil {
+			writeJSONReply(w, http.StatusBadRequest, map[string]any{"ok": false, "error": "invalid cf-scan request"})
+			return
+		}
+
+		var sec []byte
+		domain := strings.TrimSpace(req.Domain)
+		port := req.Port
+		transport := strings.TrimSpace(req.Transport)
+		wsPath := strings.TrimSpace(req.WSPath)
+
+		if strings.TrimSpace(req.Secret) != "" {
+			decoded, err := base64.StdEncoding.DecodeString(strings.TrimSpace(req.Secret))
+			if err != nil || len(decoded) < 16 {
+				writeJSONReply(w, http.StatusBadRequest, map[string]any{"ok": false, "error": "invalid probe secret"})
+				return
+			}
+			sec = decoded
+		} else if tname := strings.TrimSpace(req.TunnelName); tname != "" {
+			if err := validTunnelName(tname); err != nil {
+				writeJSONReply(w, http.StatusBadRequest, map[string]any{"ok": false, "error": err.Error()})
+				return
+			}
+			dir := confDir
+			if dir == "" {
+				dir = defaultTunnelsDir
+			}
+			cfg, err := engine.LoadConfig(filepath.Join(dir, tname+".conf"))
+			if err != nil {
+				writeJSONReply(w, http.StatusUnprocessableEntity, map[string]any{"ok": false, "error": err.Error()})
+				return
+			}
+			if err := cfg.LoadSecret(); err != nil {
+				writeJSONReply(w, http.StatusUnprocessableEntity, map[string]any{"ok": false, "error": err.Error()})
+				return
+			}
+			sec = cfg.SecretBytes()
+			if domain == "" {
+				if cfg.AltServerName != "" {
+					domain = cfg.AltServerName
+				} else {
+					domain = cfg.ServerName
+				}
+			}
+			if port <= 0 {
+				addr := cfg.TunnelAddr
+				if cfg.AltTarget != "" {
+					addr = cfg.AltTarget
+				}
+				if _, pStr, err := net.SplitHostPort(addr); err == nil {
+					port, _ = strconv.Atoi(pStr)
+				}
+			}
+			if transport == "" {
+				transport = string(cfg.Transport)
+			}
+			if wsPath == "" {
+				wsPath = cfg.WSPath
+			}
+		} else {
+			writeJSONReply(w, http.StatusBadRequest, map[string]any{"ok": false, "error": "secret or tunnel_name required"})
+			return
+		}
+
+		extendDeadlines(w, 5*time.Minute)
+		rep, err := engine.ScanCloudflareCleanIPs(r.Context(), engine.CFScanRequest{
+			Domain:      domain,
+			Port:        port,
+			Transport:   transport,
+			WSPath:      wsPath,
+			Secret:      sec,
+			Candidates:  req.Candidates,
+			MaxSelect:   req.MaxSelect,
+			Stage2Limit: req.Stage2Limit,
+		})
+		if err != nil {
+			writeJSONReply(w, http.StatusUnprocessableEntity, map[string]any{"ok": false, "error": err.Error()})
+			return
+		}
+		writeJSONReply(w, http.StatusOK, map[string]any{"ok": true, "report": rep})
+	})
+
 	// POST /api/probe/spoof-listen: listen for raw spoofed and normal UDP probe packets.
 	mux.HandleFunc("/api/probe/spoof-listen", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
