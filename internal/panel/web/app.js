@@ -81,6 +81,11 @@
     }
   }
 
+  function panelBasePrefix() {
+    const p = window.location.pathname || '/';
+    return p.replace(/\/index\.html$/, '').replace(/\/+$/, '');
+  }
+
   async function api(method, path, body) {
     const opts = { method, headers: {}, credentials: 'same-origin', cache: 'no-store' };
     if (method !== 'GET') opts.headers['X-PB-CSRF'] = csrf;
@@ -88,9 +93,10 @@
       opts.headers['Content-Type'] = 'application/json';
       opts.body = JSON.stringify(body);
     }
+    const reqUrl = path.startsWith('/') ? panelBasePrefix() + path : path;
     let res;
     try {
-      res = await fetch(path, opts);
+      res = await fetch(reqUrl, opts);
     } catch (e) {
       throw new ApiError(0, 'The panel cannot be reached right now. Check your connection.');
     }
@@ -276,6 +282,13 @@
     $('login').hidden = true;
     $('shell').hidden = false;
     lastServers = lastTunnels = '';
+    try {
+      const savedTab = sessionStorage.getItem('pb-open-tab');
+      if (savedTab && TABS.includes(savedTab)) {
+        currentTab = savedTab;
+        sessionStorage.removeItem('pb-open-tab');
+      }
+    } catch (_) {}
     selectTab(currentTab, false);
     startRefresh();
   }
@@ -4039,13 +4052,80 @@
     });
   }
 
-  async function loadSettings() {
-    const [info] = await Promise.all([api('GET', '/api/panel'), loadUpdates(), loadNotifications()]);
+  let panelInfoCache = null;
+  let panelAccessDirty = false;
+  let panelAccessLoaded = false;
+  const paccPollTimers = [];
+
+  function clearPaccPollTimers() {
+    while (paccPollTimers.length) {
+      clearTimeout(paccPollTimers.pop());
+    }
+  }
+
+  function scheduleSSLStatusPoll() {
+    clearPaccPollTimers();
+    for (const ms of [4000, 9000, 16000]) {
+      paccPollTimers.push(setTimeout(async () => {
+        if (currentTab !== 'settings' || !csrf) return;
+        try {
+          const info = await api('GET', '/api/panel');
+          renderPanelInfo(info, false);
+          if (info.certificate && info.certificate.real) {
+            clearPaccPollTimers();
+          }
+        } catch (_) {}
+      }, ms));
+    }
+  }
+
+  function cleanSlugPreview(raw) {
+    const s = String(raw || '').trim().replace(/^\/+|\/+$/g, '');
+    if (!s || /^(off|none)$/i.test(s)) return '';
+    return '/' + s + '/';
+  }
+
+  function updatePanelURLPreview() {
+    const previewEl = $('pacc-url-preview');
+    if (!previewEl) return;
+    const domInput = $('pacc-domain') ? $('pacc-domain').value.trim().toLowerCase().replace(/\.$/, '') : '';
+    const dom = (domInput && !/^(off|none)$/i.test(domInput)) ? domInput : '';
+    const slugInput = $('pacc-basepath') ? $('pacc-basepath').value : '';
+    const pathPart = cleanSlugPreview(slugInput) || '/';
+    const port = (panelInfoCache && panelInfoCache.port)
+      ? String(panelInfoCache.port)
+      : (window.location.port || '');
+    const portSuffix = (port && port !== '443') ? `:${port}` : '';
+    if (dom) {
+      previewEl.textContent = `https://${dom}${portSuffix}${pathPart}`;
+    } else {
+      previewEl.textContent = `${window.location.origin}${pathPart}`;
+    }
+  }
+
+  function randomClientSlug(len = 10) {
+    const alphabet = 'abcdefghjkmnpqrstuvwxyz23456789';
+    const bytes = new Uint8Array(len);
+    if (window.crypto && window.crypto.getRandomValues) {
+      window.crypto.getRandomValues(bytes);
+    } else {
+      for (let i = 0; i < len; i++) bytes[i] = Math.floor(Math.random() * 256);
+    }
+    let out = '';
+    for (let i = 0; i < len; i++) out += alphabet[bytes[i] % alphabet.length];
+    return out;
+  }
+
+  function renderPanelInfo(info, forcePopulate) {
+    panelInfoCache = info || {};
     const rows = [];
     const row = (k, v) => rows.push(h('dt', null, k), h('dd', null, v));
     row('Panel Version', info.version || '');
     row('Panel URL(s)', (info.addresses || []).length
-      ? h('span', null, ...info.addresses.map((a, i) => [i ? h('br') : null, a])) : '—');
+      ? h('span', { class: 'mono' }, ...info.addresses.map((a, i) => [i ? h('br') : null, a])) : '—');
+    row('Secret Login Path', info.base_path
+      ? h('span', null, h('code', null, `${info.base_path}/`), ' (root ', h('code', null, '/'), ' returns 404 Not Found)')
+      : 'None (served at /)');
     const c = info.certificate || {};
     if (c.real) {
       const until = c.until ? new Date(c.until).toLocaleDateString() : '';
@@ -4053,12 +4133,181 @@
     } else {
       row('SSL Certificate', c.domain
         ? `Self-signed for now. Certificate for ${c.domain}: ${sentence(c.note)}`
-        : 'Self-signed certificate. Configure a domain name in the CLI menu on this server to get a trusted Let\'s Encrypt certificate.');
+        : 'Self-signed IP certificate. Add a domain or subdomain in the card on the left for an automatic Let\'s Encrypt SSL certificate.');
     }
     row('Cert Fingerprint', h('span', { class: 'mono' }, info.fingerprint || ''));
-    row('Agent Callback URL', info.public_url || 'Not configured (can be set in the CLI menu on this server)');
+    row('Agent Callback URL', info.public_url || 'Auto-detected');
     $('panel-info').replaceChildren(...rows);
+
+    // Update the Panel Domain, Auto-SSL & Secret Login Path card
+    const badge = $('pacc-ssl-badge');
+    const box = $('pacc-ssl-box');
+    const sslText = $('pacc-ssl-text');
+    const retryBtn = $('pacc-retry-ssl');
+    if (badge && box && sslText) {
+      if (c.real) {
+        const until = c.until ? new Date(c.until).toLocaleDateString() : '';
+        badge.className = 'pill-tag tag-good';
+        badge.textContent = 'SSL Active · Let\'s Encrypt';
+        box.className = 'pacc-ssl-box is-ok';
+        sslText.textContent = `Trusted HTTPS certificate active for ${c.domain} (${c.issuer || 'Let\'s Encrypt'})${until ? `, valid until ${until}` : ''}. Renews automatically.`;
+        if (retryBtn) retryBtn.hidden = true;
+      } else if (c.domain || info.domain) {
+        const domName = c.domain || info.domain;
+        badge.className = 'pill-tag tag-warn';
+        badge.textContent = 'Issuing SSL…';
+        box.className = 'pacc-ssl-box is-warn';
+        sslText.textContent = `Domain ${domName} saved — ${sentence(c.note || 'requesting Let\'s Encrypt certificate now')} (IP login continues using self-signed certificate meanwhile.)`;
+        if (retryBtn) retryBtn.hidden = false;
+      } else {
+        badge.className = 'pill-tag';
+        badge.textContent = 'Self-Signed (IP Mode)';
+        box.className = 'pacc-ssl-box';
+        sslText.textContent = 'Using self-signed certificate (browsers show a warning on IP logins). Enter a domain or subdomain below to get a trusted Let\'s Encrypt certificate.';
+        if (retryBtn) retryBtn.hidden = true;
+      }
+    }
+
+    if (forcePopulate || (!panelAccessLoaded || !panelAccessDirty)) {
+      if ($('pacc-domain')) $('pacc-domain').value = info.domain || '';
+      if ($('pacc-email')) $('pacc-email').value = info.email || '';
+      if ($('pacc-basepath')) $('pacc-basepath').value = (info.base_path || '').replace(/^\/+|\/+$/g, '');
+      panelAccessLoaded = true;
+      panelAccessDirty = false;
+      updatePanelURLPreview();
+    }
+  }
+
+  async function loadSettings() {
+    const [info] = await Promise.all([api('GET', '/api/panel'), loadUpdates(), loadNotifications()]);
+    renderPanelInfo(info, false);
     if (!$('acc-user').value) $('acc-user').value = currentUser;
+    try {
+      const flash = sessionStorage.getItem('pb-access-flash');
+      if (flash && $('pacc-msg')) {
+        sessionStorage.removeItem('pb-access-flash');
+        $('pacc-msg').className = 'okay';
+        $('pacc-msg').textContent = flash;
+        if (info.domain && !(info.certificate && info.certificate.real)) {
+          scheduleSSLStatusPoll();
+        }
+      }
+    } catch (_) {}
+  }
+
+  for (const id of ['pacc-domain', 'pacc-email', 'pacc-basepath']) {
+    if ($(id)) {
+      $(id).addEventListener('input', () => {
+        panelAccessDirty = true;
+        updatePanelURLPreview();
+      });
+    }
+  }
+
+  if ($('pacc-rand-btn')) {
+    $('pacc-rand-btn').addEventListener('click', () => {
+      if (!$('pacc-basepath')) return;
+      $('pacc-basepath').value = randomClientSlug(10);
+      panelAccessDirty = true;
+      updatePanelURLPreview();
+      if ($('pacc-msg')) {
+        $('pacc-msg').className = 'muted small';
+        $('pacc-msg').textContent = 'Random secret path generated — click "Save Domain & Secret Path" below to activate it.';
+      }
+    });
+  }
+
+  if ($('pacc-clear-path-btn')) {
+    $('pacc-clear-path-btn').addEventListener('click', () => {
+      if (!$('pacc-basepath')) return;
+      $('pacc-basepath').value = '';
+      panelAccessDirty = true;
+      updatePanelURLPreview();
+    });
+  }
+
+  if ($('pacc-copy-url')) {
+    $('pacc-copy-url').addEventListener('click', () => {
+      const txt = $('pacc-url-preview') ? $('pacc-url-preview').textContent.trim() : '';
+      if (txt && txt !== '—') {
+        copyTextWithButton(txt, $('pacc-copy-url'), 'Copy URL');
+      }
+    });
+  }
+
+  if ($('pacc-retry-ssl')) {
+    $('pacc-retry-ssl').addEventListener('click', async () => {
+      const btn = $('pacc-retry-ssl');
+      btn.disabled = true;
+      if ($('pacc-err')) $('pacc-err').textContent = '';
+      if ($('pacc-msg')) {
+        $('pacc-msg').className = 'muted small';
+        $('pacc-msg').textContent = 'Triggering immediate Let\'s Encrypt certificate check…';
+      }
+      try {
+        const res = await api('POST', '/api/panel/access', { retry_cert: true });
+        renderPanelInfo(res, false);
+        if ($('pacc-msg')) {
+          $('pacc-msg').className = 'okay';
+          $('pacc-msg').textContent = 'Let\'s Encrypt verification triggered — checking status over the next few seconds…';
+        }
+        scheduleSSLStatusPoll();
+      } catch (e) {
+        if ($('pacc-msg')) $('pacc-msg').textContent = '';
+        if ($('pacc-err')) $('pacc-err').textContent = e.message;
+      } finally {
+        btn.disabled = false;
+      }
+    });
+  }
+
+  if ($('panel-access-form')) {
+    $('panel-access-form').addEventListener('submit', async (ev) => {
+      ev.preventDefault();
+      const msg = $('pacc-msg');
+      const errEl = $('pacc-err');
+      msg.className = '';
+      msg.textContent = '';
+      errEl.textContent = '';
+
+      const domain = $('pacc-domain').value.trim();
+      const email = $('pacc-email').value.trim();
+      const rawPath = $('pacc-basepath').value.trim().replace(/^\/+|\/+$/g, '');
+      const btn = $('pacc-save-btn');
+      btn.disabled = true;
+      try {
+        const prevPrefix = panelBasePrefix();
+        const res = await api('POST', '/api/panel/access', {
+          domain: domain || 'off',
+          email: email || 'off',
+          base_path: rawPath || 'off',
+          retry_cert: true,
+        });
+        const nextPrefix = res.base_path || '';
+        if (nextPrefix !== prevPrefix) {
+          try {
+            sessionStorage.setItem('pb-open-tab', 'settings');
+            sessionStorage.setItem('pb-access-flash', nextPrefix
+              ? `Secret login path active at ${nextPrefix}/! Bookmark your new Panel URL above.`
+              : 'Secret login path removed — panel is now served at /.');
+          } catch (_) {}
+          window.location.assign(`${window.location.origin}${nextPrefix}/`);
+          return;
+        }
+        renderPanelInfo(res, true);
+        msg.className = 'okay';
+        msg.textContent = res.domain
+          ? `Saved! Domain set to ${res.domain}${res.base_path ? ` with secret path ${res.base_path}/` : ''}.`
+          : `Saved!${res.base_path ? ` Secret path active at ${res.base_path}/.` : ' Panel is in IP mode at /.'}`;
+        if (res.domain && !(res.certificate && res.certificate.real)) {
+          scheduleSSLStatusPoll();
+        }
+      } catch (e) {
+        errEl.textContent = e.message;
+      } finally {
+        btn.disabled = false;
+      }
+    });
   }
 
   $('account-form').addEventListener('submit', async (ev) => {

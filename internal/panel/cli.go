@@ -161,6 +161,7 @@ func cmdSetup(args []string) error {
 	port := fs.Int("port", 0, "the port to serve on (default: keep the current one, or pick a free one)")
 	domain := fs.String("domain", "", "a domain name pointing at this server, for a real certificate (\"off\" to stop using one)")
 	email := fs.String("email", "", "an email address for the certificate's notices (\"off\" to remove it)")
+	basePath := fs.String("base-path", "", "secret URL path to hide the login page, e.g. k9x4m2 (\"random\" to generate one, \"off\" for /)")
 	group := fs.String("group", "", "the group this server is in: relay, foreign or none")
 	publicURL := fs.String("public-url", "", "the address servers that call the panel use (\"auto\" to work it out)")
 	if err := fs.Parse(args); err != nil {
@@ -240,6 +241,13 @@ func cmdSetup(args []string) error {
 			return fmt.Errorf("%q is not an email address", e)
 		}
 		cfg.Email = e
+	}
+	if strings.TrimSpace(*basePath) != "" {
+		bp, err := normalizeBasePath(*basePath)
+		if err != nil {
+			return err
+		}
+		cfg.BasePath = bp
 	}
 	switch u := strings.TrimRight(strings.TrimSpace(*publicURL), "/"); u {
 	case "":
@@ -345,6 +353,9 @@ func cmdSetup(args []string) error {
 		fmt.Println(label + a)
 	}
 	fmt.Printf("  Log in as:    %s\n", newUser)
+	if cfg.BasePath != "" {
+		fmt.Printf("  Secret path:  %s/  (opening / returns 404 Not Found)\n", cfg.BasePath)
+	}
 	fmt.Println()
 	if cfg.Domain != "" {
 		fmt.Printf("  It is getting a certificate for %s now. Until it has one, and at its\n", cfg.Domain)
@@ -458,6 +469,7 @@ func cmdStatus(args []string) error {
 			"port":        strconv.Itoa(portOf(cfg.Listen)),
 			"domain":      cfg.Domain,
 			"email":       cfg.Email,
+			"base_path":   cfg.BasePath,
 			"group":       st.ThisGroup,
 			"user":        st.Admin.User,
 			"public_url":  cfg.PublicURL,
@@ -484,6 +496,11 @@ func cmdStatus(args []string) error {
 		} else {
 			fmt.Printf("              %s\n", a)
 		}
+	}
+	if cfg.BasePath != "" {
+		fmt.Printf("Secret path:  %s/  (root / returns 404)\n", cfg.BasePath)
+	} else {
+		fmt.Println("Secret path:  none (login page is at /)")
 	}
 	fmt.Printf("Login:        %s\n", st.Admin.User)
 	group := "none"

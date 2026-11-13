@@ -36,6 +36,14 @@ const contentSecurityPolicy = "default-src 'none'; script-src 'self'; style-src 
 	"connect-src 'self'; font-src 'self'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'"
 
 func (p *Panel) routes() http.Handler {
+	hubMux := http.NewServeMux()
+	hubMux.HandleFunc("GET /hub/poll", p.hub.handlePoll)
+	hubMux.HandleFunc("POST /hub/reply", p.hub.handleReply)
+	hubMux.HandleFunc("POST /hub/register", p.handleHubRegister)
+	hubMux.HandleFunc("GET /hub/bootstrap/{ticket}", p.handleHubBootstrap)
+	hubMux.HandleFunc("GET /hub/release/{id}", p.handleRelease)
+	hubHandler := secureHeaders(hubMux)
+
 	mux := http.NewServeMux()
 
 	static := staticHandler()
@@ -43,12 +51,6 @@ func (p *Panel) routes() http.Handler {
 	mux.Handle("GET /app.js", static)
 	mux.Handle("GET /app.css", static)
 	mux.Handle("GET /icon.svg", static)
-
-	mux.HandleFunc("GET /hub/poll", p.hub.handlePoll)
-	mux.HandleFunc("POST /hub/reply", p.hub.handleReply)
-	mux.HandleFunc("POST /hub/register", p.handleHubRegister)
-	mux.HandleFunc("GET /hub/bootstrap/{ticket}", p.handleHubBootstrap)
-	mux.HandleFunc("GET /hub/release/{id}", p.handleRelease)
 
 	mux.HandleFunc("POST /api/login", p.handleLogin)
 	mux.HandleFunc("POST /api/logout", p.withAuth(p.handleLogout))
@@ -101,6 +103,7 @@ func (p *Panel) routes() http.Handler {
 	mux.HandleFunc("POST /api/servers/{id}/repair", p.withAuth(p.handleRepairServer))
 	mux.HandleFunc("POST /api/servers/hostkey", p.withAuth(p.handleHostKey))
 	mux.HandleFunc("GET /api/panel", p.withAuth(p.handlePanelInfo))
+	mux.HandleFunc("POST /api/panel/access", p.withAuth(p.handleUpdatePanelAccess))
 
 	mux.HandleFunc("GET /api/cf/accounts", p.withAuth(p.handleGetCFAccounts))
 	mux.HandleFunc("POST /api/cf/accounts", p.withAuth(p.handleAddCFAccount))
@@ -116,7 +119,39 @@ func (p *Panel) routes() http.Handler {
 	mux.HandleFunc("POST /api/backup/inspect", p.withAuth(p.handleBackupInspect))
 	mux.HandleFunc("POST /api/backup/restore", p.withAuth(p.handleBackupRestore))
 
-	return secureHeaders(mux)
+	uiHandler := secureHeaders(mux)
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Remote agents always reach the callback hub at root /hub/..., regardless
+		// of any secret login path configured for human browser access.
+		if strings.HasPrefix(r.URL.Path, "/hub/") {
+			hubHandler.ServeHTTP(w, r)
+			return
+		}
+		bp := p.basePath()
+		if bp == "" {
+			uiHandler.ServeHTTP(w, r)
+			return
+		}
+		if r.URL.Path == bp {
+			target := bp + "/"
+			if r.URL.RawQuery != "" {
+				target += "?" + r.URL.RawQuery
+			}
+			http.Redirect(w, r, target, http.StatusTemporaryRedirect)
+			return
+		}
+		if !strings.HasPrefix(r.URL.Path, bp+"/") {
+			w.Header().Set("X-Content-Type-Options", "nosniff")
+			http.NotFound(w, r)
+			return
+		}
+		r2 := r.Clone(r.Context())
+		r2.URL.Path = strings.TrimPrefix(r.URL.Path, bp)
+		if r2.URL.RawPath != "" {
+			r2.URL.RawPath = strings.TrimPrefix(r2.URL.RawPath, bp)
+		}
+		uiHandler.ServeHTTP(w, r2)
+	})
 }
 
 // secureHeaders adds what every answer carries, and caps how much can be sent.
@@ -566,15 +601,59 @@ func (p *Panel) handleTunnels(w http.ResponseWriter, _ *http.Request, _ authed) 
 	writeJSON(w, http.StatusOK, map[string]any{"tunnels": tunnels})
 }
 
-func (p *Panel) handlePanelInfo(w http.ResponseWriter, _ *http.Request, _ authed) {
-	writeJSON(w, http.StatusOK, map[string]any{
+func (p *Panel) panelInfoPayload() map[string]any {
+	cfg := p.getConfig()
+	_, port, _ := net.SplitHostPort(cfg.Listen)
+	return map[string]any{
 		"version":     engine.Version,
-		"listen":      p.cfg.Listen,
-		"addresses":   p.addresses(),
-		"public_url":  p.publicURL(),
+		"listen":      cfg.Listen,
+		"port":        port,
+		"domain":      cfg.Domain,
+		"email":       cfg.Email,
+		"base_path":   cfg.BasePath,
+		"addresses":   addressesFor(cfg),
+		"public_url":  publicURLFor(cfg),
 		"fingerprint": p.ownFingerprint(),
 		"certificate": p.certStatus(),
-	})
+	}
+}
+
+func (p *Panel) handlePanelInfo(w http.ResponseWriter, _ *http.Request, _ authed) {
+	writeJSON(w, http.StatusOK, p.panelInfoPayload())
+}
+
+func (p *Panel) handleUpdatePanelAccess(w http.ResponseWriter, r *http.Request, a authed) {
+	var req struct {
+		Domain    *string `json:"domain"`
+		Email     *string `json:"email"`
+		BasePath  *string `json:"base_path"`
+		RetryCert bool    `json:"retry_cert"`
+	}
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	cur := p.getConfig()
+	domain := cur.Domain
+	if req.Domain != nil {
+		domain = *req.Domain
+	}
+	email := cur.Email
+	if req.Email != nil {
+		email = *req.Email
+	}
+	basePath := cur.BasePath
+	if req.BasePath != nil {
+		basePath = *req.BasePath
+	}
+	if err := p.updateAccessSettings(domain, email, basePath, req.RetryCert); err != nil {
+		writeErr(w, http.StatusBadRequest, capitalise(err.Error())+".")
+		return
+	}
+	updated := p.getConfig()
+	logf("panel access settings updated by %s (domain=%q base_path=%q)", a.s.user, updated.Domain, updated.BasePath)
+	out := p.panelInfoPayload()
+	out["ok"] = true
+	writeJSON(w, http.StatusOK, out)
 }
 
 func (p *Panel) handleCreateTunnel(w http.ResponseWriter, r *http.Request, _ authed) {

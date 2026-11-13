@@ -3487,4 +3487,134 @@ label.check-card.abuse-torrent-card {
     width: 100%;
     justify-content: flex-start;
   }
+
+  .pacc-ssl-box,
+  .pacc-url-bar {
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .pacc-ssl-box button,
+  .pacc-url-bar button {
+    width: 100%;
+  }
+}
+
+/* ------------------------------------ Panel Domain, SSL & Secret Path Card */
+
+.pacc-title-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: .6rem;
+  flex-wrap: wrap;
+}
+
+.pacc-ssl-box {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: .75rem;
+  padding: .68rem .85rem;
+  margin-bottom: .85rem;
+  border-radius: var(--radius-sm);
+  background: var(--well);
+  border: 1px solid var(--line);
+}
+
+.pacc-ssl-box.is-ok {
+  background: var(--ok-soft);
+  border-color: var(--ok-border);
+}
+
+.pacc-ssl-box.is-warn {
+  background: var(--warn-soft);
+  border-color: var(--warn-border);
+}
+
+.pacc-ssl-main {
+  flex: 1;
+  min-width: 0;
+  line-height: 1.42;
+}
+
+.pacc-path-block {
+  margin-top: .75rem;
+}
+
+.pacc-inline-btns {
+  display: inline-flex;
+  align-items: center;
+  gap: .75rem;
+}
+
+.pacc-path-input-wrap {
+  display: flex;
+  align-items: center;
+  border: 1px solid var(--line-strong);
+  border-radius: var(--radius-sm);
+  background: var(--panel);
+  overflow: hidden;
+  transition: border-color .15s ease, box-shadow .15s ease;
+}
+
+.pacc-path-input-wrap:focus-within {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-soft);
+}
+
+.pacc-slash-prefix,
+.pacc-slash-suffix {
+  padding: 0 .65rem;
+  font-family: ui-monospace, "Cascadia Code", Consolas, monospace;
+  font-weight: 700;
+  color: var(--muted);
+  background: var(--well);
+  align-self: stretch;
+  display: inline-flex;
+  align-items: center;
+  user-select: none;
+}
+
+.pacc-slash-prefix {
+  border-right: 1px solid var(--line);
+}
+
+.pacc-slash-suffix {
+  border-left: 1px solid var(--line);
+}
+
+.pacc-path-input-wrap input {
+  border: 0 !important;
+  box-shadow: none !important;
+  margin: 0 !important;
+  border-radius: 0 !important;
+  flex: 1;
+  min-width: 0;
+}
+
+.pacc-url-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: .75rem;
+  margin-top: .85rem;
+  padding: .65rem .85rem;
+  border-radius: var(--radius-sm);
+  background: var(--well);
+  border: 1px solid var(--accent-border);
+}
+
+.pacc-url-col {
+  display: flex;
+  flex-direction: column;
+  gap: .15rem;
+  min-width: 0;
+}
+
+.pacc-url-code {
+  font-size: .85rem;
+  font-weight: 600;
+  color: var(--accent);
+  overflow-wrap: anywhere;
 }

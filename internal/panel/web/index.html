@@ -328,11 +328,70 @@
       <div class="toolbar">
         <div>
           <h2>Settings</h2>
-          <p class="muted small">Manage panel login credentials, full backups &amp; migration, SSL/TLS certificate status, and software updates.</p>
+          <p class="muted small">Manage panel domain &amp; Let's Encrypt SSL, secret login path, admin credentials, full backups, alerts, and software updates.</p>
         </div>
       </div>
       <div class="grid2">
         <div class="settings-stack">
+          <form id="panel-access-form" class="card settings-card" novalidate aria-labelledby="h-panel-access">
+            <div class="card-head">
+              <div class="pacc-title-row">
+                <h3 id="h-panel-access">Panel Domain, Auto-SSL &amp; Secret Login Path</h3>
+                <span id="pacc-ssl-badge" class="pill-tag">Self-Signed</span>
+              </div>
+              <p class="muted small">Attach or replace your panel's domain/subdomain for an automatic Let's Encrypt HTTPS certificate, and set a secret URL path so bots and scanners probing <code>/</code> receive a plain <code>404 Not Found</code>.</p>
+            </div>
+
+            <div id="pacc-ssl-box" class="pacc-ssl-box">
+              <div class="pacc-ssl-main">
+                <span id="pacc-ssl-text" class="small">Checking SSL certificate status…</span>
+              </div>
+              <button type="button" id="pacc-retry-ssl" hidden>Re-check SSL Now</button>
+            </div>
+
+            <div class="row2">
+              <div>
+                <label for="pacc-domain">Panel Domain / Subdomain <span class="muted">(optional · Auto Let's Encrypt SSL)</span></label>
+                <input id="pacc-domain" autocapitalize="none" spellcheck="false" placeholder="e.g. panel.yourdomain.com (empty = IP only)">
+              </div>
+              <div>
+                <label for="pacc-email">Certificate Notice Email <span class="muted">(optional)</span></label>
+                <input id="pacc-email" type="email" autocapitalize="none" spellcheck="false" placeholder="you@yourdomain.com">
+              </div>
+            </div>
+            <p class="muted small hint-box">Point an <code>A</code> / <code>AAAA</code> record to this server's IP first. If using Cloudflare DNS on a non-443 port, set Cloudflare Proxy to <strong>DNS Only (Grey Cloud)</strong> so Let's Encrypt HTTP-01 check on port <code>80</code> reaches this server. Clear the domain field to switch back to IP-only.</p>
+
+            <div class="pacc-path-block">
+              <div class="notify-label-row">
+                <label for="pacc-basepath">Secret Login URL Path <span class="muted">(hides panel at <code>/&lt;secret&gt;/</code>)</span></label>
+                <div class="pacc-inline-btns">
+                  <button type="button" id="pacc-rand-btn" class="link small">Generate Random</button>
+                  <button type="button" id="pacc-clear-path-btn" class="link small">Use Root (/)</button>
+                </div>
+              </div>
+              <div class="pacc-path-input-wrap">
+                <span class="pacc-slash-prefix" aria-hidden="true">/</span>
+                <input id="pacc-basepath" class="mono" maxlength="64" autocapitalize="none" spellcheck="false" placeholder="e.g. k9x4m2p7 (leave empty for root /)">
+                <span class="pacc-slash-suffix" aria-hidden="true">/</span>
+              </div>
+              <span class="field-hint">Connected Relay &amp; Foreign server agents always keep working seamlessly when you add or change the secret path.</span>
+            </div>
+
+            <div class="pacc-url-bar">
+              <div class="pacc-url-col">
+                <span class="detail-label">Panel Login URL</span>
+                <code id="pacc-url-preview" class="pacc-url-code">—</code>
+              </div>
+              <button type="button" id="pacc-copy-url">Copy URL</button>
+            </div>
+
+            <p id="pacc-msg" role="status"></p>
+            <p id="pacc-err" class="error" role="alert"></p>
+            <div class="actions left">
+              <button type="submit" id="pacc-save-btn" class="primary">Save Domain &amp; Secret Path</button>
+            </div>
+          </form>
+
           <section class="card settings-card" aria-labelledby="h-backup">
             <div class="card-head">
               <h3 id="h-backup">Backup &amp; Restore (Panel Migration)</h3>

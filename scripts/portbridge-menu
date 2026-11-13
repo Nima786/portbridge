@@ -4634,7 +4634,7 @@ find_free_panel_port() {
 }
 
 panel_setup() {
-    local first=no user="" pw="" cur_port def_port port domain email group g_def rc
+    local first=no user="" pw="" cur_port def_port port domain email cur_bpath="" def_bpath="" bpath="" group g_def rc
     local -a args=()
     [ -f "$PANEL_DIR/panel.conf" ] || first=yes
     hr
@@ -4710,6 +4710,48 @@ panel_setup() {
         fi
     fi
 
+    cur_bpath=$(panel_get base_path)
+    cur_bpath=${cur_bpath#/}
+    if [ "$first" = yes ] && [ -z "$cur_bpath" ]; then
+        def_bpath=$(LC_ALL=C tr -dc 'abcdefghjkmnpqrstuvwxyz23456789' </dev/urandom 2>/dev/null | head -c 8 || true)
+        [ -n "$def_bpath" ] || def_bpath="pb$(date +%s | tail -c 5)"
+    else
+        def_bpath=$cur_bpath
+    fi
+    say ""
+    say "${DIM}A secret URL path (such as /${def_bpath:-k9x4m2p7}/) hides the login page from bots${R}"
+    say "${DIM}and port scanners: anyone opening / gets a plain 404 Not Found.${R}"
+    if [ -n "$def_bpath" ]; then
+        say "${DIM}Press Enter to use '/$def_bpath/', type your own, 'random', or 'off' for none.${R}"
+    else
+        say "${DIM}Leave it empty for none (/), type a custom path, or type 'random' to generate one.${R}"
+    fi
+    while :; do
+        bpath=$(ask "Secret login path (optional)" "$def_bpath")
+        bpath=${bpath#/}
+        bpath=${bpath%/}
+        case "$bpath" in
+            '' | off | none | random | auto) break ;;
+            api | hub | app.js | app.css | icon.svg | index.html | .well-known)
+                err "  '$bpath' is reserved by the panel. Pick another word or 'random'."
+                ;;
+            *[!a-zA-Z0-9_-]*)
+                err "  Use only letters, numbers, '-' or '_' (for example: mypanel99), or 'off'."
+                ;;
+            *)
+                if [ "${#bpath}" -le 64 ]; then
+                    break
+                fi
+                err "  Keep the secret path up to 64 characters."
+                ;;
+        esac
+    done
+    if [ -z "$bpath" ]; then
+        args+=(-base-path off)
+    else
+        args+=(-base-path "$bpath")
+    fi
+
     g_def=3
     case "$(panel_get group)" in
         relay) g_def=1 ;;
@@ -4781,7 +4823,7 @@ panel_menu() {
             esac
             continue
         fi
-        item 1 "Change its settings" "port, domain name, group"
+        item 1 "Change its settings" "port, domain, secret path, group"
         item 2 "Change the login" "if the password is forgotten"
         if [ "$state" = running ]; then
             item 3 "Turn the panel off" "your tunnels are not affected"

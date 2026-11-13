@@ -256,8 +256,8 @@ func (n *notifier) panelLabel() string {
 	if st.ThisName != "" {
 		return st.ThisName
 	}
-	if n.p.cfg.Domain != "" {
-		return n.p.cfg.Domain
+	if d := n.p.getConfig().Domain; d != "" {
+		return d
 	}
 	return "PortBridge Panel"
 }

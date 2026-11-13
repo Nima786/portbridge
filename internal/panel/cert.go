@@ -50,14 +50,16 @@ type certs struct {
 	domain    string
 	m         *autocert.Manager
 	onPort443 bool
+	retryCh   chan struct{}
 
-	mu       sync.Mutex
-	have     bool
-	notAfter time.Time
-	issuer   string
-	lastErr  string
-	backoff  time.Duration
-	port80   bool
+	mu          sync.Mutex
+	have        bool
+	notAfter    time.Time
+	issuer      string
+	lastErr     string
+	backoff     time.Duration
+	port80      bool
+	port80Close func()
 }
 
 func newCerts(dir string, cfg Config) *certs {
@@ -75,7 +77,33 @@ func newCerts(dir string, cfg Config) *certs {
 		m.Client = &acme.Client{DirectoryURL: cfg.ACMEDirectory}
 	}
 	_, port, _ := net.SplitHostPort(cfg.Listen)
-	return &certs{domain: cfg.Domain, m: m, onPort443: port == "443"}
+	return &certs{
+		domain:    cfg.Domain,
+		m:         m,
+		onPort443: port == "443",
+		retryCh:   make(chan struct{}, 1),
+	}
+}
+
+func (c *certs) triggerRetry() {
+	c.mu.Lock()
+	c.backoff = 0
+	c.mu.Unlock()
+	select {
+	case c.retryCh <- struct{}{}:
+	default:
+	}
+}
+
+func (c *certs) stopPort80() {
+	c.mu.Lock()
+	fn := c.port80Close
+	c.port80Close = nil
+	c.port80 = false
+	c.mu.Unlock()
+	if fn != nil {
+		fn()
+	}
 }
 
 // wants says whether a handshake asks for the panel by its domain name.
@@ -108,7 +136,9 @@ func (c *certs) run(ctx context.Context) {
 		}
 		select {
 		case <-ctx.Done():
+			c.stopPort80()
 			return
+		case <-c.retryCh:
 		case <-time.After(wait):
 		}
 	}
@@ -140,10 +170,11 @@ func (c *certs) listenPort80(ctx context.Context) {
 	go func() { _ = srv.Serve(ln) }()
 	go func() {
 		<-ctx.Done()
-		_ = srv.Close()
+		c.stopPort80()
 	}()
 	c.mu.Lock()
 	c.port80 = true
+	c.port80Close = func() { _ = srv.Close() }
 	c.mu.Unlock()
 }
 
@@ -244,7 +275,7 @@ func (c *certs) status() certStatus {
 // getCertificate picks the certificate for a handshake: the real one for the
 // domain once it is held, and the panel's own one for everything else.
 func (p *Panel) getCertificate(hello *tls.ClientHelloInfo) (*tls.Certificate, error) {
-	if c := p.certs; c != nil && c.wants(hello) {
+	if c := p.activeCerts(); c != nil && c.wants(hello) {
 		// Let's Encrypt checking the domain on port 443.
 		if slices.Contains(hello.SupportedProtos, acme.ALPNProto) {
 			return c.m.GetCertificate(hello)

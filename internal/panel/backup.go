@@ -55,6 +55,7 @@ type BackupSourcePanel struct {
 	Listen      string   `json:"listen,omitempty"`
 	Domain      string   `json:"domain,omitempty"`
 	Email       string   `json:"email,omitempty"`
+	BasePath    string   `json:"base_path,omitempty"`
 	PublicURL   string   `json:"public_url,omitempty"`
 	Fingerprint string   `json:"fingerprint,omitempty"`
 	CertPEM     string   `json:"cert_pem,omitempty"`
@@ -262,16 +263,18 @@ func (p *Panel) CreateBackup(ctx context.Context, passphrase string) (*BackupEnv
 	certPEM, _ := os.ReadFile(filepath.Join(certDir, "panel.crt"))
 	keyPEM, _ := os.ReadFile(filepath.Join(certDir, "panel.key"))
 
+	cfg := p.getConfig()
 	src := BackupSourcePanel{
 		ThisName:    st.ThisName,
 		ThisGroup:   st.ThisGroup,
 		Hostname:    localOv.Hostname,
 		IPv4:        localOv.IPv4,
 		IPv6:        localOv.IPv6,
-		Listen:      p.cfg.Listen,
-		Domain:      p.cfg.Domain,
-		Email:       p.cfg.Email,
-		PublicURL:   p.cfg.PublicURL,
+		Listen:      cfg.Listen,
+		Domain:      cfg.Domain,
+		Email:       cfg.Email,
+		BasePath:    cfg.BasePath,
+		PublicURL:   cfg.PublicURL,
 		Fingerprint: p.ownFingerprint(),
 		CertPEM:     string(certPEM),
 		KeyPEM:      string(keyPEM),

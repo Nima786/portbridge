@@ -37,13 +37,16 @@ const defaultTunnelsDir = "/etc/portbridge/tunnels"
 
 // Panel is one running panel.
 type Panel struct {
-	dir        string
-	cfg        Config
-	store      *store
-	sessions   *sessions
-	hub        *hub
-	fleet      *fleet
-	tunnelsDir string
+	dir         string
+	cfgMu       sync.RWMutex
+	cfg         Config
+	runCtx      context.Context
+	certsCancel context.CancelFunc
+	store       *store
+	sessions    *sessions
+	hub         *hub
+	fleet       *fleet
+	tunnelsDir  string
 
 	jobsMu sync.Mutex
 	jobs   map[string]*job
@@ -164,12 +167,119 @@ func (p *Panel) hubTokens() map[string]string {
 	return out
 }
 
+func (p *Panel) getConfig() Config {
+	p.cfgMu.RLock()
+	defer p.cfgMu.RUnlock()
+	return p.cfg
+}
+
+func (p *Panel) basePath() string {
+	return p.getConfig().BasePath
+}
+
+func (p *Panel) activeCerts() *certs {
+	p.cfgMu.RLock()
+	defer p.cfgMu.RUnlock()
+	return p.certs
+}
+
+func (p *Panel) startCertManager(ctx context.Context) {
+	p.cfgMu.Lock()
+	defer p.cfgMu.Unlock()
+	p.runCtx = ctx
+	if p.cfg.Domain != "" {
+		cctx, cancel := context.WithCancel(ctx)
+		p.certsCancel = cancel
+		p.certs = newCerts(p.dir, p.cfg)
+		go p.certs.run(cctx)
+	}
+}
+
+// updateAccessSettings updates the panel's domain, certificate email, and/or
+// secret login URL path live in memory and persists them to panel.conf without
+// restarting the HTTPS server.
+func (p *Panel) updateAccessSettings(domainRaw, emailRaw, basePathRaw string, retryCert bool) error {
+	domain := strings.TrimSuffix(strings.ToLower(strings.TrimSpace(domainRaw)), ".")
+	if strings.EqualFold(domain, "off") || strings.EqualFold(domain, "none") {
+		domain = ""
+	}
+	if domain != "" && !validDomain(domain) {
+		return errors.New("that does not look like a domain or subdomain (for example: panel.example.com)")
+	}
+	email := strings.TrimSpace(emailRaw)
+	if strings.EqualFold(email, "off") || strings.EqualFold(email, "none") || domain == "" {
+		email = ""
+	}
+	if email != "" && !validEmail(email) {
+		return errors.New("that does not look like an email address")
+	}
+	bp, err := normalizeBasePath(basePathRaw)
+	if err != nil {
+		return err
+	}
+
+	p.cfgMu.Lock()
+	next := p.cfg
+	next.Domain = domain
+	next.Email = email
+	next.BasePath = bp
+	if p.dir != "" {
+		if err := writeConfig(p.dir, next); err != nil {
+			p.cfgMu.Unlock()
+			return err
+		}
+	}
+	certChanged := next.Domain != p.cfg.Domain || next.Email != p.cfg.Email
+	p.cfg = next
+
+	var oldCerts *certs
+	var oldCancel context.CancelFunc
+	var startCerts *certs
+	var startCtx context.Context
+	var retryTarget *certs
+
+	if certChanged {
+		oldCerts = p.certs
+		oldCancel = p.certsCancel
+		p.certs = nil
+		p.certsCancel = nil
+		if next.Domain != "" {
+			c := newCerts(p.dir, next)
+			p.certs = c
+			if p.runCtx != nil {
+				cctx, cancel := context.WithCancel(p.runCtx)
+				p.certsCancel = cancel
+				startCerts = c
+				startCtx = cctx
+			}
+		}
+	} else if retryCert && p.certs != nil {
+		retryTarget = p.certs
+	}
+	p.cfgMu.Unlock()
+
+	if oldCancel != nil {
+		oldCancel()
+	}
+	if oldCerts != nil {
+		oldCerts.stopPort80()
+	}
+	if startCerts != nil {
+		go startCerts.run(startCtx)
+	}
+	if retryTarget != nil {
+		retryTarget.triggerRetry()
+	}
+	return nil
+}
+
 // publicURL is the address servers that call the panel are given.
-func (p *Panel) publicURL() string { return publicURLFor(p.cfg) }
+func (p *Panel) publicURL() string { return publicURLFor(p.getConfig()) }
 
 // allCallbackURLs returns comma-separated callback URLs (domain, IPv4, IPv6)
 // that remote agents can use to reach this panel on /hub/poll.
 func (p *Panel) allCallbackURLs() string {
+	cfg := p.getConfig()
 	var list []string
 	seen := map[string]bool{}
 	add := func(u string) {
@@ -179,13 +289,13 @@ func (p *Panel) allCallbackURLs() string {
 			list = append(list, u)
 		}
 	}
-	if p.cfg.PublicURL != "" {
-		add(p.cfg.PublicURL)
+	if cfg.PublicURL != "" {
+		add(cfg.PublicURL)
 	}
-	_, port, err := net.SplitHostPort(p.cfg.Listen)
+	_, port, err := net.SplitHostPort(cfg.Listen)
 	if err == nil && port != "" {
-		if p.cfg.Domain != "" {
-			add("https://" + net.JoinHostPort(p.cfg.Domain, port))
+		if cfg.Domain != "" {
+			add("https://" + net.JoinHostPort(cfg.Domain, port))
 		}
 		v4, v6 := agent.PublicAddresses()
 		for _, ip := range v4 {
@@ -217,7 +327,7 @@ func publicURLFor(cfg Config) string {
 }
 
 // addresses is every address the panel can be opened at, for people.
-func (p *Panel) addresses() []string { return addressesFor(p.cfg) }
+func (p *Panel) addresses() []string { return addressesFor(p.getConfig()) }
 
 func addressesFor(cfg Config) []string {
 	_, port, err := net.SplitHostPort(cfg.Listen)
@@ -228,23 +338,28 @@ func addressesFor(cfg Config) []string {
 	if port == "443" {
 		suffix = ""
 	}
+	pathSuffix := ""
+	if cfg.BasePath != "" {
+		pathSuffix = cfg.BasePath + "/"
+	}
 	var out []string
 	if cfg.Domain != "" {
-		out = append(out, "https://"+cfg.Domain+suffix)
+		out = append(out, "https://"+cfg.Domain+suffix+pathSuffix)
 	}
 	if u := publicURLFor(cfg); u != "" {
 		if pu, err := url.Parse(u); err == nil && !strings.EqualFold(pu.Hostname(), cfg.Domain) {
-			out = append(out, u)
+			out = append(out, strings.TrimRight(u, "/")+pathSuffix)
 		}
 	}
 	return out
 }
 
 func (p *Panel) certStatus() certStatus {
-	if p.certs == nil {
+	c := p.activeCerts()
+	if c == nil {
 		return certStatus{Note: "no domain name is set, so the panel uses its own certificate"}
 	}
-	return p.certs.status()
+	return c.status()
 }
 
 // server is the panel's HTTPS server.
@@ -252,10 +367,9 @@ func (p *Panel) server() *http.Server {
 	tc := &tls.Config{
 		MinVersion:     tls.VersionTLS12,
 		GetCertificate: p.getCertificate,
-		NextProtos:     []string{"h2", "http/1.1"},
-	}
-	if p.certs != nil {
-		tc.NextProtos = append(tc.NextProtos, acme.ALPNProto)
+		// Always advertise acme-tls/1 so adding a domain live in Panel Settings
+		// on port 443 works immediately without restarting the service.
+		NextProtos: []string{"h2", "http/1.1", acme.ALPNProto},
 	}
 	return &http.Server{
 		Handler:           p.routes(),
@@ -299,10 +413,7 @@ func Run(dir string) error {
 	go p.traffic.run(ctx)
 	// An update that restarted the panel carries on from where it was.
 	p.updates.resume()
-	if cfg.Domain != "" {
-		p.certs = newCerts(dir, cfg)
-		go p.certs.run(ctx)
-	}
+	p.startCertManager(ctx)
 
 	ln, err := net.Listen("tcp", cfg.Listen)
 	if err != nil {

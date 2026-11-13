@@ -42,10 +42,64 @@ type Config struct {
 	Listen    string // address to listen on, e.g. 0.0.0.0:2053
 	Domain    string // optional; a real certificate is got for it
 	Email     string // for the certificate authority's notices
+	BasePath  string // optional secret URL prefix, e.g. "/k9x4m2"; empty means "/"
 	PublicURL string // how agents that call the panel reach it; empty means worked out
 	// ACMEDirectory is for testing only: "staging" uses Let's Encrypt's test
 	// service, whose certificates no browser trusts. Not offered in the menu.
 	ACMEDirectory string
+}
+
+// normalizeBasePath validates and normalizes a secret login path.
+// Empty, "/", "off", or "none" disables the secret path (returns "").
+// "random" or "auto" generates a fresh random 10-character slug.
+// Otherwise returns "/<slug>".
+func normalizeBasePath(raw string) (string, error) {
+	s := strings.TrimSpace(raw)
+	if s == "" || s == "/" || strings.EqualFold(s, "off") || strings.EqualFold(s, "none") {
+		return "", nil
+	}
+	if strings.EqualFold(s, "random") || strings.EqualFold(s, "auto") {
+		return "/" + randomBaseSlug(), nil
+	}
+	slug := strings.Trim(s, "/")
+	if slug == "" {
+		return "", nil
+	}
+	if len(slug) > 64 {
+		return "", errors.New("the secret path can be at most 64 characters")
+	}
+	parts := strings.Split(slug, "/")
+	if len(parts) > 3 {
+		return "", errors.New("the secret path can have at most 3 path segments")
+	}
+	for i, part := range parts {
+		if part == "" || part == "." || part == ".." {
+			return "", errors.New("the secret path contains an empty or invalid segment")
+		}
+		if strings.Trim(part, "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-") != "" {
+			return "", errors.New("the secret path may only contain letters, digits, '-' and '_'")
+		}
+		if i == 0 {
+			switch strings.ToLower(part) {
+			case "api", "hub", "app.js", "app.css", "icon.svg", "index.html", ".well-known", "off", "none", "random", "auto":
+				return "", fmt.Errorf("%q is reserved and cannot be used as the secret path", part)
+			}
+		}
+	}
+	return "/" + slug, nil
+}
+
+func randomBaseSlug() string {
+	const alphabet = "abcdefghjkmnpqrstuvwxyz23456789"
+	raw := make([]byte, 10)
+	if _, err := rand.Read(raw); err != nil {
+		panic(err)
+	}
+	out := make([]byte, len(raw))
+	for i, b := range raw {
+		out[i] = alphabet[int(b)%len(alphabet)]
+	}
+	return string(out)
 }
 
 func readConfig(dir string) (Config, error) {
@@ -71,6 +125,12 @@ func readConfig(dir string) (Config, error) {
 			c.Domain = v
 		case "email":
 			c.Email = v
+		case "base_path":
+			bp, err := normalizeBasePath(v)
+			if err != nil {
+				return c, fmt.Errorf("panel.conf base_path: %w", err)
+			}
+			c.BasePath = bp
 		case "public_url":
 			c.PublicURL = v
 		case "acme_directory":
@@ -92,6 +152,9 @@ func writeConfig(dir string, c Config) error {
 	}
 	if c.Email != "" {
 		fmt.Fprintf(&b, "email = %s\n", c.Email)
+	}
+	if c.BasePath != "" {
+		fmt.Fprintf(&b, "base_path = %s\n", c.BasePath)
 	}
 	if c.PublicURL != "" {
 		fmt.Fprintf(&b, "public_url = %s\n", c.PublicURL)
