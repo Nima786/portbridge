@@ -2634,6 +2634,18 @@
   const CDN_OTHER_PORTS = [80, 8080, 8880, 2052, 2082, 2086, 2095];
   const ALL_CDN_PORTS = [...CDN_HTTPS_PORTS, ...CDN_OTHER_PORTS];
 
+  function portOwnedByTunnel(p, ownNameOrTag, includeSharedSolo) {
+    if (!p || !ownNameOrTag) return false;
+    const name = String(ownNameOrTag).replace(/^PortBridge tunnel\s+/, '').replace(/^"|"$/g, '').trim();
+    if (!name) return false;
+    const by = String(p.by || '');
+    if (by === `PortBridge tunnel ${name}` || by.startsWith(`PortBridge tunnel ${name} `) ||
+        by === `PortBridge tunnel "${name}"` || by.startsWith(`PortBridge tunnel "${name}" `)) {
+      return true;
+    }
+    return !!(includeSharedSolo && p.shared && Array.isArray(p.shared_tunnels) && p.shared_tunnels.length === 1 && p.shared_tunnels[0] === name);
+  }
+
   async function scanCDNPorts(relayId, foreignId, mode, ownTag, outEl, linkInput) {
     outEl.replaceChildren(h('li', null, 'Scanning Cloudflare & CDN ports on both servers...'));
     const portStr = ALL_CDN_PORTS.join(',');
@@ -2656,8 +2668,8 @@
     const items = ALL_CDN_PORTS.map((port) => {
       const rp = rMap ? rMap[port] : null;
       const fp = fMap ? fMap[port] : null;
-      const rFree = rp && (rp.state === 'free' || (ownTag && rp.by === ownTag));
-      const fFree = fp && (fp.state === 'free' || (ownTag && fp.by === ownTag));
+      const rFree = rp && (rp.state === 'free' || portOwnedByTunnel(rp, ownTag, false));
+      const fFree = fp && (fp.state === 'free' || portOwnedByTunnel(fp, ownTag, false));
       const isCF = CDN_HTTPS_PORTS.includes(port);
       const cdnLabel = isCF ? 'Cloudflare HTTPS' : 'Other CDN';
       const needFree = mode === 'direct' ? fFree : rFree;
@@ -2742,7 +2754,7 @@
           let what = 'User listen port';
           if (p.port === linkPort && ((role === 'relay' && mode === 'reverse') || (role === 'foreign' && mode === 'direct'))) what = 'Tunnel bridge port';
           else if (role === 'foreign') what = 'Inbound port';
-          const isSelf = p.by === ownTag || (what === 'User listen port' && p.shared && Array.isArray(p.shared_tunnels) && p.shared_tunnels.length === 1 && p.shared_tunnels[0] === t.name);
+          const isSelf = portOwnedByTunnel(p, ownTag, what === 'User listen port');
           const by = p.by ? ` (${p.by.replace(/^PortBridge /, '')})` : '';
           let cls = 'good', text;
           if (what === 'Inbound port') {
@@ -4997,9 +5009,10 @@
   function showTunnelOptions() {
     const mode = radio('tn-mode');
     const gre = $('tn-gre').checked;
+    const isWBModal = !!(tunnelModalMode && tunnelModalMode.websiteBridge);
     $('tn-links').hidden = gre;
     if ($('tn-sni-route-wrap')) {
-      $('tn-sni-route-wrap').hidden = (radio('tn-fwd-proto') || 'tcp') !== 'tcp';
+      $('tn-sni-route-wrap').hidden = isWBModal || (radio('tn-fwd-proto') || 'tcp') !== 'tcp';
     }
     const backup = $('tn-backup-choice');
     backup.hidden = mode !== 'direct';
@@ -5039,11 +5052,17 @@
     if (!v6ok) $('tn-ipv6').checked = false;
 
     const loadPreset = radio('tn-load') || 'light';
-    if (!sharingTouched && loadPreset !== 'custom') {
+    if (!isWBModal && !sharingTouched && loadPreset !== 'custom') {
       applyCreateLoadPreset(loadPreset);
     }
-    if (['asymmetric', 'asymmetric-cdn', 'webrtc', 'twin'].includes(link)) {
+    if (isWBModal || ['asymmetric', 'asymmetric-cdn', 'webrtc', 'twin'].includes(link)) {
       setRadio('tn-shared', 'shared');
+    }
+    if (isWBModal && $('tn-links-n')) {
+      const isRawWB = !gre && ['icmp', 'faketcp', 'ip-spoof'].includes(link);
+      const curWBLinks = Number($('tn-links-n').value || 8);
+      if (isRawWB && curWBLinks > 2) $('tn-links-n').value = '2';
+      else if (!isRawWB && curWBLinks <= 2) $('tn-links-n').value = '8';
     }
     const isShared = radio('tn-shared') === 'shared';
     if ($('tn-pool-wrap')) $('tn-pool-wrap').hidden = isShared;
@@ -5461,9 +5480,7 @@
 
   // ----------------------------------------- smart route & transport probe
 
-  async function populateProbeCFPick() {
-    const wrap = $('tn-probe-cf-wrap');
-    const pick = $('tn-probe-cf-pick');
+  async function populateCFPickSelect(wrap, pick) {
     if (!wrap || !pick) return;
     if (!cfZones.length) {
       try {
@@ -5497,6 +5514,10 @@
     } catch (e) {
       wrap.hidden = true;
     }
+  }
+
+  function populateProbeCFPick() {
+    return populateCFPickSelect($('tn-probe-cf-wrap'), $('tn-probe-cf-pick'));
   }
 
   if ($('tn-probe-cf-pick')) {
@@ -5599,7 +5620,16 @@
       if ($('tn-probe-cleanips')) $('tn-probe-cleanips').value = joinedClean;
     }
     const preset = radio('tn-load') || 'light';
-    if (cand.gaming && ['plain', 'website', 'sni-spoof'].includes(cand.link)) {
+    const isWBModal = !!(tunnelModalMode && tunnelModalMode.websiteBridge);
+    if (isWBModal) {
+      sharingTouched = true;
+      setRadio('tn-load', 'custom');
+      setRadio('tn-shared', 'shared');
+      if ($('tn-links-n')) {
+        const isRawKCP = cand.link === 'icmp' || cand.link === 'faketcp' || cand.ip_spoof;
+        $('tn-links-n').value = isRawKCP ? '2' : '8';
+      }
+    } else if (cand.gaming && ['plain', 'website', 'sni-spoof'].includes(cand.link)) {
       // Gaming over a TCP link: one connection per user (no shared mux), so a
       // big download on one stream never holds up another player's packets.
       // The pool and connection limits come from the chosen load preset.
@@ -5658,7 +5688,7 @@
           ? `${cand.port},${cand.port + 1}`
           : String(cand.port);
         const res = await api('POST', '/api/ports', { server: listenSrv, ports: checkList });
-        const st = (res.ports || []).find((p) => p.state !== 'free' && !(ownTag && p.by === ownTag));
+        const st = (res.ports || []).find((p) => p.state !== 'free' && !portOwnedByTunnel(p, ownTag, false));
         if (st && st.state !== 'free') {
           const who = st.by ? ` by ${st.by}` : '';
           const msg = `${base} The benchmark tested on port ${cand.port}, but port ${st.port} is now used on ${listenName}${who}, so the Tunnel Bridge Port was left at ${cur}. The result may differ on another port; "Deep Scan" can check which ports get through.`;
@@ -5686,7 +5716,7 @@
     if (lastProbeReport) renderProbeResults(lastProbeReport, false, -1);
   }
 
-  function renderProbeRow(r, isLive, isActive) {
+  function renderProbeRow(r, isLive, isActive, onApply, activeAppliedID) {
     if (isActive) {
       return h('div', { class: 'probe-row active' },
         h('div', { class: 'probe-row-label' }, r.label,
@@ -5717,7 +5747,9 @@
     const st = stMap[r.status] || ['bad', r.status || 'Blocked'];
     const scoreCls = r.score >= 75 ? '' : (r.score >= 45 ? ' warn' : ' bad');
     const canUse = !isLive && (r.status === 'ok' || r.status === 'degraded');
-    const isApplied = !isLive && appliedProbeID && (r.id === appliedProbeID || r.label === appliedProbeID);
+    const chosenID = activeAppliedID !== undefined ? activeAppliedID : appliedProbeID;
+    const applyFn = onApply || applyProbeCandidate;
+    const isApplied = !isLive && chosenID && (r.id === chosenID || r.label === chosenID);
     let speedNode = '—';
     if (r.successes > 0 && r.gaming) {
       // Gaming mode only runs a 64 KB anti-freeze check; its Mbps reflects
@@ -5759,7 +5791,7 @@
         ? h('button', {
             type: 'button',
             class: 'probe-use-btn' + (isApplied ? ' is-applied' : ''),
-            onclick: () => applyProbeCandidate(r)
+            onclick: () => applyFn(r)
           }, isApplied ? '✓ Applied' : 'Use')
         : h('span', { class: 'muted small' }, '—'));
   }
@@ -6003,6 +6035,8 @@
       return;
     }
     tunnelModalMode = { kind: 'create' };
+    const oneSharedRadio = document.querySelector('#tunnel-form input[name="tn-shared"][value="one"]');
+    if (oneSharedRadio) oneSharedRadio.disabled = false;
     $('tn-title').textContent = 'Create New Tunnel';
     if ($('tn-intro')) {
       $('tn-intro').textContent = 'Link a Relay (Iran) server with a Foreign server and configure transport disguise, pooling, and port forwarding.';
@@ -6051,15 +6085,20 @@
     const e = t.edge, o = t.origin;
     const ei = e.info || {}, oi = o.info || {};
     const any = e.info ? e.info : oi;
+    const isWB = !!(ei.website_bridge || oi.website_bridge);
     const relays = serversCache.filter((s) => s.group === 'relay' || s.id === e.server_id);
     const foreigns = serversCache.filter((s) => s.group === 'foreign' || s.id === o.server_id);
 
-    tunnelModalMode = { kind: 'switch', tunnel: t };
-    $('tn-title').textContent = `Switch Mode & Benchmark: ${t.name}`;
+    tunnelModalMode = { kind: 'switch', tunnel: t, websiteBridge: isWB };
+    const oneSharedRadio = document.querySelector('#tunnel-form input[name="tn-shared"][value="one"]');
+    if (oneSharedRadio) oneSharedRadio.disabled = isWB;
+    $('tn-title').textContent = isWB ? `Switch Mode & Benchmark: ${t.name} (Website Bridge)` : `Switch Mode & Benchmark: ${t.name}`;
     if ($('tn-intro')) {
       const rName = e.server_name || e.address || 'Relay';
       const fName = o.server_name || o.address || 'Foreign';
-      $('tn-intro').textContent = `Benchmark live routes or switch transport & Direct ↔ Reverse direction between ${rName} and ${fName}. Both servers update atomically while keeping this tunnel's pairing secret and name intact.`;
+      $('tn-intro').textContent = isWB
+        ? `Benchmark all 20+ routes (including Cloudflare CDN) or switch transport & Direct ↔ Reverse direction between ${rName} and ${fName}. Website domains, Smart Outbound Proxy, and pairing secret stay intact.`
+        : `Benchmark live routes or switch transport & Direct ↔ Reverse direction between ${rName} and ${fName}. Both servers update atomically while keeping this tunnel's pairing secret and name intact.`;
     }
     if ($('tn-submit')) $('tn-submit').textContent = 'Apply & Switch Tunnel Mode';
     $('tn-progress-title').textContent = `Switching Mode: ${t.name}`;
@@ -6102,14 +6141,16 @@
 
     $('tn-domain').value = cdnDom;
     if ($('tn-probe-cdn')) $('tn-probe-cdn').value = cdnDom;
-    $('tn-claim').value = (!any.cdn && hostInLink && !/website header/i.test(rawLink))
+    const isWebHdr = /website header|opening like web traffic to/i.test(rawLink);
+    const webHdrMatch = rawLink.match(/opening like web traffic to\s+([^\s(]+)/i);
+    $('tn-claim').value = (!any.cdn && hostInLink && !isWebHdr)
       ? hostInLink
       : (['grpc', 'h3'].includes(linkKey) ? 'www.google.com' : 'www.bing.com');
     const existingClean = ((ei && ei.clean_ips) || (any && any.clean_ips) || []).join(', ');
     $('tn-cleanips').value = existingClean;
     if ($('tn-probe-cleanips')) $('tn-probe-cleanips').value = existingClean;
-    $('tn-webheader').checked = /website header/i.test(rawLink);
-    $('tn-webhost').value = (/website header/i.test(rawLink) && hostInLink) ? hostInLink : 'www.bing.com';
+    $('tn-webheader').checked = isWebHdr;
+    $('tn-webhost').value = (webHdrMatch && webHdrMatch[1]) || (isWebHdr && hostInLink) || 'www.bing.com';
     $('tn-realsite').checked = any.real_site !== false;
     $('tn-stealth').checked = /fragmented|browser TLS/i.test(rawLink);
     if ($('tn-snispoof')) $('tn-snispoof').checked = !!any.sni_spoof;
@@ -6117,17 +6158,17 @@
     if ($('tn-spoofip')) $('tn-spoofip').value = any.spoof_ip || '104.18.4.130';
     $('tn-ipv6').checked = isIPv6;
 
-    const isMux = !!any.mux;
+    const isMux = isWB || !!any.mux;
     const poolVal = ei.pool_size || oi.pool_size || 30;
-    const muxVal = ei.mux_links || oi.mux_links || 4;
-    const maxConnVal = ei.max_conn || oi.max_conn || 2000;
+    const muxVal = ei.mux_links || oi.mux_links || (isWB ? 8 : 4);
+    const maxConnVal = ei.max_conn || oi.max_conn || (isWB ? 4000 : 2000);
     setRadio('tn-shared', isMux ? 'shared' : 'one');
     if ($('tn-pool')) $('tn-pool').value = String(poolVal);
     if ($('tn-links-n')) $('tn-links-n').value = String(muxVal);
     if ($('tn-max-conn')) $('tn-max-conn').value = String(maxConnVal);
     if ($('tn-max-per-ip')) $('tn-max-per-ip').value = String(ei.max_per_ip || 0);
     if ($('tn-rate-per-ip')) $('tn-rate-per-ip').value = String(ei.rate_per_ip || 0);
-    setRadio('tn-load', detectCapacityPreset(linkKey, isMux, Number(poolVal), Number(muxVal), Number(maxConnVal)));
+    setRadio('tn-load', isWB ? 'custom' : detectCapacityPreset(linkKey, isMux, Number(poolVal), Number(muxVal), Number(maxConnVal)));
     sharingTouched = true;
 
     const pp = ei.proxy_protocol || oi.proxy_protocol || 'off';
@@ -6211,17 +6252,20 @@
   function tunnelRequest() {
     const gre = $('tn-gre').checked;
     const link = gre ? 'plain' : radio('tn-link');
+    const isWBSwitch = !!(tunnelModalMode && tunnelModalMode.kind === 'switch' && tunnelModalMode.websiteBridge && tunnelModalMode.tunnel);
+    const wbEdge = isWBSwitch && tunnelModalMode.tunnel.edge && tunnelModalMode.tunnel.edge.info ? tunnelModalMode.tunnel.edge.info : {};
+    const wbOrig = isWBSwitch && tunnelModalMode.tunnel.origin && tunnelModalMode.tunnel.origin.info ? tunnelModalMode.tunnel.origin.info : {};
     const asymmetric = !gre && (link === 'asymmetric' || link === 'asymmetric-cdn');
     const twinPath = !gre && link === 'twin';
     const isWebRTC = !gre && link === 'webrtc';
-    const shared = asymmetric || twinPath || isWebRTC || radio('tn-shared') === 'shared';
+    const shared = isWBSwitch || asymmetric || twinPath || isWebRTC || radio('tn-shared') === 'shared';
     const ipSpoof = !gre && link === 'ip-spoof';
     const sit = !gre && link === 'sit';
     const antiFreeze = !gre && link === 'split';
     const portHop = !gre && link === 'kcp-hop';
     const isH3 = !gre && (link === 'h3' || link === 'h3-cdn');
     const sniSpoof = !gre && !sit && !portHop && !twinPath && !isWebRTC && !asymmetric && !isH3 && (ipSpoof || link === 'sni-spoof' || ($('tn-snispoof') && !$('tn-opt-snispoof').hidden && $('tn-snispoof').checked));
-    return {
+    const req = {
       name: $('tn-name').value.trim(),
       relay: $('tn-relay').value,
       foreign: $('tn-foreign').value,
@@ -6246,7 +6290,7 @@
       asymmetric,
       ipv6: $('tn-ipv6').checked,
       shared,
-      shared_links: shared ? Number($('tn-links-n').value || 4) : 0,
+      shared_links: shared ? Number($('tn-links-n').value || (isWBSwitch ? 8 : 4)) : 0,
       pool: !shared ? Number(($('tn-pool') && $('tn-pool').value) || 30) : 0,
       max_conn: Number(($('tn-max-conn') && $('tn-max-conn').value) || 2000),
       max_per_ip: Math.floor(Number(($('tn-max-per-ip') && $('tn-max-per-ip').value) || 0)),
@@ -6257,13 +6301,23 @@
       service_ports: $('tn-service').value.trim(),
       user_ports: $('tn-users').value.trim(),
       link_port: Number($('tn-linkport').value || 0),
-      forward_proto: radio('tn-fwd-proto') || 'tcp',
-      route_hosts: (radio('tn-fwd-proto') || 'tcp') === 'tcp' && $('tn-route-hosts') ? $('tn-route-hosts').value.trim() : '',
-      route_default: (radio('tn-fwd-proto') || 'tcp') === 'tcp' && !!($('tn-route-default') && $('tn-route-default').checked),
+      forward_proto: isWBSwitch ? 'tcp' : (radio('tn-fwd-proto') || 'tcp'),
+      route_hosts: !isWBSwitch && (radio('tn-fwd-proto') || 'tcp') === 'tcp' && $('tn-route-hosts') ? $('tn-route-hosts').value.trim() : '',
+      route_default: !isWBSwitch && (radio('tn-fwd-proto') || 'tcp') === 'tcp' && !!($('tn-route-default') && $('tn-route-default').checked),
       proxy_protocol: radio('tn-proxy'),
       relay_ip: $('tn-relayip').value.trim(),
       auto_heal: $('tn-autoheal') ? $('tn-autoheal').checked : true,
     };
+    if (isWBSwitch) {
+      req.website_bridge = true;
+      req.website_domains = wbEdge.website_domains || wbOrig.website_domains || '';
+      req.outbound_proxy = !!(wbEdge.outbound_proxy || wbOrig.outbound_proxy);
+      req.outbound_proxy_port = wbOrig.outbound_proxy_port || wbEdge.outbound_proxy_port || 18080;
+      req.outbound_proxy_mode = wbOrig.outbound_proxy_mode || wbEdge.outbound_proxy_mode || 'split';
+      req.outbound_iran_domains = wbOrig.outbound_iran_domains || wbEdge.outbound_iran_domains || '';
+      req.outbound_bypass_domains = wbOrig.outbound_bypass_domains || wbEdge.outbound_bypass_domains || '';
+    }
+    return req;
   }
 
   // ------------------------------------------------ auto-heal & smart failover
@@ -6470,7 +6524,7 @@
           let what = 'User listen port';
           if (isBridgePort(p.port) && ((role === 'relay' && (r.mode === 'reverse' || r.asymmetric)) || (role === 'foreign' && r.mode === 'direct'))) what = 'Tunnel bridge port';
           else if (role === 'foreign') what = 'Inbound port';
-          const isSelf = !!(ownTag && (p.by === ownTag || (what === 'User listen port' && p.shared && Array.isArray(p.shared_tunnels) && p.shared_tunnels.length === 1 && p.shared_tunnels[0] === r.name)));
+          const isSelf = portOwnedByTunnel(p, ownTag, what === 'User listen port');
           const by = p.by ? ` (${p.by.replace(/^PortBridge /, '')})` : '';
           let cls = 'good', text;
           if (what === 'Inbound port') {
@@ -7153,6 +7207,13 @@
       target.edge && target.origin
         ? h('button', {
             type: 'button',
+            'data-focus': key + '-switch',
+            onclick: () => openSwitchTunnel(t)
+          }, 'Switch Mode')
+        : null,
+      target.edge && target.origin
+        ? h('button', {
+            type: 'button',
             class: ahOn ? 'btn-autoheal is-on' : 'btn-autoheal',
             'data-focus': key + '-autoheal',
             onclick: () => openTunnelAutoHeal(t)
@@ -7169,17 +7230,402 @@
       h('button', { type: 'button', class: 'danger-text', 'data-focus': key + '-delete', onclick: () => confirmDeleteTunnel(t, target) }, 'Delete'));
   }
 
-  function syncWebsiteDialogUI() {
+  const WB_CDN_LINKS = ['cdn', 'website-cdn-backup', 'xhttp-cdn', 'h3-cdn', 'grpc-cdn', 'asymmetric-cdn'];
+  const WB_DIRECT_ONLY_LINKS = ['website-cdn-backup', 'asymmetric', 'asymmetric-cdn', 'cdn', 'xhttp-cdn', 'h3-cdn', 'grpc-cdn'];
+  let wbLastProbeReport = null;
+  let wbAppliedProbeID = '';
+  let wbAppliedProbeText = '';
+  let wbAppliedProbeWarn = false;
+
+  function syncWebsiteDialogUI(changedBy) {
     const outOn = $('wb-outbound') ? $('wb-outbound').checked : true;
     if ($('wb-outbound-box')) $('wb-outbound-box').hidden = !outOn;
     if ($('wb-port-preview') && $('wb-proxy-port')) {
       $('wb-port-preview').textContent = $('wb-proxy-port').value || '18080';
     }
+    if (wbMode === 'create' && $('wb-link')) {
+      let mode = radio('wb-mode') || 'direct';
+      let link = $('wb-link').value || 'website';
+      if (changedBy === 'link' && WB_DIRECT_ONLY_LINKS.includes(link) && mode !== 'direct') {
+        setRadio('wb-mode', 'direct');
+        mode = 'direct';
+      } else if (changedBy === 'mode' && mode === 'reverse' && WB_DIRECT_ONLY_LINKS.includes(link)) {
+        $('wb-link').value = 'website';
+        link = 'website';
+      }
+      const isCDN = WB_CDN_LINKS.includes(link);
+      if ($('wb-cdn-wrap')) $('wb-cdn-wrap').hidden = !isCDN;
+      const showSNI = ['website', 'split', 'sit', 'website-cdn-backup', 'xhttp', 'h3', 'asymmetric', 'grpc', 'sni-spoof', 'ip-spoof', 'http-header'].includes(link);
+      if ($('wb-sni-wrap')) $('wb-sni-wrap').hidden = !showSNI;
+      if ($('wb-sni')) {
+        const curSNI = $('wb-sni').value.trim();
+        const defaultSNIs = ['www.bing.com', 'www.google.com', 'challenges.cloudflare.com', ''];
+        if (defaultSNIs.includes(curSNI)) {
+          if (['sni-spoof', 'ip-spoof'].includes(link)) $('wb-sni').value = 'challenges.cloudflare.com';
+          else if (['grpc', 'h3'].includes(link)) $('wb-sni').value = 'www.google.com';
+          else $('wb-sni').value = 'www.bing.com';
+        }
+      }
+      const v6ok = ['plain', 'http-header', 'website', 'split', 'sni-spoof', 'xhttp', 'h3', 'grpc', 'kcp', 'kcp-hop', 'webrtc', 'twin'].includes(link) &&
+        hasIPv6(serverById($('wb-relay') && $('wb-relay').value)) &&
+        hasIPv6(serverById($('wb-foreign') && $('wb-foreign').value));
+      if ($('wb-ipv6-wrap')) $('wb-ipv6-wrap').hidden = !v6ok;
+      if (!v6ok && $('wb-ipv6')) $('wb-ipv6').checked = false;
+
+      if ($('wb-mux-links')) {
+        const isRaw = ['icmp', 'faketcp', 'ip-spoof'].includes(link);
+        const curLinks = Number($('wb-mux-links').value || 8);
+        if (isRaw && curLinks > 2) $('wb-mux-links').value = '2';
+        else if (!isRaw && curLinks <= 2) $('wb-mux-links').value = '8';
+      }
+    }
     syncChoiceCards($('website-dialog'));
   }
 
-  if ($('wb-outbound')) $('wb-outbound').addEventListener('change', syncWebsiteDialogUI);
-  if ($('wb-proxy-port')) $('wb-proxy-port').addEventListener('input', syncWebsiteDialogUI);
+  function resetWebsiteProbeState() {
+    wbLastProbeReport = null;
+    wbAppliedProbeID = '';
+    wbAppliedProbeText = '';
+    wbAppliedProbeWarn = false;
+    if ($('wb-probe-error')) $('wb-probe-error').textContent = '';
+    if ($('wb-probe-live')) $('wb-probe-live').hidden = true;
+    if ($('wb-probe-results')) {
+      $('wb-probe-results').hidden = true;
+      $('wb-probe-results').replaceChildren();
+    }
+    if ($('wb-probe-cfscan-msg')) $('wb-probe-cfscan-msg').textContent = '';
+    if ($('wb-probe-cfscan-results')) {
+      $('wb-probe-cfscan-results').hidden = true;
+      $('wb-probe-cfscan-results').replaceChildren();
+    }
+    if ($('wb-cfscan-msg')) $('wb-cfscan-msg').textContent = '';
+    if ($('wb-cfscan-results')) {
+      $('wb-cfscan-results').hidden = true;
+      $('wb-cfscan-results').replaceChildren();
+    }
+  }
+
+  function renderWebsiteProbeResults(rep, isLive, activeIdx) {
+    const box = $('wb-probe-results');
+    if (!box) return;
+    box.hidden = false;
+    if (!isLive) wbLastProbeReport = rep;
+
+    const kids = [];
+    if (!isLive && rep.recommended) {
+      const rec = rep.recommended;
+      const recApplied = wbAppliedProbeID && (rec.id === wbAppliedProbeID || rec.label === wbAppliedProbeID);
+      kids.push(h('div', { class: 'probe-rec-card' },
+        h('div', { class: 'probe-rec-main' },
+          h('div', { class: 'probe-rec-top' },
+            h('span', { class: 'probe-score-pill' }, `★ Recommended · ${rec.score}/100`),
+            h('strong', null, rec.label)),
+          h('p', { class: 'probe-rec-summary' }, rec.summary || '')),
+        h('button', {
+          type: 'button',
+          class: 'primary' + (recApplied ? ' is-applied' : ''),
+          onclick: () => applyWebsiteProbeCandidate(rec)
+        }, recApplied ? '✓ Applied' : 'Apply Recommended')));
+    }
+    if (!isLive && wbAppliedProbeText) {
+      kids.push(h('p', {
+        class: 'probe-applied-banner' + (wbAppliedProbeWarn ? ' warn' : ''),
+        role: 'status',
+      }, wbAppliedProbeText));
+    }
+    const rows = (rep.results || []).map((r, idx) => renderProbeRow(r, !!isLive, isLive && idx === activeIdx, applyWebsiteProbeCandidate, wbAppliedProbeID));
+    if (rows.length) {
+      kids.push(h('div', { class: 'probe-list' }, ...rows));
+    }
+    for (const note of rep.notes || []) {
+      kids.push(h('p', { class: 'muted small' }, note));
+    }
+    box.replaceChildren(...kids);
+  }
+
+  async function applyWebsiteProbeCandidate(cand) {
+    if (!cand) return;
+    setRadio('wb-mode', cand.mode === 'reverse' ? 'reverse' : 'direct');
+    const resolvedLink = cand.asymmetric
+      ? (cand.cdn ? 'asymmetric-cdn' : 'asymmetric')
+      : (cand.transport === 'webrtc'
+          ? 'webrtc'
+          : (cand.twin_path || cand.link === 'twin'
+              ? 'twin'
+              : (cand.ip_spoof
+                  ? 'ip-spoof'
+                  : (cand.port_hop
+                      ? 'kcp-hop'
+                      : (cand.anti_freeze
+                          ? 'split'
+                          : (cand.sni_spoof
+                              ? 'sni-spoof'
+                              : (cand.web_header ? 'http-header' : (cand.link || 'website'))))))));
+    if ($('wb-link')) $('wb-link').value = resolvedLink;
+    if ($('wb-ipv6')) $('wb-ipv6').checked = !!cand.ipv6;
+    if ($('wb-sni')) {
+      if (cand.spoof_sni) $('wb-sni').value = cand.spoof_sni;
+      else if (cand.server_name && !cand.cdn) $('wb-sni').value = cand.server_name;
+    }
+    if (cand.domain) {
+      if ($('wb-cdn-domain')) $('wb-cdn-domain').value = cand.domain;
+      if ($('wb-probe-cdn')) $('wb-probe-cdn').value = cand.domain;
+    }
+    if (Array.isArray(cand.clean_ips) && cand.clean_ips.length) {
+      const joined = cand.clean_ips.join(', ');
+      if ($('wb-cleanips')) $('wb-cleanips').value = joined;
+      if ($('wb-probe-cleanips')) $('wb-probe-cleanips').value = joined;
+    }
+    if ($('wb-mux-links')) {
+      const isRaw = resolvedLink === 'icmp' || resolvedLink === 'faketcp' || resolvedLink === 'ip-spoof';
+      $('wb-mux-links').value = isRaw ? '2' : '8';
+    }
+    syncWebsiteDialogUI('link');
+
+    wbAppliedProbeID = cand.id || cand.label || '';
+    wbAppliedProbeWarn = false;
+    const field = $('wb-linkport');
+    const webPortNums = ($('wb-ports') ? $('wb-ports').value : '80,443').split(',').map((x) => Number(x.trim())).filter(Boolean);
+    if (cand.port && field && !webPortNums.includes(cand.port)) {
+      const listenSrv = cand.mode === 'reverse' ? $('wb-relay').value : $('wb-foreign').value;
+      let portBusy = false;
+      if (listenSrv) {
+        try {
+          const checkList = (cand.twin_path && !cand.port_hop && cand.port < 65535) ? `${cand.port},${cand.port + 1}` : String(cand.port);
+          const res = await api('POST', '/api/ports', { server: listenSrv, ports: checkList });
+          const st = (res.ports || []).find((p) => p.state !== 'free');
+          if (st) {
+            portBusy = true;
+            wbAppliedProbeWarn = true;
+            wbAppliedProbeText = `Applied "${cand.label}" (${cand.score}/100). Tested port ${cand.port} is busy on the server, so Bridge Port stayed at ${field.value}.`;
+          }
+        } catch (_) {}
+      }
+      if (!portBusy) {
+        field.value = String(cand.port);
+        wbAppliedProbeText = `✓ Applied "${cand.label}" (${cand.score}/100) — Bridge Port set to ${cand.port}. Click "Create Website Bridge" below when ready.`;
+      }
+    } else {
+      wbAppliedProbeText = `✓ Applied "${cand.label}" (${cand.score}/100). Click "Create Website Bridge" below when ready.`;
+    }
+    setStatus(wbAppliedProbeText, wbAppliedProbeWarn);
+    if (wbLastProbeReport) renderWebsiteProbeResults(wbLastProbeReport, false, -1);
+  }
+
+  if ($('wb-outbound')) $('wb-outbound').addEventListener('change', () => syncWebsiteDialogUI('outbound'));
+  if ($('wb-proxy-port')) $('wb-proxy-port').addEventListener('input', () => syncWebsiteDialogUI('outbound'));
+  if ($('wb-link')) $('wb-link').addEventListener('change', () => syncWebsiteDialogUI('link'));
+  if ($('wb-relay')) $('wb-relay').addEventListener('change', () => syncWebsiteDialogUI('server'));
+  if ($('wb-foreign')) $('wb-foreign').addEventListener('change', () => syncWebsiteDialogUI('server'));
+  for (const el of document.querySelectorAll('#website-form input[name="wb-mode"]')) {
+    el.addEventListener('change', () => syncWebsiteDialogUI('mode'));
+  }
+  if ($('wb-probe-cf-pick')) {
+    $('wb-probe-cf-pick').addEventListener('change', (ev) => {
+      if (ev.target.value) {
+        if ($('wb-probe-cdn')) $('wb-probe-cdn').value = ev.target.value;
+        if ($('wb-cdn-domain')) $('wb-cdn-domain').value = ev.target.value;
+      }
+    });
+  }
+  if ($('wb-probe-cdn') && $('wb-cdn-domain')) {
+    $('wb-probe-cdn').addEventListener('input', () => { $('wb-cdn-domain').value = $('wb-probe-cdn').value; });
+    $('wb-cdn-domain').addEventListener('input', () => { $('wb-probe-cdn').value = $('wb-cdn-domain').value; });
+  }
+  if ($('wb-probe-cleanips') && $('wb-cleanips')) {
+    $('wb-probe-cleanips').addEventListener('input', () => { $('wb-cleanips').value = $('wb-probe-cleanips').value; });
+    $('wb-cleanips').addEventListener('input', () => { $('wb-probe-cleanips').value = $('wb-cleanips').value; });
+  }
+  if ($('wb-probe-cfscan-btn')) {
+    $('wb-probe-cfscan-btn').addEventListener('click', () => {
+      const dom = ($('wb-probe-cdn') && $('wb-probe-cdn').value.trim()) || ($('wb-cdn-domain') && $('wb-cdn-domain').value.trim()) || '';
+      if (dom) {
+        if ($('wb-probe-cdn')) $('wb-probe-cdn').value = dom;
+        if ($('wb-cdn-domain')) $('wb-cdn-domain').value = dom;
+      }
+      const curLink = ($('wb-link') && $('wb-link').value) || '';
+      runCloudflareCleanIPScan({
+        btn: $('wb-probe-cfscan-btn'),
+        relay: $('wb-relay').value,
+        foreign: $('wb-foreign').value,
+        tunnel: '',
+        domain: dom,
+        port: Number(($('wb-linkport') && $('wb-linkport').value) || 8443),
+        transport: WB_CDN_LINKS.includes(curLink) ? curLink : 'cdn',
+        inputEl: $('wb-probe-cleanips'),
+        mirrorInputEl: $('wb-cleanips'),
+        msgEl: $('wb-probe-cfscan-msg'),
+        boxEl: $('wb-probe-cfscan-results'),
+        domainInputEl: $('wb-probe-cdn'),
+      });
+    });
+  }
+  if ($('wb-cfscan-btn')) {
+    $('wb-cfscan-btn').addEventListener('click', () => {
+      const dom = ($('wb-cdn-domain') && $('wb-cdn-domain').value.trim()) || ($('wb-probe-cdn') && $('wb-probe-cdn').value.trim()) || '';
+      if (dom) {
+        if ($('wb-cdn-domain')) $('wb-cdn-domain').value = dom;
+        if ($('wb-probe-cdn')) $('wb-probe-cdn').value = dom;
+      }
+      const curLink = ($('wb-link') && $('wb-link').value) || 'cdn';
+      runCloudflareCleanIPScan({
+        btn: $('wb-cfscan-btn'),
+        relay: $('wb-relay').value,
+        foreign: $('wb-foreign').value,
+        tunnel: '',
+        domain: dom,
+        port: Number(($('wb-linkport') && $('wb-linkport').value) || 8443),
+        transport: WB_CDN_LINKS.includes(curLink) ? curLink : 'cdn',
+        inputEl: $('wb-cleanips'),
+        mirrorInputEl: $('wb-probe-cleanips'),
+        msgEl: $('wb-cfscan-msg'),
+        boxEl: $('wb-cfscan-results'),
+        domainInputEl: $('wb-cdn-domain'),
+      });
+    });
+  }
+  if ($('wb-probe-btn')) {
+    $('wb-probe-btn').addEventListener('click', async () => {
+      const btn = $('wb-probe-btn');
+      const live = $('wb-probe-live');
+      const err = $('wb-probe-error');
+      const resBox = $('wb-probe-results');
+      const relay = $('wb-relay').value;
+      const foreign = $('wb-foreign').value;
+      const cdn = ($('wb-probe-cdn') && $('wb-probe-cdn').value.trim()) || ($('wb-cdn-domain') && $('wb-cdn-domain').value.trim()) || '';
+      const cleanIPs = ($('wb-probe-cleanips') && $('wb-probe-cleanips').value.trim()) || ($('wb-cleanips') && $('wb-cleanips').value.trim()) || '';
+      const webPorts = ($('wb-ports') && $('wb-ports').value.trim()) || '80,443';
+      const linkPort = Number(($('wb-linkport') && $('wb-linkport').value) || 8443);
+      if (cdn && $('wb-cdn-domain')) $('wb-cdn-domain').value = cdn;
+      if (cleanIPs && $('wb-cleanips')) $('wb-cleanips').value = cleanIPs;
+
+      const setWBProgress = (text, pct) => {
+        if (live) live.hidden = false;
+        if ($('wb-probe-status')) $('wb-probe-status').textContent = text;
+        const clamped = Math.max(0, Math.min(100, Math.round(pct)));
+        if ($('wb-probe-pct')) $('wb-probe-pct').textContent = `${clamped}%`;
+        if ($('wb-probe-progress')) $('wb-probe-progress').value = clamped;
+      };
+
+      err.textContent = '';
+      wbLastProbeReport = null;
+      wbAppliedProbeID = '';
+      wbAppliedProbeText = '';
+      wbAppliedProbeWarn = false;
+      resBox.hidden = true;
+      resBox.replaceChildren();
+      btn.disabled = true;
+      btn.textContent = 'Starting…';
+      setWBProgress('Preparing temporary benchmark listeners on both servers…', 4);
+      if (live && live.scrollIntoView) live.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+
+      let sess = null;
+      const doneResults = [];
+      const retests = [];
+      try {
+        sess = await api('POST', '/api/tunnels/probe', {
+          action: 'start',
+          relay,
+          foreign,
+          cdn_domain: cdn,
+          clean_ips: cleanIPs,
+          service_ports: webPorts,
+          user_ports: webPorts,
+          link_port: linkPort,
+        });
+        const cands = (sess.candidates || []).map((c) => Object.assign({}, c));
+        if (!cands.length) {
+          throw new Error('No benchmark candidates could be prepared for these two servers.');
+        }
+        const liveState = cands.map((c) => Object.assign({}, c));
+        const deadTCP = {};
+
+        for (let i = 0; i < cands.length; i++) {
+          const spec = cands[i];
+          const pct = Math.round(((i + 0.2) / cands.length) * 84) + 4;
+          btn.textContent = `Testing (${i + 1}/${cands.length})…`;
+          setWBProgress(`Step ${i + 1} of ${cands.length}: ${spec.label}…`, pct);
+          renderWebsiteProbeResults({ results: liveState, notes: sess.notes }, true, i);
+
+          const isTCPDirect = !spec.cdn && !spec.asymmetric && !['kcp', 'webrtc', 'h3', 'icmp', 'faketcp'].includes(spec.transport) && spec.target_addr;
+          if (isTCPDirect && (deadTCP[spec.target_addr] || 0) >= 2) {
+            const skipped = Object.assign({}, spec, {
+              status: 'blocked',
+              attempts: 1,
+              successes: 0,
+              error: 'TCP port unreachable (connection timed out)',
+              summary: 'Blocked / Unreachable — TCP port unreachable',
+            });
+            liveState[i] = skipped;
+            doneResults.push(skipped);
+            continue;
+          }
+
+          const dialerID = spec.mode === 'reverse' ? sess.foreign_id : sess.relay_id;
+          const secret = spec.mode === 'reverse' ? sess.reverse_secret : sess.direct_secret;
+          const stepRes = await api('POST', '/api/tunnels/probe', {
+            action: 'step',
+            dialer_id: dialerID,
+            secret,
+            spec,
+          });
+          if (isTCPDirect && stepRes.successes === 0 && (stepRes.error === 'TCP port unreachable (connection timed out)' || stepRes.error === 'connection refused')) {
+            deadTCP[spec.target_addr] = (deadTCP[spec.target_addr] || 0) + 1;
+          }
+          liveState[i] = stepRes;
+          doneResults.push(stepRes);
+          renderWebsiteProbeResults({ results: liveState, notes: sess.notes }, true, -1);
+        }
+
+        let retestIDs = [];
+        try {
+          retestIDs = (await api('POST', '/api/tunnels/probe', { action: 'retest', results: doneResults })).ids || [];
+        } catch (_) {
+          retestIDs = [];
+        }
+        for (let j = 0; j < retestIDs.length; j++) {
+          const idx = cands.findIndex((c) => c.id === retestIDs[j]);
+          if (idx < 0) continue;
+          const spec = cands[idx];
+          btn.textContent = `Re-checking (${j + 1}/${retestIDs.length})…`;
+          setWBProgress(`Re-checking a result that looked like a bad moment: ${spec.label}…`, 88 + Math.round((j / retestIDs.length) * 9));
+          renderWebsiteProbeResults({ results: liveState, notes: sess.notes }, true, idx);
+          const dialerID = spec.mode === 'reverse' ? sess.foreign_id : sess.relay_id;
+          const secret = spec.mode === 'reverse' ? sess.reverse_secret : sess.direct_secret;
+          try {
+            const again = await api('POST', '/api/tunnels/probe', { action: 'step', dialer_id: dialerID, secret, spec });
+            retests.push(again);
+            if (again && (again.status === 'ok' || (liveState[idx] && liveState[idx].status !== 'ok'))) {
+              liveState[idx] = Object.assign({}, again, { retested: true });
+            } else if (liveState[idx]) {
+              liveState[idx] = Object.assign({}, liveState[idx], { retested: true });
+            }
+          } catch (_) {}
+          renderWebsiteProbeResults({ results: liveState, notes: sess.notes }, true, -1);
+        }
+
+        setWBProgress('Calculating final scores and best bridge mode…', 98);
+        const finalRep = await api('POST', '/api/tunnels/probe', {
+          action: 'finish',
+          session: sess,
+          results: doneResults,
+          retests,
+        });
+        sess = null;
+        if (live) live.hidden = true;
+        renderWebsiteProbeResults(finalRep, false, -1);
+      } catch (e) {
+        if (live) live.hidden = true;
+        err.textContent = e.message;
+      } finally {
+        if (sess) {
+          api('POST', '/api/tunnels/probe', { action: 'finish', session: sess, results: doneResults }).catch(() => {});
+        }
+        btn.disabled = false;
+        btn.textContent = 'Find Best Bridge Mode';
+      }
+    });
+  }
 
   async function openNewWebsiteBridge() {
     if (!serversCache.length) {
@@ -7199,6 +7645,7 @@
     $('wb-submit').textContent = 'Create Website Bridge';
     if ($('wb-step1-title')) $('wb-step1-title').textContent = 'Servers, Bridge Name & Website Domains';
     if ($('wb-step4-title')) $('wb-step4-title').textContent = 'Inter-Server Link & Multiplexed Web Capacity';
+    if ($('wb-mode-banner')) $('wb-mode-banner').hidden = true;
 
     $('wb-relay').replaceChildren(...relays.map(serverOption));
     $('wb-foreign').replaceChildren(...foreigns.map(serverOption));
@@ -7220,12 +7667,18 @@
     setRadio('wb-mode', 'direct');
     $('wb-link').value = 'website';
     $('wb-sni').value = 'www.bing.com';
+    if ($('wb-cdn-domain')) $('wb-cdn-domain').value = '';
+    if ($('wb-probe-cdn')) $('wb-probe-cdn').value = '';
+    if ($('wb-cleanips')) $('wb-cleanips').value = '';
+    if ($('wb-probe-cleanips')) $('wb-probe-cleanips').value = '';
     if ($('wb-ipv6')) $('wb-ipv6').checked = false;
     $('wb-mux-links').value = '8';
     $('wb-max-conn').value = '4000';
     $('wb-autoheal').checked = true;
     $('wb-error').textContent = '';
     $('wb-ports-result').replaceChildren();
+    resetWebsiteProbeState();
+    populateCFPickSelect($('wb-probe-cf-wrap'), $('wb-probe-cf-pick'));
 
     syncWebsiteDialogUI();
     openDialog($('website-dialog'));
@@ -7256,6 +7709,17 @@
     if ($('wb-step1-title')) $('wb-step1-title').textContent = 'Website Domains';
     if ($('wb-step4-title')) $('wb-step4-title').textContent = 'Multiplexed Web Capacity';
 
+    if ($('wb-mode-banner')) {
+      const bothManaged = !!(e && o && e.server_id && o.server_id);
+      $('wb-mode-banner').hidden = !bothManaged;
+      if (bothManaged && $('wb-mode-summary')) {
+        const relayBridgeIP = (ei && ei.local_ip) || (oi && oi.peer_ip) || '';
+        const foreignBridgeIP = (ei && ei.peer_ip) || (oi && oi.local_ip) || '';
+        const isIPv6 = relayBridgeIP.includes(':') || foreignBridgeIP.includes(':');
+        $('wb-mode-summary').textContent = `${any.mode === 'reverse' ? 'Reverse' : 'Direct'}${isIPv6 ? ' (IPv6)' : ''} · ${shortLinkLabel(any)} · Bridge :${linkPort}`;
+      }
+    }
+
     $('wb-create-servers').hidden = true;
     $('wb-name-wrap').hidden = true;
     $('wb-create-transport').hidden = true;
@@ -7279,6 +7743,14 @@
     syncWebsiteDialogUI();
     openDialog($('website-dialog'));
     $('wb-domains').focus();
+  }
+
+  if ($('wb-switch-mode-btn')) {
+    $('wb-switch-mode-btn').addEventListener('click', () => {
+      const t = editingWebsiteBridge;
+      $('website-dialog').close();
+      if (t) openSwitchTunnel(t);
+    });
   }
 
   if ($('new-website-btn')) {
@@ -7315,7 +7787,6 @@
       out.replaceChildren(h('li', null, 'Checking web & proxy ports on both servers...'));
       const wbDomains = $('wb-domains') ? $('wb-domains').value.trim() : '';
       const hasWbDomains = !!(wbDomains && wbDomains !== '*');
-      const ownName = (wbMode === 'edit' && editingWebsiteBridge) ? editingWebsiteBridge.name : '';
       const relayPorts = webPorts + (mode === 'reverse' ? ',' + linkPort : '');
       const foreignPorts = webPorts + (mode === 'direct' ? ',' + linkPort : '') + (outOn && outPort ? ',' + outPort : '');
       const checkOne = async (srvId, list, role) => {
@@ -7325,7 +7796,7 @@
         try {
           const res = await api('POST', '/api/ports', { server: srvId, ports: list });
           return (res.ports || []).map((p) => {
-            const isSelf = !!(ownTag && (p.by === ownTag || (ownName && p.shared && Array.isArray(p.shared_tunnels) && p.shared_tunnels.length === 1 && p.shared_tunnels[0] === ownName)));
+            const isSelf = portOwnedByTunnel(p, ownTag, true);
             const by = p.by ? ` (${p.by.replace(/^PortBridge /, '')})` : '';
             if (role === 'foreign' && outOn && p.port === outPort) {
               const ok = p.state === 'free' || isSelf;
@@ -7436,21 +7907,45 @@
             btn.disabled = false;
             return fail('Choose an Iran Entry Server and a Foreign Hosting Server.');
           }
-          const link = $('wb-link').value || 'website';
-          const sni = $('wb-sni').value.trim() || 'www.bing.com';
+          const rawLink = $('wb-link').value || 'website';
+          const isGRE = rawLink === 'gre';
+          const isHTTPHeader = rawLink === 'http-header';
+          const link = isGRE ? 'plain' : (isHTTPHeader ? 'plain' : rawLink);
+          const cdnDomain = (($('wb-cdn-domain') && $('wb-cdn-domain').value.trim()) || ($('wb-probe-cdn') && $('wb-probe-cdn').value.trim()) || '');
+          const cleanIPs = (($('wb-cleanips') && $('wb-cleanips').value) || ($('wb-probe-cleanips') && $('wb-probe-cleanips').value) || '').replace(/\s+/g, '');
+          if (WB_CDN_LINKS.includes(rawLink) && !cdnDomain) {
+            btn.disabled = false;
+            return fail('Enter your Cloudflare / CDN Tunnel Subdomain (e.g. cdn-bridge.yourdomain.com).', $('wb-cdn-domain'));
+          }
+          const sni = $('wb-sni').value.trim() || (['grpc', 'h3'].includes(rawLink) ? 'www.google.com' : 'www.bing.com');
+          const asymmetric = !isGRE && (rawLink === 'asymmetric' || rawLink === 'asymmetric-cdn');
+          const ipSpoof = !isGRE && rawLink === 'ip-spoof';
+          const sit = !isGRE && rawLink === 'sit';
+          const antiFreeze = !isGRE && rawLink === 'split';
+          const sniSpoof = !isGRE && (ipSpoof || rawLink === 'sni-spoof');
+          const noV6Links = ['asymmetric', 'asymmetric-cdn', 'gre', 'sit', 'faketcp', 'icmp', 'ip-spoof'];
           const res = await api('POST', '/api/tunnels', {
             name,
             relay,
             foreign,
-            mode: link === 'asymmetric' ? 'direct' : (radio('wb-mode') || 'direct'),
+            mode: WB_DIRECT_ONLY_LINKS.includes(rawLink) ? 'direct' : (radio('wb-mode') || 'direct'),
             link,
-            asymmetric: link === 'asymmetric',
-            port_hop: link === 'kcp-hop',
-            twin_path: link === 'twin',
+            domain: cdnDomain,
+            clean_ips: cleanIPs,
+            gre: isGRE,
+            sit,
+            web_header: isHTTPHeader,
+            web_host: isHTTPHeader ? sni : '',
+            asymmetric,
+            anti_freeze: antiFreeze,
+            port_hop: rawLink === 'kcp-hop',
+            twin_path: rawLink === 'twin',
             server_name: sni,
-            spoof_sni: link === 'sni-spoof' ? sni : '',
+            sni_spoof: sniSpoof,
+            spoof_sni: sniSpoof ? sni : '',
+            ip_spoof: ipSpoof,
             stealth: true,
-            real_site: !['asymmetric', 'h3', 'webrtc', 'twin', 'kcp', 'kcp-hop', 'plain'].includes(link),
+            real_site: !['asymmetric', 'asymmetric-cdn', 'h3', 'h3-cdn', 'webrtc', 'twin', 'kcp', 'kcp-hop', 'ip-spoof', 'faketcp', 'icmp', 'gre', 'sit', 'http-header', 'plain', 'cdn', 'xhttp-cdn', 'grpc-cdn'].includes(rawLink),
             shared: true,
             shared_links: muxLinks,
             max_conn: maxConn,
@@ -7458,7 +7953,7 @@
             user_ports: webPorts,
             link_port: linkPort,
             proxy_protocol: proxyProto,
-            ipv6: link === 'asymmetric' ? false : !!($('wb-ipv6') && $('wb-ipv6').checked),
+            ipv6: noV6Links.includes(rawLink) ? false : !!($('wb-ipv6') && $('wb-ipv6').checked),
             auto_heal: $('wb-autoheal').checked,
             website_bridge: true,
             website_domains: domains,

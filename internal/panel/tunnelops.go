@@ -262,6 +262,8 @@ func (p *Panel) toSpec(r createRequest) (agent.EdgeSpec, error) {
 		}
 		s.OutboundIranDomains = strings.TrimSpace(r.OutboundIranDomains)
 		s.OutboundBypassDomains = strings.TrimSpace(r.OutboundBypassDomains)
+	} else if r.WebsiteBridge {
+		s.OutboundProxy = "off"
 	}
 	if r.Relay == "" || r.Foreign == "" || r.Relay == r.Foreign {
 		return s, errors.New("choose a relay (Iran) server and a different, foreign server")
@@ -301,6 +303,19 @@ func (p *Panel) toSpec(r createRequest) (agent.EdgeSpec, error) {
 				s.HTTPHost = "www.bing.com"
 			}
 		}
+	case "http-header":
+		s.Transport = "plain"
+		s.HTTPHeader = "on"
+		s.HTTPHost = strings.TrimSpace(r.WebHost)
+		if s.HTTPHost == "" {
+			s.HTTPHost = claimed
+		}
+		if s.HTTPHost == "" {
+			s.HTTPHost = "www.bing.com"
+		}
+	case "gre":
+		s.Transport = "plain"
+		r.GRE = true
 	case "website":
 		s.Transport = "tls"
 		s.ServerName = claimed
@@ -512,9 +527,13 @@ func (p *Panel) toSpec(r createRequest) (agent.EdgeSpec, error) {
 	}
 	if r.Shared {
 		s.Mux, s.MuxLinks = "on", r.SharedLinks
-		if s.MuxLinks == 0 {
-			if s.Transport == "icmp" || s.Transport == "faketcp" || s.IPSpoof == "on" {
+		if s.Transport == "icmp" || s.Transport == "faketcp" || s.IPSpoof == "on" {
+			if s.MuxLinks <= 0 || s.MuxLinks > 2 {
 				s.MuxLinks = 2
+			}
+		} else if s.MuxLinks <= 0 {
+			if r.WebsiteBridge {
+				s.MuxLinks = 8
 			} else {
 				s.MuxLinks = 4
 			}
@@ -597,13 +616,18 @@ func (p *Panel) checkForeignPorts(ctx context.Context, j *job, foreignID string,
 	return p.checkForeignPortsForTunnel(ctx, j, foreignID, s, "")
 }
 
-func (p *Panel) checkForeignPortsForTunnel(ctx context.Context, j *job, foreignID string, s agent.EdgeSpec, ignoreTunnel string) error {
-	ownTag := ""
-	if ignoreTunnel != "" {
-		ownTag = fmt.Sprintf("PortBridge tunnel %q", ignoreTunnel)
+func portOwnedByTunnel(by, tunnelName string) bool {
+	if tunnelName == "" || by == "" {
+		return false
 	}
+	plain := "PortBridge tunnel " + tunnelName
+	quoted := fmt.Sprintf("PortBridge tunnel %q", tunnelName)
+	return by == plain || strings.HasPrefix(by, plain+" ") || by == quoted || strings.HasPrefix(by, quoted+" ")
+}
+
+func (p *Panel) checkForeignPortsForTunnel(ctx context.Context, j *job, foreignID string, s agent.EdgeSpec, ignoreTunnel string) error {
 	isBusy := func(ps portState) bool {
-		if ownTag != "" && ps.By == ownTag {
+		if portOwnedByTunnel(ps.By, ignoreTunnel) {
 			return false
 		}
 		return ps.State == "busy" || ps.State == "reserved"
@@ -672,7 +696,7 @@ func (p *Panel) checkForeignPortsForTunnel(ctx context.Context, j *job, foreignI
 	for _, n := range intsOf(s.ServicePorts) {
 		ps := st[n]
 		switch {
-		case strings.HasPrefix(ps.By, "PortBridge tunnel ") && (ownTag == "" || ps.By != ownTag):
+		case strings.HasPrefix(ps.By, "PortBridge tunnel ") && !portOwnedByTunnel(ps.By, ignoreTunnel):
 			problems = append(problems, fmt.Sprintf("service port %d on the foreign server is used by %s, so it cannot also be your service",
 				n, strings.TrimPrefix(ps.By, "PortBridge ")))
 		case ps.State == "free":
@@ -843,6 +867,8 @@ func describeSpecMode(s agent.EdgeSpec, linkKey string) string {
 		modeName = "Source IP + SNI Spoof"
 	case "sit":
 		modeName = "Private 6in4 (SIT)"
+	case "http-header":
+		modeName = "Plain TCP + HTTP Header"
 	case "plain":
 		modeName = "Raw TCP"
 	}
@@ -2074,6 +2100,8 @@ func (p *Panel) probeBetweenServers(parent context.Context, relayID, foreignID, 
 		wg         sync.WaitGroup
 		directRes  []engine.ProbeCandidateResult
 		reverseRes []engine.ProbeCandidateResult
+		directErr  error
+		reverseErr error
 	)
 	if len(directSpecs) > 0 {
 		wg.Add(1)
@@ -2085,8 +2113,12 @@ func (p *Panel) probeBetweenServers(parent context.Context, relayID, foreignID, 
 				"secret":      sess.DirectSecret,
 				"burst_bytes": 0,
 			}, &drep)
-			if err == nil && drep.OK {
+			if err != nil {
+				directErr = err
+			} else if drep.OK {
 				directRes = drep.Results
+			} else if drep.Error != "" {
+				directErr = errors.New(drep.Error)
 			}
 		}()
 	}
@@ -2100,15 +2132,32 @@ func (p *Panel) probeBetweenServers(parent context.Context, relayID, foreignID, 
 				"secret":      sess.ReverseSecret,
 				"burst_bytes": 0,
 			}, &rrep)
-			if err == nil && rrep.OK {
+			if err != nil {
+				reverseErr = err
+			} else if rrep.OK {
 				reverseRes = rrep.Results
+			} else if rrep.Error != "" {
+				reverseErr = errors.New(rrep.Error)
 			}
 		}()
 	}
 	wg.Wait()
 
+	if directErr != nil {
+		sess.Notes = append(sess.Notes, fmt.Sprintf("Direct benchmark call on %s could not complete: %s", p.serverName(sess.RelayID), plainAgentError(directErr)))
+	}
+	if reverseErr != nil {
+		sess.Notes = append(sess.Notes, fmt.Sprintf("Reverse benchmark call on %s could not complete: %s", p.serverName(sess.ForeignID), plainAgentError(reverseErr)))
+	}
 	results := append(directRes, reverseRes...)
-	return p.finishProbeSession(*sess, results), nil
+	rep := p.finishProbeSession(*sess, results)
+	if len(results) == 0 && (directErr != nil || reverseErr != nil) {
+		if directErr != nil {
+			return nil, directErr
+		}
+		return nil, reverseErr
+	}
+	return rep, nil
 }
 
 type sniScanReport struct {

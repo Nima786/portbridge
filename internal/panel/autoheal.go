@@ -947,6 +947,10 @@ func describeTunnelInfo(ti agent.TunnelInfo) string {
 	return fmt.Sprintf("%s · %s · %s", dir, tr, fam)
 }
 
+func isRawSocketCandidate(transport string, ipSpoof bool) bool {
+	return strings.EqualFold(transport, "icmp") || strings.EqualFold(transport, "faketcp") || ipSpoof
+}
+
 func sameCandidateAsCurrent(c engine.ProbeCandidateResult, ti agent.TunnelInfo) bool {
 	if ti.CDN && !slices.Contains(engine.CDNHTTPSPorts, ti.LinkPort) {
 		// If a CDN tunnel was set to a non-Cloudflare port, switching to a valid
@@ -968,6 +972,8 @@ func sameCandidateAsCurrent(c engine.ProbeCandidateResult, ti agent.TunnelInfo) 
 		strings.EqualFold(c.Transport, ti.Transport) &&
 		c.IPv6 == curIPv6 &&
 		c.CDN == ti.CDN &&
+		c.SNISpoof == ti.SNISpoof &&
+		c.IPSpoof == ti.IPSpoof &&
 		c.AntiFreeze == ti.AntiFreeze &&
 		c.PortHop == ti.PortHop &&
 		c.TwinPath == ti.TwinPath &&
@@ -1004,7 +1010,12 @@ func (ah *autoHealer) pickBestCandidate(rep *engine.ProbeBenchmarkReport, cur ag
 		}
 	}
 	if len(working) > 0 {
-		return working[0], true
+		// When triggered automatically on a running but stalled/blocked tunnel,
+		// do not endlessly re-apply the exact same transport unless doing so
+		// repairs an overloaded raw-socket MuxLinks count (> 2 -> 2).
+		if force || !cur.Running || (isRawSocketCandidate(cur.Transport, cur.IPSpoof) && cur.MuxLinks > 2) {
+			return working[0], true
+		}
 	}
 	return engine.ProbeCandidateResult{}, false
 }
@@ -1091,14 +1102,13 @@ func (ah *autoHealer) chooseFailoverLinkPort(ctx context.Context, relayID, forei
 		}
 	}
 
-	ownLabel := "PortBridge tunnel " + cur.Name
 	portFreeIn := func(st map[int]portState, p int, cnt int) bool {
 		if st == nil {
 			return true
 		}
 		for i := 0; i < cnt; i++ {
 			ps, ok := st[p+i]
-			if ok && ps.State != "free" && ps.By != ownLabel {
+			if ok && ps.State != "free" && !portOwnedByTunnel(ps.By, cur.Name) {
 				return false
 			}
 		}
@@ -1169,14 +1179,25 @@ func (ah *autoHealer) buildFailoverEditSpec(ctx context.Context, name, relayID, 
 		return "off"
 	}
 	muxMode := "on"
-	if !best.Shared && !curInfo.Mux && !engine.IsKCPFamily(engine.Transport(best.Transport)) {
+	if !curInfo.WebsiteBridge && !best.Shared && !curInfo.Mux && !engine.IsKCPFamily(engine.Transport(best.Transport)) {
 		muxMode = "off"
 	}
-	muxLinks := max(1, curInfo.MuxLinks)
-	if best.Transport == "icmp" || best.Transport == "faketcp" || best.IPSpoof {
-		if curInfo.MuxLinks <= 0 || curInfo.MuxLinks == 4 {
+	defaultMuxLinks := 4
+	if curInfo.WebsiteBridge {
+		defaultMuxLinks = 8
+	}
+	muxLinks := curInfo.MuxLinks
+	if muxLinks <= 0 {
+		muxLinks = defaultMuxLinks
+	}
+	curWasRaw := isRawSocketCandidate(curInfo.Transport, curInfo.IPSpoof)
+	bestIsRaw := isRawSocketCandidate(best.Transport, best.IPSpoof)
+	if bestIsRaw {
+		if muxLinks > 2 {
 			muxLinks = 2
 		}
+	} else if curWasRaw && muxLinks <= 2 {
+		muxLinks = defaultMuxLinks
 	}
 	ipv6Flag := best.IPv6
 	serverName := best.ServerName
@@ -1213,6 +1234,13 @@ func (ah *autoHealer) buildFailoverEditSpec(ctx context.Context, name, relayID, 
 		}
 	}
 
+	cleanIPs := ""
+	keepCleanIPs := (best.CDN || altHost != "") && !toStandby
+	if len(best.CleanIPs) > 0 && !toStandby {
+		cleanIPs = strings.Join(best.CleanIPs, ",")
+		keepCleanIPs = false
+	}
+
 	spec := agent.EditSpec{
 		Name:         name,
 		Mode:         best.Mode,
@@ -1225,8 +1253,8 @@ func (ah *autoHealer) buildFailoverEditSpec(ctx context.Context, name, relayID, 
 		ServerName:   serverName,
 		CDN:          onOff(best.CDN),
 		AltHost:      altHost,
-		CleanIPs:     "",
-		KeepCleanIPs: (best.CDN || altHost != "") && !toStandby,
+		CleanIPs:     cleanIPs,
+		KeepCleanIPs: keepCleanIPs,
 		UTLS:         onOff(best.Stealth),
 		TLSFragment:  onOff(best.Stealth),
 		HTTPHeader:   onOff(best.WebHeader),
@@ -1768,6 +1796,24 @@ func (ah *autoHealer) healTunnel(ctx context.Context, j *job, key, name, relayID
 		}
 		if err != nil {
 			return fmt.Errorf("could not benchmark paths between servers: %s", plainAgentError(err))
+		}
+		samePassed := false
+		if rep != nil {
+			for _, c := range rep.Results {
+				if c.Status == "ok" || c.Status == "degraded" {
+					samePassed = true
+					break
+				}
+			}
+		}
+		if samePassed {
+			if cdnDomain == "" {
+				return errors.New("no alternative transport passed between these servers (current mode passed brief probe but stalls under load; add a Cloudflare CDN subdomain in Auto-Heal settings for CDN failover)")
+			}
+			return errors.New("no alternative transport passed between these servers (current mode passed brief probe but stalls under load)")
+		}
+		if cdnDomain == "" {
+			return errors.New("all tested direct and reverse modes failed or were blocked between these servers (add a Cloudflare CDN subdomain in Auto-Heal settings to enable CDN failover)")
 		}
 		return errors.New("all tested tunnel modes (Direct, Reverse, IPv4, IPv6, CDN) failed or were blocked between these servers")
 	}

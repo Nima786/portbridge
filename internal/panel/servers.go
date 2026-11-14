@@ -230,6 +230,12 @@ func (f *fleet) callLimit(ctx context.Context, srv Server, method, path string, 
 	}
 
 	prefURL, prefHub, prefStealth, prefJump := f.preferredPath(srv.ID)
+	fastGet := method == http.MethodGet && limit <= overviewLimit
+	var fastTryWait, fastStealthWait time.Duration
+	if fastGet {
+		fastTryWait = 4500 * time.Millisecond
+		fastStealthWait = 5 * time.Second
+	}
 
 	if srv.CallsPanel {
 		status, b, herr := f.p.hub.do(ctx, srv.ID, method, path, body)
@@ -241,7 +247,7 @@ func (f *fleet) callLimit(ctx context.Context, srv Server, method, path string, 
 			return status, b, herr
 		}
 		for _, u := range append([]string{srv.AgentURL}, v6URLs...) {
-			st, rb, derr := tryURL(u, 3500*time.Millisecond, 4500*time.Millisecond, false)
+			st, rb, derr := tryURL(u, 3500*time.Millisecond, fastTryWait, false)
 			if derr == nil {
 				route := "direct"
 				if slices.Contains(v6URLs, u) {
@@ -251,7 +257,7 @@ func (f *fleet) callLimit(ctx context.Context, srv Server, method, path string, 
 				return st, rb, nil
 			}
 			if !isTCPDialFailure(derr) {
-				if st, rb, serr := tryURL(u, 3500*time.Millisecond, 5*time.Second, true); serr == nil {
+				if st, rb, serr := tryURL(u, 3500*time.Millisecond, fastStealthWait, true); serr == nil {
 					f.recordPath(srv.ID, u, false, true, "stealth")
 					return st, rb, nil
 				}
@@ -268,9 +274,7 @@ func (f *fleet) callLimit(ctx context.Context, srv Server, method, path string, 
 	var dialWait, perTry time.Duration
 	if hasFallback {
 		dialWait = 3500 * time.Millisecond
-		if method == http.MethodGet && limit <= overviewLimit {
-			perTry = 4500 * time.Millisecond
-		}
+		perTry = fastTryWait
 	}
 
 	if prefHub && f.p.hub.connected(srv.ID) {
@@ -327,7 +331,7 @@ func (f *fleet) callLimit(ctx context.Context, srv Server, method, path string, 
 	}
 
 	for _, u := range stealthTargets {
-		st, rb, serr := tryURL(u, 3500*time.Millisecond, 5*time.Second, true)
+		st, rb, serr := tryURL(u, 3500*time.Millisecond, fastStealthWait, true)
 		if serr == nil {
 			f.recordPath(srv.ID, u, false, true, "stealth")
 			return st, rb, nil

@@ -2531,6 +2531,15 @@
     </div>
 
     <div class="dialog-body">
+      <div id="wb-mode-banner" class="et-mode-banner" hidden>
+        <div class="et-mode-banner-info">
+          <span class="et-mode-banner-kicker">Current Transport &amp; Direction</span>
+          <strong id="wb-mode-summary">—</strong>
+          <span class="muted small">Need to benchmark all 20+ modes (including Cloudflare CDN) or switch transport / Direct ↔ Reverse without recreating this Website Bridge?</span>
+        </div>
+        <button type="button" id="wb-switch-mode-btn" class="primary">Switch Mode / Benchmark…</button>
+      </div>
+
       <!-- STEP 1: Servers, Name & Domains -->
       <section class="step-section">
         <div class="step-header">
@@ -2692,6 +2701,64 @@
         </legend>
 
         <div id="wb-create-transport">
+          <div id="wb-probe-box" class="probe-box">
+            <div class="probe-head">
+              <div>
+                <div class="probe-title-row">
+                  <strong>Smart Route &amp; All-Mode Benchmark</strong>
+                  <span class="pill-tag tag-good">Tests All Direct · Reverse · IPv6 · UDP · CDN Modes</span>
+                </div>
+                <p class="muted small">Benchmarks every compatible transport between your Iran Entry Server and Foreign Hosting Server on temporary ports (catching ISP byte-cap freezes) and auto-fills the fastest reliable mode below.</p>
+              </div>
+            </div>
+
+            <div class="probe-subblock">
+              <div class="probe-subhead-row">
+                <span class="probe-subhead">Optional Cloudflare / CDN Failover Subdomain &amp; Clean IP Scanner</span>
+                <span class="pill-tag">Leave empty for Direct / Reverse only</span>
+              </div>
+              <div class="probe-cdn-row">
+                <div class="port-box probe-port-card">
+                  <label for="wb-probe-cdn">CDN Subdomain to Benchmark &amp; Save for Auto-Heal</label>
+                  <span class="field-hint">Proxied Cloudflare subdomain (Orange Cloud ON) pointed at your Foreign server IP</span>
+                  <input id="wb-probe-cdn" placeholder="e.g. cdn-bridge.yourdomain.com (optional)" autocapitalize="none" spellcheck="false">
+                </div>
+                <div id="wb-probe-cf-wrap" class="port-box probe-port-card" hidden>
+                  <label for="wb-probe-cf-pick">Or Pick from Cloudflare DNS</label>
+                  <span class="field-hint">Quick-fill an existing record from your Cloudflare zone</span>
+                  <select id="wb-probe-cf-pick">
+                    <option value="">— Select Cloudflare record —</option>
+                  </select>
+                </div>
+              </div>
+              <div class="port-box probe-port-card probe-clean-card">
+                <label for="wb-probe-cleanips">Cloudflare Clean Edge IPs <span class="muted">(optional — scans 44 official CF Anycast /24 subnets)</span></label>
+                <div class="cf-quick-row cfscan-input-row">
+                  <input id="wb-probe-cleanips" placeholder="104.16.12.34, 172.67.45.67 (or click Scan Clean CF IPs →)" autocapitalize="none" spellcheck="false">
+                  <button type="button" id="wb-probe-cfscan-btn">Scan Clean CF IPs</button>
+                </div>
+                <p id="wb-probe-cfscan-msg" class="small" role="status"></p>
+                <div id="wb-probe-cfscan-results" class="cfscan-results" hidden></div>
+              </div>
+            </div>
+
+            <div class="probe-cta-bar">
+              <button type="button" id="wb-probe-btn" class="primary probe-cta-btn">Find Best Bridge Mode</button>
+              <span class="muted small probe-cta-note">Tests all compatible routes safely on temporary ports and auto-fills Direction, Disguise &amp; Bridge Port below.</span>
+            </div>
+
+            <div id="wb-probe-live" class="probe-live-box" hidden>
+              <div class="probe-live-head">
+                <span class="probe-spinner" aria-hidden="true"></span>
+                <span id="wb-probe-status" role="status" aria-live="polite">Preparing benchmark...</span>
+                <span id="wb-probe-pct" class="probe-pct">0%</span>
+              </div>
+              <progress id="wb-probe-progress" class="probe-progress" max="100" value="0"></progress>
+            </div>
+            <p id="wb-probe-error" class="error" role="alert"></p>
+            <div id="wb-probe-results" class="probe-results" hidden></div>
+          </div>
+
           <div class="row2">
             <div>
               <label>Connection Direction</label>
@@ -2700,14 +2767,14 @@
                   <input type="radio" name="wb-mode" value="direct" checked>
                   <div class="choice-body">
                     <div class="choice-top"><strong>Direct (Iran → Foreign)</strong><span class="pill-tag tag-good">Best</span></div>
-                    <span class="choice-desc">Iran server dials Foreign server.</span>
+                    <span class="choice-desc">Iran server dials Foreign server (required for CDN &amp; Asymmetric modes).</span>
                   </div>
                 </label>
                 <label class="choice-card compact">
                   <input type="radio" name="wb-mode" value="reverse">
                   <div class="choice-body">
                     <div class="choice-top"><strong>Reverse (Foreign → Iran)</strong></div>
-                    <span class="choice-desc">Foreign server dials Iran server.</span>
+                    <span class="choice-desc">Foreign server dials Iran server when Iran outbound is filtered.</span>
                   </div>
                 </label>
               </div>
@@ -2715,24 +2782,67 @@
             <div>
               <label for="wb-link">Inter-Server Disguise</label>
               <select id="wb-link">
-                <option value="website">Fake TLS Website (HTTPS SNI Disguise · Recommended)</option>
-                <option value="xhttp">SplitHTTP / XHTTP (Direct Server-to-Server)</option>
-                <option value="asymmetric">Asymmetric Dual-Path (Direct XHTTP ↑ + Reverse UDP ↓)</option>
-                <option value="h3">QUIC / HTTP/3 Masquerade (Direct UDP)</option>
-                <option value="sni-spoof">Decoy Whitelisted SNI Spoof (challenges.cloudflare.com)</option>
-                <option value="split">Split-Stream TLS (14 KB Anti-Freeze Rotation)</option>
-                <option value="webrtc">WebRTC Video-Call Disguise (STUN + SRTP)</option>
-                <option value="twin">Twin-Path 1+1 Gaming UDP (Zero-Lag Duplication)</option>
-                <option value="kcp-hop">KCP Port-Hopping UDP (8-Port Rotation + FEC)</option>
-                <option value="kcp">KCP Accelerated UDP (Single-Port + FEC)</option>
-                <option value="plain">Raw TCP (No Disguise · Clean Routes)</option>
+                <optgroup label="Direct HTTPS, TLS &amp; Hybrid (No Domain Needed)">
+                  <option value="website">Fake TLS Website (HTTPS SNI Disguise · Recommended)</option>
+                  <option value="xhttp">SplitHTTP / XHTTP (Direct Server-to-Server)</option>
+                  <option value="asymmetric">Asymmetric Dual-Path (Direct XHTTP ↑ + Reverse UDP ↓)</option>
+                  <option value="sni-spoof">Decoy Whitelisted SNI Spoof (challenges.cloudflare.com)</option>
+                  <option value="split">Split-Stream TLS (14 KB Anti-Freeze Rotation)</option>
+                  <option value="grpc">gRPC Stream (Direct HTTP/2)</option>
+                </optgroup>
+                <optgroup label="Cloudflare / CDN Modes (Proxied Subdomain)">
+                  <option value="website-cdn-backup">Fake TLS + Cloudflare CDN Auto-Fallback</option>
+                  <option value="xhttp-cdn">SplitHTTP / XHTTP via Cloudflare CDN</option>
+                  <option value="cdn">WebSocket via Cloudflare CDN (WSS)</option>
+                  <option value="h3-cdn">QUIC / HTTP/3 via Cloudflare CDN</option>
+                  <option value="grpc-cdn">gRPC via Cloudflare CDN</option>
+                  <option value="asymmetric-cdn">Asymmetric CDN Hybrid (CDN XHTTP ↑ + Reverse UDP ↓)</option>
+                </optgroup>
+                <optgroup label="UDP, VoIP &amp; Multi-Port Disguises">
+                  <option value="h3">QUIC / HTTP/3 Masquerade (Direct UDP)</option>
+                  <option value="webrtc">WebRTC Video-Call Disguise (STUN + SRTP)</option>
+                  <option value="kcp-hop">KCP Port-Hopping UDP (8-Port Rotation + FEC)</option>
+                  <option value="twin">Twin-Path 1+1 UDP (Packet Duplication)</option>
+                  <option value="kcp">KCP Accelerated UDP (Single-Port + FEC)</option>
+                  <option value="ip-spoof">Source IP + Whitelisted SNI Spoof (Raw UDP)</option>
+                </optgroup>
+                <optgroup label="Raw Socket, Layer-3 &amp; Plain Modes">
+                  <option value="faketcp">FakeTCP · Paqet (Raw TCP Header + KCP/FEC)</option>
+                  <option value="icmp">ICMP Ping Tunnel (Echo KCP + FEC)</option>
+                  <option value="gre">Private GRE Layer-3 Tunnel (Protocol 47)</option>
+                  <option value="sit">Private 6in4 Layer-3 Tunnel (SIT Protocol 41)</option>
+                  <option value="http-header">Plain TCP + HTTP Website Header</option>
+                  <option value="plain">Raw TCP (No Disguise · Clean Routes)</option>
+                </optgroup>
               </select>
-              <label for="wb-sni" class="small muted">Camouflage SNI / Host</label>
-              <input id="wb-sni" value="www.bing.com" autocapitalize="none" spellcheck="false">
+              <div id="wb-sni-wrap">
+                <label for="wb-sni" class="small muted">Camouflage SNI / Host</label>
+                <input id="wb-sni" value="www.bing.com" autocapitalize="none" spellcheck="false">
+              </div>
             </div>
           </div>
 
-          <label class="check-card">
+          <div id="wb-cdn-wrap" class="sub-panel" hidden>
+            <div class="row2">
+              <div>
+                <label for="wb-cdn-domain">Cloudflare / CDN Tunnel Subdomain <span class="muted">(Proxied Orange Cloud ON)</span></label>
+                <span class="field-hint">Separate CDN tunnel subdomain pointed at your Foreign server IP (Bridge Port must be a Cloudflare HTTPS port: <code>2053</code>, <code>2083</code>, <code>2087</code>, <code>2096</code>, or <code>8443</code>)</span>
+                <input id="wb-cdn-domain" placeholder="e.g. cdn-bridge.yourdomain.com" autocapitalize="none" spellcheck="false">
+              </div>
+              <div>
+                <label for="wb-cleanips">Cloudflare Clean Edge IPs <span class="muted">(optional)</span></label>
+                <span class="field-hint">Comma-separated unthrottled Cloudflare Anycast IPs for your Iran ISP</span>
+                <div class="cf-quick-row cfscan-input-row">
+                  <input id="wb-cleanips" placeholder="e.g. 104.16.12.34, 172.67.45.67" autocapitalize="none" spellcheck="false">
+                  <button type="button" id="wb-cfscan-btn">Scan Clean CF IPs</button>
+                </div>
+                <p id="wb-cfscan-msg" class="small" role="status"></p>
+                <div id="wb-cfscan-results" class="cfscan-results" hidden></div>
+              </div>
+            </div>
+          </div>
+
+          <label id="wb-ipv6-wrap" class="check-card">
             <input type="checkbox" id="wb-ipv6">
             <span>
               <strong>Use IPv6 Between Servers</strong>
