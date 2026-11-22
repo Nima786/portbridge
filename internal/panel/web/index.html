@@ -685,22 +685,6 @@
       <button type="submit" class="primary" id="add-submit">Add Server</button>
     </div>
   </form>
-
-  <div id="add-progress" hidden>
-    <div class="dialog-header">
-      <h2 id="add-progress-title" tabindex="-1">Setting up server</h2>
-    </div>
-    <div class="dialog-body">
-      <ol id="add-log" class="log"></ol>
-      <p id="add-result" role="status" aria-live="polite"></p>
-      <p id="add-note" class="muted small">You can close this window; setup continues in the background.</p>
-    </div>
-    <div class="dialog-footer actions">
-      <button type="button" id="add-back" hidden>Back</button>
-      <button type="button" id="add-switch-join" hidden>Use 1-Line Join Command Instead</button>
-      <button type="button" id="add-close" class="primary">Close</button>
-    </div>
-  </div>
 </dialog>
 
 <!-- Renaming or moving a server -->
@@ -1653,86 +1637,67 @@
     </div>
   </form>
 
-  <div id="tn-progress" hidden>
-    <div class="dialog-header">
-      <h2 id="tn-progress-title" tabindex="-1">Creating Tunnel</h2>
-    </div>
-    <div class="dialog-body">
-      <ol id="tn-log" class="log"></ol>
-      <p id="tn-result" role="status" aria-live="polite"></p>
-    </div>
-    <div class="dialog-footer actions">
-      <button type="button" id="tn-back" hidden>Back</button>
-      <button type="button" id="tn-close" class="primary">Close</button>
-    </div>
-  </div>
-</dialog>
-
-<!-- Following a long job, such as an update -->
-<dialog id="job-dialog" aria-labelledby="job-title">
-  <div class="dialog-header">
-    <h2 id="job-title" tabindex="-1">Working</h2>
-  </div>
-  <div class="dialog-body">
-    <ol id="job-log" class="log"></ol>
-    <p id="job-result" role="status" aria-live="polite"></p>
-    <p id="job-note" class="muted small">You can close this window; the task continues in the background.</p>
-  </div>
-  <div class="dialog-footer actions">
-    <button type="button" id="job-close" class="primary">Close</button>
-  </div>
 </dialog>
 
 <!-- A tunnel's code, to paste by hand -->
 <dialog id="code-dialog" aria-labelledby="code-title">
-  <div class="dialog-header">
-    <div>
-      <h2 id="code-title">Tunnel Pairing Code</h2>
-      <p class="muted small">To pair manually on the Foreign server, open <code>portbridge-menu</code>, select "Join a tunnel", and paste this code. Keep it private.</p>
+  <div class="dialog-shell">
+    <div class="dialog-header">
+      <div>
+        <h2 id="code-title">Tunnel Pairing Code</h2>
+        <p class="muted small">To pair manually on the Foreign server, open <code>portbridge-menu</code>, select "Join a tunnel", and paste this code. Keep it private.</p>
+      </div>
     </div>
-  </div>
-  <div class="dialog-body">
-    <label for="code-text" class="visually-hidden">Pairing code</label>
-    <textarea id="code-text" rows="4" readonly spellcheck="false"></textarea>
-    <p id="code-msg" role="status"></p>
-  </div>
-  <div class="dialog-footer actions">
-    <button type="button" id="code-copy">Copy Code</button>
-    <button type="button" id="code-close" class="primary">Close</button>
+    <div class="dialog-body">
+      <label for="code-text" class="visually-hidden">Pairing code</label>
+      <textarea id="code-text" rows="4" readonly spellcheck="false"></textarea>
+      <p id="code-msg" role="status"></p>
+    </div>
+    <div class="dialog-footer actions">
+      <button type="button" id="code-copy">Copy Code</button>
+      <button type="button" id="code-close" class="primary">Close</button>
+    </div>
   </div>
 </dialog>
 
 <!-- What happened on each server -->
 <dialog id="msg-dialog" aria-labelledby="msg-title">
-  <div class="dialog-header">
-    <h2 id="msg-title"></h2>
-  </div>
-  <div class="dialog-body">
-    <ul id="msg-list" class="msg-list"></ul>
-  </div>
-  <div class="dialog-footer actions">
-    <button type="button" id="msg-close" class="primary">Close</button>
+  <div class="dialog-shell">
+    <div class="dialog-header">
+      <h2 id="msg-title"></h2>
+    </div>
+    <div class="dialog-body">
+      <ul id="msg-list" class="msg-list"></ul>
+    </div>
+    <div class="dialog-footer actions">
+      <button type="button" id="msg-close" class="primary">Close</button>
+    </div>
   </div>
 </dialog>
 
-<!-- Asking before something is removed -->
-<dialog id="confirm-dialog" aria-labelledby="confirm-title" aria-describedby="confirm-text">
-  <div class="dialog-header">
-    <h2 id="confirm-title"></h2>
-  </div>
-  <div class="dialog-body">
-    <p id="confirm-text"></p>
-    <div id="confirm-loading-wrap" class="probe-live-box" hidden>
-      <div class="probe-live-head">
-        <span class="probe-spinner" aria-hidden="true"></span>
-        <span id="confirm-loading-text">Working… Communicating with server(s)…</span>
+<!-- Asking before something is removed or confirmed -->
+<dialog id="confirm-dialog" class="confirm-modal" aria-labelledby="confirm-title" aria-describedby="confirm-text">
+  <div class="dialog-shell">
+    <div class="dialog-header confirm-head">
+      <div id="confirm-icon" class="confirm-badge is-danger" aria-hidden="true"></div>
+      <div class="confirm-head-copy">
+        <h2 id="confirm-title"></h2>
+        <p id="confirm-text" class="confirm-desc"></p>
       </div>
     </div>
-    <p id="confirm-error" class="error" role="alert"></p>
-  </div>
-  <div class="dialog-footer actions">
-    <button type="button" id="confirm-no">Cancel</button>
-    <button type="button" id="confirm-yes" class="danger"></button>
+    <div class="dialog-body confirm-body">
+      <div id="confirm-loading-wrap" class="probe-live-box" hidden>
+        <div class="probe-live-head">
+          <span class="probe-spinner" aria-hidden="true"></span>
+          <span id="confirm-loading-text">Working… Communicating with server(s)…</span>
+        </div>
+      </div>
+      <p id="confirm-error" class="error" role="alert"></p>
+    </div>
+    <div class="dialog-footer actions">
+      <button type="button" id="confirm-no">Cancel</button>
+      <button type="button" id="confirm-yes" class="danger"></button>
+    </div>
   </div>
 </dialog>
 
@@ -2070,20 +2035,6 @@
       <button type="submit" class="primary">Save &amp; Apply Changes</button>
     </div>
   </form>
-
-  <div id="et-progress" hidden>
-    <div class="dialog-header">
-      <h2 id="et-progress-title" tabindex="-1">Updating Tunnel</h2>
-    </div>
-    <div class="dialog-body">
-      <ol id="et-log" class="log"></ol>
-      <p id="et-result" role="status" aria-live="polite"></p>
-    </div>
-    <div class="dialog-footer actions">
-      <button type="button" id="et-back" hidden>Back</button>
-      <button type="button" id="et-close" class="primary">Close</button>
-    </div>
-  </div>
 </dialog>
 
 <!-- Viewing a tunnel's systemd logs -->
@@ -3069,6 +3020,29 @@
     </div>
   </form>
 </dialog>
+
+<!-- Non-blocking bottom-right background activity dock -->
+<aside id="activity-dock" class="activity-dock" role="region" aria-label="Background task activity" hidden>
+  <div class="act-bar-track" aria-hidden="true">
+    <div id="act-bar-fill" class="act-bar-fill"></div>
+  </div>
+  <div class="act-head">
+    <div id="act-icon" class="act-icon is-running" aria-hidden="true"></div>
+    <div class="act-title-wrap">
+      <strong id="act-title" class="act-title">Working…</strong>
+      <span id="act-sub" class="act-sub">Running in background</span>
+    </div>
+    <div class="act-ctrls">
+      <button type="button" id="act-toggle" class="icon-btn ghost act-ctrl-btn" title="Minimize or expand" aria-label="Minimize task details" aria-expanded="true">▾</button>
+      <button type="button" id="act-dismiss" class="icon-btn ghost act-ctrl-btn" title="Dismiss" aria-label="Dismiss activity card">✕</button>
+    </div>
+  </div>
+  <div id="act-body" class="act-body">
+    <div id="act-steps" class="act-steps" aria-live="polite"></div>
+    <div id="act-banner" class="act-banner" role="status" aria-live="polite" hidden></div>
+    <div id="act-actions" class="act-actions" hidden></div>
+  </div>
+</aside>
 </body>
 </html>
 

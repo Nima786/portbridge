@@ -235,6 +235,29 @@
     }
   }
 
+  function makeSVG(paths, viewBox) {
+    const ns = 'http://www.w3.org/2000/svg';
+    const svg = document.createElementNS(ns, 'svg');
+    svg.setAttribute('viewBox', viewBox || '0 0 24 24');
+    svg.setAttribute('fill', 'none');
+    svg.setAttribute('stroke', 'currentColor');
+    svg.setAttribute('stroke-width', '2');
+    svg.setAttribute('stroke-linecap', 'round');
+    svg.setAttribute('stroke-linejoin', 'round');
+    svg.setAttribute('aria-hidden', 'true');
+    for (const d of paths) {
+      const p = document.createElementNS(ns, 'path');
+      p.setAttribute('d', d);
+      svg.appendChild(p);
+    }
+    return svg;
+  }
+
+  let activityState = { gen: 0, running: false };
+  function isActivityRunning() {
+    return !!(activityState && activityState.running);
+  }
+
   // Dialogs give the keyboard back to whatever opened them without scrolling.
   function openDialog(dlg) {
     const key = document.activeElement && document.activeElement.dataset ? document.activeElement.dataset.focus : '';
@@ -242,7 +265,29 @@
     syncChoiceCards(dlg);
     dlg.showModal();
   }
+  const backdropCloseDialogs = new Set(['confirm-dialog', 'msg-dialog', 'code-dialog', 'logs-dialog', 'wp-setup-dialog']);
   for (const dlg of document.querySelectorAll('dialog')) {
+    const hdr = dlg.querySelector('.dialog-header');
+    if (hdr && !hdr.querySelector('.dialog-close-x')) {
+      const closeBtn = h('button', {
+        type: 'button',
+        class: 'dialog-close-x',
+        title: 'Close',
+        'aria-label': 'Close dialog',
+        onclick: () => {
+          if (dlg.id === 'confirm-dialog' && $('confirm-yes') && $('confirm-yes').disabled) return;
+          dlg.close();
+        },
+      }, '✕');
+      hdr.appendChild(closeBtn);
+    }
+    if (backdropCloseDialogs.has(dlg.id)) {
+      dlg.addEventListener('click', (ev) => {
+        if (ev.target !== dlg) return;
+        if (dlg.id === 'confirm-dialog' && $('confirm-yes') && $('confirm-yes').disabled) return;
+        dlg.close();
+      });
+    }
     dlg.addEventListener('close', () => {
       const key = dlg.dataset.returnTo;
       const el = key ? document.querySelector(`[data-focus="${CSS.escape(key)}"]`) : null;
@@ -261,6 +306,9 @@
   function showLogin(msg) {
     stopRefresh();
     csrf = '';
+    activityState.gen++;
+    activityState.running = false;
+    if ($('activity-dock')) $('activity-dock').hidden = true;
     for (const dlg of document.querySelectorAll('dialog[open]')) dlg.close();
     $('shell').hidden = true;
     $('login').hidden = false;
@@ -271,7 +319,7 @@
   let loadedVersion = '';
 
   function enter(me) {
-    if ((loadedVersion && me.version && loadedVersion !== me.version) || !$('tn-probe-live')) {
+    if ((loadedVersion && me.version && loadedVersion !== me.version) || !$('tn-probe-live') || !$('activity-dock')) {
       window.location.reload();
       return;
     }
@@ -474,7 +522,7 @@
       }
       if (statusIsProblem) setStatus('');
     } catch (e) {
-      if (e.status !== 401 && !(e.status === 0 && $('job-dialog') && $('job-dialog').open)) {
+      if (e.status !== 401 && !(e.status === 0 && isActivityRunning())) {
         setStatus(e.message, true);
       }
     }
@@ -1082,13 +1130,22 @@
   let confirmAction = null;
 
   function openConfirm(title, text, yes, action) {
+    const isDanger = /^(delete|remove|reset)\b/i.test(String(yes || '').trim());
     $('confirm-title').textContent = title;
     $('confirm-text').textContent = text;
-    $('confirm-yes').textContent = yes;
-    $('confirm-yes').dataset.origLabel = yes;
-    $('confirm-yes').classList.remove('is-loading');
-    $('confirm-yes').disabled = false;
+    const yesBtn = $('confirm-yes');
+    yesBtn.textContent = yes;
+    yesBtn.dataset.origLabel = yes;
+    yesBtn.className = isDanger ? 'danger' : 'primary';
+    yesBtn.disabled = false;
     $('confirm-no').disabled = false;
+    const iconBox = $('confirm-icon');
+    if (iconBox) {
+      iconBox.className = 'confirm-badge ' + (isDanger ? 'is-danger' : 'is-info');
+      iconBox.replaceChildren(isDanger
+        ? makeSVG(['M3 6h18', 'M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2', 'M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6', 'M10 11v6', 'M14 11v6'])
+        : makeSVG(['M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z', 'M9 12l2 2 4-4']));
+    }
     if ($('confirm-loading-wrap')) $('confirm-loading-wrap').hidden = true;
     $('confirm-error').textContent = '';
     confirmAction = action;
@@ -1155,8 +1212,6 @@
   // ------------------------------------------------------------ adding a server
 
   let keyFromFile = '';
-  let jobTimer = null;
-  let jobLines = 0;
 
   function authKind() {
     const c = document.querySelector('input[name="auth"]:checked');
@@ -1399,7 +1454,6 @@
     if ($('add-method-ssh-title')) $('add-method-ssh-title').textContent = repair ? 'Repair via SSH' : 'SSH Auto-Setup';
     if ($('add-method-join-title')) $('add-method-join-title').textContent = repair ? '1-Line Reconnect Command' : '1-Line Join Command';
     if ($('join-gen-btn')) $('join-gen-btn').textContent = repair ? 'Generate 1-Line Reconnect Command' : 'Generate 1-Line Join Command';
-    if ($('add-switch-join')) $('add-switch-join').textContent = repair ? 'Use 1-Line Reconnect Command Instead' : 'Use 1-Line Join Command Instead';
     populateAddViaOptions(add ? '' : (mode.server && mode.server.address));
     $('add-only').hidden = !add;
     $('add-only-name').hidden = !add;
@@ -1415,7 +1469,6 @@
         : 'This server runs an older PortBridge version from before one-click updates. Enter its SSH login once to upgrade it; future updates will work with one click.');
     $('add-submit').textContent = add ? 'Add Server' : (repair ? 'Repair Server' : 'Upgrade Server');
     $('add-form').hidden = false;
-    $('add-progress').hidden = true;
     $('add-error').textContent = '';
     syncAddMethodUI();
     showAuth();
@@ -1444,10 +1497,6 @@
     clearSecrets();
     $('add-dialog').close();
   });
-  $('add-close').addEventListener('click', () => {
-    clearSecrets();
-    $('add-dialog').close();
-  });
   // However the window is closed, Escape included, the password or key typed in
   // it is gone. Otherwise it would still be sitting in the form for the next
   // server the window is opened for.
@@ -1455,23 +1504,6 @@
     stopJoinPoll();
     clearSecrets();
   });
-  $('add-back').addEventListener('click', () => {
-    $('add-progress').hidden = true;
-    $('add-form').hidden = false;
-    $('add-error').textContent = '';
-    (addMode.kind === 'add' ? $('add-address') : $('add-user')).focus();
-  });
-  if ($('add-switch-join')) {
-    $('add-switch-join').addEventListener('click', () => {
-      $('add-progress').hidden = true;
-      $('add-form').hidden = false;
-      $('add-error').textContent = '';
-      const joinRadio = document.querySelector('input[name="add-method"][value="join"]');
-      if (joinRadio) joinRadio.checked = true;
-      syncAddMethodUI();
-      if ($('join-gen-btn')) $('join-gen-btn').focus();
-    });
-  }
 
   $('add-form').addEventListener('submit', async (ev) => {
     ev.preventDefault();
@@ -1555,58 +1587,202 @@
     }
   });
 
+  // ------------------------------------------------ floating activity dock
+
+  function setActivityCollapsed(collapsed) {
+    const dock = $('activity-dock');
+    const toggle = $('act-toggle');
+    if (!dock) return;
+    dock.classList.toggle('is-collapsed', !!collapsed);
+    if (toggle) {
+      toggle.textContent = collapsed ? '▴' : '▾';
+      toggle.setAttribute('aria-expanded', collapsed ? 'false' : 'true');
+      toggle.setAttribute('aria-label', collapsed ? 'Expand task details' : 'Minimize task details');
+    }
+  }
+
+  if ($('act-toggle')) {
+    $('act-toggle').addEventListener('click', (ev) => {
+      ev.stopPropagation();
+      const dock = $('activity-dock');
+      if (dock) setActivityCollapsed(!dock.classList.contains('is-collapsed'));
+    });
+  }
+  if ($('act-dismiss')) {
+    $('act-dismiss').addEventListener('click', (ev) => {
+      ev.stopPropagation();
+      if ($('activity-dock')) $('activity-dock').hidden = true;
+    });
+  }
+  if ($('activity-dock')) {
+    const head = $('activity-dock').querySelector('.act-head');
+    if (head) {
+      head.addEventListener('click', (ev) => {
+        if (ev.target.closest('.act-ctrls')) return;
+        const dock = $('activity-dock');
+        setActivityCollapsed(!dock.classList.contains('is-collapsed'));
+      });
+    }
+  }
+
+  function openActivityDock(title, subText) {
+    const gen = ++activityState.gen;
+    activityState.running = true;
+    const dock = $('activity-dock');
+    if (!dock) return gen;
+    dock.className = 'activity-dock';
+    dock.hidden = false;
+    setActivityCollapsed(false);
+    $('act-title').textContent = title;
+    $('act-sub').textContent = subText || 'Running in background…';
+    const icon = $('act-icon');
+    icon.className = 'act-icon is-running';
+    icon.replaceChildren(h('span', { class: 'act-spinner', 'aria-hidden': 'true' }));
+    $('act-steps').replaceChildren();
+    $('act-banner').hidden = true;
+    $('act-banner').textContent = '';
+    $('act-banner').className = 'act-banner';
+    $('act-actions').hidden = true;
+    $('act-actions').replaceChildren();
+    return gen;
+  }
+
+  function renderActivitySteps(lines, state) {
+    const box = $('act-steps');
+    if (!box) return;
+    const list = lines || [];
+    const nodes = list.map((line, idx) => {
+      const isLast = idx === list.length - 1;
+      let cls = 'is-done';
+      let mark = '✓';
+      if (isLast && state === 'running') {
+        cls = 'is-active';
+        mark = '';
+      } else if (isLast && state === 'error') {
+        cls = 'is-fail';
+        mark = '✕';
+      }
+      return h('div', { class: 'act-step ' + cls },
+        h('span', { class: 'act-step-dot', 'aria-hidden': 'true' }, mark),
+        h('span', { class: 'act-step-text' }, line));
+    });
+    box.replaceChildren(...nodes);
+    box.scrollTop = box.scrollHeight;
+    if (state === 'running' && $('act-sub')) {
+      $('act-sub').textContent = list.length
+        ? `Running in background · Step ${list.length}`
+        : 'Starting in background…';
+    }
+  }
+
+  function setActivityInfoBanner(text) {
+    const b = $('act-banner');
+    if (!b) return;
+    b.textContent = text;
+    b.className = 'act-banner is-info';
+    b.hidden = !text;
+  }
+
+  function finishActivityDock(ok, lines, summaryText, actionDefs) {
+    activityState.running = false;
+    const dock = $('activity-dock');
+    if (!dock) return;
+    dock.classList.remove('is-done', 'is-error');
+    dock.classList.add(ok ? 'is-done' : 'is-error');
+    if (!ok) setActivityCollapsed(false);
+    renderActivitySteps(lines || [], ok ? 'done' : 'error');
+    $('act-sub').textContent = ok ? 'Completed' : 'Failed';
+    const icon = $('act-icon');
+    icon.className = 'act-icon ' + (ok ? 'is-done' : 'is-error');
+    icon.replaceChildren(ok
+      ? makeSVG(['M20 6L9 17l-5-5'])
+      : makeSVG(['M12 9v4', 'M12 17h.01', 'M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z']));
+    const banner = $('act-banner');
+    banner.textContent = summaryText || (ok ? 'Completed.' : 'Task failed.');
+    banner.className = 'act-banner ' + (ok ? 'is-ok' : 'is-bad');
+    banner.hidden = false;
+    const actBox = $('act-actions');
+    if (actionDefs && actionDefs.length) {
+      actBox.replaceChildren(...actionDefs.map((a) => h('button', {
+        type: 'button',
+        class: a.primary ? 'primary' : '',
+        onclick: a.onClick,
+      }, a.label)));
+      actBox.hidden = false;
+    } else {
+      actBox.replaceChildren();
+      actBox.hidden = true;
+    }
+  }
+
   function startJob(id) {
-    $('add-form').hidden = true;
-    $('add-progress').hidden = false;
-    $('add-log').replaceChildren();
-    $('add-progress-title').textContent = addMode.kind === 'repair'
-      ? 'Repairing server'
-      : (addMode.kind === 'ssh-update' ? 'Upgrading server' : 'Setting up server');
-    $('add-result').textContent = 'Connecting...';
-    $('add-result').className = '';
-    $('add-note').hidden = false;
-    $('add-back').hidden = true;
-    if ($('add-switch-join')) $('add-switch-join').hidden = true;
-    $('add-progress-title').focus();
-    jobLines = 0;
-    if (jobTimer) clearTimeout(jobTimer);
+    const modeSnap = { kind: addMode.kind, server: addMode.server };
+    const updating = modeSnap.kind === 'ssh-update';
+    const repairing = modeSnap.kind === 'repair';
+    const targetLabel = (modeSnap.server && (modeSnap.server.name || modeSnap.server.address))
+      || $('add-name').value.trim()
+      || $('add-address').value.trim()
+      || 'Server';
+    const title = repairing
+      ? `Repairing ${targetLabel}`
+      : (updating ? `Upgrading ${targetLabel}` : `Setting up ${targetLabel}`);
+
+    if ($('add-dialog') && $('add-dialog').open) $('add-dialog').close();
+    const gen = openActivityDock(title, 'Connecting over SSH…');
+    let curLines = [];
+
+    const reopenAddForm = (switchToJoin) => {
+      setAddMode(modeSnap);
+      if (switchToJoin) {
+        const joinRadio = document.querySelector('input[name="add-method"][value="join"]');
+        if (joinRadio) joinRadio.checked = true;
+        syncAddMethodUI();
+      }
+      openDialog($('add-dialog'));
+      if (switchToJoin && $('join-gen-btn')) $('join-gen-btn').focus();
+      else (modeSnap.kind === 'add' ? $('add-address') : $('add-user')).focus();
+    };
+
     const poll = async () => {
+      if (gen !== activityState.gen) return;
       let job;
       try {
         job = await api('GET', '/api/jobs/' + encodeURIComponent(id));
+        if (gen !== activityState.gen) return;
       } catch (e) {
+        if (gen !== activityState.gen) return;
         if (e.status === 401) return;
-        $('add-result').textContent = e.message;
-        $('add-result').className = 'bad';
-        $('add-note').hidden = true;
+        finishActivityDock(false, curLines, e.message, [
+          { label: 'Edit & Retry', primary: true, onClick: () => reopenAddForm(false) },
+        ]);
         return;
       }
-      const lines = job.lines || [];
-      for (; jobLines < lines.length; jobLines++) $('add-log').append(h('li', null, lines[jobLines]));
-      const log = $('add-log');
-      log.scrollTop = log.scrollHeight;
+      curLines = job.lines || [];
       if (!job.done) {
-        if (lines.length > 1) $('add-result').textContent = 'Working...';
-        jobTimer = setTimeout(poll, 1000);
+        renderActivitySteps(curLines, 'running');
+        setTimeout(poll, 1000);
         return;
       }
-      $('add-note').hidden = true;
-      const updating = addMode.kind === 'ssh-update';
-      const repairing = addMode.kind === 'repair';
       if (job.error) {
         if (/older than the panel/i.test(job.error)) $('add-update').checked = true;
         const prefix = updating ? 'Upgrade failed. ' : (repairing ? 'Repair failed. ' : 'Could not add server. ');
-        $('add-result').textContent = prefix + sentence(job.error);
-        $('add-result').className = 'bad';
-        $('add-back').hidden = false;
-        if ($('add-switch-join')) $('add-switch-join').hidden = updating;
+        const actions = [];
+        if (!updating) {
+          actions.push({
+            label: repairing ? '1-Line Reconnect' : '1-Line Join Command',
+            primary: false,
+            onClick: () => reopenAddForm(true),
+          });
+        }
+        actions.push({ label: 'Edit & Retry', primary: true, onClick: () => reopenAddForm(false) });
+        finishActivityDock(false, curLines, prefix + sentence(job.error), actions);
       } else {
         clearSecrets();
-        if (repairing && addMode.server) delete retryDiagByServer[addMode.server.id];
-        $('add-result').textContent = updating
-          ? 'Success: server is updated and supports one-click updates from now on.'
-          : (repairing ? 'Success: server repaired and back online.' : 'Success: server has been added to the panel.');
-        $('add-result').className = 'good';
+        if (repairing && modeSnap.server) delete retryDiagByServer[modeSnap.server.id];
+        const okMsg = updating
+          ? 'Server updated and supports one-click updates from now on.'
+          : (repairing ? 'Server repaired and back online.' : 'Server has been added to the panel.');
+        finishActivityDock(true, curLines, okMsg, []);
         $('add-address').value = '';
         $('add-name').value = '';
       }
@@ -1616,26 +1792,10 @@
     poll();
   }
 
-  // ---------------------------------------------------------- following a job
-
-  let followJobGen = 0;
-  let followEditGen = 0;
-  let followTunnelGen = 0;
-
   function followJob(id, title, okText, failText) {
-    $('job-title').textContent = title;
-    $('job-log').replaceChildren();
-    $('job-result').textContent = 'Working...';
-    $('job-result').className = '';
-    $('job-note').hidden = false;
-    if (!$('job-dialog').open) openDialog($('job-dialog'));
-    $('job-title').focus();
-    let seen = 0;
+    const gen = openActivityDock(title, 'Running in background…');
+    let curLines = [];
     let restartTries = 0;
-    // Only the newest follower may write to the dialog: an older one still
-    // waiting on its job would otherwise mix its lines and its final result
-    // into this one's.
-    const gen = ++followJobGen;
     const syncMe = async () => {
       try {
         const me = await api('GET', '/api/me');
@@ -1647,14 +1807,14 @@
       } catch (_) {}
     };
     const poll = async () => {
-      if (gen !== followJobGen) return;
+      if (gen !== activityState.gen) return;
       let job;
       try {
         job = await api('GET', '/api/jobs/' + encodeURIComponent(id));
-        if (gen !== followJobGen) return;
+        if (gen !== activityState.gen) return;
         restartTries = 0;
       } catch (e) {
-        if (gen !== followJobGen) return;
+        if (gen !== activityState.gen) return;
         if (e.status === 401) return;
         if (e.status === 404 && restartTries < 25) {
           restartTries++;
@@ -1667,11 +1827,8 @@
             }
             if (u && !u.running && !u.panel_older) {
               await syncMe();
-              $('job-log').append(h('li', null, `The panel's own server is now on ${u.panel}.`));
-              $('job-log').scrollTop = $('job-log').scrollHeight;
-              $('job-note').hidden = true;
-              $('job-result').textContent = u.note ? `${failText} ${sentence(u.note)}` : okText;
-              $('job-result').className = u.note ? 'bad' : 'good';
+              const finalLines = [...curLines, `The panel's own server is now on ${u.panel}.`];
+              finishActivityDock(!u.note, finalLines, u.note ? `${failText} ${sentence(u.note)}` : okText, []);
               lastServers = lastTunnels = '';
               refresh();
               return;
@@ -1680,33 +1837,27 @@
         }
         if ((e.status === 0 || e.status === 404 || e.status === 502 || e.status === 503 || e.status === 504) && restartTries < 25) {
           restartTries++;
-          $('job-result').textContent = 'Restarting panel service on the new version, please wait...';
-          $('job-result').className = '';
+          setActivityInfoBanner('Restarting panel service on the new version, please wait…');
           setTimeout(poll, 1500);
           return;
         }
-        $('job-result').textContent = e.message;
-        $('job-result').className = 'bad';
-        $('job-note').hidden = true;
+        finishActivityDock(false, curLines, e.message, []);
         return;
       }
-      const lines = job.lines || [];
-      for (; seen < lines.length; seen++) $('job-log').append(h('li', null, lines[seen]));
-      $('job-log').scrollTop = $('job-log').scrollHeight;
+      curLines = job.lines || [];
       if (!job.done) {
+        setActivityInfoBanner('');
+        renderActivitySteps(curLines, 'running');
         setTimeout(poll, 1500);
         return;
       }
       await syncMe();
-      $('job-note').hidden = true;
-      $('job-result').textContent = job.error ? `${failText} ${sentence(job.error)}` : okText;
-      $('job-result').className = job.error ? 'bad' : 'good';
+      finishActivityDock(!job.error, curLines, job.error ? `${failText} ${sentence(job.error)}` : okText, []);
       lastServers = lastTunnels = '';
       refresh();
     };
     poll();
   }
-  $('job-close').addEventListener('click', () => $('job-dialog').close());
 
   function showResults(title, results) {
     $('msg-title').textContent = title;
@@ -2573,7 +2724,6 @@
     $('et-error').textContent = '';
     $('et-ports-result').replaceChildren();
     $('edit-tunnel-form').hidden = false;
-    $('et-progress').hidden = true;
     openDialog($('edit-tunnel-dialog'));
     $('et-service').focus();
   }
@@ -2624,12 +2774,6 @@
   }
 
   $('et-cancel').addEventListener('click', () => $('edit-tunnel-dialog').close());
-  $('et-close').addEventListener('click', () => $('edit-tunnel-dialog').close());
-  $('et-back').addEventListener('click', () => {
-    $('et-progress').hidden = true;
-    $('edit-tunnel-form').hidden = false;
-    $('et-service').focus();
-  });
 
   const CDN_HTTPS_PORTS = [443, 2053, 2083, 2087, 2096, 8443];
   const CDN_OTHER_PORTS = [80, 8080, 8880, 2052, 2082, 2086, 2095];
@@ -2879,42 +3023,40 @@
   });
 
   function followEditTunnelJob(id, name) {
-    $('edit-tunnel-form').hidden = true;
-    $('et-progress').hidden = false;
-    $('et-log').replaceChildren();
-    $('et-result').textContent = 'Applying updated settings...';
-    $('et-result').className = '';
-    $('et-back').hidden = true;
-    $('et-progress-title').focus();
-    let seen = 0;
-    const gen = ++followEditGen; // an older follower must not write into this one's dialog
+    if ($('edit-tunnel-dialog') && $('edit-tunnel-dialog').open) $('edit-tunnel-dialog').close();
+    const gen = openActivityDock(`Updating Tunnel "${name}"`, 'Applying updated settings…');
+    let curLines = [];
+    const reopenEdit = () => {
+      $('edit-tunnel-form').hidden = false;
+      openDialog($('edit-tunnel-dialog'));
+      $('et-service').focus();
+    };
     const poll = async () => {
-      if (gen !== followEditGen) return;
+      if (gen !== activityState.gen) return;
       let job;
       try {
         job = await api('GET', '/api/jobs/' + encodeURIComponent(id));
-        if (gen !== followEditGen) return;
+        if (gen !== activityState.gen) return;
       } catch (e) {
-        if (gen !== followEditGen) return;
+        if (gen !== activityState.gen) return;
         if (e.status === 401) return;
-        $('et-result').textContent = e.message;
-        $('et-result').className = 'bad';
+        finishActivityDock(false, curLines, e.message, [
+          { label: 'Edit Settings', primary: true, onClick: reopenEdit },
+        ]);
         return;
       }
-      const lines = job.lines || [];
-      for (; seen < lines.length; seen++) $('et-log').append(h('li', null, lines[seen]));
-      $('et-log').scrollTop = $('et-log').scrollHeight;
+      curLines = job.lines || [];
       if (!job.done) {
+        renderActivitySteps(curLines, 'running');
         setTimeout(poll, 1000);
         return;
       }
       if (job.error) {
-        $('et-result').textContent = 'Could not update tunnel. ' + sentence(job.error);
-        $('et-result').className = 'bad';
-        $('et-back').hidden = false;
+        finishActivityDock(false, curLines, 'Could not update tunnel. ' + sentence(job.error), [
+          { label: 'Edit Settings', primary: true, onClick: reopenEdit },
+        ]);
       } else {
-        $('et-result').textContent = `Success: tunnel "${name}" has been updated and restarted.`;
-        $('et-result').className = 'good';
+        finishActivityDock(true, curLines, `Tunnel "${name}" has been updated and restarted.`, []);
       }
       lastTunnels = lastServers = '';
       refresh();
@@ -6043,7 +6185,6 @@
       $('tn-intro').textContent = 'Link a Relay (Iran) server with a Foreign server and configure transport disguise, pooling, and port forwarding.';
     }
     if ($('tn-submit')) $('tn-submit').textContent = 'Create Tunnel';
-    $('tn-progress-title').textContent = 'Creating Tunnel';
     $('tn-relay').disabled = false;
     $('tn-foreign').disabled = false;
     $('tn-name').disabled = false;
@@ -6066,7 +6207,6 @@
     }
     populateProbeCFPick();
     $('tunnel-form').hidden = false;
-    $('tn-progress').hidden = true;
     sharingTouched = false;
     setRadio('tn-fwd-proto', 'tcp');
     setRadio('tn-load', 'light');
@@ -6102,7 +6242,6 @@
         : `Benchmark live routes or switch transport & Direct ↔ Reverse direction between ${rName} and ${fName}. Both servers update atomically while keeping this tunnel's pairing secret and name intact.`;
     }
     if ($('tn-submit')) $('tn-submit').textContent = 'Apply & Switch Tunnel Mode';
-    $('tn-progress-title').textContent = `Switching Mode: ${t.name}`;
 
     $('tn-relay').replaceChildren(...(relays.length ? relays.map(serverOption) : [h('option', { value: e.server_id }, e.server_name || e.server_id)]));
     $('tn-foreign').replaceChildren(...(foreigns.length ? foreigns.map(serverOption) : [h('option', { value: o.server_id }, o.server_name || o.server_id)]));
@@ -6180,7 +6319,6 @@
     resetTunnelDialogProbeState();
     populateProbeCFPick();
     $('tunnel-form').hidden = false;
-    $('tn-progress').hidden = true;
     showTunnelOptions();
     openDialog($('tunnel-dialog'));
     if ($('tn-probe-btn')) $('tn-probe-btn').focus();
@@ -6242,13 +6380,6 @@
     });
   }
   $('tn-cancel').addEventListener('click', () => $('tunnel-dialog').close());
-  $('tn-close').addEventListener('click', () => $('tunnel-dialog').close());
-  $('tn-back').addEventListener('click', () => {
-    $('tn-progress').hidden = true;
-    $('tunnel-form').hidden = false;
-    if (tunnelModalMode.kind === 'switch' && $('tn-probe-btn')) $('tn-probe-btn').focus();
-    else $('tn-name').focus();
-  });
 
   function tunnelRequest() {
     const gre = $('tn-gre').checked;
@@ -6596,46 +6727,47 @@
   });
 
   function followTunnelJob(id, name, isSwitch) {
-    $('tunnel-form').hidden = true;
-    $('tn-progress').hidden = false;
-    $('tn-log').replaceChildren();
-    $('tn-result').textContent = isSwitch
-      ? 'Switching tunnel mode atomically on both servers...'
-      : 'Configuring tunnel on both servers...';
-    $('tn-result').className = '';
-    $('tn-back').hidden = true;
-    $('tn-progress-title').focus();
-    let seen = 0;
-    const gen = ++followTunnelGen; // an older follower must not write into this one's dialog
+    if ($('tunnel-dialog') && $('tunnel-dialog').open) $('tunnel-dialog').close();
+    const title = isSwitch ? `Switching Mode: ${name}` : `Creating Tunnel "${name}"`;
+    const sub = isSwitch ? 'Switching tunnel mode atomically…' : 'Configuring tunnel on both servers…';
+    const gen = openActivityDock(title, sub);
+    let curLines = [];
+    const reopenTunnelForm = () => {
+      $('tunnel-form').hidden = false;
+      openDialog($('tunnel-dialog'));
+      if (isSwitch && $('tn-probe-btn')) $('tn-probe-btn').focus();
+      else $('tn-name').focus();
+    };
     const poll = async () => {
-      if (gen !== followTunnelGen) return;
+      if (gen !== activityState.gen) return;
       let job;
       try {
         job = await api('GET', '/api/jobs/' + encodeURIComponent(id));
-        if (gen !== followTunnelGen) return;
+        if (gen !== activityState.gen) return;
       } catch (e) {
-        if (gen !== followTunnelGen) return;
+        if (gen !== activityState.gen) return;
         if (e.status === 401) return;
-        $('tn-result').textContent = e.message;
-        $('tn-result').className = 'bad';
+        finishActivityDock(false, curLines, e.message, [
+          { label: 'Edit Tunnel Settings', primary: true, onClick: reopenTunnelForm },
+        ]);
         return;
       }
-      const lines = job.lines || [];
-      for (; seen < lines.length; seen++) $('tn-log').append(h('li', null, lines[seen]));
-      $('tn-log').scrollTop = $('tn-log').scrollHeight;
+      curLines = job.lines || [];
       if (!job.done) {
+        renderActivitySteps(curLines, 'running');
         setTimeout(poll, 1000);
         return;
       }
       if (job.error) {
-        $('tn-result').textContent = (isSwitch ? 'Could not switch tunnel mode. ' : 'Tunnel creation failed. ') + sentence(job.error);
-        $('tn-result').className = 'bad';
-        $('tn-back').hidden = false;
+        const prefix = isSwitch ? 'Could not switch tunnel mode. ' : 'Tunnel creation failed. ';
+        finishActivityDock(false, curLines, prefix + sentence(job.error), [
+          { label: 'Edit Tunnel Settings', primary: true, onClick: reopenTunnelForm },
+        ]);
       } else {
-        $('tn-result').textContent = isSwitch
-          ? `Success: tunnel "${name}" switched to the new mode and is running on both servers.`
-          : `Success: tunnel "${name}" is active on both servers.`;
-        $('tn-result').className = 'good';
+        const okMsg = isSwitch
+          ? `Tunnel "${name}" switched to the new mode and is running on both servers.`
+          : `Tunnel "${name}" is active on both servers.`;
+        finishActivityDock(true, curLines, okMsg, []);
         if (!isSwitch) $('tn-name').value = '';
       }
       lastTunnels = lastServers = '';
