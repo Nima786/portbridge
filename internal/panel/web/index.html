@@ -252,6 +252,7 @@
           <p class="muted small">Manage domains, subdomains, target IPs, and Cloudflare proxy (orange cloud) for your CDN tunnels. API tokens are encrypted at rest with AES-256-GCM.</p>
         </div>
         <div class="actions">
+          <button type="button" id="cf-open-isp-scanner">Local ISP CF Scanner</button>
           <button type="button" id="cf-refresh" hidden>Refresh</button>
           <button type="button" id="cf-open-tokens">+ API Token</button>
           <button type="button" id="cf-add-record" class="primary" hidden>+ Add Record</button>
@@ -3019,6 +3020,66 @@
       </div>
     </div>
   </form>
+</dialog>
+
+<!-- Local ISP Cloudflare Clean IP Scanner Download & Guide Dialog -->
+<dialog id="isp-scanner-dialog" class="wide" aria-labelledby="isp-scan-title">
+  <div class="dialog-shell">
+    <div class="dialog-header">
+      <div>
+        <h2 id="isp-scan-title">Local ISP Cloudflare Clean IP Scanner</h2>
+        <p class="muted small">Find real TLS + speed-verified Cloudflare IPs directly from your own home Wi-Fi or mobile SIM (MCI, Irancell, Rightel, Shatel, TCI) — bypassing the Relay server route.</p>
+      </div>
+    </div>
+    <div class="dialog-body">
+      <div class="step-section">
+        <div class="step-header">
+          <span class="step-num">1</span>
+          <div>
+            <h3>Download for Windows, macOS, or Linux</h3>
+            <span class="step-sub">Disconnect your VPN, double-click the file, and a clean local web UI opens automatically in your browser.</span>
+          </div>
+        </div>
+        <div class="isp-dl-grid">
+          <a id="isp-dl-win" class="isp-dl-card" target="_blank" rel="noopener noreferrer">
+            <strong>Windows (64-bit)</strong>
+            <span class="muted small">portbridge-scan-windows-amd64.exe · Double-click to open UI</span>
+          </a>
+          <a id="isp-dl-mac-arm" class="isp-dl-card" target="_blank" rel="noopener noreferrer">
+            <strong>macOS (Apple Silicon)</strong>
+            <span class="muted small">portbridge-scan-darwin-arm64 · M1 / M2 / M3 / M4</span>
+          </a>
+          <a id="isp-dl-mac-amd" class="isp-dl-card" target="_blank" rel="noopener noreferrer">
+            <strong>macOS (Intel)</strong>
+            <span class="muted small">portbridge-scan-darwin-amd64 · x86_64 Macs</span>
+          </a>
+          <a id="isp-dl-linux" class="isp-dl-card" target="_blank" rel="noopener noreferrer">
+            <strong>Linux (64-bit)</strong>
+            <span class="muted small">portbridge-scan-linux-amd64 · Desktop or CLI (-cli)</span>
+          </a>
+        </div>
+        <p class="muted small hint-box">Tip: To test an <strong>iPhone / mobile SIM</strong> on Windows or Mac, connect your PC to your phone's hotspot with VPN off and run the scanner.</p>
+      </div>
+
+      <div class="step-section">
+        <div class="step-header">
+          <span class="step-num">2</span>
+          <div>
+            <h3>Android Phone (Termux — No PC Needed)</h3>
+            <span class="step-sub">Turn VPN OFF on the SIM you want to test, paste this 1-line command in Termux, and tap the local URL it prints.</span>
+          </div>
+        </div>
+        <pre id="isp-termux-cmd" class="log-view"></pre>
+        <div class="actions left">
+          <button type="button" id="isp-termux-copy" class="primary">Copy Android Command</button>
+          <span id="isp-termux-msg" class="small muted" role="status" aria-live="polite"></span>
+        </div>
+      </div>
+    </div>
+    <div class="dialog-footer actions">
+      <button type="button" id="isp-scan-close" class="primary">Done</button>
+    </div>
+  </div>
 </dialog>
 
 <!-- Non-blocking bottom-right background activity dock -->

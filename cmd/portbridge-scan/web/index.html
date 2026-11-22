@@ -1,0 +1,197 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>PortBridge — Local ISP Cloudflare Clean IP Scanner</title>
+  <link rel="stylesheet" href="app.css">
+  <script src="app.js" defer></script>
+</head>
+<body>
+  <header class="topbar">
+    <div class="topbar-inner">
+      <div class="brand">
+        <div class="brand-mark" aria-hidden="true">PB</div>
+        <div>
+          <div class="brand-title">PortBridge <span class="brand-sub">ISP CF Scanner</span></div>
+          <div class="brand-tag" id="app-version">Local Real-Speed Edition</div>
+        </div>
+      </div>
+      <div class="top-actions">
+        <button type="button" id="theme-toggle" class="ghost icon-btn" title="Switch light / dark theme" aria-label="Switch theme">◐</button>
+        <button type="button" id="quit-btn" class="ghost" title="Stop local scanner server">Quit</button>
+      </div>
+    </div>
+  </header>
+
+  <main class="container">
+    <!-- ISP Status Card -->
+    <section class="card isp-card" aria-label="Detected local ISP">
+      <div class="isp-left">
+        <div class="isp-pill" id="isp-pill">Detecting your local ISP…</div>
+        <h1 class="isp-headline" id="isp-name">Checking your connection…</h1>
+        <p class="muted small" id="isp-meta">Make sure your VPN is <strong>disconnected</strong> so tests measure your real ISP route (MCI, Irancell, Rightel, Shatel, TCI, etc.).</p>
+      </div>
+      <div class="isp-right">
+        <button type="button" id="isp-refresh-btn">Re-check ISP</button>
+      </div>
+    </section>
+
+    <!-- Scan Configuration Card -->
+    <section class="card config-card">
+      <div class="card-head">
+        <div>
+          <h2>Real End-to-End Clean IP Scan</h2>
+          <p class="muted small">Stage 1 tests real TLS handshakes + SNI + 3-ping RTT/loss across distinct Cloudflare /24 subnets. Stage 2 runs uncontested 2 MB download &amp; 512 KB upload speed tests on the top finalists.</p>
+        </div>
+      </div>
+
+      <form id="scan-form" novalidate>
+        <div class="grid-3">
+          <div class="field">
+            <label for="scan-domain">Cloudflare Subdomain <span class="muted">(optional)</span></label>
+            <input id="scan-domain" placeholder="speed.cloudflare.com (or cdn.yourdomain.com)" autocapitalize="none" spellcheck="false">
+            <span class="hint">Leave blank for general clean IPs, or enter your own proxied subdomain to verify its exact SNI.</span>
+          </div>
+          <div class="field">
+            <label for="scan-port">HTTPS Port</label>
+            <select id="scan-port">
+              <option value="443" selected>443 (Standard HTTPS)</option>
+              <option value="2053">2053 (Cloudflare HTTPS)</option>
+              <option value="2083">2083 (Cloudflare HTTPS)</option>
+              <option value="2087">2087 (Cloudflare HTTPS)</option>
+              <option value="2096">2096 (Cloudflare HTTPS)</option>
+              <option value="8443">8443 (Cloudflare HTTPS)</option>
+            </select>
+          </div>
+          <div class="field">
+            <label for="scan-top">Top Clean IPs to Pick</label>
+            <select id="scan-top">
+              <option value="5" selected>Top 5 (Recommended)</option>
+              <option value="10">Top 10</option>
+              <option value="15">Top 15</option>
+              <option value="20">Top 20</option>
+            </select>
+          </div>
+        </div>
+
+        <div class="controls-row">
+          <div class="depth-group" role="radiogroup" aria-label="Scan depth">
+            <span class="field-label">Scan Depth</span>
+            <div class="seg-group">
+              <label class="seg-opt">
+                <input type="radio" name="scan-depth" value="44">
+                <span>Quick · 44 IPs</span>
+              </label>
+              <label class="seg-opt">
+                <input type="radio" name="scan-depth" value="64" checked>
+                <span>Standard · 64 IPs</span>
+              </label>
+              <label class="seg-opt">
+                <input type="radio" name="scan-depth" value="128">
+                <span>Deep · 128 IPs</span>
+              </label>
+              <label class="seg-opt">
+                <input type="radio" name="scan-depth" value="200">
+                <span>Exhaustive · 200 IPs</span>
+              </label>
+            </div>
+          </div>
+
+          <label class="toggle-card" for="scan-fragment">
+            <input type="checkbox" id="scan-fragment">
+            <span>
+              <strong>TLS ClientHello Fragmentation</strong>
+              <span class="muted small">Enable if your VPN config uses TLS Fragment (40B chunks)</span>
+            </span>
+          </label>
+        </div>
+
+        <details class="advanced-box">
+          <summary>Custom IP / CIDR Ranges <span class="muted">(optional — leave empty to scan all 64+ official Cloudflare prefixes)</span></summary>
+          <div class="advanced-body">
+            <textarea id="scan-ranges" rows="3" spellcheck="false" placeholder="e.g. 104.16.0.0/16, 172.67.18.0/24, 188.114.96.0/22 (comma or newline separated)"></textarea>
+          </div>
+        </details>
+
+        <p id="scan-error" class="error" role="alert"></p>
+
+        <div class="form-footer">
+          <button type="button" id="stop-btn" class="danger-soft" hidden>Stop Scan</button>
+          <button type="submit" id="start-btn" class="primary">Start Real Scan</button>
+        </div>
+      </form>
+    </section>
+
+    <!-- Live Progress Card -->
+    <section id="progress-card" class="card progress-card" hidden>
+      <div class="prog-head">
+        <div class="prog-title-row">
+          <span id="prog-spinner" class="spinner" aria-hidden="true"></span>
+          <strong id="prog-msg">Starting scan…</strong>
+        </div>
+        <span id="prog-pct" class="mono prog-pct">0%</span>
+      </div>
+      <progress id="prog-bar" class="prog-bar" max="100" value="0"></progress>
+      <div class="prog-stats">
+        <span id="prog-stat-tested">Tested: 0</span>
+        <span id="prog-stat-s1">TLS Reachable: 0</span>
+        <span id="prog-stat-verified">Speed Verified: 0</span>
+      </div>
+    </section>
+
+    <!-- Recommended Clean IPs Banner -->
+    <section id="winners-card" class="card winners-card" hidden>
+      <div class="winners-head">
+        <div>
+          <span class="win-badge">★ Recommended Clean IPs for Your ISP</span>
+          <h2 id="winners-title">Top Clean Cloudflare IPs</h2>
+          <p id="winners-note" class="muted small"></p>
+        </div>
+        <div class="winners-actions">
+          <button type="button" id="copy-csv-btn" class="primary">Copy Comma-Separated</button>
+          <button type="button" id="copy-lines-btn">Copy One Per Line</button>
+          <button type="button" id="export-csv-btn">Export CSV</button>
+        </div>
+      </div>
+      <div id="winners-chips" class="winners-chips"></div>
+      <p id="copy-status" class="copy-status" role="status" aria-live="polite"></p>
+    </section>
+
+    <!-- Results Table Card -->
+    <section id="results-card" class="card results-card" hidden>
+      <div class="results-head">
+        <div>
+          <h2>Measured Cloudflare Edge IPs</h2>
+          <p class="muted small" id="results-sub">Sorted by composite score (sustained download/upload speed, ping, jitter, and zero loss).</p>
+        </div>
+        <div class="results-filter">
+          <label class="inline-check">
+            <input type="checkbox" id="filter-clean-only">
+            <span>Hide blocked IPs</span>
+          </label>
+        </div>
+      </div>
+      <div class="table-wrap">
+        <table class="results-table">
+          <thead>
+            <tr>
+              <th>#</th>
+              <th>Cloudflare IP</th>
+              <th>DC</th>
+              <th>Status</th>
+              <th>Score</th>
+              <th>Download</th>
+              <th>Upload</th>
+              <th>Ping</th>
+              <th>Jitter</th>
+              <th>Action</th>
+            </tr>
+          </thead>
+          <tbody id="results-tbody"></tbody>
+        </table>
+      </div>
+    </section>
+  </main>
+</body>
+</html>

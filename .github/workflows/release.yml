@@ -95,8 +95,20 @@ jobs:
             tar -czf "dist/portbridge_${BARE}_linux_${arch}.tar.gz" -C "$stage" .
           done
 
+          # Standalone Local ISP Cloudflare Clean-IP Scanner binaries (Windows, macOS, Linux / Android Termux).
+          CGO_ENABLED=0 GOOS=windows GOARCH=amd64 \
+            go build -trimpath -ldflags="-s -w -X main.version=$TAG" -o dist/portbridge-scan-windows-amd64.exe ./cmd/portbridge-scan
+          CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 \
+            go build -trimpath -ldflags="-s -w -X main.version=$TAG" -o dist/portbridge-scan-darwin-arm64 ./cmd/portbridge-scan
+          CGO_ENABLED=0 GOOS=darwin GOARCH=amd64 \
+            go build -trimpath -ldflags="-s -w -X main.version=$TAG" -o dist/portbridge-scan-darwin-amd64 ./cmd/portbridge-scan
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
+            go build -trimpath -ldflags="-s -w -X main.version=$TAG" -o dist/portbridge-scan-linux-amd64 ./cmd/portbridge-scan
+          CGO_ENABLED=0 GOOS=linux GOARCH=arm64 \
+            go build -trimpath -ldflags="-s -w -X main.version=$TAG" -o dist/portbridge-scan-linux-arm64 ./cmd/portbridge-scan
+
           cd dist
-          sha256sum ./*.tar.gz > checksums.txt
+          sha256sum ./*.tar.gz ./portbridge-scan-* > checksums.txt
           cat checksums.txt
 
       - name: Publish
@@ -107,4 +119,5 @@ jobs:
           generate_release_notes: true
           files: |
             dist/*.tar.gz
+            dist/portbridge-scan-*
             dist/checksums.txt

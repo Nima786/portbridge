@@ -4071,6 +4071,38 @@ button.act-ctrl-btn {
   border-radius: 9px;
 }
 
+/* Local ISP CF Scanner Download Grid */
+.isp-dl-grid {
+  display: grid;
+  grid-template-columns: repeat(2, 1fr);
+  gap: .65rem;
+  margin-top: .5rem;
+}
+.isp-dl-card {
+  display: flex;
+  flex-direction: column;
+  gap: .18rem;
+  padding: .72rem .9rem;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--line-strong);
+  background: var(--panel);
+  color: var(--text);
+  text-decoration: none;
+  transition: border-color .15s ease, background-color .15s ease, transform .08s ease;
+}
+.isp-dl-card:hover {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+  text-decoration: none;
+}
+.isp-dl-card strong {
+  color: var(--accent);
+  font-size: .92rem;
+}
+@media (max-width: 600px) {
+  .isp-dl-grid { grid-template-columns: 1fr; }
+}
+
 @media (max-width: 600px) {
   .activity-dock {
     right: .65rem;

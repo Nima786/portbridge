@@ -265,7 +265,7 @@
     syncChoiceCards(dlg);
     dlg.showModal();
   }
-  const backdropCloseDialogs = new Set(['confirm-dialog', 'msg-dialog', 'code-dialog', 'logs-dialog', 'wp-setup-dialog']);
+  const backdropCloseDialogs = new Set(['confirm-dialog', 'msg-dialog', 'code-dialog', 'logs-dialog', 'wp-setup-dialog', 'isp-scanner-dialog']);
   for (const dlg of document.querySelectorAll('dialog')) {
     const hdr = dlg.querySelector('.dialog-header');
     if (hdr && !hdr.querySelector('.dialog-close-x')) {
@@ -8296,6 +8296,42 @@
   }
   if ($('obt-close')) {
     $('obt-close').addEventListener('click', () => $('outbound-test-dialog').close());
+  }
+
+  // ------------------------------------------------ local ISP CF scanner dialog
+
+  function openISPScannerDialog() {
+    const isRel = /^v\d+\.\d+\.\d+$/.test(loadedVersion || '');
+    const base = isRel
+      ? `https://github.com/Nima786/portbridge/releases/download/${loadedVersion}`
+      : 'https://github.com/Nima786/portbridge/releases/latest/download';
+    if ($('isp-dl-win')) $('isp-dl-win').href = `${base}/portbridge-scan-windows-amd64.exe`;
+    if ($('isp-dl-mac-arm')) $('isp-dl-mac-arm').href = `${base}/portbridge-scan-darwin-arm64`;
+    if ($('isp-dl-mac-amd')) $('isp-dl-mac-amd').href = `${base}/portbridge-scan-darwin-amd64`;
+    if ($('isp-dl-linux')) $('isp-dl-linux').href = `${base}/portbridge-scan-linux-amd64`;
+    const termuxCmd = `curl -fsSL -o pb-scan ${base}/portbridge-scan-linux-arm64 && chmod +x pb-scan && ./pb-scan`;
+    if ($('isp-termux-cmd')) $('isp-termux-cmd').textContent = termuxCmd;
+    if ($('isp-termux-msg')) $('isp-termux-msg').textContent = '';
+    openDialog($('isp-scanner-dialog'));
+  }
+
+  if ($('cf-open-isp-scanner')) {
+    $('cf-open-isp-scanner').addEventListener('click', openISPScannerDialog);
+  }
+  if ($('isp-scan-close')) {
+    $('isp-scan-close').addEventListener('click', () => $('isp-scanner-dialog').close());
+  }
+  if ($('isp-termux-copy')) {
+    $('isp-termux-copy').addEventListener('click', async () => {
+      const cmd = $('isp-termux-cmd') ? $('isp-termux-cmd').textContent : '';
+      if (!cmd) return;
+      try {
+        await navigator.clipboard.writeText(cmd);
+        if ($('isp-termux-msg')) $('isp-termux-msg').textContent = 'Copied to clipboard.';
+      } catch (_) {
+        if ($('isp-termux-msg')) $('isp-termux-msg').textContent = 'Select and copy the command above.';
+      }
+    });
   }
 
   // ------------------------------------------------------------------- start

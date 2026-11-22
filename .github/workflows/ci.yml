@@ -38,7 +38,10 @@ jobs:
         run: |
           for arch in amd64 arm64; do
             CGO_ENABLED=0 GOOS=linux GOARCH=$arch go build -o /dev/null ./cmd/portbridge
+            CGO_ENABLED=0 GOOS=linux GOARCH=$arch go build -o /dev/null ./cmd/portbridge-scan
+            CGO_ENABLED=0 GOOS=darwin GOARCH=$arch go build -o /dev/null ./cmd/portbridge-scan
           done
+          CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -o /dev/null ./cmd/portbridge-scan
 
   shell:
     name: Check the scripts
