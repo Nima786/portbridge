@@ -53,6 +53,16 @@ func IsReleaseVersion(v string) bool { return releaseTagRe.MatchString(v) }
 // releaseBase is where releases are downloaded from. Replaced in tests.
 var releaseBase = "https://github.com/" + releaseRepo + "/releases"
 
+// ReleaseBaseURL returns the base URL where PortBridge releases are hosted.
+func ReleaseBaseURL() string { return releaseBase }
+
+// SetReleaseBaseURLForTest overrides releaseBase in tests and returns a restore func.
+func SetReleaseBaseURLForTest(u string) func() {
+	old := releaseBase
+	releaseBase = strings.TrimRight(u, "/")
+	return func() { releaseBase = old }
+}
+
 var releaseClient = &http.Client{Timeout: 3 * time.Minute}
 
 // LatestRelease asks GitHub which release is the newest. It reads where the

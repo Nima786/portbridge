@@ -1586,6 +1586,7 @@
       const log = $('add-log');
       log.scrollTop = log.scrollHeight;
       if (!job.done) {
+        if (lines.length > 1) $('add-result').textContent = 'Working...';
         jobTimer = setTimeout(poll, 1000);
         return;
       }

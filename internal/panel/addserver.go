@@ -26,6 +26,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"golang.org/x/crypto/ssh"
@@ -215,11 +216,73 @@ func (b *syncBuffer) String() string {
 	return b.buf.String()
 }
 
-// remote is an SSH connection to a server being added.
+const sshStdinChunk = 16 * 1024
+
+// sshUploadStallTimeout is how long a bulk SSH stdin transfer (>16 KB) may go
+// without forward progress before the TCP socket is treated as frozen (for
+// example, GFW bulk-SSH throttling on port 22) and force-closed.
+var sshUploadStallTimeout = 25 * time.Second
+
+// remote is an SSH connection to a server being added, repaired, or updated.
 type remote struct {
+	mu       sync.Mutex
 	c        *ssh.Client
+	conn     net.Conn
 	sudoMode string // "", "nopass", "pass", "su"
 	sudoPass string
+	jumpDial func() (*ssh.Client, net.Conn, string, error)
+}
+
+func forceCloseSSH(c *ssh.Client, conn net.Conn) {
+	if conn != nil {
+		_ = conn.SetDeadline(time.Now())
+		_ = conn.Close()
+	}
+	if c != nil {
+		go func() { _ = c.Close() }()
+	}
+}
+
+func (rm *remote) close() {
+	rm.mu.Lock()
+	c, conn := rm.c, rm.conn
+	rm.c, rm.conn = nil, nil
+	rm.mu.Unlock()
+	forceCloseSSH(c, conn)
+}
+
+func (rm *remote) clientAndConn() (*ssh.Client, net.Conn) {
+	rm.mu.Lock()
+	defer rm.mu.Unlock()
+	return rm.c, rm.conn
+}
+
+func (rm *remote) canReconnectViaJump() bool {
+	rm.mu.Lock()
+	defer rm.mu.Unlock()
+	return rm.jumpDial != nil
+}
+
+func (rm *remote) reconnectViaJump() (string, error) {
+	rm.mu.Lock()
+	fn := rm.jumpDial
+	rm.jumpDial = nil
+	oldC, oldConn := rm.c, rm.conn
+	rm.c, rm.conn = nil, nil
+	rm.mu.Unlock()
+	forceCloseSSH(oldC, oldConn)
+	if fn == nil {
+		return "", errors.New("no jump route available")
+	}
+	newC, newConn, viaName, err := fn()
+	if err != nil {
+		return "", err
+	}
+	rm.mu.Lock()
+	rm.c = newC
+	rm.conn = newConn
+	rm.mu.Unlock()
+	return viaName, nil
 }
 
 // ensureRoot checks that a non-root SSH account can elevate to root via
@@ -271,46 +334,85 @@ func (rm *remote) runRoot(cmd string, timeout time.Duration) (string, error) {
 	}
 }
 
+type progressWriter struct {
+	dst      io.Writer
+	progress *atomic.Int64
+}
+
+func (pw progressWriter) Write(p []byte) (int, error) {
+	if len(p) > 0 && pw.progress != nil {
+		pw.progress.Store(time.Now().UnixNano())
+	}
+	return pw.dst.Write(p)
+}
+
 func (rm *remote) run(cmd string, stdin []byte, timeout time.Duration) (string, error) {
-	sess, err := rm.c.NewSession()
+	c, conn := rm.clientAndConn()
+	if c == nil {
+		return "", errors.New("SSH connection is closed")
+	}
+	sess, err := c.NewSession()
 	if err != nil {
 		return "", err
 	}
-	defer sess.Close()
 	stdoutPipe, err := sess.StdoutPipe()
 	if err != nil {
+		go func() { _ = sess.Close() }()
 		return "", err
 	}
 	stderrPipe, err := sess.StderrPipe()
 	if err != nil {
+		go func() { _ = sess.Close() }()
 		return "", err
 	}
 	inPipe, err := sess.StdinPipe()
 	if err != nil {
+		go func() { _ = sess.Close() }()
 		return "", err
 	}
-	defer inPipe.Close()
+
+	var lastProgress atomic.Int64
+	lastProgress.Store(time.Now().UnixNano())
 
 	var out syncBuffer
+	pw := progressWriter{dst: &out, progress: &lastProgress}
 	var wg sync.WaitGroup
 	wg.Add(2)
 	go func() {
 		defer wg.Done()
-		_, _ = io.Copy(&out, stdoutPipe)
+		_, _ = io.Copy(pw, stdoutPipe)
 	}()
 	go func() {
 		defer wg.Done()
-		_, _ = io.Copy(&out, stderrPipe)
+		_, _ = io.Copy(pw, stderrPipe)
 	}()
 
 	if err := sess.Start(cmd); err != nil {
+		go func() {
+			_ = inPipe.Close()
+			_ = sess.Close()
+		}()
 		return "", err
 	}
-	if stdin != nil {
+	if len(stdin) > 0 {
 		go func() {
-			_, _ = inPipe.Write(stdin)
+			rem := stdin
+			for len(rem) > 0 {
+				n := len(rem)
+				if n > sshStdinChunk {
+					n = sshStdinChunk
+				}
+				if _, werr := inPipe.Write(rem[:n]); werr != nil {
+					_ = inPipe.Close()
+					return
+				}
+				lastProgress.Store(time.Now().UnixNano())
+				rem = rem[n:]
+			}
 			_ = inPipe.Close()
 		}()
+	} else {
+		go func() { _ = inPipe.Close() }()
 	}
 
 	done := make(chan error, 1)
@@ -318,12 +420,41 @@ func (rm *remote) run(cmd string, stdin []byte, timeout time.Duration) (string, 
 		wg.Wait()
 		done <- sess.Wait()
 	}()
-	select {
-	case err := <-done:
-		return strings.TrimSpace(out.String()), err
-	case <-time.After(timeout):
-		_ = sess.Signal(ssh.SIGKILL)
-		return strings.TrimSpace(out.String()), fmt.Errorf("%q took longer than %s", cmd, timeout)
+
+	overallTimer := time.NewTimer(timeout)
+	defer overallTimer.Stop()
+
+	var stallCh <-chan time.Time
+	stallLimit := sshUploadStallTimeout
+	if len(stdin) > sshStdinChunk && stallLimit > 0 {
+		step := stallLimit / 4
+		if step < 25*time.Millisecond {
+			step = 25 * time.Millisecond
+		} else if step > time.Second {
+			step = time.Second
+		}
+		stallTicker := time.NewTicker(step)
+		defer stallTicker.Stop()
+		stallCh = stallTicker.C
+	}
+
+	for {
+		select {
+		case err := <-done:
+			go func() { _ = sess.Close() }()
+			return strings.TrimSpace(out.String()), err
+		case <-stallCh:
+			idle := time.Duration(time.Now().UnixNano() - lastProgress.Load())
+			if idle >= stallLimit {
+				forceCloseSSH(c, conn)
+				go func() { _ = sess.Close() }()
+				return strings.TrimSpace(out.String()), fmt.Errorf("SSH transfer stalled for %s (port 22 bulk upload throttled or blocked)", stallLimit)
+			}
+		case <-overallTimer.C:
+			forceCloseSSH(c, conn)
+			go func() { _ = sess.Close() }()
+			return strings.TrimSpace(out.String()), fmt.Errorf("%q took longer than %s", cmd, timeout)
+		}
 	}
 }
 
@@ -347,12 +478,11 @@ func (p *Panel) addServer(j *job, r addRequest) (string, error) {
 		},
 		Timeout: 20 * time.Second,
 	}
-	client, viaName, err := p.dialSSHClient(context.Background(), j, r.Address, r.SSHPort, cfg, r.Group, r.ViaServer)
+	rm, viaName, err := p.dialSSHRemote(context.Background(), j, r.Address, r.SSHPort, cfg, r.Group, r.ViaServer)
 	if err != nil {
 		return "", err
 	}
-	defer client.Close()
-	rm := &remote{c: client}
+	defer rm.close()
 	if viaName != "" {
 		j.say("Connected via %s (host key %s).", viaName, hostKey)
 	} else {
@@ -413,7 +543,7 @@ func (p *Panel) addServer(j *job, r addRequest) (string, error) {
 	switch c := compareVersions(installed, engine.Version); {
 	case installed == "":
 		j.say("PortBridge is not on it yet; installing %s.", engine.Version)
-		if err := p.install(j, rm, arch); err != nil {
+		if err := p.install(j, rm, arch, r.Group); err != nil {
 			return "", err
 		}
 	case c == 0:
@@ -423,7 +553,7 @@ func (p *Panel) addServer(j *job, r addRequest) (string, error) {
 			"(its tunnels restart for a few seconds), or update it yourself and add it again", installed, engine.Version)
 	case c < 0:
 		j.say("It has PortBridge %s; updating it to %s (its tunnels restart for a few seconds).", installed, engine.Version)
-		if err := p.install(j, rm, arch); err != nil {
+		if err := p.install(j, rm, arch, r.Group); err != nil {
 			return "", err
 		}
 	default:
@@ -641,13 +771,67 @@ func (p *Panel) archiveFor(arch string) ([]byte, error) {
 	return packArchive(files)
 }
 
-// install carries PortBridge across and runs its installer there.
-func (p *Panel) install(j *job, rm *remote, arch string) error {
-	archive, err := p.archiveFor(arch)
-	if err != nil {
-		return err
+func buildRemoteGitHubDownloadScript(dir, baseURL, version, arch string, connTimeoutSec, maxTimeSec int) string {
+	tarName := agent.ReleaseArchiveName(version, arch)
+	sumsURL := strings.TrimRight(baseURL, "/") + "/download/" + version + "/checksums.txt"
+	tarURL := strings.TrimRight(baseURL, "/") + "/download/" + version + "/" + tarName
+	wgetTimeout := maxTimeSec
+	if wgetTimeout > 25 {
+		wgetTimeout = 25
 	}
-	buf := bytes.NewBuffer(archive)
+	return fmt.Sprintf(
+		"set -e; dir=%s; sums_url=%s; tar_name=%s; tar_url=%s; "+
+			"rm -rf \"$dir\" && mkdir -p \"$dir\"; "+
+			"fetch() { "+
+			"if command -v curl >/dev/null 2>&1; then curl -fsSL --connect-timeout %d --max-time %d -o \"$2\" \"$1\"; "+
+			"elif command -v wget >/dev/null 2>&1; then wget -q -T %d -t 1 -O \"$2\" \"$1\" 2>/dev/null || wget -q -T %d -O \"$2\" \"$1\"; "+
+			"else echo pb_dl_err=no_http_tool; return 127; fi; "+
+			"}; "+
+			"if ! fetch \"$sums_url\" \"$dir/checksums.txt\"; then rm -rf \"$dir\"; echo pb_dl_err=checksums_unreachable; exit 10; fi; "+
+			"want=$(awk -v n=\"$tar_name\" 'NF>=2 { f=$2; sub(/^\\*/, \"\", f); sub(/^\\.\\//, \"\", f); if (f==n) { print tolower($1); exit } }' \"$dir/checksums.txt\"); "+
+			"case \"$want\" in [0-9a-f]*) [ \"${#want}\" -eq 64 ] || { rm -rf \"$dir\"; echo pb_dl_err=bad_checksum; exit 11; } ;; *) rm -rf \"$dir\"; echo pb_dl_err=bad_checksum; exit 11 ;; esac; "+
+			"if ! fetch \"$tar_url\" \"$dir/$tar_name\"; then rm -rf \"$dir\"; echo pb_dl_err=archive_unreachable; exit 12; fi; "+
+			"if command -v sha256sum >/dev/null 2>&1; then got=$(sha256sum \"$dir/$tar_name\" | awk '{print tolower($1)}'); "+
+			"elif command -v openssl >/dev/null 2>&1; then got=$(openssl dgst -sha256 \"$dir/$tar_name\" | awk '{print tolower($NF)}'); "+
+			"else rm -rf \"$dir\"; echo pb_dl_err=no_sha256; exit 13; fi; "+
+			"if [ \"$got\" != \"$want\" ]; then rm -rf \"$dir\"; echo pb_dl_err=checksum_mismatch; exit 14; fi; "+
+			"tar -xzf \"$dir/$tar_name\" -C \"$dir\"; "+
+			"rm -f \"$dir/$tar_name\" \"$dir/checksums.txt\"; "+
+			"if [ ! -f \"$dir/portbridge\" ] || [ ! -f \"$dir/install.sh\" ]; then rm -rf \"$dir\"; echo pb_dl_err=incomplete_archive; exit 15; fi; "+
+			"chmod -R a+rX \"$dir\"; "+
+			"echo pb_dl=ok",
+		shellQuote(dir), shellQuote(sumsURL), shellQuote(tarName), shellQuote(tarURL),
+		connTimeoutSec, maxTimeSec, wgetTimeout, wgetTimeout,
+	)
+}
+
+func tryRemoteGitHubDownload(rm *remote, dir, version, arch, group string) (bool, string) {
+	connSec, maxSec := 6, 60
+	sshWait := 75 * time.Second
+	if group == GroupRelay {
+		connSec, maxSec = 4, 20
+		sshWait = 30 * time.Second
+	}
+	script := buildRemoteGitHubDownloadScript(dir, agent.ReleaseBaseURL(), version, arch, connSec, maxSec)
+	out, err := rm.run("sh -c "+shellQuote(script), nil, sshWait)
+	f := parseFacts(out)
+	if err == nil && f["pb_dl"] == "ok" {
+		return true, ""
+	}
+	return false, f["pb_dl_err"]
+}
+
+func copyArchiveToRemote(rm *remote, dir string, archive []byte) (string, error) {
+	return rm.run("rm -rf "+dir+" && mkdir -p "+dir+" && tar -xzf - -C "+dir+" && chmod -R a+rX "+dir, archive, 3*time.Minute)
+}
+
+// install puts PortBridge onto the remote server and runs its installer.
+// When installing a published release, it first tells the remote server to
+// download & SHA-256-verify the release directly from GitHub (avoiding multi-MB
+// SSH uploads across GFW-throttled links). If GitHub is unreachable on that
+// server, it falls back to streaming the panel's archive over SSH, and if a
+// direct SSH upload stalls, automatically retries via an online jump server.
+func (p *Panel) install(j *job, rm *remote, arch, group string) error {
 	dir := "/tmp/portbridge-install-" + strings.ToLower(newID(6))
 	dir = strings.Map(func(r rune) rune {
 		if r == '-' || r == '/' || (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') {
@@ -655,10 +839,43 @@ func (p *Panel) install(j *job, rm *remote, arch string) error {
 		}
 		return 'x'
 	}, dir)
-	j.say("Copying PortBridge across (%d KB)...", buf.Len()/1024)
-	if out, err := rm.run("mkdir -p "+dir+" && tar -xzf - -C "+dir+" && chmod -R a+rX "+dir, buf.Bytes(), 3*time.Minute); err != nil {
-		return fmt.Errorf("copying PortBridge across failed: %v %s", err, out)
+
+	unpackedOnRemote := false
+	if agent.IsReleaseVersion(engine.Version) {
+		j.say("Downloading PortBridge %s directly on server from GitHub...", engine.Version)
+		ok, reason := tryRemoteGitHubDownload(rm, dir, engine.Version, arch, group)
+		if ok {
+			j.say("Downloaded & verified %s from GitHub.", engine.Version)
+			unpackedOnRemote = true
+		} else if reason == "checksum_mismatch" {
+			j.say("GitHub archive checksum did not match; copying verified release from panel instead...")
+		} else {
+			j.say("GitHub is not directly reachable on this server; copying PortBridge from panel instead...")
+		}
 	}
+
+	if !unpackedOnRemote {
+		archive, err := p.archiveFor(arch)
+		if err != nil {
+			return err
+		}
+		j.say("Copying PortBridge across (%d KB)...", len(archive)/1024)
+		if out, err := copyArchiveToRemote(rm, dir, archive); err != nil {
+			if !rm.canReconnectViaJump() {
+				return fmt.Errorf("copying PortBridge across failed: %v %s", err, out)
+			}
+			j.say("Direct SSH transfer stalled (%v); retrying securely via an online jump server...", err)
+			viaName, jerr := rm.reconnectViaJump()
+			if jerr != nil {
+				return fmt.Errorf("copying PortBridge across failed (%v), and jump retry could not connect (%v)", err, jerr)
+			}
+			j.say("Reconnected SSH via %s; copying PortBridge (%d KB)...", viaName, len(archive)/1024)
+			if out2, err2 := copyArchiveToRemote(rm, dir, archive); err2 != nil {
+				return fmt.Errorf("copying PortBridge via %s failed: %v %s", viaName, err2, out2)
+			}
+		}
+	}
+
 	j.say("Installing...")
 	out, err := rm.runRoot("bash "+dir+"/install.sh --from-dir "+dir+" --no-menu; rc=$?; rm -rf "+dir+"; exit $rc", 5*time.Minute)
 	_, _ = rm.run("rm -rf "+dir, nil, 15*time.Second)

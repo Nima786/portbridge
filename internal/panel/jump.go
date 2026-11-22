@@ -490,16 +490,51 @@ func (p *Panel) fetchHostKeyMultiPath(ctx context.Context, address string, port 
 	return "", "", plainSSHError(err)
 }
 
-func (p *Panel) dialSSHClient(ctx context.Context, j *job, address string, port int, cfg *ssh.ClientConfig, preferGroup, viaID string) (*ssh.Client, string, error) {
+func (p *Panel) dialTargetJumpOnly(ctx context.Context, address string, port int, preferGroup string) (net.Conn, string, error) {
+	addr := net.JoinHostPort(address, strconv.Itoa(port))
+	cands := p.jumpCandidates(address, preferGroup, "")
+	if len(cands) == 0 {
+		return nil, "", errors.New("no online jump server is available")
+	}
+	if len(cands) > 3 {
+		cands = cands[:3]
+	}
+	var lastErr error
+	for _, cand := range cands {
+		conn, err := dialViaAgent(ctx, p, cand, addr, 12*time.Second)
+		if err == nil {
+			return conn, cand.Name, nil
+		}
+		lastErr = err
+	}
+	return nil, "", lastErr
+}
+
+func (p *Panel) dialSSHRemote(ctx context.Context, j *job, address string, port int, cfg *ssh.ClientConfig, preferGroup, viaID string) (*remote, string, error) {
 	conn, viaName, err := p.dialTargetTCP(ctx, j, address, port, preferGroup, viaID)
 	if err != nil {
 		return nil, "", plainSSHError(err)
 	}
-	client, err := sshClientOverConn(conn, net.JoinHostPort(address, strconv.Itoa(port)), cfg)
+	target := net.JoinHostPort(address, strconv.Itoa(port))
+	client, err := sshClientOverConn(conn, target, cfg)
 	if err != nil {
 		return nil, "", plainSSHError(err)
 	}
-	return client, viaName, nil
+	rm := &remote{c: client, conn: conn}
+	if viaName == "" && strings.TrimSpace(viaID) != "direct" {
+		rm.jumpDial = func() (*ssh.Client, net.Conn, string, error) {
+			jconn, jName, jerr := p.dialTargetJumpOnly(context.Background(), address, port, preferGroup)
+			if jerr != nil {
+				return nil, nil, "", plainSSHError(jerr)
+			}
+			jclient, jerr := sshClientOverConn(jconn, target, cfg)
+			if jerr != nil {
+				return nil, nil, "", plainSSHError(jerr)
+			}
+			return jclient, jconn, jName, nil
+		}
+	}
+	return rm, viaName, nil
 }
 
 func agentTargetAddrs(srv Server) []string {
@@ -1019,12 +1054,11 @@ func (p *Panel) repairServer(j *job, existing Server, r addRequest) error {
 		Timeout: 20 * time.Second,
 	}
 
-	client, viaName, err := p.dialSSHClient(context.Background(), j, targetAddr, r.SSHPort, cfg, existing.Group, r.ViaServer)
+	rm, viaName, err := p.dialSSHRemote(context.Background(), j, targetAddr, r.SSHPort, cfg, existing.Group, r.ViaServer)
 	if err != nil {
 		return err
 	}
-	defer client.Close()
-	rm := &remote{c: client}
+	defer rm.close()
 	if viaName != "" {
 		j.say("Connected via %s (host key %s).", viaName, hostKey)
 	} else {
@@ -1062,12 +1096,12 @@ func (p *Panel) repairServer(j *job, existing Server, r addRequest) error {
 	switch c := compareVersions(installed, engine.Version); {
 	case installed == "":
 		j.say("PortBridge is missing on it; installing %s...", engine.Version)
-		if err := p.install(j, rm, arch); err != nil {
+		if err := p.install(j, rm, arch, existing.Group); err != nil {
 			return err
 		}
 	case c < 0 && r.AllowUpdate:
 		j.say("Updating PortBridge from %s to %s...", installed, engine.Version)
-		if err := p.install(j, rm, arch); err != nil {
+		if err := p.install(j, rm, arch, existing.Group); err != nil {
 			return err
 		}
 	default:

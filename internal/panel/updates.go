@@ -754,15 +754,14 @@ func (p *Panel) sshUpdate(j *job, s Server, r addRequest) error {
 		},
 		Timeout: 20 * time.Second,
 	}
-	client, viaName, err := p.dialSSHClient(context.Background(), j, s.Address, r.SSHPort, cfg, s.Group, r.ViaServer)
+	rm, viaName, err := p.dialSSHRemote(context.Background(), j, s.Address, r.SSHPort, cfg, s.Group, r.ViaServer)
 	if err != nil {
 		return err
 	}
-	defer client.Close()
+	defer rm.close()
 	if viaName != "" {
 		j.say("Connected over SSH via %s.", viaName)
 	}
-	rm := &remote{c: client}
 	facts, err := rm.run("echo pb_uid=$(id -u); echo pb_arch=$(uname -m)", nil, 30*time.Second)
 	if err != nil {
 		return fmt.Errorf("could not look at the server: %v", err)
@@ -780,7 +779,7 @@ func (p *Panel) sshUpdate(j *job, s Server, r addRequest) error {
 		return fmt.Errorf("its processor type (%s) is not one PortBridge is built for", f["pb_arch"])
 	}
 	j.say("Updating it to %s (its tunnels restart for a few seconds)...", engine.Version)
-	if err := p.install(j, rm, arch); err != nil {
+	if err := p.install(j, rm, arch, s.Group); err != nil {
 		return err
 	}
 	if _, err := remoteAgentSetup(rm, "-allow-updates on"); err != nil {
