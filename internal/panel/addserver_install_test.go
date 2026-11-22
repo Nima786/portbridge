@@ -421,3 +421,16 @@ func TestSSHUploadStallAbortsPromptlyAndRetriesViaJump(t *testing.T) {
 	rm.close()
 	jumpTS.CloseClientConnections()
 }
+
+func TestIsPublicJumpTargetAndForeignAutoJumpFirst(t *testing.T) {
+	for _, pub := range []string{"178.162.245.229", "203.0.113.99", "2001:4860:4860::8888", "node1.example.com"} {
+		if !isPublicJumpTarget(pub) {
+			t.Fatalf("expected %q to be treated as a public jump target", pub)
+		}
+	}
+	for _, nonPub := range []string{"", "localhost", "127.0.0.1", "::1", "10.0.0.5", "192.168.1.20", "172.20.0.1", "100.64.10.2"} {
+		if isPublicJumpTarget(nonPub) {
+			t.Fatalf("expected %q NOT to be treated as a public jump target", nonPub)
+		}
+	}
+}

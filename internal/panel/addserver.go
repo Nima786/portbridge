@@ -773,35 +773,31 @@ func (p *Panel) archiveFor(arch string) ([]byte, error) {
 
 func buildRemoteGitHubDownloadScript(dir, baseURL, version, arch string, connTimeoutSec, maxTimeSec int) string {
 	tarName := agent.ReleaseArchiveName(version, arch)
-	sumsURL := strings.TrimRight(baseURL, "/") + "/download/" + version + "/checksums.txt"
-	tarURL := strings.TrimRight(baseURL, "/") + "/download/" + version + "/" + tarName
-	wgetTimeout := maxTimeSec
-	if wgetTimeout > 25 {
-		wgetTimeout = 25
+	dlBase := strings.TrimRight(baseURL, "/") + "/download/" + version
+	sumsURL := dlBase + "/checksums.txt"
+	tarURL := dlBase + "/" + tarName
+	wt := maxTimeSec
+	if wt > 25 {
+		wt = 25
 	}
 	return fmt.Sprintf(
-		"set -e; dir=%s; sums_url=%s; tar_name=%s; tar_url=%s; "+
-			"rm -rf \"$dir\" && mkdir -p \"$dir\"; "+
-			"fetch() { "+
-			"if command -v curl >/dev/null 2>&1; then curl -fsSL --connect-timeout %d --max-time %d -o \"$2\" \"$1\"; "+
-			"elif command -v wget >/dev/null 2>&1; then wget -q -T %d -t 1 -O \"$2\" \"$1\" 2>/dev/null || wget -q -T %d -O \"$2\" \"$1\"; "+
-			"else echo pb_dl_err=no_http_tool; return 127; fi; "+
-			"}; "+
-			"if ! fetch \"$sums_url\" \"$dir/checksums.txt\"; then rm -rf \"$dir\"; echo pb_dl_err=checksums_unreachable; exit 10; fi; "+
-			"want=$(awk -v n=\"$tar_name\" 'NF>=2 { f=$2; sub(/^\\*/, \"\", f); sub(/^\\.\\//, \"\", f); if (f==n) { print tolower($1); exit } }' \"$dir/checksums.txt\"); "+
-			"case \"$want\" in [0-9a-f]*) [ \"${#want}\" -eq 64 ] || { rm -rf \"$dir\"; echo pb_dl_err=bad_checksum; exit 11; } ;; *) rm -rf \"$dir\"; echo pb_dl_err=bad_checksum; exit 11 ;; esac; "+
-			"if ! fetch \"$tar_url\" \"$dir/$tar_name\"; then rm -rf \"$dir\"; echo pb_dl_err=archive_unreachable; exit 12; fi; "+
-			"if command -v sha256sum >/dev/null 2>&1; then got=$(sha256sum \"$dir/$tar_name\" | awk '{print tolower($1)}'); "+
-			"elif command -v openssl >/dev/null 2>&1; then got=$(openssl dgst -sha256 \"$dir/$tar_name\" | awk '{print tolower($NF)}'); "+
-			"else rm -rf \"$dir\"; echo pb_dl_err=no_sha256; exit 13; fi; "+
-			"if [ \"$got\" != \"$want\" ]; then rm -rf \"$dir\"; echo pb_dl_err=checksum_mismatch; exit 14; fi; "+
-			"tar -xzf \"$dir/$tar_name\" -C \"$dir\"; "+
-			"rm -f \"$dir/$tar_name\" \"$dir/checksums.txt\"; "+
-			"if [ ! -f \"$dir/portbridge\" ] || [ ! -f \"$dir/install.sh\" ]; then rm -rf \"$dir\"; echo pb_dl_err=incomplete_archive; exit 15; fi; "+
-			"chmod -R a+rX \"$dir\"; "+
-			"echo pb_dl=ok",
+		"set -e;d=%s;u=%s;n=%s;t=%s;rm -rf \"$d\"&&mkdir -p \"$d\";"+
+			"f(){ if command -v curl >/dev/null 2>&1;then curl -fsSL --connect-timeout %d --max-time %d -o \"$2\" \"$1\";"+
+			"elif command -v wget >/dev/null 2>&1;then wget -q -T %d -t 1 -O \"$2\" \"$1\" 2>/dev/null||wget -q -T %d -O \"$2\" \"$1\";"+
+			"else echo pb_dl_err=no_http_tool;return 127;fi;};"+
+			"f \"$u\" \"$d/s\"||{ rm -rf \"$d\";echo pb_dl_err=checksums_unreachable;exit 10;};"+
+			"w=$(awk -v n=\"$n\" 'NF>=2{x=$2;sub(/^\\*/,\"\",x);sub(/^\\.\\//,\"\",x);if(x==n){print tolower($1);exit}}' \"$d/s\");"+
+			"case \"$w\" in [0-9a-f]*)[ \"${#w}\" -eq 64 ]||{ rm -rf \"$d\";echo pb_dl_err=bad_checksum;exit 11;};;*)rm -rf \"$d\";echo pb_dl_err=bad_checksum;exit 11;;esac;"+
+			"f \"$t\" \"$d/$n\"||{ rm -rf \"$d\";echo pb_dl_err=archive_unreachable;exit 12;};"+
+			"if command -v sha256sum >/dev/null 2>&1;then g=$(sha256sum \"$d/$n\"|awk '{print tolower($1)}');"+
+			"elif command -v openssl >/dev/null 2>&1;then g=$(openssl dgst -sha256 \"$d/$n\"|awk '{print tolower($NF)}');"+
+			"else rm -rf \"$d\";echo pb_dl_err=no_sha256;exit 13;fi;"+
+			"[ \"$g\" = \"$w\" ]||{ rm -rf \"$d\";echo pb_dl_err=checksum_mismatch;exit 14;};"+
+			"tar -xzf \"$d/$n\" -C \"$d\";rm -f \"$d/$n\" \"$d/s\";"+
+			"[ -f \"$d/portbridge\" ]&&[ -f \"$d/install.sh\" ]||{ rm -rf \"$d\";echo pb_dl_err=incomplete_archive;exit 15;};"+
+			"chmod -R a+rX \"$d\";echo pb_dl=ok",
 		shellQuote(dir), shellQuote(sumsURL), shellQuote(tarName), shellQuote(tarURL),
-		connTimeoutSec, maxTimeSec, wgetTimeout, wgetTimeout,
+		connTimeoutSec, maxTimeSec, wt, wt,
 	)
 }
 
@@ -877,9 +873,12 @@ func (p *Panel) install(j *job, rm *remote, arch, group string) error {
 	}
 
 	j.say("Installing...")
-	out, err := rm.runRoot("bash "+dir+"/install.sh --from-dir "+dir+" --no-menu; rc=$?; rm -rf "+dir+"; exit $rc", 5*time.Minute)
-	_, _ = rm.run("rm -rf "+dir, nil, 15*time.Second)
+	installCmd := "logf=/tmp/pb-inst-$$.log; bash " + dir + "/install.sh --from-dir " + dir +
+		" --no-menu >\"$logf\" 2>&1; rc=$?; rm -rf " + dir +
+		"; [ $rc -eq 0 ] || tail -n 16 \"$logf\"; rm -f \"$logf\"; exit $rc"
+	out, err := rm.runRoot(installCmd, 3*time.Minute)
 	if err != nil {
+		_, _ = rm.run("rm -rf "+dir, nil, 10*time.Second)
 		return fmt.Errorf("the installer failed: %v\n%s", err, lastLines(out, 12))
 	}
 	j.say("Installed.")

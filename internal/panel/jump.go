@@ -377,6 +377,24 @@ func (p *Panel) jumpCandidates(targetHost, preferGroup, explicitID string) []Ser
 	return cands
 }
 
+func isPublicJumpTarget(address string) bool {
+	h := strings.TrimSpace(address)
+	if h == "" || strings.EqualFold(h, "localhost") {
+		return false
+	}
+	ip := net.ParseIP(h)
+	if ip == nil {
+		return true
+	}
+	if !ip.IsGlobalUnicast() || ip.IsPrivate() || ip.IsLoopback() {
+		return false
+	}
+	if ip4 := ip.To4(); ip4 != nil && ip4[0] == 100 && ip4[1]&0xc0 == 64 {
+		return false
+	}
+	return true
+}
+
 func (p *Panel) dialTargetTCP(ctx context.Context, j *job, address string, port int, preferGroup, viaID string) (net.Conn, string, error) {
 	addr := net.JoinHostPort(address, strconv.Itoa(port))
 	viaID = strings.TrimSpace(viaID)
@@ -399,8 +417,39 @@ func (p *Panel) dialTargetTCP(ctx context.Context, j *job, address string, port 
 	}
 
 	cands := p.jumpCandidates(address, preferGroup, viaID)
+	triedJump := map[string]bool{}
+
+	// For public Foreign targets when at least one Foreign server is already
+	// online, hop SSH through that Foreign peer first so port-22 ISP/GFW byte
+	// policing on Relay panels never touches the SSH session. Falls back to
+	// direct TCP automatically if the jump route cannot reach the target.
+	if preferGroup == GroupForeign && viaID != "direct" && isPublicJumpTarget(address) {
+		var foreignCands []Server
+		for _, c := range cands {
+			if c.Group == GroupForeign {
+				foreignCands = append(foreignCands, c)
+				if len(foreignCands) >= 2 {
+					break
+				}
+			}
+		}
+		for _, cand := range foreignCands {
+			triedJump[cand.ID] = true
+			if j != nil {
+				j.say("Connecting to %s over SSH via %s...", addr, cand.Name)
+			}
+			jconn, jerr := dialViaAgent(ctx, p, cand, addr, 8*time.Second)
+			if jerr == nil {
+				return jconn, cand.Name, nil
+			}
+		}
+		if len(foreignCands) > 0 && j != nil {
+			j.say("Jump route could not reach %s; trying direct SSH...", addr)
+		}
+	}
+
 	directTimeout := 15 * time.Second
-	if len(cands) > 0 {
+	if len(cands) > len(triedJump) {
 		directTimeout = 8 * time.Second
 	}
 	if j != nil {
@@ -415,12 +464,21 @@ func (p *Panel) dialTargetTCP(ctx context.Context, j *job, address string, port 
 		return nil, "", derr
 	}
 
-	// Direct TCP (IPv4/IPv6) failed; try hopping through up to 3 online servers.
-	if len(cands) > 3 {
-		cands = cands[:3]
+	// Direct TCP (IPv4/IPv6) failed; try hopping through up to 3 remaining online servers.
+	var remCands []Server
+	for _, c := range cands {
+		if !triedJump[c.ID] {
+			remCands = append(remCands, c)
+			if len(remCands) >= 3 {
+				break
+			}
+		}
+	}
+	if len(remCands) == 0 {
+		return nil, "", derr
 	}
 	var lastJumpErr error
-	for _, cand := range cands {
+	for _, cand := range remCands {
 		if j != nil {
 			j.say("Direct SSH did not answer (%v); trying jump route via %s...", plainSSHError(derr), cand.Name)
 		}
