@@ -876,7 +876,39 @@
     const roleClass = s.group === 'relay' ? ' server-relay' : (s.group === 'foreign' ? ' server-foreign' : '');
 
     const chips = [];
-    if (s.address) chips.push(h('span', { class: 'meta-chip chip-ip', title: 'Server IP / Hostname' }, s.address));
+    if (s.address) {
+      const ipCopyIcon = () => makeSVG([
+        'M9 9h11a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H9a2 2 0 0 1-2-2v-9a2 2 0 0 1 2-2z',
+        'M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1',
+      ]);
+      const ipCheckIcon = () => makeSVG(['M20 6L9 17l-5-5']);
+      const iconSlot = h('span', { class: 'chip-copy-ico', 'aria-hidden': 'true' }, ipCopyIcon());
+      chips.push(h('button', {
+        type: 'button',
+        class: 'meta-chip chip-ip chip-ip-copy',
+        draggable: 'false',
+        title: `Copy IP address ${s.address}`,
+        'aria-label': `Copy IP address ${s.address}`,
+        'data-focus': `srv-${s.id}-copy-ip`,
+        ondragstart: (ev) => { ev.preventDefault(); ev.stopPropagation(); },
+        onmousedown: (ev) => { ev.stopPropagation(); },
+        onclick: async (ev) => {
+          ev.stopPropagation();
+          const btn = ev.currentTarget;
+          await copyTextSilent(s.address);
+          btn.classList.add('is-copied');
+          iconSlot.replaceChildren(ipCheckIcon());
+          setStatus(`Copied ${s.address} to clipboard.`);
+          if (btn._copyTimer) clearTimeout(btn._copyTimer);
+          btn._copyTimer = setTimeout(() => {
+            btn.classList.remove('is-copied');
+            iconSlot.replaceChildren(ipCopyIcon());
+          }, 1500);
+        },
+      },
+        h('span', { class: 'chip-ip-val' }, s.address),
+        iconSlot));
+    }
     if (ov && ov.version) chips.push(h('span', { class: 'meta-chip' }, 'PortBridge ' + ov.version));
     chips.push(h('span', { class: 'meta-chip' }, tunnels.length ? `${plural(tunnels.length, 'tunnel')} (${running} running)` : 'No tunnels'));
     let srvUpBps = 0, srvDownBps = 0, srvTotalBytes = 0;
@@ -1026,6 +1058,8 @@
           ? h('button', { type: 'button', 'data-focus': `srv-${s.id}-repair`, 'aria-label': `Repair or reconnect ${name}`, onclick: () => openRepairServer(s) },
               'Repair')
           : null,
+        h('button', { type: 'button', 'data-focus': `srv-${s.id}-share`, 'aria-label': `Share ${name} with another panel`, onclick: () => openShareServer(s) },
+          'Share'),
         h('button', { type: 'button', 'data-focus': `srv-${s.id}-edit`, 'aria-label': `Edit ${name}`, onclick: () => openEdit(s) },
           'Edit'),
         s.this ? null : h('button', { type: 'button', class: 'danger-text', 'data-focus': `srv-${s.id}-remove`, 'aria-label': `Remove ${name} from the panel`, onclick: () => confirmRemove(s) },
@@ -1043,6 +1077,10 @@
     if (s.group !== 'relay' && s.group !== 'foreign') return;
     card.draggable = true;
     card.addEventListener('dragstart', (ev) => {
+      if (ev.target && ev.target.closest && ev.target.closest('button, a, input, select, textarea')) {
+        ev.preventDefault();
+        return;
+      }
       dragged = s;
       ev.dataTransfer.effectAllowed = 'link';
       ev.dataTransfer.setData('text/plain', s.id);
@@ -1245,6 +1283,7 @@
     $('add-key').value = '';
     $('add-passphrase').value = '';
     $('add-file').value = '';
+    if ($('add-link-code')) $('add-link-code').value = '';
     keyFromFile = '';
   }
 
@@ -1293,23 +1332,25 @@
   }
 
   function populateAddViaOptions(excludeAddr) {
-    const sel = $('add-via');
-    if (!sel) return;
-    const prev = sel.value || 'auto';
-    const opts = [
-      h('option', { value: 'auto' }, 'Auto — Try Direct (IPv4/IPv6), then jump via online server'),
-      h('option', { value: 'direct' }, 'Direct from Panel only (no jump)'),
-    ];
+    const targets = [$('add-via'), $('add-link-via')].filter(Boolean);
+    if (!targets.length) return;
     const onlinePeers = serversCache.filter((s) => !s.this && s.online && (!excludeAddr || s.address !== excludeAddr));
-    for (const s of onlinePeers) {
-      const role = s.group === 'foreign' ? 'Foreign' : 'Relay';
-      opts.push(h('option', { value: s.id }, `Jump via ${s.name || s.address} (${role} · ${s.address})`));
-    }
-    sel.replaceChildren(...opts);
-    if (Array.from(sel.options).some((o) => o.value === prev)) {
-      sel.value = prev;
-    } else {
-      sel.value = 'auto';
+    for (const sel of targets) {
+      const prev = sel.value || 'auto';
+      const opts = [
+        h('option', { value: 'auto' }, 'Auto — Try Direct (IPv4/IPv6), then jump via online server'),
+        h('option', { value: 'direct' }, 'Direct from Panel only (no jump)'),
+      ];
+      for (const s of onlinePeers) {
+        const role = s.group === 'foreign' ? 'Foreign' : 'Relay';
+        opts.push(h('option', { value: s.id }, `Jump via ${s.name || s.address} (${role} · ${s.address})`));
+      }
+      sel.replaceChildren(...opts);
+      if (Array.from(sel.options).some((o) => o.value === prev)) {
+        sel.value = prev;
+      } else {
+        sel.value = 'auto';
+      }
     }
   }
 
@@ -1317,13 +1358,24 @@
     const add = addMode.kind === 'add';
     const repair = addMode.kind === 'repair';
     const showMethods = add || repair;
-    const isJoin = showMethods && addMethodKind() === 'join';
+    const method = showMethods ? addMethodKind() : 'ssh';
+    const isJoin = showMethods && method === 'join';
+    const isLink = add && method === 'link';
     if (!isJoin) stopJoinPoll();
     if ($('add-method-box')) $('add-method-box').hidden = !showMethods;
-    if ($('add-ssh-pane')) $('add-ssh-pane').hidden = isJoin;
+    if ($('add-method-link-card')) $('add-method-link-card').hidden = !add;
+    if ($('add-method-grid')) {
+      $('add-method-grid').classList.toggle('cols-3', add);
+      $('add-method-grid').classList.toggle('cols-2', !add);
+    }
+    if ($('add-ssh-pane')) $('add-ssh-pane').hidden = isJoin || isLink;
     if ($('add-address-wrap')) $('add-address-wrap').hidden = !(add || repair);
     if ($('add-join-pane')) $('add-join-pane').hidden = !isJoin;
+    if ($('add-link-pane')) $('add-link-pane').hidden = !isLink;
     $('add-submit').hidden = isJoin;
+    $('add-submit').textContent = isLink
+      ? 'Link Server'
+      : (add ? 'Add Server' : (repair ? 'Repair Server' : 'Upgrade Server'));
     $('add-cancel').textContent = isJoin ? 'Close' : 'Cancel';
     syncChoiceCards($('add-dialog'));
   }
@@ -1335,7 +1387,29 @@
     });
   }
 
-  async function copyTextWithButton(text, btn, defaultLabel) {
+  if ($('add-link-code')) {
+    $('add-link-code').addEventListener('input', () => {
+      const raw = $('add-link-code').value.trim().replace(/^["'`]|["'`]$/g, '');
+      if (!raw.startsWith('pbpanel://')) return;
+      try {
+        const b64 = raw.slice('pbpanel://'.length).replace(/-/g, '+').replace(/_/g, '/');
+        const pad = b64.length % 4 ? '='.repeat(4 - (b64.length % 4)) : '';
+        const sp = JSON.parse(atob(b64 + pad));
+        if (sp && (sp.g === 'relay' || sp.g === 'foreign') && !document.querySelector('input[name="group"]:checked')) {
+          const r = document.querySelector(`input[name="group"][value="${sp.g}"]`);
+          if (r) {
+            r.checked = true;
+            syncChoiceCards($('add-dialog'));
+          }
+        }
+        if (sp && sp.n && $('add-name') && !$('add-name').value.trim()) {
+          $('add-name').placeholder = `${sp.n} (inherited from link code)`;
+        }
+      } catch (_) {}
+    });
+  }
+
+  async function copyTextSilent(text) {
     if (!text) return;
     try {
       await navigator.clipboard.writeText(text);
@@ -1347,6 +1421,11 @@
       try { document.execCommand('copy'); } catch (_) {}
       ta.remove();
     }
+  }
+
+  async function copyTextWithButton(text, btn, defaultLabel) {
+    if (!text) return;
+    await copyTextSilent(text);
     if (btn) {
       btn.textContent = 'Copied!';
       setTimeout(() => { btn.textContent = defaultLabel; }, 1800);
@@ -1459,11 +1538,12 @@
     $('add-only-name').hidden = !add;
     $('add-update-row').hidden = !(add || repair);
     const srvLabel = (mode.server && (mode.server.name || mode.server.address)) || 'Server';
+    if ($('add-name')) $('add-name').placeholder = 'e.g. Iran-Asiatech or Germany-Hetzner';
     $('add-title').textContent = add
       ? 'Add a Server'
       : (repair ? `Repair / Reconnect ${srvLabel}` : `Upgrade ${srvLabel} via SSH`);
     $('add-intro').textContent = add
-      ? 'The panel connects via SSH once (trying Direct IPv4/IPv6 + online server jump automatically) or pairs via a 1-Line Join Command. Your SSH password or key is never stored.'
+      ? 'Connect via SSH once, pair via a 1-Line Join Command, or link a server already managed by another PortBridge panel. SSH credentials are never stored.'
       : (repair
         ? 'Reconnects this existing server in place without losing its tunnels or settings — either via SSH (Direct or Peer Jump) or with a 1-Line Reconnect Command.'
         : 'This server runs an older PortBridge version from before one-click updates. Enter its SSH login once to upgrade it; future updates will work with one click.');
@@ -1510,6 +1590,39 @@
     const err = $('add-error');
     err.textContent = '';
     const group = document.querySelector('input[name="group"]:checked');
+
+    if (addMode.kind === 'add' && addMethodKind() === 'link') {
+      const code = ($('add-link-code') && $('add-link-code').value.trim()) || '';
+      if (!code) {
+        err.textContent = 'Paste the pbpanel:// Server Link Code from your other panel.';
+        if ($('add-link-code')) $('add-link-code').focus();
+        return;
+      }
+      const btn = $('add-submit');
+      btn.disabled = true;
+      btn.classList.add('is-loading');
+      try {
+        const res = await api('POST', '/api/servers/link', {
+          code,
+          name: ($('add-name') && $('add-name').value.trim()) || '',
+          group: group ? group.value : '',
+          via_server: ($('add-link-via') && $('add-link-via').value) || 'auto',
+        });
+        clearSecrets();
+        $('add-dialog').close();
+        lastServers = '';
+        await refresh();
+        const extra = res.note ? ' ' + res.note : '';
+        setStatus(`Linked "${res.name}" (${res.address}) with ${plural(res.tunnels || 0, 'tunnel')}.${extra}`);
+      } catch (e) {
+        err.textContent = e.message;
+      } finally {
+        btn.classList.remove('is-loading');
+        btn.disabled = false;
+      }
+      return;
+    }
+
     const address = $('add-address').value.trim();
     const port = Number($('add-port').value || 22);
     const kind = authKind();
@@ -3915,7 +4028,29 @@
   async function showCode(target) {
     try {
       const res = await api('POST', '/api/tunnels/code', target);
+      $('code-title').textContent = 'Tunnel Pairing Code';
+      if ($('code-desc')) {
+        $('code-desc').textContent = 'To pair manually on the Foreign server, open portbridge-menu, select "Join a tunnel", and paste this code. Keep it private.';
+      }
+      $('code-copy').textContent = 'Copy Code';
       $('code-text').value = res.code;
+      $('code-msg').textContent = '';
+      openDialog($('code-dialog'));
+      $('code-text').select();
+    } catch (e) {
+      setStatus(e.message, true);
+    }
+  }
+  async function openShareServer(s) {
+    const label = s.name || s.address || 'Server';
+    try {
+      const res = await api('POST', '/api/servers/' + encodeURIComponent(s.id) + '/share');
+      $('code-title').textContent = `Share "${label}" to Another Panel`;
+      if ($('code-desc')) {
+        $('code-desc').textContent = 'In your other PortBridge panel, click "+ Add Server" -> "Link from Another Panel" and paste this code. No SSH password or key is needed, and both panels stay connected simultaneously. Keep this code private.';
+      }
+      $('code-copy').textContent = 'Copy Link Code';
+      $('code-text').value = res.code || '';
       $('code-msg').textContent = '';
       openDialog($('code-dialog'));
       $('code-text').select();

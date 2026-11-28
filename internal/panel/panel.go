@@ -70,8 +70,9 @@ type Panel struct {
 
 	// The panel's own server is managed through the agent's code, run here
 	// in-process, so it is handled exactly like every other server.
-	local      http.Handler
-	localToken string
+	local          http.Handler
+	localToken     string
+	localAgentConf string // optional override for tests; empty means /etc/portbridge/agent.conf
 
 	updates  *updater
 	healer   *autoHealer

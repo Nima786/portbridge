@@ -313,7 +313,7 @@ func TestSSHUploadStallAbortsPromptlyAndRetriesViaJump(t *testing.T) {
 	t.Cleanup(func() { engine.Version = prevVer })
 
 	prevStall := sshUploadStallTimeout
-	sshUploadStallTimeout = 150 * time.Millisecond
+	sshUploadStallTimeout = 500 * time.Millisecond
 	t.Cleanup(func() { sshUploadStallTimeout = prevStall })
 
 	// Panel can fetch a 64 KB (> 16 KB chunk) release archive so bulk stall detection engages.

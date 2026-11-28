@@ -914,6 +914,55 @@ button.srv-refresh-btn {
   color: var(--text);
   font-weight: 600;
 }
+button.meta-chip.chip-ip-copy {
+  display: inline-flex;
+  align-items: center;
+  gap: .36rem;
+  min-height: auto;
+  height: auto;
+  line-height: 1.35;
+  padding: .18rem .52rem .18rem .58rem;
+  font-size: .8rem;
+  font-weight: 600;
+  font-family: ui-monospace, "Cascadia Code", Consolas, monospace;
+  border-radius: 6px;
+  background: var(--well);
+  border: 1px solid var(--line);
+  color: var(--text);
+  cursor: pointer;
+  box-shadow: none;
+  transition: border-color .15s ease, background-color .15s ease, color .15s ease;
+}
+button.meta-chip.chip-ip-copy:hover {
+  border-color: var(--accent-border);
+  background: var(--accent-soft);
+}
+button.meta-chip.chip-ip-copy:active {
+  transform: translateY(0.5px);
+}
+button.meta-chip.chip-ip-copy .chip-copy-ico {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--muted);
+  transition: color .15s ease;
+}
+button.meta-chip.chip-ip-copy:hover .chip-copy-ico {
+  color: var(--accent);
+}
+button.meta-chip.chip-ip-copy .chip-copy-ico svg {
+  width: 13px;
+  height: 13px;
+  display: block;
+}
+button.meta-chip.chip-ip-copy.is-copied {
+  color: var(--ok);
+  border-color: var(--ok-border);
+  background: var(--ok-soft);
+}
+button.meta-chip.chip-ip-copy.is-copied .chip-copy-ico {
+  color: var(--ok);
+}
 
 .server .problem {
   color: var(--warn);
@@ -1036,7 +1085,8 @@ button.srv-refresh-btn {
   margin: .38rem 0 0;
   gap: .34rem;
 }
-.server.is-compact .meta-chip {
+.server.is-compact .meta-chip,
+.server.is-compact button.meta-chip.chip-ip-copy {
   font-size: .76rem;
   padding: .12rem .48rem;
 }

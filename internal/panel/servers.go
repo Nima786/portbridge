@@ -396,7 +396,8 @@ func (f *fleet) refresh(srv Server) {
 	if err == nil {
 		h.overview = ov
 		h.at = time.Now()
-		if !h.seededHome || (h.route == "jump" && !f.p.hub.connected(srv.ID)) {
+		if (!h.seededHome || (h.route == "jump" && !f.p.hub.connected(srv.ID))) &&
+			(supportsMultiPanelVersion(ov.Version) || srv.CallsPanel || srv.StandbyHub) {
 			needSeed = true
 		}
 	}

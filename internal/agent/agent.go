@@ -1372,10 +1372,12 @@ func newAgentHandler(token, confDir string, allowUpdates func() bool) *http.Serv
 		writeJSONReply(w, http.StatusOK, map[string]any{"ok": true, "report": engine.RunExplore(ctx, req)})
 	})
 
-	// POST /api/callhome: register or update the panel callback URL(s) and fingerprint
-	// so this agent calls the panel on /hub/poll in the background without needing SSH.
+	// POST /api/callhome: register or update one panel's callback URL(s) and
+	// fingerprint (merging with any other panels already registered on this
+	// server). DELETE /api/callhome: remove a specific panel's callback by its
+	// certificate fingerprint without disturbing any other panels.
 	mux.HandleFunc("/api/callhome", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
+		if r.Method != http.MethodPost && r.Method != http.MethodDelete {
 			http.Error(w, `{"error":"method not allowed"}`, http.StatusMethodNotAllowed)
 			return
 		}
@@ -1389,6 +1391,18 @@ func newAgentHandler(token, confDir string, allowUpdates func() bool) *http.Serv
 		}
 		if err := json.NewDecoder(io.LimitReader(r.Body, 4096)).Decode(&req); err != nil {
 			writeJSONReply(w, http.StatusBadRequest, map[string]any{"ok": false, "error": "invalid request"})
+			return
+		}
+		if r.Method == http.MethodDelete {
+			if strings.TrimSpace(req.PanelFingerprint) == "" {
+				writeJSONReply(w, http.StatusBadRequest, map[string]any{"ok": false, "error": "panel_fingerprint is required"})
+				return
+			}
+			if err := configureCallHome("off", req.PanelFingerprint, token, confDir, mux); err != nil {
+				writeJSONReply(w, http.StatusBadRequest, map[string]any{"ok": false, "error": err.Error()})
+				return
+			}
+			writeJSONReply(w, http.StatusOK, map[string]any{"ok": true})
 			return
 		}
 		if err := configureCallHome(req.PanelURL, req.PanelFingerprint, token, confDir, mux); err != nil {
@@ -1838,14 +1852,13 @@ func CmdAgent(args []string) error {
 		*listen = "0.0.0.0:2083"
 	}
 
-	// A panel this agent should call, if one was set up. It is in addition to
-	// the agent's own port, not instead of it: the Iran server's menu still
-	// reaches the agent there.
+	// Panels this agent should call, if any were set up. Calling panels is in
+	// addition to the agent's own HTTPS port, and multiple panels are supported
+	// simultaneously so one server can be shared across several web panels.
 	allow := updatesAllowedByConfig(*confPath)
-	if ac, err := readAgentConfig(*confPath); err == nil && ac.PanelURL != "" {
-		if err := configureCallHome(ac.PanelURL, ac.PanelFingerprint, *token, defaultTunnelsDir,
-			newAgentHandler(*token, defaultTunnelsDir, allow)); err != nil {
-			log.Printf("not calling the panel: %v", err)
+	if ac, err := readAgentConfig(*confPath); err == nil {
+		if panels := ac.allPanels(); len(panels) > 0 {
+			startAllCallHomes(panels, *token, newAgentHandler(*token, defaultTunnelsDir, allow))
 		}
 	}
 

@@ -560,14 +560,14 @@ func (p *Panel) addServer(j *job, r addRequest) (string, error) {
 		j.say("It has PortBridge %s, newer than the panel's %s. Leaving it as it is.", installed, engine.Version)
 	}
 
-	// It starts out not calling any panel. Whether it needs to is found out
-	// next, and it is switched to calling this one only if so.
+	// Preserve any existing panels already linked to this server so one server
+	// can be managed by multiple PortBridge panels simultaneously.
 	// Updates from the panel are allowed on a server added to it, so it can be
 	// kept up to date with one click. A PortBridge from before one-click updates
 	// does not know the setting, and could not use it anyway.
-	setupArgs := "-panel-url off"
+	setupArgs := ""
 	if now := installedAfter(installed, r.AllowUpdate); compareVersions(now, firstOneClickVersion) >= 0 {
-		setupArgs += " -allow-updates on"
+		setupArgs = "-allow-updates on"
 	}
 	j.say("Switching its management agent on...")
 	res, err := remoteAgentSetup(rm, setupArgs)
@@ -635,7 +635,11 @@ func (p *Panel) addServer(j *job, r addRequest) (string, error) {
 			jov, jumpName, jerr := p.tryJumpOverview(srv, r.ViaServer)
 			if jerr != nil {
 				if srv.CallsPanel {
-					_, _ = remoteAgentSetup(rm, "-panel-url off")
+					if fp := p.ownFingerprint(); fp != "" {
+						_, _ = remoteAgentSetup(rm, "-panel-url off -panel-fingerprint "+shellQuote(fp))
+					} else {
+						_, _ = remoteAgentSetup(rm, "-panel-url off")
+					}
 				}
 				if panelURL == "" {
 					return "", errors.New("the panel does not know its own public address for servers to call, and no jump route worked; " +

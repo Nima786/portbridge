@@ -556,7 +556,7 @@
 
       <fieldset class="step-box" id="add-method-box">
         <legend>Connection &amp; Pairing Method</legend>
-        <div class="choice-grid cols-2">
+        <div class="choice-grid cols-3" id="add-method-grid">
           <label class="choice-card">
             <input type="radio" name="add-method" value="ssh" checked>
             <div class="choice-body">
@@ -569,6 +569,13 @@
             <div class="choice-body">
               <div class="choice-top"><strong id="add-method-join-title">1-Line Join Command</strong><span class="pill-tag">No SSH Needed</span></div>
               <span class="choice-desc">Gives a single command to paste on the server when SSH from the panel is completely blocked or disabled.</span>
+            </div>
+          </label>
+          <label class="choice-card" id="add-method-link-card">
+            <input type="radio" name="add-method" value="link">
+            <div class="choice-body">
+              <div class="choice-top"><strong>Link from Another Panel</strong><span class="pill-tag tag-ok">Multi-Panel</span></div>
+              <span class="choice-desc">Paste a Share Link Code from another PortBridge panel. No SSH needed; both panels stay online.</span>
             </div>
           </label>
         </div>
@@ -675,6 +682,19 @@
             </div>
           </div>
           <p id="join-done-msg" class="good" role="status" hidden></p>
+        </div>
+      </div>
+
+      <div id="add-link-pane" class="join-pane" hidden>
+        <p class="muted small">On your other PortBridge panel, click <strong>Share</strong> on any server card to copy its <code>pbpanel://</code> link code, then paste it below. Both panels will manage that server simultaneously without needing SSH.</p>
+        <label for="add-link-code">Server Link Code</label>
+        <textarea id="add-link-code" rows="4" spellcheck="false" autocomplete="off" placeholder="pbpanel://..."></textarea>
+        <div id="add-link-via-wrap">
+          <label for="add-link-via">Connection Route <span class="muted">(optional)</span></label>
+          <select id="add-link-via">
+            <option value="auto">Auto — Try Direct (IPv4/IPv6), then jump via online server</option>
+            <option value="direct">Direct from Panel only (no jump)</option>
+          </select>
         </div>
       </div>
 
@@ -1646,7 +1666,7 @@
     <div class="dialog-header">
       <div>
         <h2 id="code-title">Tunnel Pairing Code</h2>
-        <p class="muted small">To pair manually on the Foreign server, open <code>portbridge-menu</code>, select "Join a tunnel", and paste this code. Keep it private.</p>
+        <p id="code-desc" class="muted small">To pair manually on the Foreign server, open <code>portbridge-menu</code>, select "Join a tunnel", and paste this code. Keep it private.</p>
       </div>
     </div>
     <div class="dialog-body">

@@ -11,6 +11,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"strings"
 	"testing"
@@ -283,7 +284,7 @@ func TestAgentSetupKeepsTheUpdateSetting(t *testing.T) {
 		t.Fatal(err)
 	}
 	got, err := readAgentConfig(path)
-	if err != nil || got != want {
+	if err != nil || !reflect.DeepEqual(got, want) {
 		t.Fatalf("read back %+v (%v), want %+v", got, err, want)
 	}
 	if errors.Is(err, os.ErrNotExist) {

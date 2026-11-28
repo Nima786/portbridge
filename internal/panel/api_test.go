@@ -47,6 +47,7 @@ func startPanel(t *testing.T, p *Panel) *httptest.Server {
 	ts.TLS = &tls.Config{Certificates: []tls.Certificate{p.selfCert}}
 	ts.StartTLS()
 	t.Cleanup(ts.Close)
+	t.Cleanup(agent.StopCallHome)
 	return ts
 }
 

@@ -12,6 +12,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -123,12 +124,13 @@ func TestAgentConfigKeepsEverySetting(t *testing.T) {
 	want := agentConfig{
 		Listen: "0.0.0.0:4356", Token: "pba_abc", CertFile: "/x.crt", KeyFile: "/x.key",
 		PanelURL: "https://203.0.113.5:2096", PanelFingerprint: "aa:bb",
+		Panels: []panelLink{{URLs: "https://203.0.113.5:2096", Fingerprint: "aa:bb"}},
 	}
 	if err := writeAgentConfig(path, want); err != nil {
 		t.Fatal(err)
 	}
 	got, err := readAgentConfig(path)
-	if err != nil || got != want {
+	if err != nil || !reflect.DeepEqual(got, want) {
 		t.Fatalf("read back %+v (%v), want %+v", got, err, want)
 	}
 	// The menu reads the same file with its own simple reader.
@@ -137,7 +139,7 @@ func TestAgentConfigKeepsEverySetting(t *testing.T) {
 		t.Fatalf("the menu would not find listen and token in:\n%s", text)
 	}
 	// Without a panel, nothing about one is written.
-	want.PanelURL, want.PanelFingerprint = "", ""
+	want.setPanels(nil)
 	_ = writeAgentConfig(path, want)
 	text, _ = os.ReadFile(path)
 	if strings.Contains(string(text), "panel") {

@@ -35,6 +35,12 @@ const (
 // the ports Cloudflare forwards, so the agent can later sit behind it.
 var agentPortCandidates = []int{2083, 2087, 2053, 8443, 2096}
 
+// panelLink represents one web panel that this agent calls back on /hub/poll.
+type panelLink struct {
+	URLs        string
+	Fingerprint string
+}
+
 // agentConfig is everything in agent.conf.
 type agentConfig struct {
 	Listen           string
@@ -43,8 +49,85 @@ type agentConfig struct {
 	KeyFile          string
 	PanelURL         string
 	PanelFingerprint string
+	Panels           []panelLink
 	// AllowUpdates is "on" when the panel may update PortBridge here.
 	AllowUpdates string
+}
+
+func panelLinkKey(urls, fp string) string {
+	if f := strings.ToLower(strings.TrimSpace(fp)); f != "" {
+		return "fp:" + f
+	}
+	return "url:" + strings.Join(splitPanelURLs(urls), ",")
+}
+
+func mergePanelLink(existing []panelLink, urls, fp string) []panelLink {
+	urls = strings.TrimSpace(urls)
+	fp = strings.TrimSpace(fp)
+	if urls == "" {
+		return existing
+	}
+	key := panelLinkKey(urls, fp)
+	out := make([]panelLink, 0, len(existing)+1)
+	replaced := false
+	for _, p := range existing {
+		if strings.TrimSpace(p.URLs) == "" {
+			continue
+		}
+		if panelLinkKey(p.URLs, p.Fingerprint) == key {
+			if !replaced {
+				out = append(out, panelLink{URLs: urls, Fingerprint: fp})
+				replaced = true
+			}
+			continue
+		}
+		out = append(out, p)
+	}
+	if !replaced {
+		out = append(out, panelLink{URLs: urls, Fingerprint: fp})
+	}
+	const maxPanels = 16
+	if len(out) > maxPanels {
+		out = out[len(out)-maxPanels:]
+	}
+	return out
+}
+
+func removePanelLink(existing []panelLink, fp string) []panelLink {
+	want := strings.ToLower(strings.TrimSpace(fp))
+	if want == "" {
+		return nil
+	}
+	var out []panelLink
+	for _, p := range existing {
+		if strings.ToLower(strings.TrimSpace(p.Fingerprint)) == want {
+			continue
+		}
+		out = append(out, p)
+	}
+	return out
+}
+
+func (ac agentConfig) allPanels() []panelLink {
+	var out []panelLink
+	if strings.TrimSpace(ac.PanelURL) != "" {
+		out = mergePanelLink(out, ac.PanelURL, ac.PanelFingerprint)
+	}
+	for _, p := range ac.Panels {
+		out = mergePanelLink(out, p.URLs, p.Fingerprint)
+	}
+	return out
+}
+
+func (ac *agentConfig) setPanels(panels []panelLink) {
+	ac.Panels = panels
+	if len(panels) > 0 {
+		ac.PanelURL = panels[0].URLs
+		ac.PanelFingerprint = panels[0].Fingerprint
+	} else {
+		ac.PanelURL = ""
+		ac.PanelFingerprint = ""
+	}
 }
 
 func readAgentConfig(path string) (agentConfig, error) {
@@ -53,6 +136,7 @@ func readAgentConfig(path string) (agentConfig, error) {
 	if err != nil {
 		return ac, err
 	}
+	var extraPanels []panelLink
 	for _, l := range strings.Split(string(data), "\n") {
 		l = strings.TrimSpace(l)
 		if l == "" || strings.HasPrefix(l, "#") {
@@ -76,19 +160,34 @@ func readAgentConfig(path string) (agentConfig, error) {
 			ac.PanelURL = v
 		case "panel_fingerprint":
 			ac.PanelFingerprint = v
+		case "panel":
+			urls, fp, _ := strings.Cut(v, "|")
+			urls, fp = strings.TrimSpace(urls), strings.TrimSpace(fp)
+			if urls != "" {
+				extraPanels = append(extraPanels, panelLink{URLs: urls, Fingerprint: fp})
+			}
 		case "allow_updates":
 			ac.AllowUpdates = v
 		}
 	}
+	ac.Panels = extraPanels
+	ac.setPanels(ac.allPanels())
 	return ac, nil
 }
 
 func writeAgentConfig(path string, ac agentConfig) error {
+	panels := ac.allPanels()
 	// Every value is written as one "key = value" line. A line break inside one
 	// would add a setting nobody asked for (allow_updates, a new token), so the
 	// whole write is refused rather than risk it.
-	for _, v := range []string{ac.Listen, ac.Token, ac.CertFile, ac.KeyFile,
-		ac.PanelURL, ac.PanelFingerprint, ac.AllowUpdates} {
+	checkVals := []string{ac.Listen, ac.Token, ac.CertFile, ac.KeyFile, ac.AllowUpdates}
+	for _, p := range panels {
+		if strings.Contains(p.URLs, "|") || strings.Contains(p.Fingerprint, "|") {
+			return errors.New("an agent panel setting contained an invalid separator; nothing was written")
+		}
+		checkVals = append(checkVals, p.URLs, p.Fingerprint)
+	}
+	for _, v := range checkVals {
 		if strings.ContainsAny(v, "\r\n") {
 			return errors.New("an agent setting contained a line break; nothing was written")
 		}
@@ -102,11 +201,14 @@ func writeAgentConfig(path string, ac agentConfig) error {
 	if ac.KeyFile != "" {
 		fmt.Fprintf(&b, "key_file = %s\n", ac.KeyFile)
 	}
-	if ac.PanelURL != "" {
-		b.WriteString("\n# The panel this agent calls, for when the panel cannot reach it.\n")
-		fmt.Fprintf(&b, "panel_url = %s\n", ac.PanelURL)
-		if ac.PanelFingerprint != "" {
-			fmt.Fprintf(&b, "panel_fingerprint = %s\n", ac.PanelFingerprint)
+	if len(panels) > 0 {
+		b.WriteString("\n# The panel(s) this agent calls, for when a panel cannot reach it directly.\n")
+		fmt.Fprintf(&b, "panel_url = %s\n", panels[0].URLs)
+		if panels[0].Fingerprint != "" {
+			fmt.Fprintf(&b, "panel_fingerprint = %s\n", panels[0].Fingerprint)
+		}
+		for _, extra := range panels[1:] {
+			fmt.Fprintf(&b, "panel = %s | %s\n", extra.URLs, extra.Fingerprint)
 		}
 	}
 	if ac.AllowUpdates != "" {
@@ -117,6 +219,36 @@ func writeAgentConfig(path string, ac agentConfig) error {
 		return err
 	}
 	return writeFileAtomic(path, []byte(b.String()), 0o600)
+}
+
+// ReadLocalAgentShareInfo returns this server's own agent port, token, and TLS
+// certificate fingerprint when portbridge-agent is configured locally.
+func ReadLocalAgentShareInfo(confPath string) (port int, token, fingerprint string, err error) {
+	if confPath == "" {
+		confPath = defaultAgentConf
+	}
+	ac, err := readAgentConfig(confPath)
+	if err != nil {
+		return 0, "", "", err
+	}
+	if ac.Token == "" {
+		return 0, "", "", errors.New("local management agent is not configured on this server yet")
+	}
+	if _, p, err := net.SplitHostPort(ac.Listen); err == nil {
+		port, _ = strconv.Atoi(p)
+	}
+	if port <= 0 {
+		port = 2083
+	}
+	certFile, keyFile := ac.CertFile, ac.KeyFile
+	if certFile == "" || keyFile == "" {
+		certFile, keyFile = defaultAgentCert, defaultAgentKey
+	}
+	cert, err := engine.EnsureCert(certFile, keyFile, "portbridge-agent")
+	if err != nil {
+		return 0, "", "", err
+	}
+	return port, ac.Token, certFingerprint(cert), nil
 }
 
 func newAgentToken() (string, error) {
@@ -234,13 +366,17 @@ func agentSetup(confPath string, port int, panelURL, panelFP, allowUpdates strin
 	switch panelURL {
 	case "":
 	case "off":
-		ac.PanelURL, ac.PanelFingerprint = "", ""
+		if strings.TrimSpace(panelFP) != "" {
+			ac.setPanels(removePanelLink(ac.allPanels(), panelFP))
+		} else {
+			ac.setPanels(nil)
+		}
 	default:
 		if err := validatePanelCallback(panelURL, panelFP); err != nil {
 			_, _ = hostRun("systemctl", "start", agentUnit)
 			return res, err
 		}
-		ac.PanelURL, ac.PanelFingerprint = panelURL, panelFP
+		ac.setPanels(mergePanelLink(ac.allPanels(), panelURL, panelFP))
 	}
 	if allowUpdates != "" {
 		ac.AllowUpdates = allowUpdates

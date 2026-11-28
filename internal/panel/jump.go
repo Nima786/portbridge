@@ -1166,9 +1166,9 @@ func (p *Panel) repairServer(j *job, existing Server, r addRequest) error {
 		j.say("PortBridge %s is installed.", installed)
 	}
 
-	setupArgs := "-panel-url off"
+	setupArgs := ""
 	if now := installedAfter(installed, r.AllowUpdate); compareVersions(now, firstOneClickVersion) >= 0 {
-		setupArgs += " -allow-updates on"
+		setupArgs = "-allow-updates on"
 	}
 	j.say("Restarting & verifying its management agent...")
 	res, err := remoteAgentSetup(rm, setupArgs)

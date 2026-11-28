@@ -58,9 +58,11 @@ func (p *Panel) routes() http.Handler {
 	mux.HandleFunc("POST /api/account", p.withAuth(p.handleAccount))
 	mux.HandleFunc("GET /api/servers", p.withAuth(p.handleServers))
 	mux.HandleFunc("POST /api/servers", p.withAuth(p.handleAddServer))
+	mux.HandleFunc("POST /api/servers/link", p.withAuth(p.handleLinkServer))
 	mux.HandleFunc("POST /api/servers/refresh", p.withAuth(p.handleRefreshAllServers))
 	mux.HandleFunc("POST /api/join-tickets", p.withAuth(p.handleCreateJoinTicket))
 	mux.HandleFunc("GET /api/join-tickets/{id}", p.withAuth(p.handleGetJoinTicket))
+	mux.HandleFunc("POST /api/servers/{id}/share", p.withAuth(p.handleShareServer))
 	mux.HandleFunc("PATCH /api/servers/{id}", p.withAuth(p.handleEditServer))
 	mux.HandleFunc("DELETE /api/servers/{id}", p.withAuth(p.handleRemoveServer))
 	mux.HandleFunc("GET /api/jobs/{id}", p.withAuth(p.handleJob))
@@ -586,6 +588,25 @@ func (p *Panel) handleRemoveServer(w http.ResponseWriter, r *http.Request, _ aut
 	case err != nil:
 		writeErr(w, http.StatusInternalServerError, "It could not be removed: "+err.Error())
 	default:
+		// Best-effort: unregister ONLY this panel's reverse callback on the
+		// remote agent using DELETE /api/callhome (ignored safely with 405 by
+		// pre-multi-panel agents so other panels are never disrupted).
+		if fp := p.ownFingerprint(); fp != "" && (gone.CallsPanel || gone.StandbyHub) {
+			tok, tokErr := p.store.open(gone.TokenEnc)
+			go func(srv Server, panelFP, token string, hasTok bool) {
+				defer p.fleet.forget(srv.ID)
+				if hasTok {
+					p.addPending(srv.ID, token)
+					defer p.dropPending(srv.ID)
+				}
+				ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
+				defer cancel()
+				body, _ := json.Marshal(map[string]string{
+					"panel_fingerprint": panelFP,
+				})
+				_, _, _ = p.fleet.call(ctx, srv, http.MethodDelete, "/api/callhome", body)
+			}(gone, fp, tok, tokErr == nil)
+		}
 		p.fleet.forget(id)
 		logf("removed %q (%s) from the panel", gone.Name, gone.Address)
 		writeJSON(w, http.StatusOK, map[string]bool{"ok": true})

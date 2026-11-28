@@ -245,16 +245,21 @@ func verifyChainFor(raw [][]byte, host string) error {
 	return err
 }
 
+type callHomeLoop struct {
+	spec   string
+	cancel context.CancelFunc
+	done   chan struct{}
+}
+
 var (
-	callHomeMu     sync.Mutex
-	callHomeCancel context.CancelFunc
-	callHomeDone   chan struct{}
-	callHomeSpec   string
+	callHomeMu    sync.Mutex
+	callHomeLoops = map[string]*callHomeLoop{}
 )
 
-// configureCallHome persists panel_url / panel_fingerprint (when on the real
-// system) and starts or updates the in-process callHome loop immediately without
-// needing to restart the agent service.
+// configureCallHome persists panel callback URL(s) + fingerprint (merging with
+// any other panels already registered on this server so one server can belong
+// to multiple PortBridge panels simultaneously) and starts or updates the
+// corresponding in-process callHome loop without restarting the agent service.
 func configureCallHome(panelURL, fingerprint, token, confDir string, h http.Handler) error {
 	panelURL = strings.TrimSpace(panelURL)
 	fingerprint = strings.TrimSpace(fingerprint)
@@ -267,73 +272,94 @@ func configureCallHome(panelURL, fingerprint, token, confDir string, h http.Hand
 	if confDir == "" || confDir == defaultTunnelsDir {
 		if ac, err := readAgentConfig(defaultAgentConf); err == nil {
 			if panelURL == "" || panelURL == "off" {
-				ac.PanelURL = ""
-				ac.PanelFingerprint = ""
+				if fingerprint != "" {
+					ac.setPanels(removePanelLink(ac.allPanels(), fingerprint))
+				} else {
+					ac.setPanels(nil)
+				}
 			} else {
-				ac.PanelURL = panelURL
-				ac.PanelFingerprint = fingerprint
+				ac.setPanels(mergePanelLink(ac.allPanels(), panelURL, fingerprint))
 			}
 			_ = writeAgentConfig(defaultAgentConf, ac)
 		}
 	}
 
-	callHomeMu.Lock()
-	spec := panelURL + "|" + fingerprint
 	if panelURL == "" || panelURL == "off" {
-		prevCancel := callHomeCancel
-		prevDone := callHomeDone
-		callHomeCancel = nil
-		callHomeDone = nil
-		callHomeSpec = ""
-		callHomeMu.Unlock()
-		if prevCancel != nil {
-			prevCancel()
+		if fingerprint == "" {
+			StopCallHome()
+			return nil
 		}
-		if prevDone != nil {
-			<-prevDone
+		key := panelLinkKey("", fingerprint)
+		callHomeMu.Lock()
+		prev := callHomeLoops[key]
+		delete(callHomeLoops, key)
+		callHomeMu.Unlock()
+		if prev != nil {
+			prev.cancel()
+			<-prev.done
 		}
 		return nil
 	}
-	if callHomeSpec == spec && callHomeCancel != nil {
+
+	startPanelCallHomeLoop(panelURL, fingerprint, token, h)
+	return nil
+}
+
+func startPanelCallHomeLoop(panelURL, fingerprint, token string, h http.Handler) {
+	key := panelLinkKey(panelURL, fingerprint)
+	spec := panelURL + "|" + fingerprint
+
+	callHomeMu.Lock()
+	if cur := callHomeLoops[key]; cur != nil && cur.spec == spec {
 		callHomeMu.Unlock()
-		return nil
+		return
 	}
-	prevCancel := callHomeCancel
-	prevDone := callHomeDone
+	prev := callHomeLoops[key]
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
-	callHomeCancel = cancel
-	callHomeDone = done
-	callHomeSpec = spec
-	callHomeMu.Unlock()
-	if prevCancel != nil {
-		prevCancel()
+	callHomeLoops[key] = &callHomeLoop{
+		spec:   spec,
+		cancel: cancel,
+		done:   done,
 	}
-	if prevDone != nil {
-		<-prevDone
+	callHomeMu.Unlock()
+
+	if prev != nil {
+		prev.cancel()
+		<-prev.done
 	}
 	go func() {
 		defer close(done)
 		callHome(ctx, panelURL, fingerprint, token, h)
 	}()
-	return nil
 }
 
-// StopCallHome cancels any background callHome loop started by configureCallHome
-// and waits for it to exit.
+// startAllCallHomes launches an independent callHome loop for every panel
+// saved in agent.conf so multi-panel setups stay connected simultaneously.
+func startAllCallHomes(panels []panelLink, token string, h http.Handler) {
+	for _, p := range panels {
+		if err := validatePanelCallback(p.URLs, p.Fingerprint); err != nil {
+			log.Printf("skipping invalid saved panel callback %q: %v", p.URLs, err)
+			continue
+		}
+		startPanelCallHomeLoop(p.URLs, p.Fingerprint, token, h)
+	}
+}
+
+// StopCallHome cancels all background callHome loops and waits for them to exit.
 func StopCallHome() {
 	callHomeMu.Lock()
-	cancel := callHomeCancel
-	done := callHomeDone
-	callHomeCancel = nil
-	callHomeDone = nil
-	callHomeSpec = ""
-	callHomeMu.Unlock()
-	if cancel != nil {
-		cancel()
+	loops := make([]*callHomeLoop, 0, len(callHomeLoops))
+	for k, l := range callHomeLoops {
+		loops = append(loops, l)
+		delete(callHomeLoops, k)
 	}
-	if done != nil {
-		<-done
+	callHomeMu.Unlock()
+	for _, l := range loops {
+		l.cancel()
+	}
+	for _, l := range loops {
+		<-l.done
 	}
 }
 
